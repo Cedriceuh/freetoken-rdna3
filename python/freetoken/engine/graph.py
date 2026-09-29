@@ -85,6 +85,7 @@ def _determine_cuda_graph_bs(
         return cuda_graph_bs
 
     free_memory_gb = free_memory / (1 << 30)
+    explicit = cuda_graph_max_bs is not None
     if cuda_graph_max_bs is None:
         if free_memory_gb > 80:  # H200
             cuda_graph_max_bs = 256
@@ -93,6 +94,10 @@ def _determine_cuda_graph_bs(
 
     if cuda_graph_max_bs < 1:
         return []
+    if explicit and cuda_graph_max_bs <= 8:
+        # a few concurrent requests (e.g. --cuda-graph-max-bs 4): capture every size, so 3 requests do not run
+        # padded to 4 (the padding row routes to extra experts: more cache misses, slower than 4 real requests)
+        return list(range(1, cuda_graph_max_bs + 1))
 
     candidates = [1, 2, 4] + list(range(8, cuda_graph_max_bs + 1, 8))
     return [bs for bs in candidates if bs <= cuda_graph_max_bs]

@@ -103,6 +103,10 @@ def resolve_row_source(folder: str) -> PleRowSource:
 class DiskRowTable:
     """``PLETableBackend`` whose rows are read from disk per fill (--ple-backend disk)."""
 
+    # every rank stages all hash heads from the host store (hashed from the full constants), so
+    # NGramEmbedding neither rebases nor all-gathers at TP>1
+    serves_all_heads = True
+
     def __init__(
         self,
         source: PleRowSource,

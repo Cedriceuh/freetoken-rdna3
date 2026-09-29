@@ -42,6 +42,7 @@ if TYPE_CHECKING:
 
 
 logger = init_logger(__name__)
+_DECODE_INTERLEAVE = int(os.environ.get("FREETOKEN_DECODE_INTERLEAVE", "0"))
 
 Indice2D: TypeAlias = Tuple[torch.Tensor, torch.Tensor]
 
@@ -63,6 +64,7 @@ ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
 
 class Scheduler(SchedulerIOMixin):
     def __init__(self, config: SchedulerConfig):
+        self._decode_credit = 0
         from freetoken.engine import Engine
 
         self.engine = Engine(config)
@@ -85,6 +87,7 @@ class Scheduler(SchedulerIOMixin):
             self.engine.num_pages, config.page_size, self.engine.page_table, config.cache_type,
             linear_state_pool=self.engine.linear_state_pool,
             swa_pool=self.engine.kv_cache,
+            kv_pool=self.engine.kv_cache,
             sliding_window_size=next(
                 (g.sliding_window for g in config.model_config.kv_cache_group_specs() if g.is_swa),
                 None,
@@ -868,11 +871,19 @@ class Scheduler(SchedulerIOMixin):
             )
 
     def _schedule_next_batch(self) -> ForwardInput | None:
-        # TODO: support other policies: e.g. DECODE first
-        batch = (
-            self.prefill_manager.schedule_next_batch(self.prefill_budget)
-            or self.decode_manager.schedule_next_batch()
-        )
+        # Prefill first (upstream policy). FREETOKEN_DECODE_INTERLEAVE=N (default 0 = off): after each prefill chunk,
+        # the requests already decoding get up to N decode steps before the next chunk, so a long read by one agent
+        # (a 16k chunk takes seconds) no longer freezes the others for its whole duration.
+        batch = None
+        if _DECODE_INTERLEAVE and self._decode_credit > 0:
+            batch = self.decode_manager.schedule_next_batch()
+            self._decode_credit = self._decode_credit - 1 if batch is not None else 0
+        if batch is None:
+            batch = self.prefill_manager.schedule_next_batch(self.prefill_budget)
+            if batch is not None and _DECODE_INTERLEAVE:
+                self._decode_credit = _DECODE_INTERLEAVE
+        if batch is None:
+            batch = self.decode_manager.schedule_next_batch()
         if batch is None:
             return None
         forward_input = self._prepare_batch(batch)

@@ -418,7 +418,8 @@ def test_track_snapshot_equals_a_prefill_stopped_at_the_boundary():
 
     stopped = torch.zeros_like(slab)
     _forward(layer, R[:CHUNK_SIZE], _meta([tokens[:CHUNK_SIZE]], [[EOS, EOS]], slots=[live]), stopped)
-    assert torch.equal(got, stopped[live])
+    # the same rows, computed by a 70-row and a 64-row forward: the projections' GEMMs may round differently per M
+    assert torch.allclose(got, stopped[live], rtol=1e-5, atol=1e-6)
 
 
 def test_prefix_hit_matches_the_uncached_run():

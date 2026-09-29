@@ -15,6 +15,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     q_ptr,
     k_cache_ptr,
     v_cache_ptr,
+    k_scale_ptr,
+    v_scale_ptr,
     indices_ptr,
     block_table_ptr,
     token_to_req_ptr,
@@ -29,6 +31,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     stride_v_block,
     stride_v_token,
     stride_v_head,
+    stride_s_block,
+    stride_s_token,
     stride_indices_row,
     stride_table_req,
     stride_output_row,
@@ -46,6 +50,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     NUM_TILES: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    KV_INT8: tl.constexpr,
 ) -> None:
     # row * stride can overflow int32 for large row counts.
     row = tl.program_id(0).to(tl.int64)
@@ -66,6 +71,10 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         mask=head_offsets[:, None] < GROUP_SIZE,
         other=0.0,
     )
+    if KV_INT8:
+        # int8 codes and fp32 -> fp16 convert natively on RDNA3 (bf16 conversions are emulated), so the int8 path
+        # runs its two dots in fp16; RMS-normed, roped queries are far inside the fp16 range
+        query = query.to(tl.float16)
 
     max_value = tl.full((BLOCK_M,), -1.0e20, dtype=tl.float32)
     normalizer = tl.zeros((BLOCK_M,), dtype=tl.float32)
@@ -119,7 +128,18 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
             mask=valid[:, None],
             other=0.0,
         )
+        if KV_INT8:
+            # int8 K/V with one fp32 scale per (token, kv head). The codes convert to fp16 exactly
+            # (|q| <= 127); the scales are per column of the score tile, so they apply after the QK dot and fold
+            # into the probabilities before the PV dot instead of touching every K/V element.
+            scale_offsets = safe_page * stride_s_block + page_offset * stride_s_token + kv_head
+            k_scale = tl.load(k_scale_ptr + scale_offsets, mask=valid, other=0.0)
+            v_scale = tl.load(v_scale_ptr + scale_offsets, mask=valid, other=0.0)
+            keys = keys.to(query.dtype)
+            values = values.to(query.dtype)
         scores = tl.dot(query, keys)
+        if KV_INT8:
+            scores *= k_scale[None, :]
         # Scaling scores avoids re-quantizing a scaled query to BF16.
         scores *= softmax_scale_log2
         scores = tl.where(valid[None, :], scores, -1.0e20)
@@ -128,8 +148,12 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         probabilities = tl.where(
             valid[None, :], tl.math.exp2(scores - next_max[:, None]), 0.0
         )
+        if KV_INT8:
+            weights = probabilities * v_scale[None, :]
+        else:
+            weights = probabilities
         accumulator = tl.dot(
-            probabilities.to(values.dtype),
+            weights.to(values.dtype),
             values,
             acc=accumulator * alpha[:, None],
         )
@@ -232,8 +256,11 @@ def qsa_sparse_paged_attention(
     block_table: torch.Tensor,
     token_to_req: torch.Tensor,
     out: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run sparse GQA directly over paged BF16 K/V caches."""
+    """Run sparse GQA directly over paged BF16 K/V caches, or int8 ones with ``[pages, page_size, kv_heads]``
+    fp32 scales (``k_scale`` / ``v_scale``, see kvcache/qsa_pool.py FREETOKEN_QSA_KV_INT8)."""
 
     if q.ndim != 3 or k_cache.ndim != 4 or v_cache.shape != k_cache.shape:
         raise ValueError("QSA sparse attention received invalid Q/K/V shapes")
@@ -247,7 +274,13 @@ def qsa_sparse_paged_attention(
         raise ValueError("QSA sparse attention requires valid grouped-query heads")
     head_dim = q.shape[2]
     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
-    assert q.dtype == k_cache.dtype == v_cache.dtype
+    kv_int8 = k_scale is not None
+    if kv_int8:
+        assert k_cache.dtype == v_cache.dtype == torch.int8 and v_scale is not None
+        assert k_scale.shape == v_scale.shape == k_cache.shape[:3] and k_scale.dtype == v_scale.dtype == torch.float32
+        assert k_scale.stride() == v_scale.stride() and k_scale.stride(2) == 1
+    else:
+        assert q.dtype == k_cache.dtype == v_cache.dtype
     assert logical_indices.dtype == block_table.dtype == torch.int32
     assert token_to_req.dtype == torch.int32
     assert q.stride(2) == k_cache.stride(3) == v_cache.stride(3) == 1
@@ -277,6 +310,16 @@ def qsa_sparse_paged_attention(
     else:
         block_n, target_splits, partial_warps = 64, 1, 2
 
+    # RDNA (gfx11 / gfx12) has 64 KiB of LDS per workgroup; the profile above was
+    # tuned on GB300. The K tile [head_dim, BLOCK_N] and the V tile [BLOCK_N, head_dim] alone
+    # cost 2 * head_dim * block_n * itemsize, which at head_dim=256 and block_n=64 is exactly
+    # 65536 B -- the whole budget -- and the launch then asks for 65792 and Triton refuses with
+    # OutOfResources. Halve the tile until the pair fits with room for the index scratch.
+    if torch.version.hip is not None:
+        _lds_budget = 60 * 1024
+        while block_n > 16 and 2 * head_dim * block_n * q.element_size() > _lds_budget:
+            block_n //= 2
+
     num_tiles = triton.cdiv(logical_indices.shape[1], block_n)
     # Avoid empty splits when the selection width is smaller than the profile.
     max_useful_splits = 1 << (num_tiles.bit_length() - 1)
@@ -303,6 +346,8 @@ def qsa_sparse_paged_attention(
         q,
         k_cache,
         v_cache,
+        k_scale if kv_int8 else q,
+        v_scale if kv_int8 else q,
         logical_indices,
         block_table,
         token_to_req,
@@ -317,6 +362,8 @@ def qsa_sparse_paged_attention(
         v_cache.stride(0),
         v_cache.stride(1),
         v_cache.stride(2),
+        k_scale.stride(0) if kv_int8 else 0,
+        k_scale.stride(1) if kv_int8 else 0,
         logical_indices.stride(0),
         block_table.stride(0),
         out.stride(0),
@@ -334,6 +381,7 @@ def qsa_sparse_paged_attention(
         NUM_TILES=num_tiles,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
+        KV_INT8=kv_int8,
         num_warps=partial_warps,
         num_stages=2,
     )

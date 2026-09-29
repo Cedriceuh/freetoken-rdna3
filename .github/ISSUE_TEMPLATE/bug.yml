@@ -1,0 +1,31 @@
+name: Bug report
+description: Something does not work or behaves unexpectedly
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what you expected
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Profile and exact command
+      description: "The output of `rdna3/serve.sh <profile> --model <dir> --dry-run` (plus any option you changed)."
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: hardware
+    attributes:
+      label: Hardware and system
+      description: "`rdna3/serve.sh --list-gpus`, system RAM, host kernel version (`uname -r`), image commit (`docker run --rm --entrypoint cat freetoken-rdna3:latest /opt/FreeToken-BUILD-PROVENANCE.txt`)."
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Server log
+      description: "`docker logs freetoken-rdna3` (the part around the problem, or all of it)."
+      render: text

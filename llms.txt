@@ -1,0 +1,54 @@
+# freetoken-rdna3
+
+> A tuned build of the FreeToken Mixture-of-Experts inference engine for AMD Radeon RX 7900 XTX / 7900 XT (RDNA3,
+> gfx1100, ROCm), serving Qwen3.8-Flash-Next (125B-parameter MoE, NVFP4) on one or two consumer GPUs with an
+> OpenAI- and Anthropic-compatible API. On an RX 7900 XTX + RX 7900 XT: 55 tok/s decode, 48-53 tok/s up to 255k tokens
+> of context, 4.5 s for an 8.4k-token prompt, up to 4 concurrent requests (113 tok/s in total); needs ~81 GiB of system
+> RAM for this model.
+
+Key facts: the engine keeps every expert in pinned system RAM (64.7 GiB for this model in NVFP4, the smallest format
+it runs for it) and caches the most used experts in VRAM; two cards run tensor-parallel with an uneven 55/45 split;
+dense layers are int8 (weights only); small all-reduces go through shared host memory (no GPU peer-to-peer on consumer
+boards); sampling on ROCm uses a top-k-first path for top_k <= 256 and an exact sorted threshold otherwise (upstream's
+cooperative sampling kernels hang on RDNA3); conversations evicted from the GPUs are kept in RAM and restored exactly.
+Every option is an environment variable (docs/rdna3/options.md gives each default): the tuning is off unless a profile
+turns it on, and only bit-exact or agent-validated changes are on by default. Precision rule: a change is either
+bit-exact (identical greedy answers) or validated on an agentic benchmark; an int8 KV cache that passed every short test
+cut the agentic score from 12-14 to 8-9 and is off in every profile (kept as an experimental option). Tested only on RX 7900 XTX + XT; NVIDIA, RDNA4, TP>2 untested.
+
+## Docs
+
+- [README](README.md): overview, headline numbers, quick start, profiles
+- [Getting started](docs/rdna3/getting-started.md): requirements, image build, model download, first run, clients, systemd
+- [Profiles](docs/rdna3/profiles.md): every setting of each hardware profile, why, and how to adapt to other cards
+- [Options](docs/rdna3/options.md): every environment variable this build adds, default, measured effect, exactness
+- [Benchmarks](docs/rdna3/benchmarks.md): method, depth sweeps per profile, parallel agents, precision, memory
+- [How it works](docs/rdna3/how-it-works.md): memory layout, decode step, split, all-reduce, prefill, sampler, RAM tier
+- [Decisions](docs/rdna3/decisions.md): each design choice with alternatives, pros, cons and the deciding measurement
+- [Journey](docs/rdna3/journey.md): chronological record of what was tried, kept and dropped, with numbers
+- [Limits and FAQ](docs/rdna3/limits.md): RAM (why not 64 GB), VRAM, other GPUs, NVIDIA, TP>2, other models, security
+- [Troubleshooting](docs/rdna3/troubleshooting.md): symptoms, causes, fixes, what to put in a bug report
+- [Testing](docs/rdna3/testing.md): CPU suite, GPU checks, micro-benchmarks, the release validation procedure
+- [Maintaining](docs/rdna3/maintaining.md): relation to upstream, sync and release procedure
+- [Changes from upstream](docs/rdna3/changes-from-upstream.md): every modified file with the reason
+- [All docs in one file](llms-full.txt): the documents above concatenated
+
+## Code map
+
+- [rdna3/serve.sh](rdna3/serve.sh): launcher (profile -> docker run + ft serve; GPU choice from the KFD topology)
+- [rdna3/profiles/](rdna3/profiles/): one env file per hardware setup (`TESTED=0` marks derived, unmeasured ones)
+- [Dockerfile.rdna3](Dockerfile.rdna3): the ROCm image (base pinned by digest, records its commit)
+- [distributed/split.py](python/freetoken/distributed/split.py): uneven tensor-parallel split
+- [kernel/host_allreduce.py](python/freetoken/kernel/host_allreduce.py): host-memory all-reduce (+ `kernel/csrc/jit/host_allreduce.cuh`)
+- [layers/quantization/int8_weight_only.py](python/freetoken/layers/quantization/int8_weight_only.py): int8 dense layers (+ `kernel/triton/int8_gemv.py`)
+- [kernel/triton/sampling_topk.py](python/freetoken/kernel/triton/sampling_topk.py): top-k-first sampler; [kernel/triton/sampling.py](python/freetoken/kernel/triton/sampling.py) `_sorted_threshold`: ROCm exact path
+- [kvcache/host_kv_pool.py](python/freetoken/kvcache/host_kv_pool.py) + [kvcache/hybrid_radix_cache.py](python/freetoken/kvcache/hybrid_radix_cache.py): conversations kept in RAM
+- [moe/fused_nvfp4.py](python/freetoken/moe/fused_nvfp4.py): NVFP4 expert kernels, tuned tiles, blocked prefill
+- [models/qwen4_exp/](python/freetoken/models/qwen4_exp/): Qwen3.8-Flash-Next (tensor-parallel port, PLE)
+- [engine/engine.py](python/freetoken/engine/engine.py): memory planning, rank token broadcast, int8 conversion
+- [rdna3/tests/](rdna3/tests/), [rdna3/bench/](rdna3/bench/): GPU checks and micro-benchmarks; `rdna3/bench/quick_bench.py` measures a running server
+
+## Optional
+
+- [Upstream FreeToken README](docs/FREETOKEN_UPSTREAM_README.md), [upstream CLI reference](docs/cli.md), [upstream model list](docs/models.md)
+- [AGENTS.md](AGENTS.md): how to work on this code (build, tests, rules)

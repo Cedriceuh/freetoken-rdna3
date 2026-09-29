@@ -1,0 +1,17 @@
+name: docs
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Links, anchors and llms-full.txt
+        run: python3 rdna3/tools/check_doc_links.py
+      - name: Shell scripts parse
+        run: for f in rdna3/serve.sh rdna3/tools/*.sh rdna3/tests/*.sh; do bash -n "$f"; done
+      - name: Python scripts compile
+        run: python3 -m py_compile rdna3/bench/*.py rdna3/tests/*.py rdna3/tools/*.py

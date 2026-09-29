@@ -60,6 +60,23 @@ class PyNCCLDistributedImpl(DistributedImpl):
         return result
 
 
+@dataclass
+class HostStagedDistributedImpl(DistributedImpl):
+    """Small all-reduces through shared host memory (kernel/host_allreduce.py), the rest on
+    ``fallback``. The choice depends only on dtype / size / layout, identical on both ranks."""
+
+    ar: object
+    fallback: DistributedImpl
+
+    def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
+        if self.ar.supports(x):
+            return self.ar(x)
+        return self.fallback.all_reduce(x)
+
+    def all_gather(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fallback.all_gather(x)
+
+
 class DistributedCommunicator:
     plugins: List[DistributedImpl] = [TorchDistributedImpl()]
 
@@ -90,8 +107,29 @@ def enable_pynccl_distributed(
     DistributedCommunicator.plugins.append(PyNCCLDistributedImpl(comm))
 
 
+def enable_host_allreduce(tp_info: DistributedInfo, tp_cpu_group: torch.distributed.ProcessGroup) -> bool:
+    """FREETOKEN_HOST_ALLREDUCE=1 with two ranks: route small all-reduces through host memory."""
+    from freetoken.kernel import host_allreduce
+
+    if tp_info.size != 2 or not host_allreduce.enabled():
+        return False
+    if getattr(torch.version, "hip", None) is None:
+        from freetoken.utils import init_logger
+
+        init_logger(__name__).warning("FREETOKEN_HOST_ALLREDUCE=1 ignored: ROCm (hipHostRegister) only")
+        return False
+    ar = host_allreduce.HostAllReduce(tp_info.rank, tp_info.size, tp_cpu_group)
+    fallback = DistributedCommunicator.plugins[-1]
+    DistributedCommunicator.plugins.append(HostStagedDistributedImpl(ar, fallback))
+    return True
+
+
 def destroy_distributed() -> None:
     """
     Destroy all the distributed communication plugins.
     """
+    for plugin in DistributedCommunicator.plugins:
+        ar = getattr(plugin, "ar", None)
+        if ar is not None and hasattr(ar, "close"):
+            ar.close()  # unregister before the mapping can be garbage-collected
     DistributedCommunicator.plugins = []

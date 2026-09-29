@@ -1,0 +1,35 @@
+name: Hardware report
+description: Numbers from your setup (especially for the untested profiles), so it can get a measured profile
+labels: [hardware-report]
+body:
+  - type: input
+    id: gpus
+    attributes:
+      label: GPUs
+      placeholder: 2x RX 7900 XT
+    validations:
+      required: true
+  - type: input
+    id: profile
+    attributes:
+      label: Profile (and changes to it)
+      placeholder: xt-xt, unchanged
+    validations:
+      required: true
+  - type: textarea
+    id: bench
+    attributes:
+      label: quick_bench output
+      description: "`python3 rdna3/bench/quick_bench.py --label '<your setup>'` with the server running (paste the table as printed)."
+    validations:
+      required: true
+  - type: textarea
+    id: system
+    attributes:
+      label: System
+      description: System RAM, CPU, host kernel version, anything unusual (PCIe risers, power limits).
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else
+      description: Free memory printed at start-up, stalls, errors, what you changed and why.

@@ -25,6 +25,10 @@ _FUSED_COPY = os.getenv("FREETOKEN_FUSED_COPY", "1").strip().lower() not in {"0"
 # entry the batch sees is >= this size.
 _SMALL_BANK_FEAT_BYTES = 256 * 1024
 
+# FREETOKEN_PREFILL_HIT_LOG=1: log each prefill chunk's hit-D2D share (expert rows gathered
+# from the cache instead of crossing PCIe).
+_PREFILL_HIT_LOG = os.getenv("FREETOKEN_PREFILL_HIT_LOG", "").strip().lower() in ("1", "true", "yes", "on")
+
 from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
@@ -288,6 +292,7 @@ class OffloadMoeCache:
         self._batch_memcpy = None
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
+        self._chunk_hit_rows = 0
 
     def set_bank_sources(
         self,
@@ -721,7 +726,7 @@ class OffloadMoeCache:
                 f"(needs > {2 * self.num_experts} slots)"
             )
         elif not self._resolve_batch_memcpy():
-            reason = "cudaMemcpyBatchAsync is unavailable"  # resolve logged the specifics
+            reason = "batch memcpy is unavailable (cudaMemcpyBatchAsync / ROCm batch or loop)"  # resolve logged why
         else:
             return True
         if not self._hit_d2d_fallback_logged:
@@ -769,8 +774,17 @@ class OffloadMoeCache:
         E = self.num_experts
         snap = self._prefill_snapshot_np[layer_id]
         hit_mask = snap >= 2 * E
-        self.prefill_hit_rows += int(hit_mask.sum())
+        hits = int(hit_mask.sum())
+        self.prefill_hit_rows += hits
         self.prefill_total_rows += E
+        if _PREFILL_HIT_LOG:
+            self._chunk_hit_rows += hits
+            if layer_id == self.num_layers - 1:
+                logger.info(
+                    f"prefill hit-D2D chunk: {self._chunk_hit_rows}/{self.num_layers * E} expert rows "
+                    f"from the cache ({100 * self._chunk_hit_rows / (self.num_layers * E):.1f} %)"
+                )
+                self._chunk_hit_rows = 0
         if self._gather_dst_ptrs is not None:
             prefill_hit_compact(self, layer_id, buffer_id)
             # blocks_per_bank=64 vs the PCIe-tuned default of 8: HBM D2D needs the

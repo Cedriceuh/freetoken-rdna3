@@ -12,6 +12,7 @@ import torch
 from freetoken.attention import AttnType, attention_backend_info, create_attention_backend
 from freetoken.core import Batch, Context, Req, set_global_ctx
 from freetoken.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
+from freetoken.distributed.split import tp_shares
 from freetoken.gpu_select import gpu_identity
 from freetoken.layers import set_rope_device
 from freetoken.layers.quantization import LayerKind, QuantBackend, finalize_quant, set_quant_backend
@@ -349,8 +350,9 @@ class Engine:
 
         self.tp_cpu_group = self._init_communication(config)
         free_min, free_max = self._sync_get_memory()
-        init_free_memory = free_max  # startup KV sizing keeps cross-rank MAX (unchanged)
+        init_free_memory = free_max  # startup KV sizing: cross-rank MAX (the MIN under FREETOKEN_TP_ALLOW_IMBALANCE when the ranks differ by > 2 GiB)
         self._baseline_free = free_min  # rebuild baseline: cross-rank MIN, deterministic across ranks
+        self._local_baseline_free = self._local_free  # this rank's own, for the uneven TP split's plan
         logger.info_rank0(f"Free memory before loading model: {mem_GB(init_free_memory)}")
 
         # ======================= Model initialization ========================
@@ -370,6 +372,7 @@ class Engine:
             self.model.place_encoder_weights(config.mm.encoder_weights)
         post_weights_free = self._sync_get_memory()[0]
         self._weights_bytes = self._baseline_free - post_weights_free
+        self._local_weights_bytes = self._local_baseline_free - self._local_free
         # Pool-budget baseline for the desktop cache sliders: free VRAM after the weights are
         # resident but before ANY runtime cache pool (MoE expert cache below, KV pages, GDN
         # state) is allocated. This is the stable "if all free VRAM went to one pool" budget —
@@ -498,7 +501,17 @@ class Engine:
             self._warmup_prefill()
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
-        if config.tp_info.size == 1 or config.use_pynccl:
+        use_pynccl = config.use_pynccl
+        if config.tp_info.size > 1 and use_pynccl:
+            from freetoken.kernel.backend import is_rocm
+
+            if is_rocm():
+                logger.warning_rank0(
+                    "PyNCCL is NVIDIA-only; using PyTorch's ROCm/RCCL process group instead"
+                )
+                use_pynccl = False
+
+        if config.tp_info.size == 1 or use_pynccl:
             torch.distributed.init_process_group(
                 backend="gloo",
                 rank=config.tp_info.rank,
@@ -522,6 +535,19 @@ class Engine:
             )
             tp_cpu_group = torch.distributed.new_group(backend="gloo")
             assert tp_cpu_group is not None
+            # Every rank samples its own copy of the logits. On unequal GPUs a sampler can reduce in a
+            # device-dependent order (e.g. split by CU count), so a draw could differ once in a while and that
+            # rank would go on with other tokens; broadcasting rank 0's tokens (the ones the client gets)
+            # after each sampled step rules it out. FREETOKEN_TP_SYNC_TOKENS=0 turns it off; =check also compares
+            # the ranks' own draws first and logs every disagreement (a sync per step: diagnostics only).
+            mode = os.environ.get("FREETOKEN_TP_SYNC_TOKENS", "1")
+            self._sync_sampled_tokens = mode in ("1", "check")
+            self._check_sampled_tokens = mode == "check"
+            self._sampled_disagreements = 0
+            from freetoken.distributed import enable_host_allreduce
+
+            if enable_host_allreduce(config.tp_info, tp_cpu_group):
+                logger.info_rank0("small all-reduces go through shared host memory (FREETOKEN_HOST_ALLREDUCE)")
         return tp_cpu_group
 
     def _load_weights(self, config: EngineConfig) -> None:
@@ -534,6 +560,13 @@ class Engine:
         with _weight_load_context():
             self.model.load_state_dict(self._load_weight_state_dict(config))
         finalize_quant(self.model)
+        from freetoken.layers.quantization import int8_weight_only
+
+        if int8_weight_only.enabled():
+            # before the post-weights memory snapshot, so the freed VRAM is budgeted to the MoE / KV pools
+            int8_weight_only.convert_model(self.model)
+            if os.environ.get("FREETOKEN_INT8_COMPACT", "1") == "1":
+                int8_weight_only.compact_device_tensors(self.model)
 
     def _load_weight_state_dict(self, config: EngineConfig) -> Dict[str, torch.Tensor]:
         model_state = self.model.state_dict()
@@ -598,9 +631,20 @@ class Engine:
         fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
         num_experts = config.model_config.num_experts
         total_experts = config.model_config.num_moe_layers * num_experts
-        return resolve_moe_cache_auto(
-            baseline_free=self._baseline_free,
-            weights_bytes=self._weights_bytes,
+        baseline_free, weights_bytes = self._baseline_free, self._weights_bytes
+        uneven = tp_shares(config.tp_info.size) is not None
+        if uneven:
+            # FREETOKEN_TP_SPLIT: the ranks' weights and expert slots differ in size, so each rank plans
+            # on its OWN free memory and weights, then all take the smallest plan (the scheduler and
+            # the expert cache must decide the same on every rank). The (1 - memory_ratio) headroom
+            # stays the smaller card's in bytes: activations and graphs do not grow with a bigger card,
+            # so the surplus of a bigger card goes to the cache whole (baseline_min + surplus / ratio).
+            surplus = self._local_baseline_free - self._baseline_free
+            baseline_free = self._baseline_free + int(surplus / config.memory_ratio)
+            weights_bytes = self._local_weights_bytes
+        size, pages, overlap = resolve_moe_cache_auto(
+            baseline_free=baseline_free,
+            weights_bytes=weights_bytes,
             memory_ratio=config.memory_ratio,
             cache_per_page=cache_per_page,
             fixed_cache_size=fixed_cache_size,
@@ -612,6 +656,15 @@ class Engine:
             page_size=page_tokens,
             max_slots=method.slot_limit() if method is not None else None,
         )
+        if uneven:
+            plan = torch.tensor([size, pages, int(overlap)], dtype=torch.int64)
+            torch.distributed.all_reduce(plan, op=torch.distributed.ReduceOp.MIN, group=self.tp_cpu_group)
+            logger.info(
+                f"uneven TP plan (rank {config.tp_info.rank}): own moe_cache_size={size} num_pages={pages}, "
+                f"common {int(plan[0])} / {int(plan[1])}"
+            )
+            size, pages, overlap = int(plan[0]), int(plan[1]), bool(plan[2])
+        return size, pages, overlap
 
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
         method = shared_offload_method(self.model)
@@ -732,7 +785,7 @@ class Engine:
             self._resolve_hybrid_fetch(config, cache)
         # Must be set before CUDA graph capture so the (device-side) accumulation ops are
         # captured and re-run on every decode replay.
-        cache.collect_stats = config.moe_collect_stats
+        cache.collect_stats = config.moe_collect_stats or os.environ.get("FT_MOE_STATS") == "1"
         layers = attach_offload_moe_cache(self.model, cache)
         assert len(layers) == config.model_config.num_moe_layers
         if cache.decode_target in ("cpu", "hybrid"):
@@ -814,6 +867,7 @@ class Engine:
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(self.device)
         free_memory = get_free_memory(self.device)
+        self._local_free = free_memory
         free_mem_tensor = torch.tensor([free_memory, -free_memory], device="cpu", dtype=torch.int64)
         torch.distributed.all_reduce(
             free_mem_tensor, op=torch.distributed.ReduceOp.MIN, group=self.tp_cpu_group
@@ -821,9 +875,21 @@ class Engine:
         min_free_memory = int(free_mem_tensor[0].item())
         max_free_memory = -int(free_mem_tensor[1].item())
         if max_free_memory - min_free_memory > 2 * 1024 * 1024 * 1024:
+            # Every rank plans with the min, so unequal cards (e.g. 24 GB + 20 GB) work at the cost
+            # of the bigger card's surplus; opt in with FREETOKEN_TP_ALLOW_IMBALANCE=1.
+            if os.environ.get("FREETOKEN_TP_ALLOW_IMBALANCE") == "1":
+                logger.warning(
+                    f"Memory across TP ranks are imbalanced:"
+                    f" min {mem_GB(min_free_memory)}, max {mem_GB(max_free_memory)}; planning with the min"
+                )
+                # min for both: the startup KV sizing reads the max slot, and sizing the pool from the
+                # bigger card would run the smaller one out of memory (without --moe-cache-auto, which
+                # overrides the page count from its own min-based plan)
+                return min_free_memory, min_free_memory
             logger.error(
                 f"Memory across TP ranks are imbalanced:"
                 f" min {mem_GB(min_free_memory)}, max {mem_GB(max_free_memory)}"
+                " (set FREETOKEN_TP_ALLOW_IMBALANCE=1 to plan every rank on the min)"
             )
             raise RuntimeError("Memory across TP ranks are imbalanced")
 
@@ -888,6 +954,11 @@ class Engine:
         if (moe_cache_size is None and num_pages is None and num_mamba_slots is None
                 and num_swa_pages is None):
             return
+        if tp_shares(config.tp_info.size) is not None:
+            # FREETOKEN_TP_SPLIT: the ranks' expert slots differ in size, and the fit-check below mixes the
+            # cross-rank-min baseline with this rank's own sizes, so the ranks could disagree and one would tear
+            # down (and hit collectives) while the other rejects. Same env on every rank: all reject together.
+            raise CacheRebuildRejected("runtime cache rebuild is not supported with FREETOKEN_TP_SPLIT")
 
         # 0a. Geometry prevalidation BEFORE any destructive free. An invalid target (moe
         #     slots on a model with no offload cache, moe below num_experts / above the
@@ -1022,8 +1093,16 @@ class Engine:
         if batch.mm_gather_plan:
             self._run_mm_encoder(batch)
         use_graph = self.graph_runner.can_use_cuda_graph(batch)
+        prof = self.__dict__.get("_ftprof")
+        if prof is None:
+            from freetoken.engine.ftprof import DecodeProfiler
+
+            prof = self._ftprof = DecodeProfiler(self)
+        counted = use_graph or (prof.eager and not batch.is_prefill)
+        prof.start(counted)
         with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph):
             logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
+        prof.end(counted)
         if self.cpu_moe_executor is not None:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.
@@ -1034,6 +1113,16 @@ class Engine:
 
         batch_logits = logits[: batch.size]
         next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
+        if args.temperatures is not None and getattr(self, "_sync_sampled_tokens", False):
+            if self._check_sampled_tokens:
+                own = [torch.empty_like(next_tokens_gpu) for _ in range(self.config.tp_info.size)]
+                torch.distributed.all_gather(own, next_tokens_gpu)
+                diff = int(sum((o != own[0]).sum() for o in own[1:]).item())
+                if diff:
+                    self._sampled_disagreements += diff
+                    logger.warning(f"TP ranks sampled different tokens in {diff} row(s) of this step "
+                                   f"({self._sampled_disagreements} so far); rank 0's are kept")
+            torch.distributed.broadcast(next_tokens_gpu, src=0)  # greedy (argmax) needs no sync
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)

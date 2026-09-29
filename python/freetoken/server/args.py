@@ -359,7 +359,9 @@ def parse_args(
         "--graph",
         type=int,
         default=ServerArgs.cuda_graph_max_bs,
-        help="The maximum batch size for CUDA graph capture. None means auto-tuning based on the GPU memory.",
+        help=("The maximum batch size for CUDA graph capture. None means auto-tuning based on the GPU memory. "
+              "An explicit value <= 8 captures every size 1..N (a batch padded to the next captured size would "
+              "route its dummy rows to extra experts)."),
     )
 
     parser.add_argument(

@@ -299,6 +299,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
 
         self._update_index_cache(index, md, slot)
         indices = self._select(index, md, slot)
+        int8 = self.kvcache.kv_int8
         return qsa_sparse_paged_attention(
             q,
             self.kvcache.k_cache(layer_id),
@@ -307,6 +308,8 @@ class QSASparseAttnBackend(BaseAttnBackend):
             md.block_table,
             md.token_to_req,
             torch.empty_like(q),
+            k_scale=self.kvcache.k_scale(layer_id) if int8 else None,
+            v_scale=self.kvcache.v_scale(layer_id) if int8 else None,
         )
 
     def _plan_index_writes(self, md: QSASparseMetadata, batch: Batch) -> None:

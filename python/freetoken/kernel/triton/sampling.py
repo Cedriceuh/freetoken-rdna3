@@ -162,8 +162,40 @@ _SR_CFGS = [
 ]
 
 
+def _sorted_threshold(probs, top_k, top_p):
+    """Exact per-row threshold from one sort (ROCm), keep x >= thr: top-k = the k-th largest value (boundary ties
+    kept); top-p (after top-k, on the renormalized survivors) = the largest t with mass(x >= t) >= p * mass(top-k).
+    The same definitions as the fused kernels, without their per-row scans: no cooperative barrier, and a flat row
+    costs what a peaked one does (the one-CTA mass rounds took ~60 ms per call on a flat 248k-token row)."""
+    B, V = probs.shape
+    vals = probs.sort(-1, descending=True).values
+    thr = torch.zeros(B, 1, device=probs.device, dtype=probs.dtype)
+    if top_k is not None:
+        k = _topk_target(top_k, B, probs.device).long().clamp(1, V)
+        thr = vals.gather(-1, (k - 1)[:, None])
+    if top_p is not None:
+        csum = vals.cumsum(-1)
+        p = _topp_target(top_p, B, probs.device)[:, None]
+        target = p
+        if top_k is not None:
+            n_k = (vals >= thr).sum(-1, keepdim=True)  # ties at the k-th value included
+            target = p * csum.gather(-1, n_k - 1)
+        j = torch.searchsorted(csum, target).clamp(max=V - 1)
+        # p >= 1 cuts nothing (the fp32 cumsum saturates before the tail and would drop its tiniest tokens)
+        thr_p = torch.where(p >= 1.0, torch.zeros_like(thr), vals.gather(-1, j))
+        thr = torch.maximum(thr, thr_p)
+    return thr.squeeze(-1).contiguous()
+
+
+def _renorm_sorted(probs, thr):
+    out = torch.where(probs >= thr[:, None], probs, torch.zeros_like(probs))
+    return out / out.sum(-1, keepdim=True)
+
+
 def top_p_renorm_probs(probs, top_p):
     probs = probs.float()
+    if _SORTED_THRESHOLD:
+        return _renorm_sorted(probs, _sorted_threshold(probs, None, top_p))
     return _topp(probs, _topp_target(top_p, probs.size(0), probs.device), None, False)
 
 
@@ -285,7 +317,10 @@ def top_p_sampling_from_probs(probs, top_p, indices=None, deterministic=True, ge
                               check_nan=False, seed=None, offset=None, return_valid=False):
     probs = probs.float()
     src = probs if indices is None else probs[indices].contiguous()
-    out = _topp(src, _topp_target(top_p, src.size(0), src.device), None, True, seed, offset)
+    if _SORTED_THRESHOLD:
+        out = _draw(src, _sorted_threshold(src, None, top_p), seed, offset)
+    else:
+        out = _topp(src, _topp_target(top_p, src.size(0), src.device), None, True, seed, offset)
     out = out.to(indices.dtype) if indices is not None else out
     return (out, torch.ones_like(out, dtype=torch.bool)) if return_valid else out
 
@@ -522,6 +557,14 @@ def _topp_fused(
 
 
 _COOPERATIVE_DISABLED = set()
+# ROCm: RDNA3 does not guarantee the co-residency the multi-CTA rows spin on (observed hanging on gfx1100), so every
+# row runs as ONE CTA there -- the same exact algorithm, the barrier then passes at once.
+_ONE_CTA_PER_ROW = getattr(torch.version, "hip", None) is not None
+# ROCm: top-k / top-p draws (and the renormalize API) take their threshold from a sort and draw with the multi-CTA
+# inverse-CDF kernels instead (see _sorted_threshold): with one CTA per row, the fused top-p mass rounds cost
+# ~10 ms per call on a peaked 248k-token row and ~60 ms on a flat one, the sort path 0.24 ms (B=1) either way,
+# and their renormalize mode faults (top-p) or leaves rows unnormalized (top-k) on gfx1100.
+_SORTED_THRESHOLD = _ONE_CTA_PER_ROW
 _COOP_CTAS_PER_SM = 2  # the fused kernels use ~80 regs/thread at 8 warps; 4/SM fails the cooperative launch
 
 
@@ -584,7 +627,7 @@ def _is_cooperative_launch_error(exc):
 
 def _exact_launch(probs, kernel, tk, tp, draw, seed, offset):
     key = _cooperative_key(probs, kernel, tk, draw)
-    force_single = key in _COOPERATIVE_DISABLED
+    force_single = _ONE_CTA_PER_ROW or key in _COOPERATIVE_DISABLED
     G, _ = _fused_plan(*probs.shape, probs.device, force_single)
     try:
         return _fused_launch(probs, kernel, tk, tp, draw, seed, offset, force_single)
@@ -619,6 +662,8 @@ def _topp_target(top_p, B, dev):
 
 def top_k_renorm_probs(probs, top_k):
     probs = probs.float()
+    if _SORTED_THRESHOLD:
+        return _renorm_sorted(probs, _sorted_threshold(probs, top_k, None))
     return _topk(probs, _topk_target(top_k, probs.size(0), probs.device), False)
 
 
@@ -626,7 +671,10 @@ def top_k_sampling_from_probs(probs, top_k, indices=None, deterministic=True, ge
                               check_nan=False, seed=None, offset=None, return_valid=False):
     probs = probs.float()
     src = probs if indices is None else probs[indices].contiguous()
-    out = _topk(src, _topk_target(top_k, src.size(0), src.device), True, seed, offset)
+    if _SORTED_THRESHOLD:
+        out = _draw(src, _sorted_threshold(src, top_k, None), seed, offset)
+    else:
+        out = _topk(src, _topk_target(top_k, src.size(0), src.device), True, seed, offset)
     out = out.to(indices.dtype) if indices is not None else out
     return (out, torch.ones_like(out, dtype=torch.bool)) if return_valid else out
 
@@ -638,7 +686,10 @@ def top_k_top_p_sampling_from_probs(probs, top_k, top_p, indices=None,
     probs = probs.float()
     src = probs if indices is None else probs[indices].contiguous()
     B = src.size(0)
-    out = _topp(src, _topp_target(top_p, B, src.device), _topk_target(top_k, B, src.device), True, seed, offset)
+    if _SORTED_THRESHOLD:
+        out = _draw(src, _sorted_threshold(src, top_k, top_p), seed, offset)
+    else:
+        out = _topp(src, _topp_target(top_p, B, src.device), _topk_target(top_k, B, src.device), True, seed, offset)
     out = out.to(indices.dtype) if indices is not None else out
     return (out, torch.ones_like(out, dtype=torch.bool)) if return_valid else out
 

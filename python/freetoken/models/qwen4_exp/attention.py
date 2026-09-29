@@ -19,9 +19,10 @@ from typing import TYPE_CHECKING, Protocol
 
 import torch
 from freetoken.core import get_global_ctx
-from freetoken.layers import BaseOP, GemmaPlusOneRMSNorm, LinearColParallelMerged, LinearReplicated
+from freetoken.distributed import get_tp_info
+from freetoken.layers import BaseOP, GemmaPlusOneRMSNorm, LinearColParallelMerged, LinearOProj, LinearReplicated
 from freetoken.layers.rotary import get_rope
-from freetoken.utils import nvtx_annotate
+from freetoken.utils import div_even, nvtx_annotate
 
 if TYPE_CHECKING:
     from freetoken.core import Batch
@@ -118,18 +119,30 @@ class Qwen4ExpAttention(BaseOP):
 
     def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = "") -> None:
         self.layer_id = layer_id
-        self.num_q = config.num_qo_heads
-        self.num_kv = config.num_kv_heads
+        tp_size = get_tp_info().size
+        # Head counts and every width derived from them are RANK-LOCAL: `qkv_proj` shards its declared
+        # outputs, so the split applied to the GEMM result must be the local one. The KV pool divides
+        # the same way (`div_even(..., allow_replicate=True)`).
+        self.num_q = div_even(config.num_qo_heads, tp_size)
+        self.num_kv = div_even(config.num_kv_heads, tp_size, allow_replicate=True)
         self.head_dim = config.head_dim
         self.qo_attn_dim = self.num_q * self.head_dim
         self.kv_attn_dim = self.num_kv * self.head_dim
         self._qkv_split = [self.qo_attn_dim * 2, self.kv_attn_dim, self.kv_attn_dim]
+        full_qo_attn_dim = config.num_qo_heads * self.head_dim
+        full_kv_attn_dim = config.num_kv_heads * self.head_dim
         self.qkv_proj = LinearColParallelMerged(
-            config.hidden_size, self._qkv_split, has_bias=False,
+            config.hidden_size, [full_qo_attn_dim * 2, full_kv_attn_dim, full_kv_attn_dim], has_bias=False,
             quant_config=config.quant, prefix=f"{prefix}.qkv_proj",
         )
-        self.o_proj = LinearReplicated(
-            self.qo_attn_dim, config.hidden_size, has_bias=False,
+        assert sum(self._qkv_split) == self.qkv_proj.local_output_size, (
+            f"declared split {self._qkv_split} does not tile the local GEMM width "
+            f"{self.qkv_proj.local_output_size} at tp_size={tp_size}"
+        )
+        # Each rank attends over its own heads and holds a partial sum of the output projection:
+        # row-parallel, all-reduced at TP>1 (a plain replicated linear at TP=1).
+        self.o_proj = LinearOProj(
+            full_qo_attn_dim, config.hidden_size, has_bias=False,
             quant_config=config.quant, prefix=f"{prefix}.o_proj",
         )
         self.q_norm = GemmaPlusOneRMSNorm(self.head_dim, eps=config.rms_norm_eps)

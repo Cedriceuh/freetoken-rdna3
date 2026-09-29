@@ -71,8 +71,13 @@ class PrefillAdder:
         if self.table_manager.available_size == 0:
             return None
 
-        # TODO: consider host cache match case
         mr = self.cache_manager.match_req(req)
+        if self.cache_manager.host_kv is not None:
+            # host tier: pull a deeper prefix back from host memory when the admission fits
+            mr = self.cache_manager.maybe_promote(
+                req, mr,
+                lambda cached: self._kv_reservation_size(req.input_len + req.output_len, cached)
+                + self.reserved_size)
         handle = mr.cuda_handle
         cached_len = handle.cached_len
         # TODO: better estimate policy
@@ -140,6 +145,7 @@ class PrefillAdder:
         linear_slot_idx: int | None = None,
         ping_pong: tuple | None = None,
         next_track_idx: int = 0,
+        last_track_seqlen: int | None = None,
         restore_src: int | None = None,
         swa_evicted_seqlen: int = 0,
     ) -> Req | None:
@@ -223,6 +229,16 @@ class PrefillAdder:
         req.linear_slot_idx = linear_slot_idx
         req.mamba_ping_pong = ping_pong
         req.mamba_next_track_idx = next_track_idx
+        # boundary carry (from lukascechovic's rocm-gfx1201 port): carry the tracked boundary across the chunk seam. A prefill forward
+        # tracks a GDN boundary only when ITS OWN chunk is >= CHUNK+1 tokens (attention/linear.py
+        # _build_track_metadata), and only the FINAL chunk commits (the scheduler skips
+        # ChunkedReq). Dropping this field here therefore threw away an earlier chunk's snapshot
+        # whenever the turn's last chunk was short -- `_cache_req_hybrid` saw `L is None` and the
+        # turn donated no reusable resume point at all, so the next turn resumed from the last
+        # turn that did. It is carried as a PAIR with `next_track_idx`: the two are only ever set
+        # together (linear.py _build_track_metadata, cache.py snapshot_toolcall_anchor), so `ping_pong[1 - next_track_idx]` is
+        # the slot that wrote the state at `last_track_seqlen` however many chunks ago that was.
+        req.mamba_last_track_seqlen = last_track_seqlen
         req.mamba_restore_src = restore_src
         req.swa_evicted_seqlen = swa_evicted_seqlen  # carry the extend-free watermark across chunks
         return req
@@ -240,6 +256,8 @@ class PrefillAdder:
                 linear_slot_idx=chunked_req.linear_slot_idx,
                 ping_pong=chunked_req.mamba_ping_pong,
                 next_track_idx=chunked_req.mamba_next_track_idx,
+                # carried as a pair with next_track_idx -- see _add_one_req
+                last_track_seqlen=chunked_req.mamba_last_track_seqlen,
                 restore_src=None,  # continuation chunk already has live state
                 swa_evicted_seqlen=chunked_req.swa_evicted_seqlen,  # extend-free watermark so far
             )

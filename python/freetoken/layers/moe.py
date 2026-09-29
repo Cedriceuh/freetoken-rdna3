@@ -69,6 +69,9 @@ class MoELayer(BaseOP):
         tp_info = get_tp_info()
         self.tp_rank = tp_info.rank
         self.tp_size = tp_size = tp_info.size
+        # a parent that sums this layer's partial output with another partial (e.g. a shared expert) sets
+        # this and all-reduces the sum once instead
+        self.defer_all_reduce = False
         self.renormalize = renormalize
         self.activation = activation
         self.apply_router_weight_on_input = apply_router_weight_on_input
@@ -93,7 +96,7 @@ class MoELayer(BaseOP):
             self.quant_method.finalize(self)
 
     def _maybe_all_reduce(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.tp_size > 1:
+        if self.tp_size > 1 and not self.defer_all_reduce:
             return self._comm.all_reduce(hidden_states)
         return hidden_states
 

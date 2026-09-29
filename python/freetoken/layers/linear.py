@@ -84,12 +84,18 @@ class LinearColParallelMerged(_LinearTPImpl):
         output_sizes: List[int],
         has_bias: bool,
         *,
+        local_output_sizes: List[int] | None = None,
         quant_config: QuantConfig | None = None,
         prefix: str = "",
     ):
-        # check that all output sizes are divisible by tp_size
+        # each declared output size is split evenly over the ranks, unless the caller gives this
+        # rank's segments itself (the uneven split of freetoken.distributed.split)
         tp_info = get_tp_info()
-        tp_output_sizes = [div_even(size, tp_info.size) for size in output_sizes]
+        if local_output_sizes is not None:
+            assert len(local_output_sizes) == len(output_sizes), (local_output_sizes, output_sizes)
+            tp_output_sizes = list(local_output_sizes)
+        else:
+            tp_output_sizes = [div_even(size, tp_info.size) for size in output_sizes]
         output_size = sum(output_sizes)
         tp_output_size = sum(tp_output_sizes)
         super().__init__(
@@ -161,14 +167,18 @@ class LinearRowParallel(_LinearTPImpl):
         output_size: int,
         has_bias: bool,
         *,
+        local_input_size: int | None = None,
         quant_config: QuantConfig | None = None,
         prefix: str = "",
     ):
         tp_info = get_tp_info()
-        local_input_size = div_even(input_size, tp_info.size)
+        if local_input_size is None:
+            local_input_size = div_even(input_size, tp_info.size)
         local_output_size = output_size
         self._comm = DistributedCommunicator()
         self._tp_size = tp_info.size
+        # set by a parent that all-reduces this partial sum together with another one
+        self.defer_all_reduce = False
         super().__init__(
             input_size, output_size, local_input_size, local_output_size, has_bias,
             quant_config=quant_config, prefix=prefix,
@@ -176,6 +186,6 @@ class LinearRowParallel(_LinearTPImpl):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = self.quant_method.apply(self, x)
-        if self._tp_size > 1:
+        if self._tp_size > 1 and not self.defer_all_reduce:
             y = self._comm.all_reduce(y)
         return y

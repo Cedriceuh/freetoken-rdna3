@@ -22,6 +22,9 @@ class MHAKVCache(BaseKVCachePool):
     dense slot, avoiding a multiple-x over-allocation of unused slabs.
     """
 
+    # host KV tier (kvcache/host_kv_pool.py): _kv_buffer is this pool's only per-page state
+    host_tier_supported = True
+
     def __init__(
         self,
         num_kv_heads: int,

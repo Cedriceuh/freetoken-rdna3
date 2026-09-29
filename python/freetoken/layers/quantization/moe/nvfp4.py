@@ -34,6 +34,54 @@ MARLIN_MAX_SLOTS = 992
 B12X_MIN_INTERMEDIATE = 1024
 
 
+def _tp_shard_reason(cfg: MoEConfig) -> str | None:
+    """Why the intermediate axis cannot be split ``cfg.tp_size`` ways, or None.
+
+    ``gate``/``up`` carry the intermediate as an unpacked row axis (any split is legal), but
+    ``down`` / ``down_scale`` carry it as their packed (2 values per byte) and block (one scale per
+    16 values) axes, so each rank's slice must start and end on a 16-value block.
+    """
+    from freetoken.distributed.split import tp_shares
+
+    if tp_shares(cfg.tp_size) is None and cfg.intermediate % cfg.tp_size:
+        return f"intermediate {cfg.intermediate} does not divide over TP={cfg.tp_size}"
+    if cfg.local_intermediate % GROUP:
+        return f"intermediate shard {cfg.local_intermediate} is not a multiple of the NVFP4 block {GROUP}"
+    return None
+
+
+def _tp_slice_pieces(pieces: dict[str, torch.Tensor], cfg: MoEConfig) -> dict[str, torch.Tensor]:
+    """This rank's slice of the intermediate axis of one batch of full-width expert pieces."""
+    if cfg.tp_size == 1:
+        return pieces
+    full = cfg.intermediate
+    lo, local = cfg.local_intermediate_range
+    rows = slice(lo, lo + local)
+
+    def gate_up_rows(t: torch.Tensor) -> torch.Tensor:  # fused [gate | up] on the row axis
+        return torch.cat([t[:, lo:lo + local], t[:, full + lo:full + lo + local]], dim=1)
+
+    out: dict[str, torch.Tensor] = {}
+    for role, t in pieces.items():
+        if role in ("gate", "up", "gate_scale", "up_scale"):
+            out[role] = t[:, rows]
+        elif role in ("gate_up", "gate_up_scale"):
+            out[role] = gate_up_rows(t)
+        elif role in ("gate_global", "up_global"):
+            out[role] = t[:, rows] if t.shape[1] == full else t  # per-row or a per-expert scalar
+        elif role == "gate_up_global":
+            out[role] = gate_up_rows(t) if t.shape[1] == 2 * full else t
+        elif role == "down":
+            out[role] = t[:, :, lo // 2:(lo + local) // 2]  # packed axis: two fp4 values per byte
+        elif role == "down_scale":
+            out[role] = t[:, :, lo // GROUP:(lo + local) // GROUP]  # block axis: one scale per 16 values
+        elif role == "down_global":
+            out[role] = t  # per output (hidden) row or scalar: not on the intermediate axis
+        else:
+            raise ValueError(f"nvfp4 expert piece role {role!r} has no TP slicing rule")
+    return out
+
+
 class TritonNvfp4MoEKernel(MoEKernel):
     """FreeToken's inline-dequant kernels over the native ModelOpt rows."""
 
@@ -41,14 +89,22 @@ class TritonNvfp4MoEKernel(MoEKernel):
     cpu_format = "nvfp4"
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
-        reason = self._common_reject(cfg, resident_ok=False, tp_ok=False, cpu_ok=True, plain_silu_only=False)
+        reason = self._common_reject(cfg, resident_ok=False, tp_ok=True, cpu_ok=True, plain_silu_only=False)
         if reason:
             return reason
+        if cfg.tp_size > 1:
+            if cfg.decode_target != "gpu":
+                return "triton nvfp4 MoE kernel: the CPU executor is not TP-aware"
+            reason = _tp_shard_reason(cfg)
+            if reason:
+                return f"triton nvfp4 MoE kernel: {reason}"
         reason = gated_epilogue_reason(cfg)
         return f"triton nvfp4 MoE kernel: {reason}" if reason else None
 
     def layout(self, cfg: MoEConfig) -> dict[str, BankSpec]:
-        i, h = cfg.intermediate, cfg.hidden
+        # TP: every rank keeps all experts and every routing decision, and holds its own slice of the
+        # intermediate axis; the fused kernels stay dense-in/dense-out and MoELayer all-reduces the sum
+        i, h = cfg.local_intermediate, cfg.hidden
         return {
             "gate_up": BankSpec((2 * i, h // 2), torch.uint8),
             "gate_up_scale": BankSpec((2 * i, h // GROUP), FP8),
@@ -59,9 +115,10 @@ class TritonNvfp4MoEKernel(MoEKernel):
         }
 
     def pack(self, pieces, cfg: MoEConfig, out):
+        pieces = _tp_slice_pieces(pieces, cfg)
         out["gate_up"].copy_(fused_piece(pieces, "gate_up"))
         out["gate_up_scale"].copy_(fused_piece(pieces, "gate_up_scale"))
-        out["gate_up_global"].copy_(fused_global(pieces, cfg.intermediate))
+        out["gate_up_global"].copy_(fused_global(pieces, cfg.local_intermediate))
         out["down"].copy_(pieces["down"])
         out["down_scale"].copy_(pieces["down_scale"])
         out["down_global"].copy_(global_rows(pieces["down_global"], cfg.hidden))

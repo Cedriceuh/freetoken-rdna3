@@ -18,11 +18,21 @@ Two tiers ride alongside the shadow slab and are NOT per-token:
 
 The slab is amortized into the per-token KV price (``unit_bytes``); the ring and scratch are
 fixed and priced through ``kv_cost``'s ``fixed_cache_size``.
+
+``FREETOKEN_QSA_KV_INT8=1`` (EXPERIMENTAL, NOT RECOMMENDED: on a long-context agentic bench it cut the
+success rate by about a third and changed the agent's behaviour, although short scored benches and needle
+tests saw no loss -- one scale per (token, kv head) over 256 dims lets the keys' outlier channels crush the
+others) stores the paged K/V as symmetric int8 with one fp32 scale per
+(token, kv head) (kernel/triton/qsa/kv_int8.py writes it, the attend kernel dequantizes the
+selected tokens): 520 instead of 1024 bytes per token per layer at head_dim 256, priced as such
+in ``kv_cost`` so the planner hands the freed memory to the MoE expert cache. The index slab and
+the ring stay in the compute dtype.
 """
 
 from __future__ import annotations
 
 import math
+import os
 from typing import Sequence
 
 import torch
@@ -33,6 +43,12 @@ from .mha_pool import MHAKVCache
 _INDEX_DTYPE_BYTES = 2
 # t/h/w int32 rope position kept per KV slot on mrope models
 _ROPE_POS_BYTES = 3 * 4
+KV_INT8_ENV = "FREETOKEN_QSA_KV_INT8"
+_KV_SCALE_BYTES = 4  # fp32 scale per (token, kv head), K and V each
+
+
+def kv_int8_enabled() -> bool:
+    return os.environ.get(KV_INT8_ENV) == "1"
 
 
 class QSAKVCache(MHAKVCache):
@@ -44,6 +60,9 @@ class QSAKVCache(MHAKVCache):
     ``cmp_scratch_base`` on are the per-request-slot scratch sinks. ``slot`` is the sparse
     layer's order in the attention backend, same convention as BSAKVCache/DSAKVCache.
     """
+
+    # host KV tier: K/V (+ int8 scales), the compressed index rows and the mrope positions, all copied per page
+    host_tier_supported = True
 
     @classmethod
     def ring_capacity_for(cls, index_ratio: int, num_speculative_tokens: int = 0) -> int:
@@ -93,24 +112,34 @@ class QSAKVCache(MHAKVCache):
         self._index_dtype = dtype
         self._page_size = page_size
         self._mrope = mrope
+        self._kv_int8 = kv_int8_enabled()
+        self._kv_scale: torch.Tensor | None = None
         super().__init__(
             num_kv_heads=num_kv_heads,
             num_layers=num_layers,
             head_dim=head_dim,
             num_pages=num_pages,
             page_size=page_size,
-            dtype=dtype,
+            dtype=torch.int8 if self._kv_int8 else dtype,
             device=device,
             layer_ids=layer_ids,
         )
+        self._alloc_kv_scales()
         self._zero_kv_slabs()
         self._alloc_index_tiers(num_pages)
+
+    def _alloc_kv_scales(self) -> None:
+        if self._kv_int8:
+            # [2, storage_layers, pages, page_size, kv_heads]: the K/V buffer without its head_dim axis
+            self._kv_scale = torch.zeros(self._kv_buffer.shape[:5], dtype=torch.float32, device=self._device)
 
     def _zero_kv_slabs(self) -> None:
         # Defense-in-depth: the attend kernels pos-mask every K/V load (the real fix for
         # torch.empty's recycled NaN/Inf bit patterns), but a zeroed slab keeps any future
         # unmasked read finite instead of model-poisoning. One memset per (re)allocation.
         self._kv_buffer.zero_()
+        if self._kv_scale is not None:
+            self._kv_scale.zero_()
 
     def _alloc_index_tiers(self, num_pages: int) -> None:
         # ZERO-initialized: the score kernel reads whole rows of blocks unmasked and relies on
@@ -148,7 +177,9 @@ class QSAKVCache(MHAKVCache):
         self._cmp_k_buffer = None
         self._pending_ring = None
         self._rope_positions = None
+        self._kv_scale = None
         super().rebuild(num_pages)
+        self._alloc_kv_scales()
         self._zero_kv_slabs()
         try:
             self._alloc_index_tiers(num_pages)
@@ -170,6 +201,13 @@ class QSAKVCache(MHAKVCache):
             if spec.is_swa:
                 continue
             per_token += spec_kv_bytes_per_token(spec, config)
+            if spec.attn_type is AttnType.QSA and kv_int8_enabled():
+                # int8 codes + one fp32 scale per (token, kv head) instead of compute-dtype K/V
+                from freetoken.utils import div_even
+
+                heads = div_even(spec.num_kv_heads, config.tp_info.size, allow_replicate=True)
+                slabs = 2 * heads * spec.num_layers
+                per_token += slabs * (spec.head_dim * 1 + _KV_SCALE_BYTES) - slabs * spec.head_dim * config.dtype.itemsize
             if spec.attn_type is AttnType.QSA:
                 # One index-key row = all index layers at one position.
                 row = spec.index_head_dim * spec.num_index_layers * _INDEX_DTYPE_BYTES
@@ -183,6 +221,8 @@ class QSAKVCache(MHAKVCache):
         # the scratch rows are the fixed term kv_cost reports separately.
         kv, swa = super().unit_bytes()
         tokens = int(self._kv_buffer.shape[2]) * int(self._kv_buffer.shape[3])
+        if self._kv_scale is not None:
+            kv += int(self._kv_scale.numel() * self._kv_scale.element_size()) // tokens
         slab = (
             self._num_index_layers
             * self._cmp_scratch_base
@@ -190,6 +230,39 @@ class QSAKVCache(MHAKVCache):
             * self._index_dtype.itemsize
         )
         return kv + slab // tokens + (_ROPE_POS_BYTES if self._mrope else 0), swa
+
+    @property
+    def dtype(self) -> torch.dtype:
+        """The compute dtype (the index tiers'); the K/V slab itself is int8 under FREETOKEN_QSA_KV_INT8."""
+        return self._index_dtype
+
+    @property
+    def kv_int8(self) -> bool:
+        return self._kv_int8
+
+    def k_scale(self, layer_id: int) -> torch.Tensor:
+        """``[pages, page_size, kv_heads]`` fp32 scales of one layer's int8 keys."""
+        assert self._kv_scale is not None, f"K/V scales exist only with {KV_INT8_ENV}=1"
+        return self._kv_scale[0, self._dense(layer_id)]
+
+    def v_scale(self, layer_id: int) -> torch.Tensor:
+        assert self._kv_scale is not None, f"K/V scales exist only with {KV_INT8_ENV}=1"
+        return self._kv_scale[1, self._dense(layer_id)]
+
+    def store_kv(self, k: torch.Tensor, v: torch.Tensor, out_loc: torch.Tensor, layer_id: int) -> None:
+        if not self._kv_int8:
+            return super().store_kv(k, v, out_loc, layer_id)
+        from freetoken.kernel.triton.qsa.kv_int8 import store_kv_int8
+
+        dense = self._dense(layer_id)
+        slots, heads, _ = self._storage_shape
+        store_kv_int8(
+            k, v, out_loc,
+            self._k_buffer[dense].view(self._storage_shape),
+            self._v_buffer[dense].view(self._storage_shape),
+            self._kv_scale[0, dense].view(slots, heads),
+            self._kv_scale[1, dense].view(slots, heads),
+        )
 
     def cmp_k_cache(self, slot: int) -> torch.Tensor:
         """Compressed index keys of one sparse layer: ``[rows, index_head_dim]``."""

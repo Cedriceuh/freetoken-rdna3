@@ -19,14 +19,17 @@ gathers rows over UVA, optionally started early on a side stream (``PLELayer.sta
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Protocol, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
 from freetoken.core import get_global_ctx
+from freetoken.distributed import DistributedCommunicator, get_tp_info
 from freetoken.layers import BaseOP, LinearReplicated
 from freetoken.mm import restore_placeholder
+from freetoken.utils import div_even
 
 from .config import PLE_CONV_STATE, PLE_NGRAM_STATE
 from .hc import GroupedPlusOneRMSNorm
@@ -269,6 +272,10 @@ def derive_ngram_hash_constants(
     return multipliers, sizes, offsets
 
 
+# time block of the PLE prefill forward (0 = one packed pass): a prefill longer than this many tokens (one request or
+# several packed) runs PLELayer._forward_blocks, which keeps one [T, hc_count * hidden] tensor instead of ~7
+PLE_CONV_BLOCK = int(os.environ.get("FREETOKEN_PLE_CONV_BLOCK", "4096"))
+
 @dataclass
 class PLEMetadata:
     """Per-forward PLE inputs, built once and shared by every PLE layer (sibling of ``FLAMetadata``).
@@ -417,6 +424,16 @@ class NGramEmbedding(BaseOP):
         self.heads_per_ngram = args.heads_per_ngram
         self.num_heads = args.num_ngram_heads
         self.eos_token_id = args.ngram_boundary_token_id
+        # TP: the table is sharded on the HASH HEAD axis. Each head owns a contiguous row range of the
+        # flat table, so a head split is a row split: this rank's bank holds only its heads' rows, the
+        # lookup yields its ``local_num_heads * head_dim`` slice and one all-gather rebuilds the
+        # embedding (so ``key_proj`` / ``value_proj`` stay replicated). A backend that stages every
+        # head on every rank (``serves_all_heads``, the disk store) skips both the rebase and the gather.
+        self.tp = get_tp_info()
+        self._comm = DistributedCommunicator()
+        self.local_num_heads = div_even(self.num_heads, self.tp.size)
+        self.local_head_lo = self.local_num_heads * self.tp.rank
+        self.local_head_hi = self.local_head_lo + self.local_num_heads
         self.layer_multipliers = torch.empty(args.ngram_size, dtype=torch.int64)
         self.ngram_heads_vocab_sizes = torch.empty(self.num_heads, dtype=torch.int64)
         self.ngram_heads_offsets = torch.empty(self.num_heads, dtype=torch.int64)
@@ -467,7 +484,39 @@ class NGramEmbedding(BaseOP):
             shifted.append(torch.where(valid, gathered, packed.new_full((), self.eos_token_id)))
         return shifted
 
+    def _sharded(self) -> bool:
+        return self.tp.size > 1 and not getattr(self._table, "serves_all_heads", False)
+
+    @property
+    def local_row_base(self) -> torch.Tensor:
+        """First global table row this rank owns -- its shard is packed from zero at this offset."""
+        return self.ngram_heads_offsets[self.local_head_lo]
+
     def row_ids(self, meta: PLEMetadata) -> torch.Tensor:
+        """Table row per (token, hash head) as ``[T, heads]`` int64: the global rows of every head, or,
+        on a head-sharded table, this rank's heads rebased onto its own packed-from-zero shard."""
+        rows = self._global_row_ids(meta)
+        if not self._sharded():
+            return rows
+        return rows[..., self.local_head_lo:self.local_head_hi] - self.local_row_base
+
+    def lookup(self, row_ids: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+        """The full ``[T, num_heads * head_dim]`` embedding for ``row_ids`` (see :meth:`row_ids`)."""
+        if not self._sharded():
+            return self.table.lookup(row_ids, out)
+        local = self.table.lookup(row_ids).contiguous()
+        # all_gather concatenates on dim 0 (rank-major over tokens); the embedding wants the ranks'
+        # head slices side by side per token, which is that view transposed. Rank r owns heads
+        # [r * local, (r + 1) * local), so head order is preserved.
+        gathered = self._comm.all_gather(local)
+        tokens = local.shape[0]
+        full = gathered.view(self.tp.size, tokens, -1).transpose(0, 1).reshape(tokens, -1)
+        if out is None:
+            return full
+        out.copy_(full)
+        return out
+
+    def _global_row_ids(self, meta: PLEMetadata) -> torch.Tensor:
         """Global table row per (token, hash head): ``[T, num_ngram_heads]`` int64."""
         packed, select = self._window(meta)
         tokens = [select(s) for s in self._shift_ignore_eos(packed)]
@@ -483,7 +532,7 @@ class NGramEmbedding(BaseOP):
         return torch.cat(blocks, dim=-1)
 
     def forward(self, meta: PLEMetadata, out: torch.Tensor | None = None) -> torch.Tensor:
-        return self.table.lookup(self.row_ids(meta), out)
+        return self.lookup(self.row_ids(meta), out)
 
 
 class _DepthwiseConv1d(BaseOP):
@@ -604,7 +653,10 @@ class PLELayer(BaseOP):
         if row_ids is None:
             row_ids = self.ple_embedding.row_ids(meta)
 
-        embeddings = self.ple_embedding.table.lookup(row_ids).to(R.dtype)
+        embeddings = self.ple_embedding.lookup(row_ids).to(R.dtype)
+        if (not meta.is_decode and R.shape[0] > PLE_CONV_BLOCK > 0
+                and self.state_len == (self.conv1d.weight.shape[-1] - 1) * self.dilation):
+            return self._forward_blocks(R, batch, meta, embeddings, conv_states)
         key = self.norm_key.forward(self.key_proj.forward(embeddings))
         value = self.value_proj.forward(embeddings)
         query = self.norm_query.forward(R)
@@ -618,6 +670,55 @@ class PLELayer(BaseOP):
         if fla is not None and fla.track_boundary_row is not None:
             self._write_track_snapshot(states, x, fla)
         return gated + self._short_conv(x, meta, states)
+
+    def _forward_blocks(self, R: torch.Tensor, batch: Batch, meta: PLEMetadata, embeddings: torch.Tensor,
+                        conv_states: torch.Tensor | None) -> torch.Tensor:
+        """forward() for a long prefill (one request, or several packed), PLE_CONV_BLOCK tokens at a time.
+
+        Every op but the conv is per token; the conv runs per request and reads the state_len inputs before each of
+        that request's blocks. The only [T, hc_count * hidden] tensor kept is ``gated``, and the conv output is added
+        into it in place: the packed forward held ~7 of them (key, query, gated, x, the conv's history / output /
+        result), ~2 GiB at a 16k-token chunk, which ran a 20 GB card out of memory at depth -- and with several requests
+        prefilled together (up to --max-prefill-length tokens in all) too."""
+        total = R.shape[0]
+        shape = (-1, self.hc_count, self.hidden_size)
+        value = self.value_proj.forward(embeddings)
+        gated = R.new_empty(total, self.hc_count * self.hidden_size)
+        for start in range(0, total, PLE_CONV_BLOCK):
+            end = min(start + PLE_CONV_BLOCK, total)
+            key = self.norm_key.forward(self.key_proj.forward(embeddings[start:end]))
+            query = self.norm_query.forward(R[start:end])
+            gate = (key.view(shape) * query.view(shape)).sum(-1, keepdim=True) / math.sqrt(self.hidden_size)
+            gate = torch.sigmoid(gate.sign() * gate.abs().clamp_min(1e-6).sqrt())
+            gated[start:end] = (gate * value[start:end].unsqueeze(-2)).flatten(-2)
+            del key, query, gate
+        states = conv_states if conv_states is not None else self._conv_state_slab(R)
+        fla = getattr(batch, "fla_metadata", None)
+        if fla is not None and fla.track_boundary_row is not None:
+            src = fla.track_boundary_row.unsqueeze(1) + torch.arange(-self.state_len, 0, device=R.device)
+            rows = self.norm_conv.forward(gated.index_select(0, src.reshape(-1))).view(*src.shape, -1)
+            states.index_copy_(0, fla.track_dst, rows.transpose(-1, -2).contiguous().to(states.dtype))
+        width = gated.shape[1]
+        hists = self._read_state(meta, states, gated.dtype)  # [B, width, state_len]
+        lens = list(meta.seq_lens)
+        new_states = []
+        off = 0
+        for i, n in enumerate(lens):
+            hist = hists[i]
+            for start in range(off, off + n, PLE_CONV_BLOCK):
+                end = min(start + PLE_CONV_BLOCK, off + n)
+                x = self.norm_conv.forward(gated[start:end])
+                h = torch.cat([hist, x.transpose(0, 1)], dim=1)
+                conv = F.conv1d(h.unsqueeze(0), self.conv1d.weight, groups=width, dilation=self.dilation).squeeze(0)
+                gated[start:end] += F.silu(conv.transpose(0, 1))
+                hist = h[:, -self.state_len:]
+                del x, h, conv
+            # one request: keep the view (as before); several: copy, so each request's last block is freed
+            new_states.append(hist if len(lens) == 1 else hist.clone())
+            off += n
+        assert off == total, (off, total)
+        states.index_copy_(0, meta.state_slots, torch.stack(new_states).to(states.dtype).contiguous())
+        return gated
 
     def _write_track_snapshot(self, states: torch.Tensor, x: torch.Tensor, fla) -> None:
         """Copy the conv history at the GDN track boundary into the same donatable slot, so a radix
@@ -670,7 +771,9 @@ class PLELayer(BaseOP):
     def _prefill_conv(
         self, x: torch.Tensor, meta: PLEMetadata, states: torch.Tensor
     ) -> torch.Tensor:
-        """One conv over every request packed as ``[state_0 | chunk_0 | state_1 | chunk_1 | ...]``.
+        """One conv over every request packed as ``[state_0 | chunk_0 | state_1 | chunk_1 | ...]``
+        (prefills longer than PLE_CONV_BLOCK tokens never get here: :meth:`forward` sends them to
+        :meth:`_forward_blocks`).
 
         The blocks abut exactly, so each output window stays inside its own request: request i's
         first token reads history columns base_i .. base_i+state_len, which is its own state.

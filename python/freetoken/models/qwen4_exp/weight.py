@@ -16,24 +16,28 @@ import os
 import re
 import struct
 from dataclasses import dataclass
-from typing import Iterator
+from typing import TYPE_CHECKING, Iterator
 
 import safetensors
 import torch
 from freetoken.distributed import get_tp_info
+from freetoken.distributed.split import gdn_head_partition, intermediate_partition
 from freetoken.models.qwen3_vl.weight import rename_vl_prefix
 
 from freetoken.models.config import VISION_KEY_PREFIXES
-from freetoken.models.loader import drop_page_cache, iter_weight_files
+from freetoken.models.loader import drop_page_cache, iter_weight_files, shard_tensor
 from freetoken.models.nvfp4_banks import (
     Nvfp4ExpertSourceSpec,
 )
 from freetoken.layers.quantization import get_quant_config
 from freetoken.models.register import get_model_spec
 from freetoken.moe.host_banks import HostBank, read_range_into
-from freetoken.utils import cached_load_hf_config, download_hf_weight
+from freetoken.utils import cached_load_hf_config, div_ceil, div_even, download_hf_weight
 from freetoken.utils.progress import byte_bar
 from tqdm import tqdm
+
+if TYPE_CHECKING:
+    from freetoken.models.config import LinearGatedDeltaGroupConfig, ModelConfig
 
 # Routed NVFP4 experts (nvidia modelopt layout): per-expert, un-fused. Matched against the RAW
 # weight_map key in nvfp4_banks. The ``model.language_model.`` anchor excludes the MTP head's
@@ -188,6 +192,159 @@ class _DenseFuser:
         return [(fused + kind, torch.cat(rows, dim=0))]
 
 
+# ======================================================================================
+# Tensor parallelism (rewritten from lukascechovic/FreeToken rocm-gfx1201, d9fddf7 + 2433af3)
+# ======================================================================================
+#
+# The dense tensors whose module is tensor-parallel are sharded HERE, on the checkpoint's own
+# per-projection keys, BEFORE ``_DenseFuser`` concatenates them. Everything not listed here or in
+# the GDN tables below is replicated: the HC mixers, the PLE projections, the QSA indexer, every
+# norm and the routers are ``LinearReplicated`` and every rank needs them whole. The vision tower is
+# NOT supported at tp_size > 1 (its Qwen3-VL modules are tensor-parallel but nothing shards their
+# weights here): serve with --text-model-only.
+#
+# These five are fusion parts. A flat row chunk of the fused tensor has the right shape and is a
+# different tensor (``qkv_proj`` is ``[2*qo | kv | kv]``), so each part is cut on its own axis;
+# ``LinearColParallelMerged`` divides each declared output size on its own, which is the layout
+# the per-part shards concatenate into.
+_SHARD_BEFORE_FUSE = (
+    ".self_attn.q_proj.weight",  # head-major, [q | gate] interleaved per head: a chunk is head-aligned
+    ".self_attn.k_proj.weight",
+    ".self_attn.v_proj.weight",
+    ".mlp.shared_expert.gate_proj.weight",
+    ".mlp.shared_expert.up_proj.weight",
+)
+# Not fused: the row-parallel projections (sharded on their INPUT axis, the one their
+# column-parallel producer already split) and the vocab-parallel pair.
+_SHARD_UNFUSED = (
+    ".self_attn.o_proj.weight",
+    ".mlp.shared_expert.down_proj.weight",
+    "model.embed_tokens.weight",
+    "lm_head.weight",
+)
+_TP_SHARDED = _SHARD_BEFORE_FUSE + _SHARD_UNFUSED
+# The shared expert's intermediate axis: gate/up rows, down columns. Cut here rather than by
+# shard_tensor so it can follow the uneven FREETOKEN_TP_SPLIT like the routed experts.
+_SHARED_EXPERT_ROWS = (".mlp.shared_expert.gate_proj.weight", ".mlp.shared_expert.up_proj.weight")
+_SHARED_EXPERT_COLUMNS = (".mlp.shared_expert.down_proj.weight",)
+# Their width follows ``num_kv_heads``: below one head per rank ``shard_tensor`` replicates.
+_KV_PROJ = (".self_attn.k_proj.weight", ".self_attn.v_proj.weight")
+# ``VocabParallelEmbedding`` allocates ``div_ceil(V, tp)`` rows on every rank (``ParallelLMHead``
+# all-gathers, which needs the same shape everywhere); ``shard_tensor`` hands the last rank the
+# short real slice, so a vocab that does not divide needs zero rows appended.
+_VOCAB_PARALLEL = ("model.embed_tokens.weight", "lm_head.weight")
+
+
+def _pad_vocab_rows(local: torch.Tensor, full_rows: int, *, world_size: int) -> torch.Tensor:
+    """``local`` grown to the module's ``div_ceil(V, tp)`` partition with zero rows (never read)."""
+    per_rank = div_ceil(full_rows, world_size)
+    pad = per_rank - local.shape[0]
+    assert pad >= 0, f"vocab shard is {local.shape[0]} rows, wider than the {per_rank}-row buffer"
+    if pad == 0:
+        return local
+    return torch.cat(
+        [local, torch.zeros(pad, *local.shape[1:], dtype=local.dtype, device=local.device)], dim=0
+    )
+
+
+# The GDN tensors are composite one level deeper: ``in_proj_qkv`` and ``conv1d`` are laid out on
+# ``conv_dim = [key | key | value]``, so each sub-block is split on its OWN head count. The whole
+# GDN is sharded together: ``in_proj`` is a four-part fusion (``qkv | z | b | a``).
+_GDN_INFIX = ".linear_attn."
+_GDN_CONV_COMPOSITE = ("in_proj_qkv.weight", "conv1d.weight")  # dim 0, [key | key | value]
+_GDN_VALUE_ROWS = ("in_proj_z.weight", "in_proj_b.weight", "in_proj_a.weight", "A_log", "dt_bias")
+_GDN_VALUE_COLUMNS = ("out_proj.weight",)  # dim 1: row-parallel over the value heads
+_GDN_REPLICATED = ("norm.weight",)  # head_v_dim wide: a per-head width, not a head count
+
+
+def _heads_narrow(tensor: torch.Tensor, dim: int, num_heads: int, offset: int, count: int) -> torch.Tensor:
+    """Heads ``[offset, offset + count)`` of ``dim``, which holds ``num_heads`` equal-width heads."""
+    width = tensor.shape[dim]
+    assert width % num_heads == 0, f"{width} does not divide into {num_heads} heads"
+    per_head = width // num_heads
+    return tensor.narrow(dim, offset * per_head, count * per_head).clone()
+
+
+def _shard_gdn(
+    leaf: str, tensor: torch.Tensor, group: LinearGatedDeltaGroupConfig, *, rank: int, world_size: int
+) -> torch.Tensor:
+    """This rank's slice of one GDN tensor, named by its leaf below ``.linear_attn.``.
+
+    The heads come from :func:`gdn_head_partition`, the rule the module and the state pool size
+    themselves with (even, or the uneven ``FREETOKEN_TP_SPLIT``).
+    An unclassified leaf raises: loaded whole into a rank-local buffer it would be silently wrong.
+    """
+    if leaf in _GDN_REPLICATED:
+        return tensor
+    nk, nv = group.num_key_heads, group.num_value_heads
+    k_off, k_n, v_off, v_n = gdn_head_partition(nk, nv, rank=rank, world_size=world_size)
+    if leaf in _GDN_CONV_COMPOSITE:
+        key_dim = group.num_key_heads * group.key_head_dim
+        value_dim = group.num_value_heads * group.value_head_dim
+        assert tensor.shape[0] == 2 * key_dim + value_dim, (
+            f"GDN {leaf} is {tuple(tensor.shape)}, expected conv_dim "
+            f"{2 * key_dim + value_dim} = 2*{key_dim} + {value_dim} rows"
+        )
+        q, k, v = torch.split(tensor, [key_dim, key_dim, value_dim], dim=0)
+        return torch.cat(
+            [
+                _heads_narrow(q, 0, nk, k_off, k_n),
+                _heads_narrow(k, 0, nk, k_off, k_n),
+                _heads_narrow(v, 0, nv, v_off, v_n),
+            ],
+            dim=0,
+        )
+    if leaf in _GDN_VALUE_ROWS:
+        return _heads_narrow(tensor, 0, nv, v_off, v_n)
+    if leaf in _GDN_VALUE_COLUMNS:
+        return _heads_narrow(tensor, 1, nv, v_off, v_n)
+    raise NotImplementedError(
+        f"GDN tensor {leaf!r} is not classified for tensor parallelism; add it to one of "
+        f"_GDN_CONV_COMPOSITE / _GDN_VALUE_ROWS / _GDN_VALUE_COLUMNS / _GDN_REPLICATED"
+    )
+
+
+def _shard_for_rank(name: str, tensor: torch.Tensor, *, config: ModelConfig) -> torch.Tensor:
+    """This rank's slice of ``name``, or the tensor whole when its module is replicated.
+
+    Attention and the dense projections go through :func:`freetoken.models.loader.shard_tensor`
+    (the rule every other model loads with, including its ``num_kv_heads < world_size`` branch);
+    the GDN goes through :func:`_shard_gdn` because its axes are composite.
+    """
+    tp = get_tp_info()
+    if tp.size == 1:
+        return tensor
+    if name.startswith("model.visual.") or ".visual." in name:
+        raise NotImplementedError(
+            f"{name}: the vision tower is not tensor-parallel sharded; serve with --text-model-only at tp_size={tp.size}")
+    if tensor.dtype in _FP8_DTYPES or name.endswith(".weight_scale_inv"):
+        # The block-fp8 dense path is not TP-aware (a 128x128 scale grid does not follow a head split).
+        raise NotImplementedError(f"{name}: block-fp8 dense weights are not supported at tp_size={tp.size}")
+    leaf = name.split(_GDN_INFIX, 1)[1] if _GDN_INFIX in name else None
+    if leaf is not None:
+        return _shard_gdn(leaf, tensor, config.linear_attention_group(), rank=tp.rank, world_size=tp.size)
+    if name.endswith(_SHARED_EXPERT_ROWS + _SHARED_EXPERT_COLUMNS):
+        # intermediate_partition: the rule Qwen4ExpMoE sizes its shared expert with (even, or uneven)
+        dim = 0 if name.endswith(_SHARED_EXPERT_ROWS) else 1
+        full = tensor.shape[dim]
+        assert full == config.shared_expert_intermediate_size, (name, tuple(tensor.shape))
+        lo, size = intermediate_partition(full, rank=tp.rank, world_size=tp.size)
+        return tensor.narrow(dim, lo, size).clone()
+    if not name.endswith(_TP_SHARDED):
+        return tensor
+    local = shard_tensor(name, tensor, rank=tp.rank, world_size=tp.size, num_kv_heads=config.num_kv_heads)
+    # shard_tensor returns an unrecognised key unchanged; a key declared tensor-parallel must come back
+    # smaller, except on the kv replication branch where the whole projection IS the rank-local tensor.
+    if not (name.endswith(_KV_PROJ) and config.num_kv_heads < tp.size):
+        assert local.shape != tensor.shape, (
+            f"{name!r} is declared tensor-parallel but shard_tensor returned it whole "
+            f"({tuple(tensor.shape)}) at rank {tp.rank}/{tp.size}"
+        )
+    if name.endswith(_VOCAB_PARALLEL):
+        local = _pad_vocab_rows(local, tensor.shape[0], world_size=tp.size)
+    return local
+
+
 def iter_weights(
     model_path: str,
     device: torch.device,
@@ -203,12 +360,15 @@ def iter_weights(
     Fusions, per kind: attention q|k|v -> ``qkv_proj``; GDN ``in_proj_{qkv,z,b,a}`` -> ``in_proj``, or ``in_proj_qkvz`` + bf16 ``in_proj_ba`` when qkv|z is quantized; shared-expert gate|up -> ``gate_up_proj``; each per-layer HC's ``input_mix_weight_down`` | ``block_inject_weight`` -> a zero-padded ``input_mix_weight_down_block_inject``.
     ``include_moe_experts`` is accepted for the loader contract but never yields anything: the routed experts are NVFP4 and always come from the offload cache's expert reader.
     """
-    if get_tp_info().size > 1:
-        raise NotImplementedError("qwen4_exp weight loading supports TP=1 only")
+    # TP: the modules shard their own head counts, so the tensors backing them arrive rank-local;
+    # ``_shard_for_rank`` runs before ``fuser.fuse`` so the fusion parts are cut on their own axes.
     if not include_non_moe:
         return
 
+    from .config import parse_config
+
     hf_config = cached_load_hf_config(model_path)
+    config = parse_config(hf_config)
     spec = get_model_spec(hf_config.architectures[0])
     fuser = _DenseFuser(get_quant_config(), spec.packed_modules_mapping)
     for file in tqdm(
@@ -223,7 +383,7 @@ def iter_weights(
                     continue
                 if not include_vision and name.startswith(VISION_KEY_PREFIXES):
                     continue
-                tensor = f.get_tensor(raw_name)
+                tensor = _shard_for_rank(name, f.get_tensor(raw_name), config=config)
                 fused = fuser.fuse(name, tensor)
                 if fused is None:
                     fuser.check_unfused(name, tensor)
@@ -315,6 +475,33 @@ def ftw_side_files(model_path: str, out_dir: str) -> list[str]:
     return written
 
 
+def _ple_row_shard(folder: str, bank_rows: int) -> tuple[int, int]:
+    """This rank's ``[lo, hi)`` row range of the flat n-gram table.
+
+    The table is sharded on the hash-head axis: rank ``r`` owns heads ``[r * H/tp, (r + 1) * H/tp)``,
+    and each head's prime-sized vocab is laid out back to back, so those heads are one contiguous
+    row range. The split point comes from the checkpoint's own ``ngram_heads_offsets`` (the tensor
+    ``NGramEmbedding.local_row_base`` rebases lookups against); the last rank absorbs the padding.
+    """
+    from freetoken.models.loader import safetensors_weight_map
+
+    info = get_tp_info()
+    if info.size == 1:
+        return 0, bank_rows
+    offsets = None
+    for name, shard in safetensors_weight_map(folder).items():
+        if name.endswith(".ple.ple_embedding.ngram_heads_offsets"):
+            with safetensors.safe_open(os.path.join(folder, shard), framework="pt", device="cpu") as f:
+                offsets = f.get_tensor(name).tolist()
+            break
+    if offsets is None:
+        raise ValueError("PLE table cannot be TP-sharded: no ngram_heads_offsets in the checkpoint")
+    per_rank = div_even(len(offsets), info.size)
+    lo = int(offsets[per_rank * info.rank])
+    hi = bank_rows if info.rank == info.size - 1 else int(offsets[per_rank * (info.rank + 1)])
+    return lo, hi
+
+
 def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
                    workers: int = 8, chunk: int = 8 << 20) -> PleTable:
     """Concatenate the checkpoint's ``ngram_embedding.shard_<i>`` tensors into one pinned host bank.
@@ -359,17 +546,24 @@ def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
     if scale is None:
         raise ValueError("PLE table has no weight_scale")
 
-    bank = HostBank((expected * rows, cols), torch.float8_e4m3fn)
     shard_bytes = rows * cols
-    bar = byte_bar(expected * shard_bytes, "Loading PLE table")
+    row_lo, row_hi = _ple_row_shard(folder, expected * rows)
+    bank = HostBank((row_hi - row_lo, cols), torch.float8_e4m3fn)
+    bar = byte_bar((row_hi - row_lo) * cols, "Loading PLE table")
     try:
         buf = bank.memoryview()
         for shard in range(expected):
             path, offset, nbytes = parts[shard]
             assert nbytes == shard_bytes, f"PLE shard {shard} is {nbytes} B, expected {shard_bytes}"
-            read_range_into(buf, path, file_offset=offset, nbytes=nbytes,
-                            dest_offset=shard * shard_bytes, workers=workers, chunk=chunk)
-            bar.update(nbytes)
+            # This shard covers global rows [lo, hi); keep only its overlap with this rank's range.
+            lo, hi = shard * rows, (shard + 1) * rows
+            take_lo, take_hi = max(lo, row_lo), min(hi, row_hi)
+            if take_lo >= take_hi:
+                continue
+            take = (take_hi - take_lo) * cols
+            read_range_into(buf, path, file_offset=offset + (take_lo - lo) * cols, nbytes=take,
+                            dest_offset=(take_lo - row_lo) * cols, workers=workers, chunk=chunk)
+            bar.update(take)
     finally:
         bar.close()
     if pin and torch.cuda.is_available():

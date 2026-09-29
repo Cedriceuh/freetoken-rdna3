@@ -7,7 +7,8 @@ from typing import TYPE_CHECKING, List, Tuple
 import torch
 from freetoken.core import Req
 from freetoken.kvcache import BaseCacheHandle, MatchResult, create_prefix_cache
-from freetoken.utils import align_down, div_ceil
+from freetoken.kvcache.host_kv_pool import host_kv_log
+from freetoken.utils import align_down, div_ceil, init_logger
 
 if TYPE_CHECKING:
     from .utils import PendingReq
@@ -22,6 +23,7 @@ def _swa_eviction_interval() -> int:
 
 
 _SWA_EVICTION_INTERVAL = _swa_eviction_interval()
+logger = init_logger(__name__)
 
 # Finish-time retention keeps [P - window - gap, P) swa-live for the next turn's cut near the
 # prompt end. The gap covers templates whose generation prompt injects tokens that vanish when
@@ -31,7 +33,7 @@ _SWA_RETAIN_GAP = 16
 
 class CacheManager:
     def __init__(self, num_pages: int, page_size: int, page_table: torch.Tensor, type: str,
-                 linear_state_pool=None, swa_pool=None, sliding_window_size=None):
+                 linear_state_pool=None, swa_pool=None, sliding_window_size=None, kv_pool=None):
         # The `_free_slots` follows a page-aligned manner. For example, if page_size = 2,
         # the `_free_slots` may look like [0, 2, 4, 6, ...], and each slot represents a page.
         device = page_table.device
@@ -61,9 +63,21 @@ class CacheManager:
         self.page_table = page_table
         self.page_size = page_size
         self.cache_type = type
+        if self.is_hybrid:
+            # FREETOKEN_HOST_KV=1: demote evicted tree leaves to host memory, promote them back
+            # on a deeper host match (kvcache/host_kv_pool.py). None = drop on evict.
+            from freetoken.kvcache.host_kv_pool import make_host_kv_pool
+            self.host_kv = make_host_kv_pool(kv_pool, linear_state_pool, page_size, device)
+            self.prefix_cache.host = self.host_kv
+        else:
+            from freetoken.kvcache.host_kv_pool import host_kv_enabled
+            if host_kv_enabled():
+                logger.warning_rank0(f"FREETOKEN_HOST_KV=1 ignored: the host tier needs the hybrid_radix cache "
+                                     f"(this model runs {type})")
 
     # ----- capability hooks (defaults; plugged-in pools may narrow them) -----
     supports_runtime_rebuild = True
+    host_kv = None  # host tier (hybrid only), see __init__
     prefill_chunk_budget = None  # generic shared page pool: no per-model prefill chunk cap
 
     @property
@@ -104,6 +118,63 @@ class CacheManager:
             return MatchResult(
                 HybridCacheHandle(m.cached_len, m.node, m.kv_indices), mamba_value=m.mamba_value)
         return self.prefix_cache.match_prefix(ids)
+
+    def maybe_promote(self, req: PendingReq, mr: MatchResult, need) -> MatchResult:
+        """Host tier: if the tree holds a deeper resumable prefix of ``req`` in HOST memory than
+        the device match ``mr``, copy it back to the device and return the new (device) match.
+
+        ``need(cached_len)`` is the admission's KV demand beyond the matched prefix (the new
+        tokens' pages + what the pass already reserved). The promotion takes device pages of its
+        own, so it only runs when both fit: a request that cannot be admitted anyway must not
+        pull its prefix in (it would be evicted again before it runs, every pass). Deterministic
+        in the tree state alone, so every TP rank takes the same decision."""
+        pc = self.prefix_cache
+        plan = pc.plan_promotion(req.input_ids[: req.input_len - 1])
+        if plan is None:
+            return mr
+        parent, nodes = plan
+        tokens = sum(n.length for n in nodes)
+        target_len = pc._path_len(nodes[-1])
+        pool = self.linear_state_pool
+        pc.inc_lock(parent)
+        pc.host_pin(nodes, 1)
+        promoted = []
+        try:
+            if tokens + need(target_len) > self.available_size:
+                return mr
+            # 1 slot for the restored snapshot + the 3 the admission takes right after.
+            if pool.num_free_slots < 4:
+                self.ensure_mamba_slots(4)
+            if pool.num_free_slots < 4:
+                # ensure_mamba_slots may have tombstoned the snapshot mr resumes from: match again
+                return self.match_req(req)
+            slot = pool.alloc(1)[0]
+            # Node by node, top-down: each node's device pages may demote other leaves to host, and its own host
+            # copy is released right after, so the host never has to hold this whole context AND its victims (that
+            # overflow dropped other agents' contexts). Each promoted node is locked until the path is done.
+            try:
+                for n in nodes:
+                    dev = self._page_to_token(self._allocate(n.length // self.page_size))
+                    pc.promote_node(n, dev, slot if n is nodes[-1] else None)
+                    pc.inc_lock(n)
+                    promoted.append(n)
+            except BaseException:
+                if nodes[-1].mamba_value != slot:  # the target never took the restored snapshot's slot
+                    pool.free([slot])
+                raise
+        finally:
+            for n in reversed(promoted):
+                pc.dec_lock(n)
+            pc.host_pin(nodes, -1)
+            pc.dec_lock(parent)
+        if host_kv_log():
+            st = self.host_kv.stats
+            logger.info_rank0(
+                f"host KV: promoted {tokens} tokens (device match {mr.cuda_handle.cached_len} ->"
+                f" {target_len}); host holds {pc.host_tokens} tokens; totals demoted"
+                f" {st['demoted_tokens']} promoted {st['promoted_tokens']} dropped {st['dropped_tokens']}"
+                f" (snapshots released {st['released_snaps']})")
+        return self.match_req(req)
 
     @property
     def available_size(self) -> int:
@@ -383,13 +454,28 @@ class CacheManager:
         L = req.mamba_last_track_seqlen
         if L is None:
             return  # no ×64 boundary crossed this chunk; req keeps its pages (committed later)
+        if not (old_handle.cached_len < L <= req.cached_len):
+            # boundary carry: since the boundary is carried across chunk seams, L can be older
+            # than this forward -- so state the window it must sit in instead of inheriting it.
+            # UPPER: insert() reads `page_indices[:L]` off a row only `req.cached_len` long, and
+            # the state must not encode more tokens than are committed. LOWER: below the handle's
+            # own prefix the re-point and the `_free` slice below invert, and `unlock(old_handle)`
+            # would drop the longer lock for a shorter one under a request whose page-table row
+            # still names those pages. Both hold by construction for a carried boundary (an
+            # earlier chunk of THIS turn tracked at >= its own start + CHUNK, and every chunk
+            # starts at or after the admission match) -- this makes them enforced, not argued.
+            req.mamba_last_track_seqlen = None
+            return
         if align_down(L, self.page_size) != L:
             # page_size>1 only: insert would align the key down, attaching a state that encodes
             # L tokens to a SHORTER node -- a future hit would COW-restore an over-advanced
             # state. Skip; the next aligned boundary (or the finish-donate) commits instead.
             req.mamba_last_track_seqlen = None
             return
-        frozen_idx = 1 - req.mamba_next_track_idx          # the slot the forward just wrote
+        # The slot the last TRACKING forward wrote -- this chunk's, or an earlier chunk's carried
+        # across the seam (the boundary carry). `mamba_last_track_seqlen` and `mamba_next_track_idx` are only
+        # ever set together, so the pair still names the state captured at exactly L.
+        frozen_idx = 1 - req.mamba_next_track_idx
         frozen = req.mamba_ping_pong[frozen_idx]
         prefix_len, mamba_exist = self.prefix_cache.insert(
             req.input_ids[:L], page_indices[:L], frozen)
@@ -565,6 +651,10 @@ class CacheManager:
         # reclaim the whole LinearStatePool free-list (else those slots leak -> admission hangs).
         if self.is_hybrid:
             self.linear_state_pool.reclaim_all_slots()
+            if self.host_kv is not None:
+                # the discarded tree also owned every host entry; the pools were reallocated
+                self.host_kv.refresh()
+                self.prefix_cache.host = self.host_kv
 
     @contextmanager
     def lazy_free_region(self):

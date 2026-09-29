@@ -1,0 +1,69 @@
+# freetoken-rdna3: FreeToken for AMD RDNA3 (gfx1100: RX 7900 XTX / XT / GRE).
+#
+#   docker build -f Dockerfile.rdna3 -t freetoken-rdna3:latest .       (from a git clone: the build records the commit)
+#   rdna3/serve.sh <profile> --model DIR                               (docs/rdna3/getting-started.md)
+#
+# Builds THE TREE YOU HAVE CHECKED OUT; nothing is fetched or patched. Derived from a community ROCm port's
+# Dockerfile.gfx1201 (see docs/rdna3/credits.md).
+#
+# Run-time settings the engine does not check for you (rdna3/serve.sh sets them; docs/rdna3/options.md):
+#   PYTORCH_ALLOC_CONF=expandable_segments:False, OMP_WAIT_POLICY=PASSIVE, HIP_VISIBLE_DEVICES set explicitly,
+#   --ulimit memlock=-1, --ipc=host, FREETOKEN_TP_ALLOW_IMBALANCE=1 for unequal cards, --ple-backend disk.
+
+# The base is pinned by DIGEST: the tag is mutable on someone else's registry.
+FROM rocm/pytorch@sha256:a223aee17aef5d21c3b9f63436dd19d27d1c665ec8b2f40011c9546cabae2a80
+
+ARG GPU_ARCH=gfx1100
+ENV PYTORCH_ROCM_ARCH=${GPU_ARCH} \
+    FREETOKEN_ROCM_ARCH=${GPU_ARCH} \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+COPY . /opt/FreeToken
+
+# Provenance, derived and never typed: the commit and tree this image was built from.
+RUN set -eux; \
+    git config --global --add safe.directory /opt/FreeToken; \
+    cd /opt/FreeToken; \
+    git rev-parse --git-dir >/dev/null; \
+    git config user.email build@localhost; git config user.name build; \
+    COMMIT="$(git rev-parse HEAD)"; \
+    git add -A; \
+    TREE="$(git write-tree)"; \
+    DIRTY="$(git status --porcelain | head -20)"; \
+    if [ -n "${DIRTY}" ]; then echo "WARNING: working tree was not clean"; echo "${DIRTY}"; fi; \
+    printf '%s\n' "commit ${COMMIT}" "tree   ${TREE}" > /opt/FreeToken-BUILD-PROVENANCE.txt
+
+# --no-build-isolation keeps the base image's ROCm torch for the C++/HIP extensions; [accel] is
+# CUDA-only (flashinfer, sgl_kernel) and gated off on ROCm anyway.
+RUN set -eux; \
+    cd /opt/FreeToken; \
+    python -m pip install --no-cache-dir "setuptools>=77" wheel; \
+    python -m pip install --no-cache-dir --no-build-isolation -e .
+
+# One cache directory per image: AITER / Triton key their caches on the directory, not the image.
+ENV XDG_CACHE_HOME=/root/.cache/freetoken-rdna3 \
+    TRITON_CACHE_DIR=/root/.cache/freetoken-rdna3/triton \
+    FREETOKEN_KERNEL_CACHE_DIR=/root/.cache/freetoken-rdna3/freetoken/kernels
+RUN mkdir -p /root/.cache/freetoken-rdna3/triton /root/.cache/freetoken-rdna3/freetoken/kernels
+
+RUN python -c 'import torch, triton; print("torch", torch.__version__, "| hip", torch.version.hip, "| triton", triton.__version__); assert torch.version.hip and torch.version.cuda is None'
+
+# The port, checked by content (absence gates use `if grep; then exit 1`, never `! grep`).
+RUN set -eux; \
+    cd /opt/FreeToken; \
+    if grep -q 'qwen4_exp weight loading supports TP=1 only' python/freetoken/models/qwen4_exp/weight.py; then \
+      echo "FATAL: this tree still refuses --tp-size > 1 for qwen4_exp (not the rdna3 branch?)"; exit 1; fi; \
+    grep -q 'def _shard_for_rank' python/freetoken/models/qwen4_exp/weight.py; \
+    grep -q 'LinearOProj' python/freetoken/models/qwen4_exp/attention.py; \
+    grep -q 'LinearRowParallel' python/freetoken/models/qwen4_exp/gdn.py; \
+    grep -q 'serves_all_heads = True' python/freetoken/models/qwen4_exp/ple_disk.py; \
+    grep -q 'def _tp_slice_pieces' python/freetoken/layers/quantization/moe/nvfp4.py; \
+    grep -q '_lds_budget = 60 \* 1024' python/freetoken/kernel/triton/qsa/attend.py; \
+    grep -q 'def _handshake_rank_relay' python/freetoken/scheduler/io.py; \
+    grep -q 'FREETOKEN_TP_ALLOW_IMBALANCE' python/freetoken/engine/engine.py; \
+    if grep -rEq 'live_moe_kv_budget_bytes|_finalize_moe_cache_from_live_warmup' python/freetoken/; then \
+      echo "FATAL: live moe-cache sizing is present (-24.8% decode on the gfx1201 branch)"; exit 1; fi; \
+    command -v ft; \
+    cat /opt/FreeToken-BUILD-PROVENANCE.txt
+
+WORKDIR /opt/FreeToken

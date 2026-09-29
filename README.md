@@ -1,85 +1,89 @@
-<div align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/FlashML-org/FreeToken/main/assets/freetoken-logo-dark.svg">
-    <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/FlashML-org/FreeToken/main/assets/freetoken-logo-light.svg">
-    <img alt="FreeToken" src="https://raw.githubusercontent.com/FlashML-org/FreeToken/main/assets/freetoken-logo.svg" width=65%>
-  </picture>
-</div>
+# freetoken-rdna3
 
-<p align="center">
-| <a href="https://www.flashml.ai/"><b>Download</b></a> | <a href="https://arxiv.org/abs/2608.16157"><b>Paper</b></a> | <a href="https://join.slack.com/t/flashml/shared_invite/zt-3zpdh5j10-9dwTXrgLiqpVxizhA9KVbA"><b>Developer Slack</b></a> | <a href="https://discord.gg/MsA277cJzZ"><b>Community Discord</b></a> | <a href="https://github.com/FlashML-org/FreeToken/issues/482"><b>Community WeChat</b></a> |
-</p>
+![freetoken-rdna3: 55 tok/s on RX 7900 XTX + XT](docs/rdna3/assets/social-preview.png)
 
+**Fast local inference of big Mixture-of-Experts models on AMD Radeon RX 7900 XTX / 7900 XT (RDNA3, ROCm), on one or
+two consumer GPUs** (Linux, ~96-128 GB of system RAM, ~135 GB of disk for the model). A tuned build of the [FreeToken](https://github.com/FlashML-org/FreeToken) MoE engine: tensor
+parallelism across two unequal cards, a GPU expert cache fed from system RAM, int8 dense layers, exact sampling on
+ROCm, parallel agents, and conversations that leave the GPUs kept in RAM instead of being recomputed.
 
-Unlock datacenter-class intelligence on the hardware you already own — Run 290B+ frontier MoE models locally on your gaming PC at blistering interactive speeds.
+Built for, and measured with, **Qwen3.8-Flash-Next** (125B-parameter MoE, NVFP4) behind a coding agent (OpenCode),
+with an OpenAI- and Anthropic-compatible API.
 
-## About
+| On an RX 7900 XTX + RX 7900 XT | freetoken-rdna3 (`xtx-xt`) | FreeToken ported to ROCm, TP=2, untuned |
+|---|---:|---:|
+| Decode, short context | **55 tok/s** | 36 tok/s |
+| Decode, 10k to 255k tokens of context | **48-53 tok/s** | 33-35 tok/s |
+| 8.4k-token prompt | **4.5 s** | 6.3 s |
+| Requests at once | **4** (113 tok/s in total) | 1 |
 
-FreeToken is an edge-native Mixture-of-Experts (MoE) serving engine designed for running frontier-scale open-weight models on personal and consumer hardware. It treats heterogeneous edge resources—GPUs, CPUs, host memory, and interconnects—as a unified, elastic inference platform. Its core features include:  
+Four agents with ~100k-token conversations taking turns: **35 s instead of 599 s** without the RAM tier, because a
+conversation pushed off the GPUs is kept in system RAM and resumes in ~2 s instead of being re-read.
 
-- **Fast Edge-Native Runtime**: Provides efficient MoE serving with bandwidth-adaptive CPU–GPU co-execution ($q^\star$ policy), full-layer double-buffered prefill streaming, global LRU expert caching, graph-compatible execution, and the FTW fast weight format.  
-- **Semantic-Aware Caching**: Features semantic anchor checkpoints for recurrent state and KV caches, allowing agentic context edits (e.g., tool calls, thinking blocks) to avoid redundant context recomputation.  
-- **Elastic Memory Management**: Supports dynamic, runtime VRAM re-allocation between expert caches and KV memory without engine restarts or weight reloading.  
-- **Broad MoE & Ecosystem Support**: Supports frontier open-weight MoE models (e.g., DeepSeek-V4-Flash, Qwen3.6-35B-A3B, GLM-5.2) across various parameter scales and quantization formats (e.g., MXFP4, NVFP4, FP8, BF16), with Anthropic/OpenAI-compatible APIs for seamless integration with real-world coding and tool-calling agents (e.g., Codex, Claude Code, OpenCode, OpenClaw, DeepSeek Harness). 
-- **Diverse Consumer Hardware**: Scales across consumer laptops, gaming desktops, and workstation GPUs, with native support for NVIDIA RTX 30, RTX 40, and RTX 50 series GPUs.  
+Full numbers, methods and the one-card results: [docs/rdna3/benchmarks.md](docs/rdna3/benchmarks.md).
 
-## Getting Started
+## Quick start
 
-### Desktop app
-
-Download FreeToken for Windows or Linux at [flashml.ai](https://www.flashml.ai/). It sets the engine up for you and gives you a GUI for running models, chatting, and tuning the engine.
-
-<div align="center">
-  <img alt="FreeToken Desktop" src="https://raw.githubusercontent.com/FlashML-org/FreeToken/main/assets/desktop-console.png" width=92%>
-</div>
-
-### CLI
-
-Install FreeToken with [uv](https://docs.astral.sh/uv/) (recommended) or pip:
+You need Linux with the `amdgpu` driver, Docker, an RX 7900 XTX and/or 7900 XT, and **~96-128 GB of RAM** for this
+model (why: [limits](docs/rdna3/limits.md)). Everything runs in the Docker image below; the `install.sh` at the root is
+upstream's NVIDIA / CUDA installer and is not used here.
 
 ```bash
-uv pip install "freetoken[accel]"
+git clone https://github.com/Cedriceuh/freetoken-rdna3 && cd freetoken-rdna3
+docker build -f Dockerfile.rdna3 -t freetoken-rdna3:latest .          # ROCm + PyTorch base image, ~30 GB
+mkdir -p ~/models      # model download (~135 GB), with the image's own `hf`
+docker run --rm --user "$(id -u):$(id -g)" -e HF_HOME=/models/.cache/huggingface -v ~/models:/models \
+  --entrypoint hf freetoken-rdna3:latest download RadixArk/Qwen3.8-Flash-Next-NVFP4 \
+  --local-dir /models/Qwen3.8-Flash-Next-NVFP4
+rdna3/serve.sh xtx-xt --model ~/models/Qwen3.8-Flash-Next-NVFP4       # or: xtx, xt (one card); stays in the foreground
 ```
 
-Or build from source:
+Loading takes ~2.5 minutes (the first start of a new image also compiles GPU kernels for a few minutes); the server
+is ready when `curl -s http://127.0.0.1:1919/health` (from another terminal) reports `"ok"`. Then point any
+OpenAI-compatible client at `http://127.0.0.1:1919/v1` (model `qwen3.8-flash-next`), or an Anthropic-compatible one at
+`http://127.0.0.1:1919`. Step by step,
+with a client example and a systemd unit: [docs/rdna3/getting-started.md](docs/rdna3/getting-started.md).
 
-```bash
-git clone https://github.com/FlashML-org/FreeToken.git && cd FreeToken
-uv venv && source .venv/bin/activate
-uv pip install -e ".[accel]"
-```
+## Profiles
 
-For More details:
+One ready-made profile per tested hardware setup, with its measured settings ([details](docs/rdna3/profiles.md)):
 
-- [Install FreeToken](https://github.com/FlashML-org/FreeToken/blob/main/docs/install.md)
-- [Quick start](https://github.com/FlashML-org/FreeToken/blob/main/docs/quickstart.md)
-- [Supported models](https://github.com/FlashML-org/FreeToken/blob/main/docs/models.md)
-- [CLI reference](https://github.com/FlashML-org/FreeToken/blob/main/docs/cli.md)
-- [Repairing old FTW checkpoints](https://github.com/FlashML-org/FreeToken/blob/main/docs/ftw-hotfix.md)
+| Profile | GPUs | Context | Decode | Requests at once |
+|---|---|---:|---:|---:|
+| `xtx-xt` | RX 7900 XTX 24 GB + RX 7900 XT 20 GB | 262k | 55 tok/s | 4 |
+| `xtx` | one RX 7900 XTX 24 GB | 131k | 36.5 tok/s | 1 |
+| `xt` | one RX 7900 XT 20 GB | 131k | 28.5 tok/s | 1 |
+| `xtx-xtx` *(untested)* | two RX 7900 XTX | 262k | expected >= 55 tok/s | 4 |
+| `xt-xt` *(untested)* | two RX 7900 XT | 262k | expected ~50 tok/s | 4 |
+| `gre` *(untested)* | one RX 7900 GRE 16 GB | 64k | expected ~20 tok/s | 1 |
 
-## Citation
+Untested profiles are derived from the measured ones and the engine's memory plans; the script says so when you start
+one. Measured something? Please open an issue with your numbers.
 
-If you use FreeToken for your research, please cite our [paper](https://arxiv.org/abs/2608.16157):
+`rdna3/serve.sh` picks the right cards by itself; `--dry-run` shows the exact `docker run` it would start.
 
-```bibtex
-@article{yang2026freetoken,
-  title={FreeToken: Efficient Edge-Native MoE Serving with Bandwidth-Adaptive Execution},
-  author={Yang, Shuo and Fan, Xiaoze and Pan, Melissa and Xi, Haocheng and Wang, Zhe and Sun, Shanlin and Keutzer, Kurt and Han, Song and Zaharia, Matei and Xu, Chenfeng and Stoica, Ion},
-  journal={arXiv preprint arXiv:2608.16157},
-  year={2026}
-}
-```
+## Documentation
 
-## Acknowledgment
+- [Getting started](docs/rdna3/getting-started.md): install, first run, clients, running it as a service
+- [Profiles](docs/rdna3/profiles.md): what each profile sets and how to adapt one to other cards
+- [Options](docs/rdna3/options.md): every setting this build adds, with its measured effect
+- [Benchmarks](docs/rdna3/benchmarks.md): speed at every context depth, parallel agents, precision
+- [How it works](docs/rdna3/how-it-works.md): what was changed in the engine and why
+- [Limits and FAQ](docs/rdna3/limits.md): RAM, other GPUs (RDNA4, NVIDIA), other models
+- [Troubleshooting](docs/rdna3/troubleshooting.md)
+- [The journey](docs/rdna3/journey.md): what was tried, measured, kept and dropped
 
-FreeToken was deeply inspired by [mini-sglang](https://github.com/sgl-project/mini-sglang), and
-learned the design and reused code from the following projects:
-[SGLang](https://github.com/sgl-project/sglang),
-[vLLM](https://github.com/vllm-project/vllm),
-[FlashInfer](https://github.com/flashinfer-ai/flashinfer),
-[flash-linear-attention](https://github.com/fla-org/flash-linear-attention),
-[LightLLM](https://github.com/ModelTC/lightllm) and [llama.cpp](https://github.com/ggml-org/llama.cpp).
+For LLM agents: [`llms.txt`](llms.txt) indexes everything, [`AGENTS.md`](AGENTS.md) explains how to work on the code.
 
-## License
+## Status
 
-[Apache License 2.0](https://github.com/FlashML-org/FreeToken/blob/main/LICENSE).
+Tested on one machine: RX 7900 XTX + RX 7900 XT (gfx1100), Threadripper 3970X, 128 GB DDR4, ROCm 7.14 in the
+container. Other RDNA3 cards, RDNA4, more than two GPUs and NVIDIA are untested ([limits](docs/rdna3/limits.md)).
+Reports from other setups are very welcome.
+
+## Credits and license
+
+A modified version of [FreeToken](https://github.com/FlashML-org/FreeToken) (Apache License 2.0), with ROCm work from
+the FreeToken community. What changed from upstream and who wrote what: [NOTICE](NOTICE),
+[docs/rdna3/changes-from-upstream.md](docs/rdna3/changes-from-upstream.md), [docs/rdna3/credits.md](docs/rdna3/credits.md).
+Upstream's own README: [docs/FREETOKEN_UPSTREAM_README.md](docs/FREETOKEN_UPSTREAM_README.md).

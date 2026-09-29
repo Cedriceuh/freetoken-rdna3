@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import time
 from typing import TYPE_CHECKING, Final, List
 
 import torch
@@ -63,6 +65,77 @@ class SchedulerIOMixin:
 
         self.receive_msg = recv
         self.send_result = send
+
+        if tp_info.size > 1:
+            self._handshake_rank_relay(tp_info)
+
+    # ------------------------------------------------------------------------------------------
+    # The rank-0 -> rank-N request relay is ZeroMQ PUB/SUB. A PUB socket DROPS every message for
+    # which no subscription is registered yet, and rank N's connect + SUBSCRIBE travel through
+    # ZeroMQ's I/O thread asynchronously -- nothing above waits for them to land. Without a
+    # handshake the first request published after readiness can be lost: rank 0 then blocks in
+    # the gloo broadcast of `_recv_msg_multi_rank0` waiting for a rank N that blocks in the SUB
+    # receive of `_recv_msg_multi_rank1`, no timeout, no error, while the frontend keeps
+    # answering GETs (observed: a first request wedged at ready+1 s and was only served at ready+60 s).
+    #
+    # The handshake: rank 0 publishes a hello frame and every rank reports, through the gloo
+    # group (the same `broadcast` primitive the relay already uses), whether it has received one;
+    # rank 0 repeats until every subscriber has. Then rank 0 publishes ONE done frame and each
+    # subscriber drains hello frames until it sees it -- ZeroMQ preserves order on a connection
+    # whose subscription is registered, so the done frame is the last handshake frame that can
+    # arrive, and nothing of the handshake can be mistaken for a request later. Only after that
+    # does the caller reach `sync_all_ranks()` and the "Scheduler is ready" ack.
+    # ------------------------------------------------------------------------------------------
+    _RELAY_HELLO: Final = b"\x00freetoken-relay-hello"
+    _RELAY_DONE: Final = b"\x00freetoken-relay-done"
+    _RELAY_POLL_MS: Final = 50
+    _RELAY_MAX_HELLOS: Final = int(os.environ.get("FREETOKEN_RELAY_HANDSHAKE_MAX_HELLOS", "2400"))
+
+    def _handshake_rank_relay(self, tp_info) -> None:
+        t0 = time.monotonic()
+        size = tp_info.size
+        if tp_info.is_primary():
+            pub = self._send_into_ranks.socket
+            hellos = 0
+            while True:
+                hellos += 1
+                pub.send(self._RELAY_HELLO)
+                if self._relay_subscribers_seen(tp_info, seen=False) == size - 1:
+                    break
+                if hellos >= self._RELAY_MAX_HELLOS:
+                    raise RuntimeError(
+                        f"TP relay handshake: no subscriber acknowledged after {hellos} hellos "
+                        f"({time.monotonic() - t0:.1f} s); the rank-0 PUB never reached rank>=1's SUB"
+                    )
+            pub.send(self._RELAY_DONE)
+            logger.info(
+                f"TP relay handshake: {size - 1} subscriber(s) joined after {hellos} hello(s) "
+                f"in {(time.monotonic() - t0) * 1000:.0f} ms"
+            )
+        else:
+            sub = self._recv_from_rank0.socket
+            seen = False
+            while True:
+                if not seen and sub.poll(timeout=self._RELAY_POLL_MS):
+                    frame = sub.recv()
+                    assert frame == self._RELAY_HELLO, f"unexpected relay frame during handshake: {frame!r}"
+                    seen = True
+                if self._relay_subscribers_seen(tp_info, seen=seen) == size - 1:
+                    break
+            while True:
+                frame = sub.recv()
+                if frame == self._RELAY_DONE:
+                    break
+                assert frame == self._RELAY_HELLO, f"unexpected relay frame during handshake: {frame!r}"
+
+    def _relay_subscribers_seen(self, tp_info, seen: bool) -> int:
+        """One round of the handshake: every rank >= 1 broadcasts whether it has received a hello."""
+        total = 0
+        for root in range(1, tp_info.size):
+            flag = torch.tensor(int(seen) if tp_info.rank == root else 0)
+            self.tp_cpu_group.broadcast(flag, root=root).wait()
+            total += int(flag.item())
+        return total
 
     def run_when_idle(self):
         raise NotImplementedError("should be implemented")

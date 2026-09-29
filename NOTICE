@@ -1,0 +1,12 @@
+freetoken-rdna3
+Copyright 2026 TheGreenery
+
+This product is a modified version of FreeToken (https://github.com/FlashML-org/FreeToken), licensed under the
+Apache License, Version 2.0 (see LICENSE). It was taken from upstream commit 0d652e7 (2026-09-26); every file changed
+or added since is listed, with the reason, in docs/rdna3/changes-from-upstream.md.
+
+It includes ROCm support contributed to FreeToken by zihaomu (upstream pull requests #133, #134, #135) and pieces of a
+community ROCm port of FreeToken by lukascechovic; see docs/rdna3/credits.md.
+
+Model weights (e.g. Qwen3.8-Flash-Next and its NVFP4 conversions) are not part of this product and are covered by
+their own licenses.

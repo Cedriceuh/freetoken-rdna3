@@ -8,6 +8,7 @@ down so a test fits on a shared GPU. Holds no tests itself.
 
 from __future__ import annotations
 
+import contextlib
 from types import SimpleNamespace
 
 import pytest
@@ -19,6 +20,19 @@ EOS = 7
 VOCAB = 512
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+
+
+@contextlib.contextmanager
+def as_rank(rank: int, size: int):
+    """Run the block as one rank of a ``size``-way TP group (set_tp_info is write-once)."""
+    from freetoken.distributed import info
+
+    saved = info._TP_INFO
+    info._TP_INFO = info.DistributedInfo(rank=rank, size=size)
+    try:
+        yield
+    finally:
+        info._TP_INFO = saved
 
 
 def hf_config(

@@ -20,14 +20,18 @@ class _SharedExpert(BaseOP):
     """Always-present shared SwiGLU expert of width ``shared_expert_intermediate_size``."""
 
     def __init__(
-        self, config: ModelConfig, hidden_size: int, intermediate_size: int, *, prefix: str = ""
+        self, config: ModelConfig, hidden_size: int, intermediate_size: int, *, prefix: str = "",
+        local_intermediate: int | None = None,
     ):
+        # local_intermediate: this rank's width when the caller splits the intermediate axis itself
+        # (uneven TP); None splits it evenly
+        local = None if local_intermediate is None else [local_intermediate, local_intermediate]
         self.gate_up_proj = LinearColParallelMerged(
             hidden_size, [intermediate_size, intermediate_size], has_bias=False,
-            quant_config=config.quant, prefix=f"{prefix}.gate_up_proj",
+            local_output_sizes=local, quant_config=config.quant, prefix=f"{prefix}.gate_up_proj",
         )
         self.down_proj = LinearRowParallel(
-            intermediate_size, hidden_size, has_bias=False,
+            intermediate_size, hidden_size, has_bias=False, local_input_size=local_intermediate,
             quant_config=config.quant, prefix=f"{prefix}.down_proj",
         )
 

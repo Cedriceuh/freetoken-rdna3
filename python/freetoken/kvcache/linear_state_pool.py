@@ -6,7 +6,6 @@ import torch
 from freetoken.distributed import get_tp_info
 from freetoken.env import ENV
 from freetoken.models.config import LinearGatedDeltaGroupConfig, SlotStateSpec
-from freetoken.utils import div_even
 
 _SSM_DTYPES = {
     "float32": torch.float32,
@@ -25,8 +24,16 @@ def _linear_local_dims(
 ) -> tuple[int, int, int]:
     """TP-local ``(n_layers, conv_dim, v_heads)`` for the GDN state tensors -- the single
     source of the sharding math shared by the pool allocation and the byte estimate."""
-    local_k_heads = div_even(group.num_key_heads, tp_size, allow_replicate=True)
-    local_v_heads = div_even(group.num_value_heads, tp_size, allow_replicate=True)
+    from freetoken.distributed.info import try_get_tp_info
+    from freetoken.distributed.split import gdn_head_partition
+
+    # the rank's own heads: gdn_head_partition is the rule the GDN module shards with (even, or the
+    # uneven FREETOKEN_TP_SPLIT); byte estimates made before TP is set up price rank 0
+    info = try_get_tp_info()
+    rank = info.rank if info is not None and info.size == tp_size else 0
+    _, local_k_heads, _, local_v_heads = gdn_head_partition(
+        group.num_key_heads, group.num_value_heads, rank=rank, world_size=tp_size
+    )
     local_conv_dim = 2 * local_k_heads * group.key_head_dim + local_v_heads * group.value_head_dim
     return len(group.layer_ids), local_conv_dim, local_v_heads
 

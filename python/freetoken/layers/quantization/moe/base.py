@@ -56,7 +56,20 @@ class MoEConfig:
 
     @property
     def local_intermediate(self) -> int:
-        return self.intermediate // self.tp_size
+        return self.local_intermediate_range[1]
+
+    @property
+    def local_intermediate_range(self) -> tuple[int, int]:
+        """``(offset, size)`` of this rank's slice of the intermediate axis: even, or the uneven
+        ``FREETOKEN_TP_SPLIT`` (freetoken.distributed.split)."""
+        if self.tp_size == 1:
+            return 0, self.intermediate
+        from freetoken.distributed.split import intermediate_partition, tp_shares
+
+        if tp_shares(self.tp_size) is None:
+            local = self.intermediate // self.tp_size
+            return self.tp_rank * local, local
+        return intermediate_partition(self.intermediate, rank=self.tp_rank, world_size=self.tp_size)
 
     @property
     def plain_silu(self) -> bool:

@@ -44,6 +44,15 @@ class RadixTreeNode:
         self.swa_ref_count: int = 0
         self.swa_uuid: int | None = None
 
+        # Host tier (HybridRadixCache with FREETOKEN_HOST_KV=1). ``on_host``: this node's KV
+        # lives in host memory and ``value`` holds HOST token slots, not device ones; every
+        # descendant of a host node is a host node too. ``host_mamba``: host snapshot row of the
+        # GDN state at this node's end boundary (the device ``mamba_value`` of a demoted node).
+        # ``host_pin``: >0 while a promotion is copying this node back (host eviction skips it).
+        self.on_host: bool = False
+        self.host_mamba: int | None = None
+        self.host_pin: int = 0
+
         # these fields should be updated later
         self._key: torch.Tensor
         self._value: torch.Tensor
@@ -99,6 +108,10 @@ class RadixTreeNode:
         new_node.swa_tombstone = self.swa_tombstone
         new_node.swa_uuid = self.swa_uuid
         self.swa_uuid = None
+        # Host tier: both halves live where the node did; the snapshot (host or device) stays on
+        # the suffix, whose end boundary is unchanged.
+        new_node.on_host = self.on_host
+        assert self.host_pin == 0, "a node being promoted is never split"
 
         self.set_key_value(self._key[pos:], self._value[pos:])
         self.set_parent(new_node)

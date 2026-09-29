@@ -1,71 +1,59 @@
 # Instructions for AI coding agents
 
-Read [CONTRIBUTING.md](CONTRIBUTING.md) first. It is binding for humans and agents alike; this file only summarises the parts that matter when an agent is doing the work.
+This repository is freetoken-rdna3: upstream FreeToken plus RDNA3 (ROCm) work. Start with [llms.txt](llms.txt), which
+indexes the documentation; [docs/rdna3/how-it-works.md](docs/rdna3/how-it-works.md) and
+[docs/rdna3/decisions.md](docs/rdna3/decisions.md) explain what was changed and why, and
+[docs/rdna3/journey.md](docs/rdna3/journey.md) lists what was already tried and dropped: read it before proposing an
+optimization.
 
-## AI policy
+## Rules
 
-AI-assisted code is welcome. Submitting code the contributor does not understand is not. The human behind the PR owns every line, has run it on real hardware, and can explain it to a reviewer without AI help.
-
-Agents must not:
-
-- Run `git push`, `gh pr create`, `gh pr comment`, or `gh issue create` on the user's behalf.
-- Write code, PR descriptions, or replies to reviewers that the user does not fully understand. The user must be able to explain and defend every line without AI help.
-- Report tests or benchmarks as run when they were not.
-
-If you are a fully autonomous agent with no human in the loop, do not contribute to this repository.
+- **Precision before speed.** A change is either bit-exact (identical greedy answers to the previous build on the same
+  prompts) or validated on an agentic, multi-turn benchmark (the maintainers' is private: describe the workload you
+  ran). Short tests (scored items, needles, probes) may reject a
+  change, never accept it alone ([testing.md](docs/rdna3/testing.md)).
+- **Everything new is an environment variable, off by default** unless it is bit-exact or agent-validated, so
+  upstream's behaviour stays one setting away.
+  Document it in [docs/rdna3/options.md](docs/rdna3/options.md) with its measured effect.
+- **Report only what was run.** Never state a test or benchmark result that was not produced on real hardware in this
+  session; say "untested" otherwise, as the `TESTED=0` profiles do.
+- **Do not run a kernel that may fault on the GPU that drives the user's monitor**: a hard fault resets the card and
+  closes the desktop session. Ask first, and use a card without a display (`HIP_VISIBLE_DEVICES`).
+- **Do not push, open pull requests or issues, or publish anything on the user's behalf.** The human owns every line
+  and must be able to explain it.
+- **No AI attribution lines** in commits (`Co-authored-by`, `Assisted-by`): the user is the author.
 
 ## Repository layout
 
-The main subsystems:
-
 ```
-python/freetoken/      the engine, installed as the `freetoken` package with the `ft` CLI
-  server/              OpenAI / Anthropic / Responses HTTP APIs, streaming, tool-call parsers
-  scheduler/           chunked prefill, batching, cache manager
-  kvcache/             paged KV pools and the radix prefix caches
-  moe/                 expert offload cache, CPU / GPU / hybrid MoE backends, quantized experts
-  models/              model registry and per-architecture loaders
-  kernel/              CUDA / Triton kernels, JIT cache, C++ extensions (`csrc/`)
-  layers/, attention/  fused ops and attention backends
-  engine/              cache budget planning and config resolution
-  checkpoint/          HF -> FTW fast-load conversion
-tests/                 mirrors python/freetoken/ by subsystem, see tests/README.md
-benchmarks/            end-to-end and micro benchmarks, see benchmarks/README.md
-docs/                  install, quickstart, CLI and model docs
-freetoken-kernel-cache/ companion wheel of prebuilt kernels, see its README
-scripts/               wheel build and release scripts
+python/freetoken/      the engine (upstream layout: server/, scheduler/, kvcache/, moe/, models/, kernel/, layers/, engine/)
+  distributed/split.py        uneven tensor-parallel split
+  kernel/host_allreduce.py    host-memory all-reduce
+  kernel/triton/              RDNA3 GEMVs, top-k-first sampler, sampling (ROCm sorted threshold)
+  kvcache/host_kv_pool.py     conversations kept in RAM (with kvcache/hybrid_radix_cache.py)
+  models/qwen4_exp/           Qwen3.8-Flash-Next, tensor-parallel port
+tests/                 CPU tests, mirroring python/freetoken/
+rdna3/                 profiles, serve.sh, GPU checks (tests/), micro-benchmarks (bench/), TunableOp files, tools/
+docs/rdna3/            this repository's documentation; docs/*.md is upstream's
+Dockerfile.rdna3       the ROCm image
 ```
 
 ## Development
 
-Linux x86_64 with an NVIDIA GPU. Use `uv`, not bare `pip`:
+Everything runs in the image (ROCm 7.14, PyTorch 2.11, Triton), with the working tree mounted over it:
 
 ```bash
-uv venv && source .venv/bin/activate
-uv pip install -e ".[accel]"
-uv run pytest tests/ -m "not slow"
+docker build -f Dockerfile.rdna3 -t freetoken-rdna3:latest .
+docker run --rm -w /opt/FreeToken --entrypoint python3 freetoken-rdna3:latest \
+  -m pytest -q -p no:cacheprovider tests          # CPU suite, ~5 min, 3 known environment failures (testing.md)
 ```
 
-CUDA kernels are JIT-compiled with `nvcc` on first use unless the prebuilt `freetoken-kernel-cache` wheel is installed. The C++ extensions under `python/freetoken/kernel/csrc/` are built by `setup.py`; after changing them run `python setup.py build_ext --inplace`.
+GPU checks and benchmarks: [docs/rdna3/testing.md](docs/rdna3/testing.md). A bug fix comes with a test that fails
+before and passes after; a performance change comes with interleaved A/B numbers on the whole model. After editing the
+docs, regenerate `llms-full.txt` with `rdna3/tools/make-llms-full.sh`.
 
-Put a new test in the `tests/` directory that mirrors the module it protects, and extend an existing file before creating a new one. Bug fixes come with a test that fails before and passes after. Performance changes come with A/B numbers against `main`.
+## Code comments and commits
 
-## Issues and PRs
-
-- Search existing issues and PRs before starting. Items on the [Roadmap](https://github.com/FlashML-org/FreeToken/issues/79) are discussed with maintainers before implementation; features not on it start as an issue.
-- When helping the user draft an issue, follow the matching template in `.github/ISSUE_TEMPLATE/` (engine bug, model checkpoint, feature request) and fill in every required field: hardware, driver, FreeToken version, checkpoint ID, exact command, and the full log.
-- One change per PR, linked to its issue, with the hardware, checkpoint ID and exact command it was tested with.
-
-## Code comments
-
-Comments explain a non-obvious "why", never restate the code. Write the code first, then add a comment only where a reader would otherwise be confused. Keep them to one or two lines. Configuration files get no comments. Use ASCII: `-` not em-dash, `->` not arrows.
-
-## Commits
-
-[Conventional Commits](https://www.conventionalcommits.org/), one line, imperative, lowercase, no trailing period:
-
-```
-fix(kvcache): size the SWA radix pool for chunked prefill
-```
-
-PRs are squash-merged, so the PR title follows the same format. The subject line is usually enough; add a body only when the change needs a why that the diff does not show, and keep it to a few lines. Only commit when the user asks. If the user wants attribution, use `Assisted-by: <agent name>`, not `Co-authored-by`.
+Comments explain a non-obvious "why", in one or two lines, in ASCII (`-`, `->`). Commits follow Conventional Commits,
+imperative and lowercase (`fix(kvcache): size the host tier in pages, not bytes`), with a body only when the why is not
+in the diff. Commit only when the user asks.
