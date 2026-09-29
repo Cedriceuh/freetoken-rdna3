@@ -89,7 +89,7 @@ the draws outside the top-20 on one distribution) and its top-p was approximate.
 
 Up to 4 requests decode together (`--max-running-requests 4`), with CUDA graphs captured for every batch size up to 4.
 The decode GEMVs run their unchanged per-row body once per request (the weight tile loaded once when the reduction fits
-one tile), so batching changes speed, not answers: 57 / 82 / 113 tok/s in total at 1 / 2 / 4 requests. Prefills are
+one tile), so batching changes speed, not answers: 55 / 81 / 98 / 105 tok/s in total at 1 / 2 / 3 / 4 requests. Prefills are
 not mixed with decode steps in one batch (estimated at ~3 %, not done); agents naturally overlap their prefills.
 
 ## Conversations kept in RAM

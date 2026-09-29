@@ -106,7 +106,8 @@ from every profile. From then on the rule was: **bit-exact changes, or changes v
   prefill MoE x1.5-1.8, long reads -11 %, decode +1.3 %.
 - **Several requests**: the decode GEMVs run their unchanged per-row body once per request, so a request gets the same
   bits alone or batched; CUDA graphs for every batch size up to 4. 57 / 82 / 113 tok/s in total at 1 / 2 / 4
-  requests; four agents finish the same work ~2.6x sooner.
+  requests on that first build; reserving the recurrent states of four requests then cost ~650 expert-cache slots, and
+  the release build does 55 / 81 / 98 / 105 at 1 / 2 / 3 / 4. Four agents finish the same work ~2.6x sooner.
 - One multi-request crash found on the way: several requests prefilled together made the PLE layer allocate ~2.6 GiB
   of temporaries and ran the XT out of memory; blocking it for several requests too brought it to 0.7 GiB, same output.
 

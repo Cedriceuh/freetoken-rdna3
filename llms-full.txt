@@ -24,8 +24,9 @@ with an OpenAI- and Anthropic-compatible API.
 |---|---:|---:|
 | Decode, short context | **55 tok/s** | 36 tok/s |
 | Decode, 10k to 255k tokens of context | **48-53 tok/s** | 33-35 tok/s |
-| 8.4k-token prompt | **4.5 s** | 6.3 s |
-| Requests at once | **4** (113 tok/s in total) | 1 |
+| Reading an 8.4k-token prompt, cold (PP) | **4.1-4.5 s, ~1850-2030 tok/s** | 6.3 s, ~1330 tok/s |
+| Reading the new part of an agent turn (PP), 10k to 255k | **1400-1850 tok/s** | 1290-1620 tok/s |
+| Requests decoding at once | **4** (105 tok/s in total) | 1 |
 
 Four agents with ~100k-token conversations taking turns: **35 s instead of 599 s** without the RAM tier, because a
 conversation pushed off the GPUs is kept in system RAM and resumes in ~2 s instead of being re-read.
@@ -298,7 +299,7 @@ A comment may follow a value on the same line. Copy a file to make your own prof
 | `--expert-load parallel` | | reads the expert files into RAM with parallel readers; `auto` (the engine's default) does the same but falls back to a slower serial read when free RAM is short: use it on a machine with little RAM to spare |
 | `--quant-backend moe.nvfp4=triton` | | the Triton NVFP4 expert kernels (the other backends need NVIDIA hardware) |
 | `--ple-backend disk` | | the 51 GB n-gram embedding tables are read from the checkpoint files on demand |
-| `--max-running-requests 4 --cuda-graph-max-bs 4` | | up to 4 requests decoded together, each computed row by row as if alone (prompts prefilled in the same batch can differ at rounding level): 57 / 82 / 113 tok/s in total at 1 / 2 / 4 |
+| `--max-running-requests 4 --cuda-graph-max-bs 4` | | up to 4 requests decoded together, each computed row by row as if alone (prompts prefilled in the same batch can differ at rounding level): 55 / 81 / 98 / 105 tok/s in total at 1 / 2 / 3 / 4 requests |
 | `--max-prefill-length 16384` | | 16k-token prompt chunks: each chunk streams every expert once, so bigger chunks read long prompts ~1.5x faster |
 | `--memory-ratio 0.80` | | VRAM budget; 0.80 leaves the headroom 16k chunks need on the 20 GB card |
 | `--moe-prefill-hit-d2d` | | experts already cached on the GPU are reused during prefill instead of crossing PCIe: agent turn 1.55 -> 1.18 s |
@@ -501,12 +502,12 @@ re-measured against it: decode -0.4 % (within noise), 8.4k prefill ~1 % faster, 
 
 ## Summary
 
-| Profile | Decode | Decode, 10k to max depth | Cold 8.4k prompt | PP of new tokens | Agent turn, 10k -> max | Max depth |
+| Profile | Decode | Decode, 10k to max depth | Cold 8.4k prompt (PP) | PP of new tokens | Agent turn, 10k -> max | Max depth |
 |---|---:|---:|---:|---:|---:|---:|
-| `xtx-xt` | 55.3 tok/s | 48-53 tok/s | 4.5 s | 1400-1850 tok/s | 1.2 -> 1.9 s | 255k |
-| baseline, 2 cards | 35.9 tok/s | 33-35 tok/s | 6.3 s | 1290-1620 tok/s | 1.4 -> 2.0 s | 255k |
-| `xtx` | 36.5 tok/s | 32.5-34.3 tok/s | 10.5 s | 1180-1300 tok/s | 2.3 -> 2.7 s | 124k |
-| `xt` | 28.5 tok/s | 27-28 tok/s | 8.9 s | 1100-1190 tok/s | 2.4 -> 2.7 s | 124k |
+| `xtx-xt` | 55.3 tok/s | 48-53 tok/s | 4.5 s, ~1850 tok/s | 1400-1850 tok/s | 1.2 -> 1.9 s | 255k |
+| baseline, 2 cards | 35.9 tok/s | 33-35 tok/s | 6.3 s, ~1330 tok/s | 1290-1620 tok/s | 1.4 -> 2.0 s | 255k |
+| `xtx` | 36.5 tok/s | 32.5-34.3 tok/s | 10.5 s, ~800 tok/s | 1180-1300 tok/s | 2.3 -> 2.7 s | 124k |
+| `xt` | 28.5 tok/s | 27-28 tok/s | 8.9 s, ~940 tok/s | 1100-1190 tok/s | 2.4 -> 2.7 s | 124k |
 
 Decode holds to the maximum context on every profile (at most ~10 % lower at 255k than at 10k). Reading the new part
 of an agent turn costs about the same with or without the tuning: every prefill pass streams the experts it uses from
@@ -561,10 +562,16 @@ The XT ends at 124k with 0.8 GiB of VRAM free: 131k is its limit. A 60k-token pr
 
 | Workload | Result |
 |---|---|
-| Decode throughput, 1 / 2 / 4 requests | 57 / 82 / 113 tok/s in total |
+| Decode, 1 / 2 / 3 / 4 requests at once | 55 / 81 / 98 / 105 tok/s in total (55 / 40 / 33 / 26 per request) |
+| Cold 8.4k-token prompts (PP), 1 / 4 at once | 4.1 s, ~2030 tok/s / all four in 15.7 s, ~2120 tok/s in total (the first answers after 11.5 s) |
 | 4 agents, 82-117k-token conversations, 3 turns each (together more than the GPUs hold) | 35 s, first token of each turn 1.9-2.3 s; without the RAM tier 599 s and ~47 s per turn (1.15M tokens recomputed) |
 | 4 agents x 12 short turns, small GPU pool | 94 s instead of 143 s without the RAM tier |
-| 4 requests with different sampling settings (greedy, top-p only, top-k 1000, top-k 20) | ~28 tok/s per request |
+| 4 requests with different sampling settings (greedy, top-p only, top-k 1000, top-k 20), 256-token answers | ~27-28 tok/s per request |
+
+The first two rows are the release build (`rdna3-v0.1.0`), median of two passes: 512-token answers, counted only while
+every request is decoding. Four requests share one decode step, so each gets ~26 tok/s; real agents also wait for
+each other's prefills. The first long prompt after a start is slower (8.4k tokens in 6.0 s: one-time kernel
+preparation).
 
 A request is computed the same way alone or batched (per-row kernels); prompts prefilled in the same batch can differ
 at rounding level, as they already do with prefix caching.
@@ -578,7 +585,7 @@ at rounding level, as they already do with prefix caching.
 | + int8 dense layers, split-K GEMVs, one MoE all-reduce per block | 52.4 |
 | + top-k-first sampler, uneven 0.55 split | 55.5 |
 | + host-memory all-reduce, tuned NVFP4 tiles, bf16 attention KV (int8 KV dropped) | 56-57 |
-| + up to 4 requests, 16k prefill chunks, conversations kept in RAM (`xtx-xt`) | 55 alone, 113 at 4 |
+| + up to 4 requests, 16k prefill chunks, conversations kept in RAM (`xtx-xt`) | 55 alone, 105 at 4 |
 
 Details of every step, including what did not work: [journey.md](journey.md).
 
@@ -701,7 +708,7 @@ the draws outside the top-20 on one distribution) and its top-p was approximate.
 
 Up to 4 requests decode together (`--max-running-requests 4`), with CUDA graphs captured for every batch size up to 4.
 The decode GEMVs run their unchanged per-row body once per request (the weight tile loaded once when the reduction fits
-one tile), so batching changes speed, not answers: 57 / 82 / 113 tok/s in total at 1 / 2 / 4 requests. Prefills are
+one tile), so batching changes speed, not answers: 55 / 81 / 98 / 105 tok/s in total at 1 / 2 / 3 / 4 requests. Prefills are
 not mixed with decode steps in one batch (estimated at ~3 %, not done); agents naturally overlap their prefills.
 
 ## Conversations kept in RAM
@@ -796,7 +803,7 @@ probes) are used to reject changes, never to accept them alone.
 |---|---|
 | Choice | `--max-running-requests 4` with CUDA graphs for every batch size up to 4, per-row decode kernels |
 | Alternatives | One request at a time (upstream's single-agent setting) |
-| For | 57 / 82 / 113 tok/s in total at 1 / 2 / 4 requests; parallel sub-agents finish ~2.6x sooner; a request alone computes exactly as before |
+| For | 55 / 81 / 98 / 105 tok/s in total at 1 / 2 / 3 / 4 requests; parallel sub-agents finish ~2.6x sooner; a request alone computes exactly as before |
 | Against | Each request decodes slower when others run (~41 tok/s each at 2, ~28 at 4); prompts prefilled in one batch can differ at rounding level; GDN state for 4 requests (too much for one card: one card stays at 1) |
 
 ## Conversations kept in RAM
@@ -957,7 +964,8 @@ from every profile. From then on the rule was: **bit-exact changes, or changes v
   prefill MoE x1.5-1.8, long reads -11 %, decode +1.3 %.
 - **Several requests**: the decode GEMVs run their unchanged per-row body once per request, so a request gets the same
   bits alone or batched; CUDA graphs for every batch size up to 4. 57 / 82 / 113 tok/s in total at 1 / 2 / 4
-  requests; four agents finish the same work ~2.6x sooner.
+  requests on that first build; reserving the recurrent states of four requests then cost ~650 expert-cache slots, and
+  the release build does 55 / 81 / 98 / 105 at 1 / 2 / 3 / 4. Four agents finish the same work ~2.6x sooner.
 - One multi-request crash found on the way: several requests prefilled together made the PLE layer allocate ~2.6 GiB
   of temporaries and ran the XT out of memory; blocking it for several requests too brought it to 0.7 GiB, same output.
 

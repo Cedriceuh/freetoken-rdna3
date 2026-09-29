@@ -3,8 +3,8 @@
 > A tuned build of the FreeToken Mixture-of-Experts inference engine for AMD Radeon RX 7900 XTX / 7900 XT (RDNA3,
 > gfx1100, ROCm), serving Qwen3.8-Flash-Next (125B-parameter MoE, NVFP4) on one or two consumer GPUs with an
 > OpenAI- and Anthropic-compatible API. On an RX 7900 XTX + RX 7900 XT: 55 tok/s decode, 48-53 tok/s up to 255k tokens
-> of context, 4.5 s for an 8.4k-token prompt, up to 4 concurrent requests (113 tok/s in total); needs ~81 GiB of system
-> RAM for this model.
+> of context, 4.1-4.5 s to read an 8.4k-token prompt (~1850-2030 tok/s), up to 4 concurrent requests (105 tok/s in total);
+> needs ~81 GiB of system RAM for this model.
 
 Key facts: the engine keeps every expert in pinned system RAM (64.7 GiB for this model in NVFP4, the smallest format
 it runs for it) and caches the most used experts in VRAM; two cards run tensor-parallel with an uneven 55/45 split;

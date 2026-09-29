@@ -14,8 +14,9 @@ with an OpenAI- and Anthropic-compatible API.
 |---|---:|---:|
 | Decode, short context | **55 tok/s** | 36 tok/s |
 | Decode, 10k to 255k tokens of context | **48-53 tok/s** | 33-35 tok/s |
-| 8.4k-token prompt | **4.5 s** | 6.3 s |
-| Requests at once | **4** (113 tok/s in total) | 1 |
+| Reading an 8.4k-token prompt, cold (PP) | **4.1-4.5 s, ~1850-2030 tok/s** | 6.3 s, ~1330 tok/s |
+| Reading the new part of an agent turn (PP), 10k to 255k | **1400-1850 tok/s** | 1290-1620 tok/s |
+| Requests decoding at once | **4** (105 tok/s in total) | 1 |
 
 Four agents with ~100k-token conversations taking turns: **35 s instead of 599 s** without the RAM tier, because a
 conversation pushed off the GPUs is kept in system RAM and resumes in ~2 s instead of being re-read.

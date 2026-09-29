@@ -18,12 +18,12 @@ re-measured against it: decode -0.4 % (within noise), 8.4k prefill ~1 % faster, 
 
 ## Summary
 
-| Profile | Decode | Decode, 10k to max depth | Cold 8.4k prompt | PP of new tokens | Agent turn, 10k -> max | Max depth |
+| Profile | Decode | Decode, 10k to max depth | Cold 8.4k prompt (PP) | PP of new tokens | Agent turn, 10k -> max | Max depth |
 |---|---:|---:|---:|---:|---:|---:|
-| `xtx-xt` | 55.3 tok/s | 48-53 tok/s | 4.5 s | 1400-1850 tok/s | 1.2 -> 1.9 s | 255k |
-| baseline, 2 cards | 35.9 tok/s | 33-35 tok/s | 6.3 s | 1290-1620 tok/s | 1.4 -> 2.0 s | 255k |
-| `xtx` | 36.5 tok/s | 32.5-34.3 tok/s | 10.5 s | 1180-1300 tok/s | 2.3 -> 2.7 s | 124k |
-| `xt` | 28.5 tok/s | 27-28 tok/s | 8.9 s | 1100-1190 tok/s | 2.4 -> 2.7 s | 124k |
+| `xtx-xt` | 55.3 tok/s | 48-53 tok/s | 4.5 s, ~1850 tok/s | 1400-1850 tok/s | 1.2 -> 1.9 s | 255k |
+| baseline, 2 cards | 35.9 tok/s | 33-35 tok/s | 6.3 s, ~1330 tok/s | 1290-1620 tok/s | 1.4 -> 2.0 s | 255k |
+| `xtx` | 36.5 tok/s | 32.5-34.3 tok/s | 10.5 s, ~800 tok/s | 1180-1300 tok/s | 2.3 -> 2.7 s | 124k |
+| `xt` | 28.5 tok/s | 27-28 tok/s | 8.9 s, ~940 tok/s | 1100-1190 tok/s | 2.4 -> 2.7 s | 124k |
 
 Decode holds to the maximum context on every profile (at most ~10 % lower at 255k than at 10k). Reading the new part
 of an agent turn costs about the same with or without the tuning: every prefill pass streams the experts it uses from
@@ -78,10 +78,16 @@ The XT ends at 124k with 0.8 GiB of VRAM free: 131k is its limit. A 60k-token pr
 
 | Workload | Result |
 |---|---|
-| Decode throughput, 1 / 2 / 4 requests | 57 / 82 / 113 tok/s in total |
+| Decode, 1 / 2 / 3 / 4 requests at once | 55 / 81 / 98 / 105 tok/s in total (55 / 40 / 33 / 26 per request) |
+| Cold 8.4k-token prompts (PP), 1 / 4 at once | 4.1 s, ~2030 tok/s / all four in 15.7 s, ~2120 tok/s in total (the first answers after 11.5 s) |
 | 4 agents, 82-117k-token conversations, 3 turns each (together more than the GPUs hold) | 35 s, first token of each turn 1.9-2.3 s; without the RAM tier 599 s and ~47 s per turn (1.15M tokens recomputed) |
 | 4 agents x 12 short turns, small GPU pool | 94 s instead of 143 s without the RAM tier |
-| 4 requests with different sampling settings (greedy, top-p only, top-k 1000, top-k 20) | ~28 tok/s per request |
+| 4 requests with different sampling settings (greedy, top-p only, top-k 1000, top-k 20), 256-token answers | ~27-28 tok/s per request |
+
+The first two rows are the release build (`rdna3-v0.1.0`), median of two passes: 512-token answers, counted only while
+every request is decoding. Four requests share one decode step, so each gets ~26 tok/s; real agents also wait for
+each other's prefills. The first long prompt after a start is slower (8.4k tokens in 6.0 s: one-time kernel
+preparation).
 
 A request is computed the same way alone or batched (per-row kernels); prompts prefilled in the same batch can differ
 at rounding level, as they already do with prefix caching.
@@ -95,7 +101,7 @@ at rounding level, as they already do with prefix caching.
 | + int8 dense layers, split-K GEMVs, one MoE all-reduce per block | 52.4 |
 | + top-k-first sampler, uneven 0.55 split | 55.5 |
 | + host-memory all-reduce, tuned NVFP4 tiles, bf16 attention KV (int8 KV dropped) | 56-57 |
-| + up to 4 requests, 16k prefill chunks, conversations kept in RAM (`xtx-xt`) | 55 alone, 113 at 4 |
+| + up to 4 requests, 16k prefill chunks, conversations kept in RAM (`xtx-xt`) | 55 alone, 105 at 4 |
 
 Details of every step, including what did not work: [journey.md](journey.md).
 

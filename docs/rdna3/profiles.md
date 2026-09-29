@@ -47,7 +47,7 @@ A comment may follow a value on the same line. Copy a file to make your own prof
 | `--expert-load parallel` | | reads the expert files into RAM with parallel readers; `auto` (the engine's default) does the same but falls back to a slower serial read when free RAM is short: use it on a machine with little RAM to spare |
 | `--quant-backend moe.nvfp4=triton` | | the Triton NVFP4 expert kernels (the other backends need NVIDIA hardware) |
 | `--ple-backend disk` | | the 51 GB n-gram embedding tables are read from the checkpoint files on demand |
-| `--max-running-requests 4 --cuda-graph-max-bs 4` | | up to 4 requests decoded together, each computed row by row as if alone (prompts prefilled in the same batch can differ at rounding level): 57 / 82 / 113 tok/s in total at 1 / 2 / 4 |
+| `--max-running-requests 4 --cuda-graph-max-bs 4` | | up to 4 requests decoded together, each computed row by row as if alone (prompts prefilled in the same batch can differ at rounding level): 55 / 81 / 98 / 105 tok/s in total at 1 / 2 / 3 / 4 requests |
 | `--max-prefill-length 16384` | | 16k-token prompt chunks: each chunk streams every expert once, so bigger chunks read long prompts ~1.5x faster |
 | `--memory-ratio 0.80` | | VRAM budget; 0.80 leaves the headroom 16k chunks need on the 20 GB card |
 | `--moe-prefill-hit-d2d` | | experts already cached on the GPU are reused during prefill instead of crossing PCIe: agent turn 1.55 -> 1.18 s |

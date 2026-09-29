@@ -69,7 +69,7 @@ probes) are used to reject changes, never to accept them alone.
 |---|---|
 | Choice | `--max-running-requests 4` with CUDA graphs for every batch size up to 4, per-row decode kernels |
 | Alternatives | One request at a time (upstream's single-agent setting) |
-| For | 57 / 82 / 113 tok/s in total at 1 / 2 / 4 requests; parallel sub-agents finish ~2.6x sooner; a request alone computes exactly as before |
+| For | 55 / 81 / 98 / 105 tok/s in total at 1 / 2 / 3 / 4 requests; parallel sub-agents finish ~2.6x sooner; a request alone computes exactly as before |
 | Against | Each request decodes slower when others run (~41 tok/s each at 2, ~28 at 4); prompts prefilled in one batch can differ at rounding level; GDN state for 4 requests (too much for one card: one card stays at 1) |
 
 ## Conversations kept in RAM
