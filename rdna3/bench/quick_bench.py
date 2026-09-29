@@ -5,7 +5,7 @@
 
 Standard library only. Four measurements, each on text the server has never seen (so no cache hit inflates them):
   decode      tokens/s of a 512-token answer, after its first token (the model's default sampling, thinking off)
-  cold read   time to first token of a ~8.4k-token prompt with nothing cached (as in docs/rdna3/benchmarks.md)
+  cold read   time to first token of a ~8.3k-token prompt with nothing cached (as in docs/rdna3/benchmarks.md)
   agent turn  time to first token when ~1.5k new tokens are appended to that (now cached) conversation
   tool call   whether a tool call comes back parsed
 Prints a Markdown table to paste in an issue. Takes about a minute; run it when nothing else uses the server.

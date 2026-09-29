@@ -7,8 +7,8 @@ How this repository relates to upstream FreeToken and how to keep it current. Fo
 Upstream [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken) at `0d652e7` (2026-09-26, "feat(rocm): add
 RDNA3 and RDNA4 runtime foundation (#132)"), plus the changes listed file by file in
 [changes-from-upstream.md](changes-from-upstream.md). The history is upstream's own up to that commit, then this
-project's commits on top (the first one holds everything up to 0.1.0). `git diff $(git merge-base HEAD upstream/main)`
-shows every change against the upstream version this tree is based on.
+project's commits on top (the first one holds everything up to 0.1.0). Once the `upstream` remote is set up (below),
+`git diff $(git merge-base HEAD upstream/main)` shows every change against the upstream version this tree is based on.
 
 ## The stack on top of upstream (oldest first)
 
@@ -21,7 +21,7 @@ shows every change against the upstream version this tree is based on.
 | TP>1 relay handshake before the first request | community ROCm port (lukascechovic), upstream issue #364 | upstream fixes #364 |
 | GDN boundary carried across the prefill chunk seam | community ROCm port (lukascechovic) | upstream carries it |
 | qwen4_exp tensor parallelism | rewritten from the community port's | upstream supports qwen4_exp at TP>1 |
-| unequal cards, uneven split, int8 dense, GEMVs, host all-reduce, sampler, tuned tiles, blocked prefill, multi-request, RAM tier, review fixes | this repository | proposed upstream piece by piece |
+| unequal cards, uneven split, int8 dense, GEMVs, host all-reduce, sampler, tuned tiles, blocked prefill, multi-request, RAM tier, review fixes | this repository | upstream merges it (to be proposed piece by piece) |
 | `Dockerfile.rdna3`, `rdna3/`, `docs/rdna3/` | this repository | never |
 
 ## Keeping current
@@ -50,7 +50,9 @@ After a merge, update the base commit named in `NOTICE`, this file and
 
 ## Releasing
 
-1. Update the numbers in the docs if they moved ([benchmarks.md](benchmarks.md), profile headers), and `CHANGELOG.md`.
+1. Measure on the image being released, then update every place the numbers appear: [benchmarks.md](benchmarks.md),
+   `README.md`, `llms.txt`, [profiles.md](profiles.md), the headers in `rdna3/profiles/`, the banner
+   (`docs/rdna3/assets/social-preview.png`) and `CHANGELOG.md`; then run `rdna3/tools/make-llms-full.sh`.
 2. `rdna3/tools/privacy_scan.sh`: no personal paths, hostnames, e-mail addresses, secrets or AI co-author lines in the
    tree or the history being published.
 3. Tag the release `rdna3-vX.Y.Z` (upstream's own tags are `vX.Y.Z`, so a fetch from upstream never clashes), with

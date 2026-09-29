@@ -3,18 +3,21 @@
 > A tuned build of the FreeToken Mixture-of-Experts inference engine for AMD Radeon RX 7900 XTX / 7900 XT (RDNA3,
 > gfx1100, ROCm), serving Qwen3.8-Flash-Next (125B-parameter MoE, NVFP4) on one or two consumer GPUs with an
 > OpenAI- and Anthropic-compatible API. On an RX 7900 XTX + RX 7900 XT: 55 tok/s decode, 48-53 tok/s up to 255k tokens
-> of context, 4.1-4.5 s to read an 8.4k-token prompt (~1850-2030 tok/s), up to 4 concurrent requests (105 tok/s in total);
-> needs ~81 GiB of system RAM for this model.
+> of context, 4.1-4.5 s to read a cold 8.4k-token prompt (~1870-2050 tok/s), up to 4 concurrent requests (105 tok/s in
+> total); uses ~81 GiB of system RAM for this model.
 
-Key facts: the engine keeps every expert in pinned system RAM (64.7 GiB for this model in NVFP4, the smallest format
-it runs for it) and caches the most used experts in VRAM; two cards run tensor-parallel with an uneven 55/45 split;
-dense layers are int8 (weights only); small all-reduces go through shared host memory (no GPU peer-to-peer on consumer
-boards); sampling on ROCm uses a top-k-first path for top_k <= 256 and an exact sorted threshold otherwise (upstream's
-cooperative sampling kernels hang on RDNA3); conversations evicted from the GPUs are kept in RAM and restored exactly.
-Every option is an environment variable (docs/rdna3/options.md gives each default): the tuning is off unless a profile
-turns it on, and only bit-exact or agent-validated changes are on by default. Precision rule: a change is either
-bit-exact (identical greedy answers) or validated on an agentic benchmark; an int8 KV cache that passed every short test
-cut the agentic score from 12-14 to 8-9 and is off in every profile (kept as an experimental option). Tested only on RX 7900 XTX + XT; NVIDIA, RDNA4, TP>2 untested.
+Key facts: the engine keeps every expert in pinned system RAM (~63 GiB for this model in NVFP4, the smallest format it
+runs for it; each rank pins its own share) and caches the most used experts in VRAM; two cards run tensor-parallel
+with an uneven 55/45 split; dense layers are int8 (weights only, lossy but agent-validated); small all-reduces go
+through shared host memory (no GPU peer-to-peer on the reference machine, as usual on consumer boards); sampling on
+ROCm uses a top-k-first path for top_k <= 256 and an exact sorted threshold otherwise (upstream's cooperative sampling
+kernels hang on gfx1100); conversations evicted from the GPUs are kept in RAM and restored exactly. The tuning is
+switched by environment variables (docs/rdna3/options.md gives each default): most of it is off unless a profile turns
+it on; what is on by default is bit-exact, agent-validated, or (the release's sampler rework, exact by kernel tests,
+and its token broadcast, checked in `check`-mode server runs) new and not agent-validated. Precision rule: a change is either bit-exact (identical greedy answers) or validated on an
+agentic benchmark; an int8 KV cache that passed every short test cut the agentic score from 12-14 to 8-9 and is off in
+every profile (kept as an experimental option). Tested only on RX 7900 XTX + XT; NVIDIA, RDNA4 and TP>2 untested (this
+model cannot run above TP=2 in this build).
 
 ## Docs
 
@@ -31,7 +34,8 @@ cut the agentic score from 12-14 to 8-9 and is off in every profile (kept as an 
 - [Testing](docs/rdna3/testing.md): CPU suite, GPU checks, micro-benchmarks, the release validation procedure
 - [Maintaining](docs/rdna3/maintaining.md): relation to upstream, sync and release procedure
 - [Changes from upstream](docs/rdna3/changes-from-upstream.md): every modified file with the reason
-- [All docs in one file](llms-full.txt): the documents above concatenated
+- [Credits](docs/rdna3/credits.md): who wrote what
+- [All docs in one file](llms-full.txt): the documents above concatenated (README included)
 
 ## Code map
 

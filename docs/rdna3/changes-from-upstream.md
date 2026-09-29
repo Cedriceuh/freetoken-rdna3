@@ -2,8 +2,7 @@
 
 This repository is a modified version of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken) (Apache
 License 2.0), taken at `0d652e7` (2026-09-26). Every file changed or added relative to that commit is listed here with
-the reason, as the notice of changes the Apache License 2.0 asks for (section 4(b)). Line counts are `added/removed`. Who wrote what:
-[credits.md](credits.md).
+the reason. Line counts are `added/removed`. Who wrote what: [credits.md](credits.md).
 
 ## ROCm portability (upstream PRs #133-#135 by zihaomu, and fixes on top)
 
@@ -20,12 +19,12 @@ the reason, as the notice of changes the Apache License 2.0 asks for (section 4(
 
 | File | Lines | Change |
 |---|---:|---|
-| `python/freetoken/models/qwen4_exp/weight.py` | 205/11 | per-rank sharding of every weight (even or uneven split); explicit error for the vision tower at TP>1 |
+| `python/freetoken/models/qwen4_exp/weight.py` | 205/11 | per-rank sharding of the split weights (even or uneven split; the rest replicated); explicit error for the vision tower at TP>1 |
 | `python/freetoken/models/qwen4_exp/attention.py` | 20/7 | attention heads and output projection sharded |
 | `python/freetoken/models/qwen4_exp/gdn.py` | 41/14 | GatedDeltaNet heads sharded, unevenly when a split is set |
 | `python/freetoken/models/qwen4_exp/moe.py` | 30/2 | routed / shared experts sharded; one all-reduce per MoE block |
-| `python/freetoken/models/qwen4_exp/ple.py` | 106/3 | PLE heads sharded; the PLE convolution processed in time blocks for long and batched prefills |
-| `python/freetoken/models/qwen4_exp/ple_disk.py` | 4/0 | per-rank PLE rows from disk |
+| `python/freetoken/models/qwen4_exp/ple.py` | 106/3 | PLE heads sharded (except with the disk source, which serves every head to every rank); the PLE convolution processed in time blocks for long and batched prefills |
+| `python/freetoken/models/qwen4_exp/ple_disk.py` | 4/0 | the disk source declares that it serves every PLE head, so each rank reads them all |
 | `python/freetoken/layers/quantization/moe/nvfp4.py`, `layers/quantization/moe/base.py` | 60/3, 14/1 | NVFP4 expert banks sliced per rank, unevenly when a split is set |
 | `python/freetoken/models/qwen3_5_moe/moe.py` | 7/3 | `_SharedExpert` accepts a rank-local width (used by qwen4_exp's uneven split) |
 | `python/freetoken/layers/linear.py`, `layers/moe.py` | 14/4, 4/1 | uneven shard sizes; the fused MoE all-reduce |

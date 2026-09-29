@@ -11,9 +11,10 @@ With a server running (any profile):
 python3 rdna3/bench/quick_bench.py --label "2x RX 7900 XT, xt-xt"
 ```
 
-About a minute; it measures decode speed, a cold ~8k-token read, an agent turn on the cached conversation and a tool
-call, on text the server has never seen, and prints a Markdown table for an issue. For comparison, `xtx-xt` gives
-~55 tok/s, ~4.5 s and ~1.2 s.
+About a minute; it measures decode speed, a cold ~8.3k-token read, an agent turn on the cached conversation and a
+tool call, on text the server has never seen, and prints a Markdown table for an issue. For comparison, the release
+build on `xtx-xt` gives ~53-54 tok/s, ~4.1 s and ~1.25 s, tool call parsed. On a fresh image the first run can be
+slower (one-time kernel preparation): run it twice.
 
 ## CPU test suite
 
@@ -73,8 +74,8 @@ real step's. Decide on the whole model.
 ## Before trusting a change: the procedure used here
 
 1. **Bit-exactness**: a fixed set of greedy prompts (thinking off; 120 here, not published: any set of your own, the
-   same on both builds) on the old and the new build must give identical answers. A
-   change that is not bit-exact goes to step 5.
+   same on both builds) on the old and the new build must give identical answers. A change that is not bit-exact
+   must also pass step 5.
 2. **Speed**: decode and 8.4k-prefill windows, sessions interleaved (A B A B); a difference counts only beyond the
    spread between sessions. Never build images or run anything else on the machine meanwhile.
 3. **Depth**: the growing-conversation sweep to the profile's maximum context ([benchmarks.md](benchmarks.md)).
@@ -82,4 +83,5 @@ real step's. Decide on the whole model.
    top-p only, large and small top-k) alone and batched, with `FREETOKEN_TP_SYNC_TOKENS=check` (no disagreement lines
    expected), and a smoke test with a tool call.
 5. **Anything not bit-exact**: a scored benchmark to reject it early, then an agentic, multi-turn benchmark to accept
-   it (the one used here is private; a long agent workload of your own, run on both builds). Short tests (scored items, needles, probes) missed a change that cost a third of the agentic score.
+   it (the one used here is private; a long agent workload of your own, run on both builds). Short tests (scored
+   items, needles, probes) missed a change that cost a third of the agentic score.

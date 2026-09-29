@@ -13,7 +13,7 @@ optimization.
   ran). Short tests (scored items, needles, probes) may reject a
   change, never accept it alone ([testing.md](docs/rdna3/testing.md)).
 - **Everything new is an environment variable, off by default** unless it is bit-exact or agent-validated, so
-  upstream's behaviour stays one setting away.
+  upstream's behavior stays one setting away.
   Document it in [docs/rdna3/options.md](docs/rdna3/options.md) with its measured effect.
 - **Report only what was run.** Never state a test or benchmark result that was not produced on real hardware in this
   session; say "untested" otherwise, as the `TESTED=0` profiles do.
@@ -40,7 +40,9 @@ Dockerfile.rdna3       the ROCm image
 
 ## Development
 
-Everything runs in the image (ROCm 7.14, PyTorch 2.11, Triton), with the working tree mounted over it:
+Everything runs in the image (ROCm 7.14, PyTorch 2.11, Triton). The command below tests the tree the image was built
+from; to test your working tree without rebuilding, mount it as [testing.md](docs/rdna3/testing.md#cpu-test-suite)
+shows:
 
 ```bash
 docker build -f Dockerfile.rdna3 -t freetoken-rdna3:latest .

@@ -2,14 +2,15 @@
 
 ## The server takes minutes to start
 
-Normal: ~2.5 minutes to load the experts into RAM and build the plan. The first start of a new image also compiles and
+Normal: ~2.5 minutes on the reference machine to read ~68 GB of experts into RAM and build the plan. The first start of a new image also compiles and
 autotunes GPU kernels (a few more minutes); results are cached in the `freetoken-rdna3-kcache-<image id>` Docker
 volume, so it happens once per image. `/health` answers `"loading"` until the weights are in.
 
 ## Slow decode right after starting a new image
 
-Kernels still compiling or autotuning on first use (a cold cache once made a 52 tok/s build measure 23.9). Send a few
-requests, then measure. If it stays slow, check that the kernel-cache volume is mounted (`serve.sh` does it).
+Kernels still compiling or autotuning on first use (a cold cache once made a 52 tok/s build measure 23.9; on a fresh
+image the first long prompt and the first reuse of a cached conversation are also slower once). Send a few requests,
+then measure. If it stays slow, check that the kernel-cache volume is mounted (`serve.sh` does it).
 
 ## My desktop session closed, or the screen went black
 
@@ -26,20 +27,23 @@ first; one-card profiles take the smallest card with enough VRAM. Force a choice
 
 - On one card, keep 8k prefill chunks (`--max-prefill-length 8192`): with 16k chunks a 60k-token prompt took 166 s
   and decode fell to 1.9 tok/s (the allocator thrashes).
-- Lower the context (`--ctx 131072`), or the memory ratio (`-- --memory-ratio 0.75`), in that order.
+- Lower the context (`--ctx 131072` on two cards, `--ctx 65536` on one), then the memory ratio
+  (`-- --memory-ratio 0.75`).
 - The container needs `--ulimit memlock=-1` (pinned RAM for the experts and the RAM tier) and enough RAM under its
   `--memory` limit (default 110g); an OOM kill shows as exit code 137.
 
-## Long pauses (9-21 s) in the middle of a run
+## Long pauses (a few seconds, up to ~21 s) in the middle of a run
 
-A known, not yet understood stall seen in about one run in three on every build of this engine on these cards. If you
-catch one with `FT_STATS_EVERY=40` set, the log around it is very welcome in an issue.
+A known, not yet understood decode stall, seen on the reference machine in about one run in three on every build
+measured since 2026-09-28. If you catch one with `FT_STATS_EVERY=40` set, the log around it is very welcome in an
+issue.
 
 ## Sampling hangs
 
-Upstream's cooperative top-k / top-p kernels hang on RDNA3; this build never uses them on ROCm. If you run a different
-build, test it with `rdna3/tests/run_sampling_tests.sh freetoken.kernel.triton.sampling` (each mode is killed after
-90 s). Always smoke-test with a temperature above 0: greedy decoding never reaches the sampler.
+Upstream's cooperative top-k / top-p kernels hang on gfx1100; this build never uses them on ROCm. If you run a
+different build, test it on a card that drives no display: `HIP_VISIBLE_DEVICES=<index>
+rdna3/tests/run_sampling_tests.sh freetoken.kernel.triton.sampling`, with the index `rdna3/serve.sh --list-gpus` shows
+for that card (GPU 0 otherwise; each mode is killed after 90 s). Always smoke-test with a temperature above 0: greedy decoding never reaches the sampler.
 
 ## Warnings about TunableOp
 
@@ -48,7 +52,8 @@ The files in `rdna3/tunableop/` match this image's PyTorch / HIP / hipBLASLt ver
 
 ## `FREETOKEN_NVFP4_DECODE_TUNED: no tuned tiles for (N, K) = ...` in the log
 
-Expected with a split or card combination other than `xtx-xt`: those shapes use the default tiles. Harmless.
+Expected with a split or card combination other than `xtx-xt` (one card included): those shapes use the default
+tiles. Harmless.
 
 ## `TP ranks sampled different tokens in ... row(s)` in the log
 

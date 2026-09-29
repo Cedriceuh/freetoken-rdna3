@@ -17,4 +17,23 @@
 | [credits.md](credits.md) | who wrote what |
 
 Upstream FreeToken's own documentation is in the parent directory ([install](../install.md), [CLI](../cli.md),
-[models](../models.md), [quickstart](../quickstart.md)).
+[models](../models.md), [quickstart](../quickstart.md)); its install guides are not how this build is installed: use
+[getting-started.md](getting-started.md).
+
+## Terms used in these pages
+
+| Term | Meaning |
+|---|---|
+| TP | tensor parallelism: every layer split over the GPUs, which work on every token together |
+| TG / decode | generating tokens, in tokens/s |
+| PP / prefill | reading the prompt (prompt processing), in tokens/s or as time to first token |
+| MoE, experts | Mixture of Experts: each layer holds 512 small networks, and a router sends each token to 10 of them (plus one shared expert) |
+| GDN | GatedDeltaNet, the linear-attention layers (36 of the model's 48) with a fixed-size recurrent state |
+| QSA | the model's full-attention layers (12 of 48), which keep a KV cache |
+| KV cache | the attention layers' keys and values for every token of a conversation |
+| PLE | per-layer n-gram embeddings: big lookup tables (51 GB) read from disk |
+| NVFP4 | 4-bit floating-point weights with shared scales, the experts' format |
+| MTP | multi-token prediction, the model's speculative-decoding head (not used) |
+| LDS | the GPU's on-chip shared memory (64 KiB per work group on RDNA3) |
+| FTW | FreeToken's own weight format |
+| RAM tier | this build's copy of evicted conversations in system RAM (`FREETOKEN_HOST_KV`) |

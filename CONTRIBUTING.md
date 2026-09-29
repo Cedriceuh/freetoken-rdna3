@@ -6,7 +6,7 @@ Thanks for helping! The most useful contributions right now:
    `python3 rdna3/bench/quick_bench.py --label "<your cards>"`, and open an issue with the table, your GPUs
    (`rdna3/serve.sh --list-gpus`), RAM, and the profile. A setup that works deserves a measured profile.
 2. **Bug reports** with what [troubleshooting.md](docs/rdna3/troubleshooting.md#reporting-a-problem) lists: profile,
-   `serve.sh --dry-run` output, GPUs, kernel version, image commit, server log.
+   `serve.sh --dry-run` output, GPUs, host kernel version, image commit, server log.
 3. **Fixes and optimizations**, following the rules below.
 
 ## Pull requests
@@ -17,7 +17,8 @@ Thanks for helping! The most useful contributions right now:
   builds). See [testing.md](docs/rdna3/testing.md).
 - **Performance**: interleaved A/B numbers (same model, prompts and settings, on `main` and on your branch), tokens/s
   and time to first token, with the commands.
-- **New behaviour behind an environment variable**, off by default unless it is bit-exact, documented in
+- **New behavior behind an environment variable**, off by default unless it is bit-exact or validated on an agentic
+  workload, documented in
   [options.md](docs/rdna3/options.md).
 - **Bug fixes** come with a test that fails before and passes after, where the code allows it.
 - Commit messages: [Conventional Commits](https://www.conventionalcommits.org/) (`fix(sampler): ...`), imperative,
