@@ -55,7 +55,7 @@ disagreements over ~8k sampled tokens in `check` mode). It is on the torch.distr
 
 | Variable | Default | Effect |
 |---|---|---|
-| `FREETOKEN_INT8_DENSE` | unset | `1`: every dense (non-expert) linear layer in int8, weights only, one scale per output channel and rank; routers stay bf16. Converted at load. **+28 % decode**, frees ~2.4 GiB per card for the expert cache. Lossy, not bit-exact; no measurable loss on the scored benchmark, *agent-validated*. |
+| `FREETOKEN_INT8_DENSE` | unset | `1`: every dense (non-expert) linear layer in int8, weights only, one scale per output channel and rank; routers and the vision tower stay bf16. Converted at load. **+28 % decode**, frees ~2.4 GiB per card for the expert cache. Lossy, not bit-exact; no measurable loss on the scored benchmark, *agent-validated*. |
 | `FREETOKEN_INT8_DENSE_SKIP` | empty | Comma-separated module names to keep in bf16. |
 | `FREETOKEN_INT8_COMPACT` | `1` | Compact the device allocator after the conversion; without it the freed VRAM stays fragmented and is lost to the expert cache. |
 | `FREETOKEN_INT8_ROWS_MAX` | `8` | Decode batches up to this many rows (concurrent requests) use the row-looped GEMVs (the int8 one and the bf16 Triton one), each row bit-identical to a batch of one; bigger batches dequantize the int8 weight per call (bf16 layers use `F.linear`). |

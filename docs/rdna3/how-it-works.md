@@ -120,6 +120,20 @@ agent turn is one node), capacities are counted in pages and snapshots so both r
 nodes being promoted are pinned against eviction. Four agents with 82-117k-token conversations, 3 turns each: after
 the first reads, the rounds of turns take 35 s instead of 599 s.
 
+## Images (`--vision`, off by default)
+
+The Qwen3.8 vision tower (27 ViT blocks, ~0.45 B parameters) is upstream's, and it was never split across the GPUs.
+
+- **Where the tower runs.** Rank 0 builds it whole and encodes every image. The embeddings are broadcast to the
+  other rank (5 MiB for a 1024-token image), so both ranks put the same numbers in their residual stream. Rank 1
+  holds no tower, and its expert cache keeps the room.
+- **Weights.** The tower's blocks stream from pinned RAM two at a time, and the tower stays bf16 under
+  `FREETOKEN_INT8_DENSE`.
+- **Positions.** The text model switches to the 3-axis rope (mrope) that the image positions need. For text it gives
+  the same rotation: greedy answers are identical, and speed is the same up to 255k of context on two cards.
+
+Numbers: [benchmarks.md](benchmarks.md#images---vision-xtx-xt).
+
 ## What stays upstream's
 
 The HTTP APIs and parsers and the FTW format are upstream's. The scheduler, the radix cache, the offload engine and the

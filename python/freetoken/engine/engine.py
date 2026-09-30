@@ -18,6 +18,7 @@ from freetoken.layers import set_rope_device
 from freetoken.layers.quantization import LayerKind, QuantBackend, finalize_quant, set_quant_backend
 from freetoken.moe.offload_cache import iter_offload_moe_layers
 from freetoken.mm.config import ENCODER_SECTIONS
+from freetoken.models.config import VISION_KEY_PREFIXES
 from freetoken.models import create_model, load_weight
 from freetoken.models.weight import ftw_lacks_vision
 from freetoken.moe import is_offload_moe_strategy
@@ -570,6 +571,10 @@ class Engine:
 
     def _load_weight_state_dict(self, config: EngineConfig) -> Dict[str, torch.Tensor]:
         model_state = self.model.state_dict()
+        # a TP rank other than 0 may build no tower (it never encodes: _encode_item)
+        vision = bool(config.active_encoders) and (
+            config.tp_info.rank == 0 or any(k.startswith(VISION_KEY_PREFIXES) for k in model_state)
+        )
         if config.use_dummy_weight:
             return _make_dummy_weight_state_dict(model_state, device=self.device)
         # _materialize casts each loaded tensor to its model-param dtype (model_state), so
@@ -581,17 +586,39 @@ class Engine:
                 config.model_path,
                 self.device,
                 include_moe_experts=not is_offload_moe_strategy(config.moe_strategy),
-                include_vision=bool(config.active_encoders),
+                include_vision=vision,
             ),
             device=self.device,
         )
 
     @torch.inference_mode()
     def _warmup_encoders(self) -> None:
+        if self.config.tp_info.rank != 0:
+            return  # only rank 0 encodes (_encode_item)
         for item in self.mm_processor.dummy_items(self.dtype, self.device):
             if item.modality in self.config.served_modalities:
                 self.model.encode(item)
         torch.cuda.synchronize(self.device)
+
+    def _encode_item(self, item) -> torch.Tensor:
+        """``model.encode(item)`` on rank 0, broadcast to the other ranks.
+
+        Every rank must feed the text model the same embeddings: two cards can round the tower's GEMMs differently
+        (per-device BLAS picks, autotune), and a per-rank difference would stay in the residual stream.
+        """
+        if self.config.tp_info.size == 1:
+            return self.model.encode(item)
+        if self.config.tp_info.rank == 0:
+            # the gather casts every slice to self.dtype anyway (_run_mm_encoder)
+            emb = self.model.encode(item).to(self.dtype).contiguous()
+            shape = torch.tensor(emb.shape, dtype=torch.int64)
+        else:
+            shape = torch.empty(2, dtype=torch.int64)
+        torch.distributed.broadcast(shape, src=0, group=self.tp_cpu_group)
+        if self.config.tp_info.rank != 0:
+            emb = torch.empty(tuple(shape.tolist()), dtype=self.dtype, device=self.device)
+        torch.distributed.broadcast(emb, src=0)
+        return emb
 
     @torch.inference_mode()
     def _run_mm_encoder(self, batch: Batch) -> None:
@@ -607,7 +634,7 @@ class Engine:
                 if item.precomputed_embeddings is not None:
                     emb = item.precomputed_embeddings.to(self.device, non_blocking=True)
                 else:
-                    emb = self.model.encode(item)
+                    emb = self._encode_item(item)
                 cache.put(item.hash, emb)
             # cached now; free the ~MiB feature buffer
             item.feature = None

@@ -46,8 +46,9 @@ the ROCm pieces (sampling routes, host-memory all-reduce, RDNA3 GEMVs, ROCm copy
 most tuning options are off unless set. Some changes are active everywhere: tensor parallelism for Qwen3.8-Flash-Next
 itself (with its one all-reduce per MoE block and blocked PLE and prefill MoE), the TP>1 relay handshake, a GDN
 boundary fix in the prefix cache, CUDA graphs captured for every batch size up to `--cuda-graph-max-bs` (when it is 8
-or less), rank 0's token broadcast on the torch.distributed path (with `--disable-pynccl`), and an explicit error for
-the vision tower at TP>1. On NVIDIA, upstream FreeToken is the better-tested choice.
+or less), rank 0's token broadcast on the torch.distributed path (with `--disable-pynccl`), and the Qwen VL vision
+tower never split (Qwen3.8 builds it on rank 0 only), with rank 0's image embeddings broadcast at TP>1. On NVIDIA,
+upstream FreeToken is the better-tested choice.
 
 ## More than two GPUs?
 
@@ -64,8 +65,27 @@ the ROCm fixes (untested here); the tuning options may or may not apply to them.
 
 ## Images (vision)?
 
-`rdna3/serve.sh` always passes `--text-model-only`. The vision tower is not split across GPUs, so at TP>1 the engine
-stops with an explicit error without that flag (edit `serve.sh` to try); one card may work but is untested.
+Off by default: `rdna3/serve.sh` passes `--text-model-only` unless it is started with `--vision`. Measured on
+`xtx-xt`, `xtx` and `xt`, up to each profile's full context ([benchmarks.md](benchmarks.md#images---vision-xtx-xt)).
+With `--vision`:
+
+- **Rank 0 holds the tower and encodes.** The vision tower (27 ViT blocks, ~0.45 B parameters, 856 MiB in bf16) is
+  built whole on rank 0 only, never split, so encoding adds no all-reduce. Rank 0 broadcasts the embeddings, so every
+  rank feeds the text model the same numbers. On the reference pair both cards encode bit-identically anyway, but
+  other cards may round the tower's GEMMs differently, and a per-rank difference would stay in the residual stream.
+- **The tower stays bf16.** `FREETOKEN_INT8_DENSE` skips it.
+- **Weights streamed from RAM.** Its blocks stream from pinned RAM two at a time (`--mm-encoder-weights host`, the
+  default). It keeps 294 MiB of VRAM instead of 1034 MiB resident, at the same encode speed.
+- **Images are capped at 1024 tokens.** Images are scaled down to 1024 tokens (one per 32x32 pixels, about one
+  megapixel). `-- --image-max-tokens N` changes it; the checkpoint allows 16384. The tower attends over the whole
+  image, so its cost grows faster than the image: 0.1 s at 1024 tokens, 0.9 s at 4096 and 12 s at 16384 on the XTX.
+  Every image token is also a prompt token.
+- **Text is unchanged.** The text model switches to the 3-axis rope (mrope). The greedy answers were identical to the
+  text-only build.
+- **Speed on two cards.** Decode, prompt reading and the agent turn stayed within the spread between sessions at
+  every depth up to 255k.
+- **Speed on one card.** The tower shares the only card, so the expert cache holds ~165 fewer experts and decode is
+  ~1.5-2 % slower. Use `--vision` there only if you send images.
 
 ## Anything else to know?
 

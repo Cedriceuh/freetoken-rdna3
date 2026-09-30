@@ -11,7 +11,9 @@ runs for it; each rank pins its own share) and caches the most used experts in V
 with an uneven 55/45 split; dense layers are int8 (weights only, lossy but agent-validated); small all-reduces go
 through shared host memory (no GPU peer-to-peer on the reference machine, as usual on consumer boards); sampling on
 ROCm uses a top-k-first path for top_k <= 256 and an exact sorted threshold otherwise (upstream's cooperative sampling
-kernels hang on gfx1100); conversations evicted from the GPUs are kept in RAM and restored exactly. The tuning is
+kernels hang on gfx1100); conversations evicted from the GPUs are kept in RAM and restored exactly. Image input is
+off by default (`rdna3/serve.sh --vision`): the vision tower runs on rank 0 only and its embeddings are broadcast, with
+no measurable cost on two cards and ~1.5-2 % of decode on one. The tuning is
 switched by environment variables (docs/rdna3/options.md gives each default): most of it is off unless a profile turns
 it on; what is on by default is bit-exact, agent-validated, or (the release's sampler rework, exact by kernel tests,
 and its token broadcast, checked in `check`-mode server runs) new and not agent-validated. Precision rule: a change is either bit-exact (identical greedy answers) or validated on an

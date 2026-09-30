@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, List
 
 import torch
 from freetoken.core import get_global_ctx
+from freetoken.distributed import get_tp_info
 from freetoken.layers import BaseOP, OPList, ParallelLMHead, VocabParallelEmbedding
 from freetoken.models.blocks import BaseLLMModel
 from freetoken.utils import nvtx_annotate
@@ -216,7 +217,8 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
 class Qwen4ExpForConditionalGeneration(QwenVLVisionMixin, Qwen4ExpForCausalLM):
     def __init__(self, config: ModelConfig) -> None:
         super().__init__(config)
-        if config.is_multimodal:
+        # rank 0 alone encodes (the engine broadcasts its embeddings): the other ranks hold no tower
+        if config.is_multimodal and get_tp_info().rank == 0:
             assert not config.vision_config.deepstack_visual_indexes, "Qwen3.8 consumes no DeepStack features"
             self.visual = Qwen3VLVisionModel(config.vision_config, quant_config=config.quant, prefix="visual")
 

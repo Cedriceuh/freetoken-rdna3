@@ -364,7 +364,7 @@ def install_quant_config(model_path: str) -> None:
     set_quant_config(checkpoint_quant_config(model_path, hf, get_model_spec(hf.architectures[0])))
 
 
-def meta_state_dict(model_path: str) -> dict[str, torch.Tensor]:
+def meta_state_dict(model_path: str, *, vision: bool = False) -> dict[str, torch.Tensor]:
     """State dict of the model the engine builds for ``model_path`` (experts offloaded), on the meta device."""
     from freetoken.engine.config import EngineConfig
     from freetoken.engine.engine import _decode_target
@@ -376,7 +376,7 @@ def meta_state_dict(model_path: str) -> dict[str, torch.Tensor]:
     if try_get_tp_info() is None:
         set_tp_info(rank=0, size=1)
     config = EngineConfig(model_path=model_path, tp_info=try_get_tp_info(), dtype=torch.bfloat16, moe_strategy="offload",
-                          mm=MultimodalConfig(disabled_encoders=frozenset(ENCODER_KINDS)))
+                          mm=MultimodalConfig(disabled_encoders=frozenset() if vision else frozenset(ENCODER_KINDS)))
     object.__setattr__(config.model_config, "moe_strategy", "offload")
     object.__setattr__(config.model_config, "decode_target", _decode_target(config))
     saved = rotary._ROPE_DEVICE

@@ -58,7 +58,8 @@ The script picks the cards by itself (for `xtx-xt` the larger one becomes rank 0
 a choice, `--dry-run` prints the full `docker run` command instead of running it. Other options: `--port`
 (default 1919), `--host` (default 127.0.0.1; 0.0.0.0 serves your network, and the API has no authentication:
 [limits.md](limits.md#anything-else-to-know)), `--ctx`, `--served-name`, `--name`,
-`--image`, `--memory`, and `-- <extra ft serve flags>`.
+`--image`, `--memory`, `--vision` (image input, off by default:
+[limits.md](limits.md#images-vision)), and `-- <extra ft serve flags>`.
 
 Loading takes about 2.5 minutes on the reference machine (it reads ~68 GB of experts). The very first start of a new image also compiles and autotunes GPU kernels for a few
 more minutes; the results are kept in a Docker volume (`freetoken-rdna3-kcache-<image id>`), so later starts are fast.

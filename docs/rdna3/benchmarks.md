@@ -129,6 +129,93 @@ Details of every step, including what did not work: [journey.md](journey.md).
   rows identical (`moe_block_check.py`, `int8_rows_check.py`); four conversations pushed out to the RAM tier and brought
   back give the same greedy answers (and `host_kv_check.py` checks the copies).
 
+## Images (`--vision`, `xtx-xt`)
+
+Measured on 2026-09-30 on a build of the release tree plus the image changes (`rdna3/serve.sh --vision`), with images
+capped at 1024 tokens unless stated otherwise.
+
+**Text with the vision build.** Four sessions ran interleaved (text-only, vision, text-only, vision), each with three
+`quick_bench.py` runs; the ranges below span both sessions of each mode:
+
+| | text-only | `--vision` |
+|---|---:|---:|
+| decode, 512 tokens | 53.1-55.1 tok/s | 53.3-54.3 tok/s |
+| cold read, 8.3k tokens | 4.28-4.40 s | 4.37-4.40 s |
+| agent turn, ~1.5k new tokens | 1.27-1.29 s | 1.27-1.28 s |
+| expert cache (both ranks take the smaller plan) | 7,228 | 7,217 |
+| greedy answers, 34 prompts of 20 to 20k tokens (thinking off) | reference | identical in every session |
+
+With the tower on both ranks (the first version), rank 1 planned 351 fewer experts (6,877): rank 1 never encodes, so
+it now holds no tower.
+
+**Depth, two cards.** The depth sweep of this page ran four times, interleaved (text-only, vision, text-only,
+vision). Each ran on a fresh server, with the same unseen text for the two modes of a pass and greedy 256-token
+answers (`ignore_eos`). The depths land a little below the sweeps above:
+
+| Depth | TG text (2 passes) | TG `--vision` | PP new, text / vision | Agent turn, text / vision |
+|---:|---:|---:|---:|---:|
+| 9.2k | 55.3 / 55.4 | 54.5 / 54.0 | 1496 / 1505 | 1.27 / 1.27 s |
+| 16.6k | 55.3 / 56.5 | 55.8 / 56.2 | 1840 / 1838 | 1.28 / 1.28 s |
+| 35.9k | 54.9 / 55.7 | 55.4 / 55.4 | 1902 / 1890 | 1.33 / 1.33 s |
+| 73.9k | 55.3 / 56.1 | 52.5 / 55.3 | 1942 / 1944 | 1.44 / 1.44 s |
+| 103.2k | 56.5 / 56.2 | 56.0 / 55.0 | 1878 / 1876 | 1.51 / 1.53 s |
+| 139.1k | 54.5 / 55.5 | 56.7 / 53.2 | 1811 / 1806 | 1.66 / 1.67 s |
+| 166.3k | 56.1 / 56.1 | 56.4 / 54.6 | 1751 / 1756 | 1.74 / 1.72 s |
+| 202.9k | 55.4 / 55.3 | 55.1 / 55.1 | 1727 / 1731 | 1.88 / 1.85 s |
+| 232.3k | 56.5 / 57.0 | 54.5 / 56.1 | 1676 / 1676 | 1.94 / 1.93 s |
+| 253.5k | 54.7 / 55.2 | 54.5 / 54.3 | 1617 / 1606 | 1.98 / 2.00 s |
+
+At the full depth (255.6k tokens), vision was asked about a screenshot at the end of the conversation. It read the
+id in both passes (first token in 2.5 s).
+
+**Depth, one card** (`xtx` and `xt`, two passes of each mode, same method, to 124k):
+
+| Depth | `xtx` TG text | `xtx` TG vision | `xtx` PP text / vision | `xt` TG text | `xt` TG vision | `xt` PP text / vision |
+|---:|---:|---:|---:|---:|---:|---:|
+| 8.7k | 35.3 / 35.4 | 34.2 / 34.7 | 731 / 939 | 28.1 / 29.0 | 27.9 / 27.9 | 860 / 879 |
+| 16.4k | 43.9 / 35.6 | 34.3 / 34.3 | 1417 / 1412 | 34.2 / 28.1 | 27.5 / 28.0 | 1258 / 1264 |
+| 32.8k | 35.2 / 34.3 | 34.8 / 34.6 | 1468 / 1468 | 27.7 / 28.2 | 33.5 / 27.2 | 1340 / 1344 |
+| 66.1k | 34.8 / 34.7 | 34.0 / 34.2 | 1452 / 1456 | 28.5 / 37.4 | 27.4 / 28.0 | 1328 / 1328 |
+| 97.7k | 35.1 / 37.7 | 40.3 / 43.9 | 1397 / 1408 | 28.7 / 36.8 | 33.9 / 27.3 | 1274 / 1277 |
+| 123.2k | 35.3 / 38.7 | 34.9 / 41.8 | 1374 / 1378 | 28.9 / 37.3 | 36.0 / 29.0 | 1248 / 1254 |
+
+
+On one card the tower sits on the only rank, and the expert cache shrinks by ~165 experts: `xtx` 3,653 -> 3,487
+(-4.5 %), `xt` 2,420 -> 2,255 (-6.8 %). That is 436 MiB. Measured with the tower alone, the streamed weights and
+their staging take 130 MiB, and the first encode takes ~170 MiB more outside PyTorch's allocator (94 MiB of it for
+the patch embedding's Conv3d, in MIOpen). Decode loses ~1.5-2 % outside the steps where both modes jump (35-44 tok/s on
+the XTX, 33-37 on the XT, depending on the generated text): `xtx` ~35.2 -> ~34.5 tok/s, `xt` ~28.4 -> ~27.8 tok/s.
+Prompt reading is unchanged, and the agent turn is 0-1.5 % longer. The screenshot at 125.3k was read in all four vision
+passes (first token in 3.2-3.3 s).
+
+**The tower alone** (`rdna3/bench/vision_tower_bench.py`; one card, weights streamed from RAM, seeded random pixels):
+
+| image tokens | pixels | XTX | XT | peak VRAM beyond the weights |
+|---:|---:|---:|---:|---:|
+| 256 | 0.3 MP | 33 ms | 33 ms | 25 MiB |
+| 1024 | 1.0 MP | 91 ms | 107 ms | 97 MiB |
+| 2048 | 2.1 MP | 268 ms | 307 ms | 142 MiB |
+| 4096 | 4.2 MP | 871 ms | 1012 ms | 253 MiB |
+| 8192 | 8.4 MP | 3.2 s | 3.8 s | 371 MiB |
+| 16384 | 16.8 MP | 12.1 s | 15.0 s | 742 MiB |
+
+- **Attention memory is linear.** PyTorch's attention runs its AOTriton kernel (`attn_fwd`) on gfx1100, so memory
+  grows linearly with the image; nothing ran out of memory up to 16384 tokens.
+- **Weight placement.** Streaming the weights from RAM leaves 294 MiB of them in VRAM; keeping them all resident
+  (`--mm-encoder-weights gpu`) takes 1034 MiB and gains nothing (106 against 107 ms at 1024 tokens on the XT).
+- **Both cards agree.** The XTX and the XT gave bit-identical embeddings at nine sizes from 64 to 8192 tokens.
+
+**Requests** (thinking off, 16 to 120 output tokens):
+
+- **Small print.** A 1920x1080 screenshot of 30 lines of 16-pixel text becomes 1055 prompt tokens at the 1024 cap. 3
+  ids of 3 were read, in 1.6 s; at a 2048 cap it was 2087 tokens, 1.9 s, same answers.
+- **Concurrent requests.** Four sampled image requests at once were all correct, with 0 rank disagreements under
+  `FREETOKEN_TP_SYNC_TOKENS=check`.
+- **Repeated image and follow-up turn.** The same image twice in one prompt was answered correctly. A follow-up turn
+  reused the cached image prefix (2048 cached tokens, 52 new).
+- **Latency.** The first image request after a start took 3.7 s; later ones took 1.8-2.0 s for a 1034-token prompt.
+  The first request of any kind after a start takes ~10 s in both modes.
+
 ## Memory while serving (`xtx-xt`, release build)
 
 | | Used |

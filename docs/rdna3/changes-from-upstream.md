@@ -19,7 +19,9 @@ the reason. Line counts are `added/removed`. Who wrote what: [credits.md](credit
 
 | File | Lines | Change |
 |---|---:|---|
-| `python/freetoken/models/qwen4_exp/weight.py` | 205/11 | per-rank sharding of the split weights (even or uneven split; the rest replicated); explicit error for the vision tower at TP>1 |
+| `python/freetoken/models/qwen4_exp/weight.py` | 203/11 | per-rank sharding of the split weights (even or uneven split; the rest, the vision tower included, replicated) |
+| `python/freetoken/models/qwen3_vl/vision.py` | 18/23 | the Qwen VL vision tower never split (whole on a rank) instead of tensor-parallel modules whose weights nothing sharded; a rank without a tower places nothing |
+| `python/freetoken/models/qwen4_exp/model.py` | 3/1 | the vision tower built on rank 0 only (rank 0 encodes for every rank) |
 | `python/freetoken/models/qwen4_exp/attention.py` | 20/7 | attention heads and output projection sharded |
 | `python/freetoken/models/qwen4_exp/gdn.py` | 41/14 | GatedDeltaNet heads sharded, unevenly when a split is set |
 | `python/freetoken/models/qwen4_exp/moe.py` | 30/2 | routed / shared experts sharded; one all-reduce per MoE block |
@@ -30,24 +32,25 @@ the reason. Line counts are `added/removed`. Who wrote what: [credits.md](credit
 | `python/freetoken/layers/linear.py`, `layers/moe.py` | 14/4, 4/1 | uneven shard sizes; the fused MoE all-reduce |
 | `python/freetoken/kvcache/linear_state_pool.py` | 10/3 | GDN state pool sized per rank |
 | `tests/models/qwen4_exp/test_tp_shard.py`, `test_tp_uneven.py`, `test_ple_conv_blocks.py`, `test_ple.py` | new / 2/1 | sharding, uneven split and blocked PLE tests; the snapshot test compares with a tolerance |
-| `tests/models/qwen4_exp/common.py` | 14/0 | `as_rank()`: run a test block as one rank of a TP group |
+| `tests/models/qwen4_exp/common.py` | 16/2 | `as_rank()`: run a test block as one rank of a TP group; `meta_state_dict(vision=True)` |
 
 ## Two unequal cards
 
 | File | Lines | Change |
 |---|---:|---|
 | `python/freetoken/distributed/split.py` | 134/0 | the uneven split (`FREETOKEN_TP_SPLIT`): which dimensions split, rounding to NVFP4 scale blocks |
-| `python/freetoken/engine/engine.py` | 95/6 | memory planned on the smaller card (`FREETOKEN_TP_ALLOW_IMBALANCE`); runtime cache rebuild refused under an uneven split; rank 0's sampled tokens broadcast (`FREETOKEN_TP_SYNC_TOKENS`); int8 conversion; profiling hooks |
+| `python/freetoken/engine/engine.py` | 124/8 | memory planned on the smaller card (`FREETOKEN_TP_ALLOW_IMBALANCE`); runtime cache rebuild refused under an uneven split; rank 0's sampled tokens broadcast (`FREETOKEN_TP_SYNC_TOKENS`); rank 0 encodes images and broadcasts the embeddings (the other ranks load no tower); int8 conversion; profiling hooks |
 | `python/freetoken/distributed/impl.py`, `distributed/__init__.py` | 38/0, 2/1 | host-memory all-reduce wiring |
 | `python/freetoken/kernel/host_allreduce.py`, `kernel/csrc/jit/host_allreduce.cuh` | 143/0, 179/0 | the host-memory all-reduce (`FREETOKEN_HOST_ALLREDUCE`) |
 | `python/freetoken/scheduler/io.py` | 73/0 | the TP>1 relay handshakes before the first request |
 | `tests/scheduler/test_io_relay_handshake.py` | new | |
+| `tests/engine/test_mm_encoder.py` | 59/4 | rank 0's image embeddings reach rank 1, which never encodes |
 
 ## Dense layers
 
 | File | Lines | Change |
 |---|---:|---|
-| `python/freetoken/layers/quantization/int8_weight_only.py` | 171/0 | weight-only int8 conversion of the dense layers (`FREETOKEN_INT8_DENSE`), allocator compaction |
+| `python/freetoken/layers/quantization/int8_weight_only.py` | 173/0 | weight-only int8 conversion of the dense layers (`FREETOKEN_INT8_DENSE`; the vision tower stays bf16), allocator compaction |
 | `python/freetoken/kernel/triton/int8_gemv.py` | 132/0 | int8 decode GEMV for RDNA3, row-looped for several requests |
 | `python/freetoken/kernel/triton/dense_gemv.py` | 92/0 | split-K bf16 decode GEMVs for RDNA3, row-looped (batch-invariant) |
 | `python/freetoken/layers/quantization/linear/unquantized.py` | 33/0 | route bf16 decode projections to those GEMVs on gfx11 |

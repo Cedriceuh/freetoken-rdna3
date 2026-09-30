@@ -1,4 +1,5 @@
-"""Engine._run_mm_encoder against a fake model: chunked gathers, a shared image, precomputed embeddings, orphan jobs."""
+"""Engine._run_mm_encoder against a fake model: chunked gathers, a shared image, precomputed embeddings, orphan jobs,
+rank 0's embeddings broadcast to the other TP ranks."""
 
 from __future__ import annotations
 
@@ -23,11 +24,14 @@ class _FakeVision:
         return torch.full((item.num_tokens, H), float(item.hash))
 
 
-def _engine(cache: EncoderCache, model=None) -> SimpleNamespace:
-    return SimpleNamespace(
+def _engine(cache: EncoderCache, model=None, *, rank: int = 0, size: int = 1) -> SimpleNamespace:
+    eng = SimpleNamespace(
         encoder_cache=cache, device=torch.device("cpu"), dtype=torch.float32,
-        model=model or _FakeVision(),
+        model=model or _FakeVision(), config=SimpleNamespace(tp_info=SimpleNamespace(rank=rank, size=size)),
+        tp_cpu_group=None,
     )
+    eng._encode_item = lambda item: Engine._encode_item(eng, item)
+    return eng
 
 
 def _item(h: int, n_tokens: int, precomputed: torch.Tensor | None = None) -> MMItem:
@@ -94,3 +98,54 @@ def test_job_without_gather_row_fails_loudly():
     eng = _engine(EncoderCache(storage="cpu"))
     with pytest.raises(AssertionError, match="encoder jobs without gather rows"):
         Engine._run_mm_encoder(eng, _batch([_item(h=1, n_tokens=2)], []))
+
+
+def test_tp_rank0_encodes_and_the_other_ranks_receive_its_embeddings(monkeypatch):
+    sent = []
+
+    def send(tensor, src, group=None):
+        assert src == 0
+        sent.append(tensor.clone())
+
+    def receive(tensor, src, group=None):
+        assert src == 0
+        tensor.copy_(sent.pop(0))
+
+    batches = {}
+    for rank, broadcast in ((0, send), (1, receive)):
+        monkeypatch.setattr(torch.distributed, "broadcast", broadcast)
+        cache = EncoderCache(storage="cpu")
+        eng = _engine(cache, rank=rank, size=2)
+        cache.register(6, 1, 3)
+        batches[rank] = _batch([_item(h=6, n_tokens=3)], [(1, 6, 0, 3, 3, 0)])
+        Engine._run_mm_encoder(eng, batches[rank])
+        # rank 0 runs the tower once; rank 1 never does
+        assert eng.model.calls == (1 if rank == 0 else 0)
+    assert not sent
+    assert torch.equal(batches[1].mm_embeds, batches[0].mm_embeds)
+    assert torch.equal(batches[0].mm_embeds, torch.full((3, H), 6.0))
+
+
+def test_tp_encoder_warmup_runs_on_rank0_only():
+    class _NoProcessor:
+        def dummy_items(self, dtype, device):
+            raise AssertionError("rank 1 never encodes: no warmup")
+
+    eng = _engine(EncoderCache(storage="cpu"), rank=1, size=2)
+    eng.mm_processor = _NoProcessor()
+    Engine._warmup_encoders(eng)
+
+
+def test_tp_precomputed_embeddings_skip_the_broadcast_on_every_rank(monkeypatch):
+    def no_broadcast(tensor, src, group=None):
+        raise AssertionError("precomputed embeddings reach every rank with the request: nothing to broadcast")
+
+    monkeypatch.setattr(torch.distributed, "broadcast", no_broadcast)
+    emb = torch.arange(2 * H, dtype=torch.float32).view(2, H)
+    for rank in (0, 1):
+        cache = EncoderCache(storage="cpu")
+        eng = _engine(cache, rank=rank, size=2)
+        cache.register(4, 1, 2)
+        batch = _batch([_item(h=4, n_tokens=2, precomputed=emb.clone())], [(1, 4, 0, 2, 2, 0)])
+        Engine._run_mm_encoder(eng, batch)
+        assert eng.model.calls == 0 and torch.equal(batch.mm_embeds, emb)

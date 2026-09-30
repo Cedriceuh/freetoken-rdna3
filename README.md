@@ -9,7 +9,9 @@ ROCm, up to 4 concurrent requests (parallel sub-agents), and a RAM tier that kee
 instead of recomputing them.
 
 Built for, and measured with, **Qwen3.8-Flash-Next** only (125B-parameter MoE, ~6B active per token, NVFP4) behind
-a coding agent (OpenCode), with an OpenAI- and Anthropic-compatible API.
+a coding agent (OpenCode), with an OpenAI- and Anthropic-compatible API. Image input is optional
+(`rdna3/serve.sh --vision`). It costs no measurable speed on two cards and ~1.5-2 % of decode on one
+([limits](docs/rdna3/limits.md#images-vision)).
 
 | On an RX 7900 XTX + RX 7900 XT | freetoken-rdna3 (`xtx-xt`) | FreeToken ported to ROCm, TP=2, TunableOp only |
 |---|---:|---:|

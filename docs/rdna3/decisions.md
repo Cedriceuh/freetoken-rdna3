@@ -102,6 +102,16 @@ docs say which.
 | For | Exact on any request; 0.07 ms with the model's default `top_k`, 0.2-1 ms otherwise; the two GPUs cannot drift apart |
 | Against | The sort costs up to ~1 ms per step with 4 requests when one of them has no `top_k`; 15 µs per step for the broadcast; new in the release build: the sampler checked by kernel tests, the broadcast in `check`-mode server runs; not run on the agentic benchmark |
 
+## Images: one tower on rank 0, embeddings broadcast
+
+| | |
+|---|---|
+| Choice | Off by default (`serve.sh --vision`). The vision tower is never split: rank 0 alone holds it and encodes, then broadcasts the embeddings. Weights stream from RAM, in bf16. Images are scaled down to 1024 tokens |
+| Alternatives | Split the tower like the text layers; keep a whole tower on both ranks; weights resident in VRAM; a larger image cap |
+| For | No all-reduce while encoding. Both ranks get the same embeddings whatever the cards round. Two-card speed is unchanged up to 255k of context, and text answers are identical |
+| Against | Rank 1 waits while rank 0 encodes. One-card profiles lose ~1.5-2 % of decode (the tower takes expert-cache room on the only card). The encode time grows faster than the image (0.1 s at 1024 tokens, 12 s at 16384) |
+| Evidence | A tower on both ranks cost rank 1 351 experts of cache; resident weights take 1034 MiB instead of 294 MiB for the same encode speed; the two cards encode bit-identically, so the broadcast changes nothing on the reference pair ([benchmarks.md](benchmarks.md#images---vision-xtx-xt)) |
+
 ## Not done, on purpose
 
 | Idea | Why |

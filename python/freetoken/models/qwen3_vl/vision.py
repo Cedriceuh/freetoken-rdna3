@@ -1,4 +1,8 @@
-"""Qwen VL vision tower: full-attention ViT blocks and a 2x2 patch merger; DeepStack taps ride along as extra output columns."""
+"""Qwen VL vision tower: full-attention ViT blocks and a 2x2 patch merger; DeepStack taps ride along as extra output columns.
+
+Never sharded under tensor parallelism, like every other tower in tree: a rank holds the whole tower (~0.9 GB bf16
+for Qwen3.8) or none (qwen4_exp builds it on rank 0 only), and no encode step all-reduces.
+"""
 
 from __future__ import annotations
 
@@ -7,16 +11,7 @@ from typing import TYPE_CHECKING, List
 
 import torch
 import torch.nn.functional as F
-from freetoken.distributed import get_tp_info
-from freetoken.layers import (
-    BaseOP,
-    LinearColParallelMerged,
-    LinearOProj,
-    LinearQKVMerged,
-    LinearRowParallel,
-    OPList,
-)
-from freetoken.utils import div_even
+from freetoken.layers import BaseOP, LinearReplicated, OPList
 
 from freetoken.models.weight_stream import BlockWeightStreamer
 
@@ -74,13 +69,12 @@ def _apply_vision_rope(
 
 class VisionAttention(BaseOP):
     def __init__(self, vc: VisionConfig, *, quant_config: QuantConfig | None = None, prefix: str = ""):
-        self.num_heads = div_even(vc.num_heads, get_tp_info().size)
+        self.num_heads = vc.num_heads
         self.head_dim = vc.hidden_size // vc.num_heads
-        self.qkv = LinearQKVMerged(
-            vc.hidden_size, self.head_dim, vc.num_heads, vc.num_heads, has_bias=True,
-            quant_config=quant_config, prefix=f"{prefix}.qkv",
+        self.qkv = LinearReplicated(
+            vc.hidden_size, 3 * vc.hidden_size, has_bias=True, quant_config=quant_config, prefix=f"{prefix}.qkv"
         )
-        self.proj = LinearOProj(
+        self.proj = LinearReplicated(
             vc.hidden_size, vc.hidden_size, has_bias=True, quant_config=quant_config, prefix=f"{prefix}.proj"
         )
 
@@ -110,10 +104,10 @@ class VisionAttention(BaseOP):
 
 class VisionMLP(BaseOP):
     def __init__(self, vc: VisionConfig, *, quant_config: QuantConfig | None = None, prefix: str = ""):
-        self.linear_fc1 = LinearColParallelMerged(
-            vc.hidden_size, [vc.intermediate_size], has_bias=True, quant_config=quant_config, prefix=f"{prefix}.linear_fc1"
+        self.linear_fc1 = LinearReplicated(
+            vc.hidden_size, vc.intermediate_size, has_bias=True, quant_config=quant_config, prefix=f"{prefix}.linear_fc1"
         )
-        self.linear_fc2 = LinearRowParallel(
+        self.linear_fc2 = LinearReplicated(
             vc.intermediate_size, vc.hidden_size, has_bias=True, quant_config=quant_config, prefix=f"{prefix}.linear_fc2"
         )
 
@@ -196,10 +190,10 @@ class VisionPatchMerger(BaseOP):
         merged = vc.hidden_size * vc.spatial_merge_size**2
         # the DeepStack mergers normalize the 2x2-merged vector, the final merger each patch
         self.norm = VisionLayerNorm(merged if use_postshuffle_norm else vc.hidden_size)
-        self.linear_fc1 = LinearColParallelMerged(
-            merged, [merged], has_bias=True, quant_config=quant_config, prefix=f"{prefix}.linear_fc1"
+        self.linear_fc1 = LinearReplicated(
+            merged, merged, has_bias=True, quant_config=quant_config, prefix=f"{prefix}.linear_fc1"
         )
-        self.linear_fc2 = LinearRowParallel(
+        self.linear_fc2 = LinearReplicated(
             merged, vc.out_hidden_size, has_bias=True, quant_config=quant_config, prefix=f"{prefix}.linear_fc2"
         )
         self._merged = merged
@@ -366,7 +360,8 @@ class QwenVLVisionMixin:
     visual: Qwen3VLVisionModel
 
     def place_encoder_weights(self, mode: str) -> None:
-        self.visual.place_weights(mode)
+        if hasattr(self, "visual"):  # a TP rank other than 0 may hold no tower (qwen4_exp)
+            self.visual.place_weights(mode)
 
     def encode(self, item: MMItem) -> torch.Tensor:
         return self.visual.forward(item.feature, [item.grid_thw])

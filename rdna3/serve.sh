@@ -16,6 +16,9 @@
 #   --name NAME        container name (default freetoken-rdna3)
 #   --served-name ID   model id the API reports (default qwen3.8-flash-next)
 #   --memory SIZE      container RAM limit (default: the profile's MEMORY)
+#   --vision           accept image input: builds the vision tower on rank 0 (measured on xtx-xt, xtx and xt:
+#                      docs/rdna3/benchmarks.md); images are scaled down to 1024 tokens (one per 32x32 pixels),
+#                      `-- --image-max-tokens N` changes it
 #   --dry-run          print the docker command instead of running it
 #
 # The kernel cache (JIT + autotune results) lives in a docker volume named after the image id, so it is built once
@@ -24,7 +27,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DOCKER="$(command -v docker || echo docker)"
 image="freetoken-rdna3:latest" name="freetoken-rdna3" served="qwen3.8-flash-next" host=127.0.0.1 port=1919
-model="" ctx="" gpus="" memory="" dry="" profile="" extra=()
+model="" ctx="" gpus="" memory="" dry="" profile="" extra=() mm_args=(--text-model-only)
 
 list_gpus() {  # "hip_index vram_bytes pci_address" per GPU, from the kernel's KFD topology (no GPU context opened):
   # HIP numbers the GPU nodes in topology order
@@ -51,6 +54,7 @@ while [ $# -gt 0 ]; do
     --name) need "$@"; name="$2"; shift 2 ;;
     --served-name) need "$@"; served="$2"; shift 2 ;;
     --memory) need "$@"; memory="$2"; shift 2 ;;
+    --vision) mm_args=(--image-max-tokens 1024); shift ;;
     --dry-run) dry=1; shift ;;
     --list)
       for f in "$HERE"/profiles/*.env; do printf '%-9s %s\n' "$(basename "$f" .env)" "$(sed -n '1s/^# //p' "$f")"; done
@@ -138,7 +142,7 @@ cmd=("$DOCKER" run --rm --init --name "$name" --network host --ipc=host "${gpu_f
      --ulimit memlock=-1 --memory "$memory"
      -e PYTORCH_ALLOC_CONF=expandable_segments:False -e OMP_WAIT_POLICY=PASSIVE -e "HIP_VISIBLE_DEVICES=$gpus"
      "${envs[@]}" "${mounts[@]}"
-     "$image_id" ft serve --model /models/m --host "$host" --port "$port" --served-model-name "$served" --text-model-only
+     "$image_id" ft serve --model /models/m --host "$host" --port "$port" --served-model-name "$served" "${mm_args[@]}"
      --max-seq-len-override "$ctx" --kv-reserve-tokens "$ctx" "${ft_args[@]}" "${extra[@]}")
 if [ -n "$dry" ]; then
   echo "# first: $DOCKER rm -f $name  (a container left behind would hold the GPUs and the port)"

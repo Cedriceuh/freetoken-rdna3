@@ -161,7 +161,27 @@ The GPU validation of the review-fix branch (before its last sampler changes): 1
 decode -0.5 % (noise), prefill ~1 % faster. The published image itself was measured afterwards
 ([benchmarks.md](benchmarks.md)).
 
-## 14. Dropped along the way
+## 14. Images (2026-09-30)
+
+- **The dead check.** The TP>1 error the review had added for the vision tower never fired: the loader renames the
+  tower's keys to `visual.` before the check, which looked for `model.visual.`. So a TP=2 start with the tower got as
+  far as a shape assertion (165 tower tensors the wrong size).
+- **Never split.** The tower (0.45 B parameters, prefill only) is now never split. Rank 0 encodes and broadcasts the
+  embeddings, which keeps the ranks' residual streams identical whatever the cards round. The two cards turned out to
+  encode bit-identically, so the broadcast is insurance here.
+- **Only rank 0 holds it.** A first version kept the tower on both ranks. Rank 1 then planned 351 fewer experts
+  (-4.9 %), and decode measured 51.5-52.8 tok/s against 54.1 (single sessions). With the tower on rank 0 only, the
+  plan loses 11 experts, and decode and prefill are within the spread between sessions.
+- **Answers unchanged.** Greedy answers stayed identical with the switch to mrope.
+- **Two cards, to 255k.** The depth sweep to 255k showed no difference beyond noise.
+- **One card.** One-card profiles lose ~1.5-2 % of decode, because the tower shares the only card and the expert
+  cache holds 165 fewer experts (436 MiB). Measured with the tower alone, the streamed weights take 130 MiB and the
+  first encode takes ~170 MiB outside PyTorch's allocator, 94 MiB of that for MIOpen's Conv3d. Replacing that Conv3d
+  with the equivalent matmul would win back ~36 experts but round differently, so it is left as it is.
+- **Default cap.** 1024 image tokens: a full-HD screenshot of 16-pixel text stays readable, with half the prompt
+  tokens of a 2048 cap (1.6 s instead of 1.9 s). Numbers: [benchmarks.md](benchmarks.md#images---vision-xtx-xt).
+
+## 15. Dropped along the way
 
 | Idea | Why not |
 |---|---|
@@ -175,10 +195,12 @@ decode -0.5 % (noise), prefill ~1 % faster. The published image itself was measu
 | Speculative decoding (MTP) | acceptance ~0.6 on real traffic, about break-even |
 | Online TunableOp | retunes every new prompt length |
 
-## 15. Still open
+## 16. Still open
 
 - An occasional decode stall (a few seconds, up to ~21 s), in about one run in three, on every build measured since
   2026-09-28: not understood yet.
 - The model needs ~63 GiB of RAM for its experts alone (the engine keeps every expert in RAM, and NVFP4 is the smallest
   format it runs for this model): no 64 GB machine can serve it ([limits.md](limits.md)).
 - More than two GPUs, other RDNA3 cards, RDNA4 and NVIDIA are untested.
+- Image input (`serve.sh --vision`) is measured on `xtx-xt`, `xtx` and `xt` only. The derived profiles (`xtx-xtx`,
+  `xt-xt`, `gre`) are untested with it, as they are without it.

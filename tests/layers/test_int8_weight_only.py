@@ -66,3 +66,19 @@ def test_compaction_is_a_no_op_on_cpu_and_keeps_values():
     iwo.compact_device_tensors(root)  # no CUDA here: returns early, nothing moves
     after = root.state_dict()
     assert before.keys() == after.keys() and all(torch.equal(before[k], after[k]) for k in before)
+
+
+class _Tower(BaseOP):
+    def __init__(self):
+        self.proj = LinearReplicated(64, 64, has_bias=True, prefix="visual.blocks.0.attn.proj")
+
+
+def test_vision_tower_stays_bf16():
+    from freetoken.layers.quantization import int8_weight_only as iwo
+
+    root = _root()
+    root.visual = _Tower()
+    root.visual.proj.weight = (torch.randn(64, 64) * 0.05).to(torch.bfloat16)
+    n, _ = iwo.convert_model(root)
+    assert n == 2 and root.visual.proj.weight.dtype is torch.bfloat16
+    assert root.lm_head.weight.dtype is torch.int8

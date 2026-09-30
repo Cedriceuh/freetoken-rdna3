@@ -1,6 +1,7 @@
 """Compare the loader's rank-local tensors with the buffers the model declares, per TP rank (CPU, meta model).
 
-Runs inside the image with the tree mounted at /src and the checkpoint at /models/m (the paths below)."""
+Runs inside the image with the tree mounted at /src and the checkpoint at /models/m (the paths below); ``--vision``
+checks the model built with its vision tower (rdna3/serve.sh --vision)."""
 import sys
 import torch
 sys.path.insert(0, "/src")
@@ -8,12 +9,14 @@ from tests.models.qwen4_exp.common import as_rank, install_quant_config, meta_st
 from freetoken.models.qwen4_exp.weight import iter_weights
 
 M = "/models/m"
+VISION = "--vision" in sys.argv[1:]
 install_quant_config(M)
 for rank in (0, 1):
     with as_rank(rank, 2):
-        sd = meta_state_dict(M)
+        sd = meta_state_dict(M, vision=VISION)
         bad, seen = [], set()
-        for name, t in iter_weights(M, torch.device("cpu"), include_moe_experts=False, include_non_moe=True, include_vision=False):
+        for name, t in iter_weights(M, torch.device("cpu"), include_moe_experts=False, include_non_moe=True,
+                                   include_vision=VISION and any(k.startswith("visual.") for k in sd)):
             seen.add(name)
             p = sd.get(name)
             if p is None:

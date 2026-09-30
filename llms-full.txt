@@ -19,7 +19,9 @@ ROCm, up to 4 concurrent requests (parallel sub-agents), and a RAM tier that kee
 instead of recomputing them.
 
 Built for, and measured with, **Qwen3.8-Flash-Next** only (125B-parameter MoE, ~6B active per token, NVFP4) behind
-a coding agent (OpenCode), with an OpenAI- and Anthropic-compatible API.
+a coding agent (OpenCode), with an OpenAI- and Anthropic-compatible API. Image input is optional
+(`rdna3/serve.sh --vision`). It costs no measurable speed on two cards and ~1.5-2 % of decode on one
+([limits](docs/rdna3/limits.md#images-vision)).
 
 | On an RX 7900 XTX + RX 7900 XT | freetoken-rdna3 (`xtx-xt`) | FreeToken ported to ROCm, TP=2, TunableOp only |
 |---|---:|---:|
@@ -169,7 +171,8 @@ The script picks the cards by itself (for `xtx-xt` the larger one becomes rank 0
 a choice, `--dry-run` prints the full `docker run` command instead of running it. Other options: `--port`
 (default 1919), `--host` (default 127.0.0.1; 0.0.0.0 serves your network, and the API has no authentication:
 [limits.md](limits.md#anything-else-to-know)), `--ctx`, `--served-name`, `--name`,
-`--image`, `--memory`, and `-- <extra ft serve flags>`.
+`--image`, `--memory`, `--vision` (image input, off by default:
+[limits.md](limits.md#images-vision)), and `-- <extra ft serve flags>`.
 
 Loading takes about 2.5 minutes on the reference machine (it reads ~68 GB of experts). The very first start of a new image also compiles and autotunes GPU kernels for a few
 more minutes; the results are kept in a Docker volume (`freetoken-rdna3-kcache-<image id>`), so later starts are fast.
@@ -440,7 +443,7 @@ disagreements over ~8k sampled tokens in `check` mode). It is on the torch.distr
 
 | Variable | Default | Effect |
 |---|---|---|
-| `FREETOKEN_INT8_DENSE` | unset | `1`: every dense (non-expert) linear layer in int8, weights only, one scale per output channel and rank; routers stay bf16. Converted at load. **+28 % decode**, frees ~2.4 GiB per card for the expert cache. Lossy, not bit-exact; no measurable loss on the scored benchmark, *agent-validated*. |
+| `FREETOKEN_INT8_DENSE` | unset | `1`: every dense (non-expert) linear layer in int8, weights only, one scale per output channel and rank; routers and the vision tower stay bf16. Converted at load. **+28 % decode**, frees ~2.4 GiB per card for the expert cache. Lossy, not bit-exact; no measurable loss on the scored benchmark, *agent-validated*. |
 | `FREETOKEN_INT8_DENSE_SKIP` | empty | Comma-separated module names to keep in bf16. |
 | `FREETOKEN_INT8_COMPACT` | `1` | Compact the device allocator after the conversion; without it the freed VRAM stays fragmented and is lost to the expert cache. |
 | `FREETOKEN_INT8_ROWS_MAX` | `8` | Decode batches up to this many rows (concurrent requests) use the row-looped GEMVs (the int8 one and the bf16 Triton one), each row bit-identical to a batch of one; bigger batches dequantize the int8 weight per call (bf16 layers use `F.linear`). |
@@ -666,6 +669,93 @@ Details of every step, including what did not work: [journey.md](journey.md).
   rows identical (`moe_block_check.py`, `int8_rows_check.py`); four conversations pushed out to the RAM tier and brought
   back give the same greedy answers (and `host_kv_check.py` checks the copies).
 
+## Images (`--vision`, `xtx-xt`)
+
+Measured on 2026-09-30 on a build of the release tree plus the image changes (`rdna3/serve.sh --vision`), with images
+capped at 1024 tokens unless stated otherwise.
+
+**Text with the vision build.** Four sessions ran interleaved (text-only, vision, text-only, vision), each with three
+`quick_bench.py` runs; the ranges below span both sessions of each mode:
+
+| | text-only | `--vision` |
+|---|---:|---:|
+| decode, 512 tokens | 53.1-55.1 tok/s | 53.3-54.3 tok/s |
+| cold read, 8.3k tokens | 4.28-4.40 s | 4.37-4.40 s |
+| agent turn, ~1.5k new tokens | 1.27-1.29 s | 1.27-1.28 s |
+| expert cache (both ranks take the smaller plan) | 7,228 | 7,217 |
+| greedy answers, 34 prompts of 20 to 20k tokens (thinking off) | reference | identical in every session |
+
+With the tower on both ranks (the first version), rank 1 planned 351 fewer experts (6,877): rank 1 never encodes, so
+it now holds no tower.
+
+**Depth, two cards.** The depth sweep of this page ran four times, interleaved (text-only, vision, text-only,
+vision). Each ran on a fresh server, with the same unseen text for the two modes of a pass and greedy 256-token
+answers (`ignore_eos`). The depths land a little below the sweeps above:
+
+| Depth | TG text (2 passes) | TG `--vision` | PP new, text / vision | Agent turn, text / vision |
+|---:|---:|---:|---:|---:|
+| 9.2k | 55.3 / 55.4 | 54.5 / 54.0 | 1496 / 1505 | 1.27 / 1.27 s |
+| 16.6k | 55.3 / 56.5 | 55.8 / 56.2 | 1840 / 1838 | 1.28 / 1.28 s |
+| 35.9k | 54.9 / 55.7 | 55.4 / 55.4 | 1902 / 1890 | 1.33 / 1.33 s |
+| 73.9k | 55.3 / 56.1 | 52.5 / 55.3 | 1942 / 1944 | 1.44 / 1.44 s |
+| 103.2k | 56.5 / 56.2 | 56.0 / 55.0 | 1878 / 1876 | 1.51 / 1.53 s |
+| 139.1k | 54.5 / 55.5 | 56.7 / 53.2 | 1811 / 1806 | 1.66 / 1.67 s |
+| 166.3k | 56.1 / 56.1 | 56.4 / 54.6 | 1751 / 1756 | 1.74 / 1.72 s |
+| 202.9k | 55.4 / 55.3 | 55.1 / 55.1 | 1727 / 1731 | 1.88 / 1.85 s |
+| 232.3k | 56.5 / 57.0 | 54.5 / 56.1 | 1676 / 1676 | 1.94 / 1.93 s |
+| 253.5k | 54.7 / 55.2 | 54.5 / 54.3 | 1617 / 1606 | 1.98 / 2.00 s |
+
+At the full depth (255.6k tokens), vision was asked about a screenshot at the end of the conversation. It read the
+id in both passes (first token in 2.5 s).
+
+**Depth, one card** (`xtx` and `xt`, two passes of each mode, same method, to 124k):
+
+| Depth | `xtx` TG text | `xtx` TG vision | `xtx` PP text / vision | `xt` TG text | `xt` TG vision | `xt` PP text / vision |
+|---:|---:|---:|---:|---:|---:|---:|
+| 8.7k | 35.3 / 35.4 | 34.2 / 34.7 | 731 / 939 | 28.1 / 29.0 | 27.9 / 27.9 | 860 / 879 |
+| 16.4k | 43.9 / 35.6 | 34.3 / 34.3 | 1417 / 1412 | 34.2 / 28.1 | 27.5 / 28.0 | 1258 / 1264 |
+| 32.8k | 35.2 / 34.3 | 34.8 / 34.6 | 1468 / 1468 | 27.7 / 28.2 | 33.5 / 27.2 | 1340 / 1344 |
+| 66.1k | 34.8 / 34.7 | 34.0 / 34.2 | 1452 / 1456 | 28.5 / 37.4 | 27.4 / 28.0 | 1328 / 1328 |
+| 97.7k | 35.1 / 37.7 | 40.3 / 43.9 | 1397 / 1408 | 28.7 / 36.8 | 33.9 / 27.3 | 1274 / 1277 |
+| 123.2k | 35.3 / 38.7 | 34.9 / 41.8 | 1374 / 1378 | 28.9 / 37.3 | 36.0 / 29.0 | 1248 / 1254 |
+
+
+On one card the tower sits on the only rank, and the expert cache shrinks by ~165 experts: `xtx` 3,653 -> 3,487
+(-4.5 %), `xt` 2,420 -> 2,255 (-6.8 %). That is 436 MiB. Measured with the tower alone, the streamed weights and
+their staging take 130 MiB, and the first encode takes ~170 MiB more outside PyTorch's allocator (94 MiB of it for
+the patch embedding's Conv3d, in MIOpen). Decode loses ~1.5-2 % outside the steps where both modes jump (35-44 tok/s on
+the XTX, 33-37 on the XT, depending on the generated text): `xtx` ~35.2 -> ~34.5 tok/s, `xt` ~28.4 -> ~27.8 tok/s.
+Prompt reading is unchanged, and the agent turn is 0-1.5 % longer. The screenshot at 125.3k was read in all four vision
+passes (first token in 3.2-3.3 s).
+
+**The tower alone** (`rdna3/bench/vision_tower_bench.py`; one card, weights streamed from RAM, seeded random pixels):
+
+| image tokens | pixels | XTX | XT | peak VRAM beyond the weights |
+|---:|---:|---:|---:|---:|
+| 256 | 0.3 MP | 33 ms | 33 ms | 25 MiB |
+| 1024 | 1.0 MP | 91 ms | 107 ms | 97 MiB |
+| 2048 | 2.1 MP | 268 ms | 307 ms | 142 MiB |
+| 4096 | 4.2 MP | 871 ms | 1012 ms | 253 MiB |
+| 8192 | 8.4 MP | 3.2 s | 3.8 s | 371 MiB |
+| 16384 | 16.8 MP | 12.1 s | 15.0 s | 742 MiB |
+
+- **Attention memory is linear.** PyTorch's attention runs its AOTriton kernel (`attn_fwd`) on gfx1100, so memory
+  grows linearly with the image; nothing ran out of memory up to 16384 tokens.
+- **Weight placement.** Streaming the weights from RAM leaves 294 MiB of them in VRAM; keeping them all resident
+  (`--mm-encoder-weights gpu`) takes 1034 MiB and gains nothing (106 against 107 ms at 1024 tokens on the XT).
+- **Both cards agree.** The XTX and the XT gave bit-identical embeddings at nine sizes from 64 to 8192 tokens.
+
+**Requests** (thinking off, 16 to 120 output tokens):
+
+- **Small print.** A 1920x1080 screenshot of 30 lines of 16-pixel text becomes 1055 prompt tokens at the 1024 cap. 3
+  ids of 3 were read, in 1.6 s; at a 2048 cap it was 2087 tokens, 1.9 s, same answers.
+- **Concurrent requests.** Four sampled image requests at once were all correct, with 0 rank disagreements under
+  `FREETOKEN_TP_SYNC_TOKENS=check`.
+- **Repeated image and follow-up turn.** The same image twice in one prompt was answered correctly. A follow-up turn
+  reused the cached image prefix (2048 cached tokens, 52 new).
+- **Latency.** The first image request after a start took 3.7 s; later ones took 1.8-2.0 s for a 1034-token prompt.
+  The first request of any kind after a start takes ~10 s in both modes.
+
 ## Memory while serving (`xtx-xt`, release build)
 
 | | Used |
@@ -807,6 +897,20 @@ agent turn is one node), capacities are counted in pages and snapshots so both r
 nodes being promoted are pinned against eviction. Four agents with 82-117k-token conversations, 3 turns each: after
 the first reads, the rounds of turns take 35 s instead of 599 s.
 
+## Images (`--vision`, off by default)
+
+The Qwen3.8 vision tower (27 ViT blocks, ~0.45 B parameters) is upstream's, and it was never split across the GPUs.
+
+- **Where the tower runs.** Rank 0 builds it whole and encodes every image. The embeddings are broadcast to the
+  other rank (5 MiB for a 1024-token image), so both ranks put the same numbers in their residual stream. Rank 1
+  holds no tower, and its expert cache keeps the room.
+- **Weights.** The tower's blocks stream from pinned RAM two at a time, and the tower stays bf16 under
+  `FREETOKEN_INT8_DENSE`.
+- **Positions.** The text model switches to the 3-axis rope (mrope) that the image positions need. For text it gives
+  the same rotation: greedy answers are identical, and speed is the same up to 255k of context on two cards.
+
+Numbers: [benchmarks.md](benchmarks.md#images---vision-xtx-xt).
+
 ## What stays upstream's
 
 The HTTP APIs and parsers and the FTW format are upstream's. The scheduler, the radix cache, the offload engine and the
@@ -921,6 +1025,16 @@ docs say which.
 | Alternatives | Upstream's exact kernels (hang on gfx1100 with several blocks per row; 10-60 ms per step with one); the vendored module from before upstream PR #329 (wrong: up to 89 % of draws outside the top-k, and not faster) |
 | For | Exact on any request; 0.07 ms with the model's default `top_k`, 0.2-1 ms otherwise; the two GPUs cannot drift apart |
 | Against | The sort costs up to ~1 ms per step with 4 requests when one of them has no `top_k`; 15 µs per step for the broadcast; new in the release build: the sampler checked by kernel tests, the broadcast in `check`-mode server runs; not run on the agentic benchmark |
+
+## Images: one tower on rank 0, embeddings broadcast
+
+| | |
+|---|---|
+| Choice | Off by default (`serve.sh --vision`). The vision tower is never split: rank 0 alone holds it and encodes, then broadcasts the embeddings. Weights stream from RAM, in bf16. Images are scaled down to 1024 tokens |
+| Alternatives | Split the tower like the text layers; keep a whole tower on both ranks; weights resident in VRAM; a larger image cap |
+| For | No all-reduce while encoding. Both ranks get the same embeddings whatever the cards round. Two-card speed is unchanged up to 255k of context, and text answers are identical |
+| Against | Rank 1 waits while rank 0 encodes. One-card profiles lose ~1.5-2 % of decode (the tower takes expert-cache room on the only card). The encode time grows faster than the image (0.1 s at 1024 tokens, 12 s at 16384) |
+| Evidence | A tower on both ranks cost rank 1 351 experts of cache; resident weights take 1034 MiB instead of 294 MiB for the same encode speed; the two cards encode bit-identically, so the broadcast changes nothing on the reference pair ([benchmarks.md](benchmarks.md#images---vision-xtx-xt)) |
 
 ## Not done, on purpose
 
@@ -1108,7 +1222,27 @@ The GPU validation of the review-fix branch (before its last sampler changes): 1
 decode -0.5 % (noise), prefill ~1 % faster. The published image itself was measured afterwards
 ([benchmarks.md](benchmarks.md)).
 
-## 14. Dropped along the way
+## 14. Images (2026-09-30)
+
+- **The dead check.** The TP>1 error the review had added for the vision tower never fired: the loader renames the
+  tower's keys to `visual.` before the check, which looked for `model.visual.`. So a TP=2 start with the tower got as
+  far as a shape assertion (165 tower tensors the wrong size).
+- **Never split.** The tower (0.45 B parameters, prefill only) is now never split. Rank 0 encodes and broadcasts the
+  embeddings, which keeps the ranks' residual streams identical whatever the cards round. The two cards turned out to
+  encode bit-identically, so the broadcast is insurance here.
+- **Only rank 0 holds it.** A first version kept the tower on both ranks. Rank 1 then planned 351 fewer experts
+  (-4.9 %), and decode measured 51.5-52.8 tok/s against 54.1 (single sessions). With the tower on rank 0 only, the
+  plan loses 11 experts, and decode and prefill are within the spread between sessions.
+- **Answers unchanged.** Greedy answers stayed identical with the switch to mrope.
+- **Two cards, to 255k.** The depth sweep to 255k showed no difference beyond noise.
+- **One card.** One-card profiles lose ~1.5-2 % of decode, because the tower shares the only card and the expert
+  cache holds 165 fewer experts (436 MiB). Measured with the tower alone, the streamed weights take 130 MiB and the
+  first encode takes ~170 MiB outside PyTorch's allocator, 94 MiB of that for MIOpen's Conv3d. Replacing that Conv3d
+  with the equivalent matmul would win back ~36 experts but round differently, so it is left as it is.
+- **Default cap.** 1024 image tokens: a full-HD screenshot of 16-pixel text stays readable, with half the prompt
+  tokens of a 2048 cap (1.6 s instead of 1.9 s). Numbers: [benchmarks.md](benchmarks.md#images---vision-xtx-xt).
+
+## 15. Dropped along the way
 
 | Idea | Why not |
 |---|---|
@@ -1122,13 +1256,15 @@ decode -0.5 % (noise), prefill ~1 % faster. The published image itself was measu
 | Speculative decoding (MTP) | acceptance ~0.6 on real traffic, about break-even |
 | Online TunableOp | retunes every new prompt length |
 
-## 15. Still open
+## 16. Still open
 
 - An occasional decode stall (a few seconds, up to ~21 s), in about one run in three, on every build measured since
   2026-09-28: not understood yet.
 - The model needs ~63 GiB of RAM for its experts alone (the engine keeps every expert in RAM, and NVFP4 is the smallest
   format it runs for this model): no 64 GB machine can serve it ([limits.md](limits.md)).
 - More than two GPUs, other RDNA3 cards, RDNA4 and NVIDIA are untested.
+- Image input (`serve.sh --vision`) is measured on `xtx-xt`, `xtx` and `xt` only. The derived profiles (`xtx-xtx`,
+  `xt-xt`, `gre`) are untested with it, as they are without it.
 
 
 ---
@@ -1183,8 +1319,9 @@ the ROCm pieces (sampling routes, host-memory all-reduce, RDNA3 GEMVs, ROCm copy
 most tuning options are off unless set. Some changes are active everywhere: tensor parallelism for Qwen3.8-Flash-Next
 itself (with its one all-reduce per MoE block and blocked PLE and prefill MoE), the TP>1 relay handshake, a GDN
 boundary fix in the prefix cache, CUDA graphs captured for every batch size up to `--cuda-graph-max-bs` (when it is 8
-or less), rank 0's token broadcast on the torch.distributed path (with `--disable-pynccl`), and an explicit error for
-the vision tower at TP>1. On NVIDIA, upstream FreeToken is the better-tested choice.
+or less), rank 0's token broadcast on the torch.distributed path (with `--disable-pynccl`), and the Qwen VL vision
+tower never split (Qwen3.8 builds it on rank 0 only), with rank 0's image embeddings broadcast at TP>1. On NVIDIA,
+upstream FreeToken is the better-tested choice.
 
 ## More than two GPUs?
 
@@ -1201,8 +1338,27 @@ the ROCm fixes (untested here); the tuning options may or may not apply to them.
 
 ## Images (vision)?
 
-`rdna3/serve.sh` always passes `--text-model-only`. The vision tower is not split across GPUs, so at TP>1 the engine
-stops with an explicit error without that flag (edit `serve.sh` to try); one card may work but is untested.
+Off by default: `rdna3/serve.sh` passes `--text-model-only` unless it is started with `--vision`. Measured on
+`xtx-xt`, `xtx` and `xt`, up to each profile's full context ([benchmarks.md](benchmarks.md#images---vision-xtx-xt)).
+With `--vision`:
+
+- **Rank 0 holds the tower and encodes.** The vision tower (27 ViT blocks, ~0.45 B parameters, 856 MiB in bf16) is
+  built whole on rank 0 only, never split, so encoding adds no all-reduce. Rank 0 broadcasts the embeddings, so every
+  rank feeds the text model the same numbers. On the reference pair both cards encode bit-identically anyway, but
+  other cards may round the tower's GEMMs differently, and a per-rank difference would stay in the residual stream.
+- **The tower stays bf16.** `FREETOKEN_INT8_DENSE` skips it.
+- **Weights streamed from RAM.** Its blocks stream from pinned RAM two at a time (`--mm-encoder-weights host`, the
+  default). It keeps 294 MiB of VRAM instead of 1034 MiB resident, at the same encode speed.
+- **Images are capped at 1024 tokens.** Images are scaled down to 1024 tokens (one per 32x32 pixels, about one
+  megapixel). `-- --image-max-tokens N` changes it; the checkpoint allows 16384. The tower attends over the whole
+  image, so its cost grows faster than the image: 0.1 s at 1024 tokens, 0.9 s at 4096 and 12 s at 16384 on the XTX.
+  Every image token is also a prompt token.
+- **Text is unchanged.** The text model switches to the 3-axis rope (mrope). The greedy answers were identical to the
+  text-only build.
+- **Speed on two cards.** Decode, prompt reading and the agent turn stayed within the spread between sessions at
+  every depth up to 255k.
+- **Speed on one card.** The tower shares the only card, so the expert cache holds ~165 fewer experts and decode is
+  ~1.5-2 % slower. Use `--vision` there only if you send images.
 
 ## Anything else to know?
 
@@ -1280,6 +1436,11 @@ tiles. Harmless.
 Only printed with `FREETOKEN_TP_SYNC_TOKENS=check`. Rank 0's tokens are what the client receives either way; please
 report the lines with your setup.
 
+## `image input is disabled on this server (--text-model-only)`
+
+The server was started without `--vision`: `rdna3/serve.sh <profile> --model DIR --vision`. On one card, `--vision`
+costs ~1.5-2 % of decode even without images ([limits.md](limits.md#images-vision)).
+
 ## Reporting a problem
 
 Open an issue with: the profile and any changed option (`rdna3/serve.sh ... --dry-run` prints everything), the GPUs
@@ -1315,7 +1476,7 @@ slower (one-time kernel preparation): run it twice.
 docker run --rm -w /opt/FreeToken --entrypoint python3 freetoken-rdna3:latest -m pytest -q -p no:cacheprovider tests
 ```
 
-About 5 minutes, no GPU needed, on the tree the image was built from: 1471 passed, 501 skipped and 3 failures that
+About 5 minutes, no GPU needed, on the tree the image was built from: 1481 passed, 501 skipped and 3 failures that
 come from the environment (they need flashinfer, an NVIDIA-only package) and fail the same way on upstream
 (`test_cache_budget.py::test_adjust_config_defaults_moe_cache_auto_for_auto_resolved_offload_backend`,
 `test_cache_budget.py::test_adjust_config_resolves_num_tokens_generic`,
@@ -1348,7 +1509,7 @@ docker run --rm --device=/dev/kfd --device=/dev/dri --security-opt seccomp=uncon
 | `host_kv_check.py` | the RAM-tier copies (device -> RAM -> device) are exact |
 | `qsa_kv_int8_check.py` | the experimental int8 attention KV against bf16 and an fp32 reference |
 | `run_sampling_tests.sh <module>` + `sampling_test.py` | sampling kernels in four modes, each killed after 90 s (hang detector). Runs on the host and starts its own containers (image: `FREETOKEN_IMAGE`, default `freetoken-rdna3:latest`) |
-| `shape_check.py` (CPU) | the loader's per-rank tensors match the buffers the model declares, per TP rank; needs the checkpoint mounted at `/models/m` (`-v <model dir>:/models/m:ro`) |
+| `shape_check.py` (CPU) | the loader's per-rank tensors match the buffers the model declares, per TP rank; `--vision` includes the vision tower; needs the checkpoint mounted at `/models/m` (`-v <model dir>:/models/m:ro`) |
 
 ## Micro-benchmarks (`rdna3/bench/`)
 
@@ -1360,6 +1521,7 @@ docker run --rm --device=/dev/kfd --device=/dev/dri --security-opt seccomp=uncon
 | `dense_gemv_bench.py` | decode dense projections, bf16 vs int8 |
 | `router_topk_bench.py` | the MoE router softmax + top-k |
 | `allreduce_bench.py` | tiny all-reduce latency between two GPUs (`torchrun --nproc-per-node 2`) |
+| `vision_tower_bench.py` | the vision tower alone on one card: encode time, peak VRAM and attention kernel per image size; `--save` writes the embeddings to compare two cards bit for bit |
 
 Microbenchmarks only locate a cost: the weights stay hot in the 80-96 MB Infinity Cache and the kernel mix is not a
 real step's. Decide on the whole model.
@@ -1477,7 +1639,9 @@ the reason. Line counts are `added/removed`. Who wrote what: [credits.md](credit
 
 | File | Lines | Change |
 |---|---:|---|
-| `python/freetoken/models/qwen4_exp/weight.py` | 205/11 | per-rank sharding of the split weights (even or uneven split; the rest replicated); explicit error for the vision tower at TP>1 |
+| `python/freetoken/models/qwen4_exp/weight.py` | 203/11 | per-rank sharding of the split weights (even or uneven split; the rest, the vision tower included, replicated) |
+| `python/freetoken/models/qwen3_vl/vision.py` | 18/23 | the Qwen VL vision tower never split (whole on a rank) instead of tensor-parallel modules whose weights nothing sharded; a rank without a tower places nothing |
+| `python/freetoken/models/qwen4_exp/model.py` | 3/1 | the vision tower built on rank 0 only (rank 0 encodes for every rank) |
 | `python/freetoken/models/qwen4_exp/attention.py` | 20/7 | attention heads and output projection sharded |
 | `python/freetoken/models/qwen4_exp/gdn.py` | 41/14 | GatedDeltaNet heads sharded, unevenly when a split is set |
 | `python/freetoken/models/qwen4_exp/moe.py` | 30/2 | routed / shared experts sharded; one all-reduce per MoE block |
@@ -1488,24 +1652,25 @@ the reason. Line counts are `added/removed`. Who wrote what: [credits.md](credit
 | `python/freetoken/layers/linear.py`, `layers/moe.py` | 14/4, 4/1 | uneven shard sizes; the fused MoE all-reduce |
 | `python/freetoken/kvcache/linear_state_pool.py` | 10/3 | GDN state pool sized per rank |
 | `tests/models/qwen4_exp/test_tp_shard.py`, `test_tp_uneven.py`, `test_ple_conv_blocks.py`, `test_ple.py` | new / 2/1 | sharding, uneven split and blocked PLE tests; the snapshot test compares with a tolerance |
-| `tests/models/qwen4_exp/common.py` | 14/0 | `as_rank()`: run a test block as one rank of a TP group |
+| `tests/models/qwen4_exp/common.py` | 16/2 | `as_rank()`: run a test block as one rank of a TP group; `meta_state_dict(vision=True)` |
 
 ## Two unequal cards
 
 | File | Lines | Change |
 |---|---:|---|
 | `python/freetoken/distributed/split.py` | 134/0 | the uneven split (`FREETOKEN_TP_SPLIT`): which dimensions split, rounding to NVFP4 scale blocks |
-| `python/freetoken/engine/engine.py` | 95/6 | memory planned on the smaller card (`FREETOKEN_TP_ALLOW_IMBALANCE`); runtime cache rebuild refused under an uneven split; rank 0's sampled tokens broadcast (`FREETOKEN_TP_SYNC_TOKENS`); int8 conversion; profiling hooks |
+| `python/freetoken/engine/engine.py` | 124/8 | memory planned on the smaller card (`FREETOKEN_TP_ALLOW_IMBALANCE`); runtime cache rebuild refused under an uneven split; rank 0's sampled tokens broadcast (`FREETOKEN_TP_SYNC_TOKENS`); rank 0 encodes images and broadcasts the embeddings (the other ranks load no tower); int8 conversion; profiling hooks |
 | `python/freetoken/distributed/impl.py`, `distributed/__init__.py` | 38/0, 2/1 | host-memory all-reduce wiring |
 | `python/freetoken/kernel/host_allreduce.py`, `kernel/csrc/jit/host_allreduce.cuh` | 143/0, 179/0 | the host-memory all-reduce (`FREETOKEN_HOST_ALLREDUCE`) |
 | `python/freetoken/scheduler/io.py` | 73/0 | the TP>1 relay handshakes before the first request |
 | `tests/scheduler/test_io_relay_handshake.py` | new | |
+| `tests/engine/test_mm_encoder.py` | 44/4 | rank 0's image embeddings reach rank 1, which never encodes |
 
 ## Dense layers
 
 | File | Lines | Change |
 |---|---:|---|
-| `python/freetoken/layers/quantization/int8_weight_only.py` | 171/0 | weight-only int8 conversion of the dense layers (`FREETOKEN_INT8_DENSE`), allocator compaction |
+| `python/freetoken/layers/quantization/int8_weight_only.py` | 173/0 | weight-only int8 conversion of the dense layers (`FREETOKEN_INT8_DENSE`; the vision tower stays bf16), allocator compaction |
 | `python/freetoken/kernel/triton/int8_gemv.py` | 132/0 | int8 decode GEMV for RDNA3, row-looped for several requests |
 | `python/freetoken/kernel/triton/dense_gemv.py` | 92/0 | split-K bf16 decode GEMVs for RDNA3, row-looped (batch-invariant) |
 | `python/freetoken/layers/quantization/linear/unquantized.py` | 33/0 | route bf16 decode projections to those GEMVs on gfx11 |

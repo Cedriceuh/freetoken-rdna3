@@ -60,6 +60,11 @@ tiles. Harmless.
 Only printed with `FREETOKEN_TP_SYNC_TOKENS=check`. Rank 0's tokens are what the client receives either way; please
 report the lines with your setup.
 
+## `image input is disabled on this server (--text-model-only)`
+
+The server was started without `--vision`: `rdna3/serve.sh <profile> --model DIR --vision`. On one card, `--vision`
+costs ~1.5-2 % of decode even without images ([limits.md](limits.md#images-vision)).
+
 ## Reporting a problem
 
 Open an issue with: the profile and any changed option (`rdna3/serve.sh ... --dry-run` prints everything), the GPUs

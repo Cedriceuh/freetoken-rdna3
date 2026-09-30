@@ -14,8 +14,10 @@ Lossy (per-row int8): validated on the author's hardware with proxy benches and 
 score with and without), not bit-exact against bf16. Tuned for <= 8 concurrent requests.
 
 Enable with ``FREETOKEN_INT8_DENSE=1``. Routers (``mlp.gate``, ``mlp.shared_expert_gate``) stay bf16: a flipped
-expert choice costs more than their bytes. ``FREETOKEN_INT8_DENSE_SKIP`` adds comma-separated substrings of the
-module path (attribute path from the model root, e.g. ``lm_head,hyper_connection``) to keep in bf16.
+expert choice costs more than their bytes. The Qwen VL vision tower (``visual``) stays bf16 too: it only runs on
+prefill, where int8 saves no time, and streams its weights from host RAM. ``FREETOKEN_INT8_DENSE_SKIP`` adds
+comma-separated substrings of the module path (attribute path from the model root, e.g. ``lm_head,hyper_connection``)
+to keep in bf16.
 """
 
 from __future__ import annotations
@@ -30,7 +32,7 @@ from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
 
-_ALWAYS_SKIP = (".mlp.gate", ".mlp.shared_expert_gate")
+_ALWAYS_SKIP = (".mlp.gate", ".mlp.shared_expert_gate", ".visual")
 
 
 def enabled() -> bool:

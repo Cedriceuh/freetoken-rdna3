@@ -392,3 +392,87 @@ def test_shard_for_rank_splits_attention_pads_vocab_and_refuses_fp8():
             _shard_for_rank("model.layers.0.self_attn.q_proj.weight", q.to(torch.float8_e4m3fn), config=config)
     with as_rank(0, 1):
         assert _shard_for_rank("lm_head.weight", vocab, config=config) is vocab
+
+
+# ----------------------------------------------------------------------------------
+# The vision tower: replicated, whole on every rank, never all-reduced
+# ----------------------------------------------------------------------------------
+
+
+def _tower():
+    from freetoken.models.qwen3_vl.config import VisionConfig
+    from freetoken.models.qwen3_vl.vision import Qwen3VLVisionModel
+
+    vc = VisionConfig(
+        hidden_size=64, depth=2, num_heads=4, intermediate_size=96, patch_size=2, temporal_patch_size=2,
+        spatial_merge_size=2, num_position_embeddings=16, out_hidden_size=32, in_channels=3,
+    )
+    return Qwen3VLVisionModel(vc)
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_vision_tower_declares_the_tp1_shapes_at_tp2(rank):
+    with as_rank(0, 1):
+        whole = {k: tuple(v.shape) for k, v in _tower().state_dict().items()}
+    with as_rank(rank, 2):
+        tower = _tower()
+    assert {k: tuple(v.shape) for k, v in tower.state_dict().items()} == whole
+    assert tower.blocks.op_list[0].attn.num_heads == 4
+
+
+def test_vision_tower_never_all_reduces_at_tp2(monkeypatch):
+    from freetoken.distributed.impl import DistributedCommunicator
+
+    calls = []
+    monkeypatch.setattr(DistributedCommunicator, "all_reduce", lambda self, x: (calls.append(x.shape), x)[1])
+    with as_rank(1, 2):
+        tower = _tower()
+    for op in tower.state_dict().values():
+        op.zero_()
+    block = tower.blocks.op_list[0]
+    block.mlp.forward(torch.zeros(3, 64))
+    block.attn.proj.forward(torch.zeros(3, 64))
+    tower.merger.forward(torch.zeros(4, 64))
+    assert calls == []
+
+
+def test_shard_for_rank_keeps_vision_tensors_whole():
+    from freetoken.models.qwen4_exp.weight import _shard_for_rank
+
+    config = SimpleNamespace(num_kv_heads=2, linear_attention_group=_group)
+    qkv, bias = torch.randn(12, 4), torch.randn(4)
+    with as_rank(1, 2):
+        assert _shard_for_rank("visual.blocks.0.attn.qkv.weight", qkv, config=config) is qkv
+        assert _shard_for_rank("visual.merger.linear_fc2.bias", bias, config=config) is bias
+
+
+@pytest.mark.parametrize("rank, holds_tower", [(0, True), (1, False)])
+def test_only_rank0_builds_the_vision_tower(rank, holds_tower):
+    """Rank 0 alone encodes at TP>1 (Engine._encode_item broadcasts): the other ranks hold no tower."""
+    from freetoken.layers import rotary
+    from freetoken.models.qwen4_exp.config import parse_config
+    from freetoken.models.qwen4_exp.model import Qwen4ExpForConditionalGeneration
+
+    from .common import hf_config
+
+    hf = hf_config(**DEPLOYED)
+    hf.vision_config = SimpleNamespace(
+        hidden_size=64, depth=1, num_heads=4, intermediate_size=96, patch_size=2, temporal_patch_size=2,
+        spatial_merge_size=2, num_position_embeddings=16, out_hidden_size=512, in_channels=3,
+        deepstack_visual_indexes=[],
+    )
+    saved = rotary._ROPE_DEVICE
+    rotary.set_rope_device(torch.device("cpu"))  # get_rope refuses to build on meta
+    rotary.get_rope.cache_clear()
+    try:
+        with as_rank(rank, 2):
+            config = parse_config(hf)
+            with torch.device("meta"):
+                model = Qwen4ExpForConditionalGeneration(config)
+    finally:
+        rotary.set_rope_device(saved)
+        rotary.get_rope.cache_clear()
+    assert config.is_multimodal  # every rank still parses the vision section (and its 3-axis rope)
+    assert any(k.startswith("visual.") for k in model.state_dict()) is holds_tower
+    if not holds_tower:
+        model.place_encoder_weights("host")  # nothing to place (the tower's pinned banks need a GPU)

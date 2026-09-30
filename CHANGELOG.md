@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- Image input on Qwen3.8-Flash-Next, off by default (`rdna3/serve.sh --vision`, images scaled down to 1024 tokens).
+  The vision tower is never split: rank 0 encodes and broadcasts the embeddings, and the tower stays bf16 under
+  `FREETOKEN_INT8_DENSE`. Measured on `xtx-xt`, `xtx` and `xt` to the full context: text answers are identical, there
+  is no speed change on two cards, and decode is ~1.5-2 % slower on one.
+- Fix: the TP>1 check for the vision tower never fired (it looked for `model.visual.` after the loader had renamed the
+  keys to `visual.`), so such a start failed on a bare shape assertion.
+- `rdna3/bench/vision_tower_bench.py`; `rdna3/tests/shape_check.py --vision`.
+
 ## 0.1.0 (2026-09-29)
 
 First public release, on top of FreeToken `0d652e7` (the engine reports version 0.1.3).

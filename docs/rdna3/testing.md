@@ -22,7 +22,7 @@ slower (one-time kernel preparation): run it twice.
 docker run --rm -w /opt/FreeToken --entrypoint python3 freetoken-rdna3:latest -m pytest -q -p no:cacheprovider tests
 ```
 
-About 5 minutes, no GPU needed, on the tree the image was built from: 1471 passed, 501 skipped and 3 failures that
+About 5 minutes, no GPU needed, on the tree the image was built from: 1481 passed, 501 skipped and 3 failures that
 come from the environment (they need flashinfer, an NVIDIA-only package) and fail the same way on upstream
 (`test_cache_budget.py::test_adjust_config_defaults_moe_cache_auto_for_auto_resolved_offload_backend`,
 `test_cache_budget.py::test_adjust_config_resolves_num_tokens_generic`,
@@ -55,7 +55,7 @@ docker run --rm --device=/dev/kfd --device=/dev/dri --security-opt seccomp=uncon
 | `host_kv_check.py` | the RAM-tier copies (device -> RAM -> device) are exact |
 | `qsa_kv_int8_check.py` | the experimental int8 attention KV against bf16 and an fp32 reference |
 | `run_sampling_tests.sh <module>` + `sampling_test.py` | sampling kernels in four modes, each killed after 90 s (hang detector). Runs on the host and starts its own containers (image: `FREETOKEN_IMAGE`, default `freetoken-rdna3:latest`) |
-| `shape_check.py` (CPU) | the loader's per-rank tensors match the buffers the model declares, per TP rank; needs the checkpoint mounted at `/models/m` (`-v <model dir>:/models/m:ro`) |
+| `shape_check.py` (CPU) | the loader's per-rank tensors match the buffers the model declares, per TP rank; `--vision` includes the vision tower; needs the checkpoint mounted at `/models/m` (`-v <model dir>:/models/m:ro`) |
 
 ## Micro-benchmarks (`rdna3/bench/`)
 
@@ -67,6 +67,7 @@ docker run --rm --device=/dev/kfd --device=/dev/dri --security-opt seccomp=uncon
 | `dense_gemv_bench.py` | decode dense projections, bf16 vs int8 |
 | `router_topk_bench.py` | the MoE router softmax + top-k |
 | `allreduce_bench.py` | tiny all-reduce latency between two GPUs (`torchrun --nproc-per-node 2`) |
+| `vision_tower_bench.py` | the vision tower alone on one card: encode time, peak VRAM and attention kernel per image size; `--save` writes the embeddings to compare two cards bit for bit |
 
 Microbenchmarks only locate a cost: the weights stay hot in the 80-96 MB Infinity Cache and the kernel mix is not a
 real step's. Decide on the whole model.

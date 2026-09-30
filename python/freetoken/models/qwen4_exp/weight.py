@@ -200,8 +200,7 @@ class _DenseFuser:
 # per-projection keys, BEFORE ``_DenseFuser`` concatenates them. Everything not listed here or in
 # the GDN tables below is replicated: the HC mixers, the PLE projections, the QSA indexer, every
 # norm and the routers are ``LinearReplicated`` and every rank needs them whole. The vision tower is
-# NOT supported at tp_size > 1 (its Qwen3-VL modules are tensor-parallel but nothing shards their
-# weights here): serve with --text-model-only.
+# never sharded either: rank 0 alone holds it (its tensors arrive already renamed under ``visual.``).
 #
 # These five are fusion parts. A flat row chunk of the fused tensor has the right shape and is a
 # different tensor (``qkv_proj`` is ``[2*qo | kv | kv]``), so each part is cut on its own axis;
@@ -314,9 +313,8 @@ def _shard_for_rank(name: str, tensor: torch.Tensor, *, config: ModelConfig) -> 
     tp = get_tp_info()
     if tp.size == 1:
         return tensor
-    if name.startswith("model.visual.") or ".visual." in name:
-        raise NotImplementedError(
-            f"{name}: the vision tower is not tensor-parallel sharded; serve with --text-model-only at tp_size={tp.size}")
+    if name.startswith(VISION_KEY_PREFIXES):
+        return tensor  # the tower is never sharded: rank 0 holds it whole and encodes, the engine broadcasts
     if tensor.dtype in _FP8_DTYPES or name.endswith(".weight_scale_inv"):
         # The block-fp8 dense path is not TP-aware (a 128x128 scale grid does not follow a head split).
         raise NotImplementedError(f"{name}: block-fp8 dense weights are not supported at tp_size={tp.size}")
