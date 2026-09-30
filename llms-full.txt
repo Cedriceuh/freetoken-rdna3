@@ -1664,7 +1664,7 @@ the reason. Line counts are `added/removed`. Who wrote what: [credits.md](credit
 | `python/freetoken/kernel/host_allreduce.py`, `kernel/csrc/jit/host_allreduce.cuh` | 143/0, 179/0 | the host-memory all-reduce (`FREETOKEN_HOST_ALLREDUCE`) |
 | `python/freetoken/scheduler/io.py` | 73/0 | the TP>1 relay handshakes before the first request |
 | `tests/scheduler/test_io_relay_handshake.py` | new | |
-| `tests/engine/test_mm_encoder.py` | 44/4 | rank 0's image embeddings reach rank 1, which never encodes |
+| `tests/engine/test_mm_encoder.py` | 59/4 | rank 0's image embeddings reach rank 1, which never encodes |
 
 ## Dense layers
 
