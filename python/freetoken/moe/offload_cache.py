@@ -261,6 +261,7 @@ class OffloadMoeCache:
         # Source pointers are per layer (_copy_src_ptrs[layer_id] -> [num_banks] device
         # tensor); dst/feat are layer-invariant.
         self._copy_fused_ok = False
+        self._copy_side_stream: torch.cuda.Stream | None = None
         self._copy_dst_ptrs: torch.Tensor | None = None
         self._copy_src_ptrs: list[torch.Tensor] | None = None
         self._copy_feat_bytes: torch.Tensor | None = None
@@ -1021,6 +1022,25 @@ class OffloadMoeCache:
             "oracle_hit_at_slots": oracle_hit,
             "norm_entropy": norm_ent,
         }
+
+    def can_copy_async(self, layer_id: int) -> bool:
+        """Whether ``copy_missing_async`` may stage this layer's decode misses (GPU decode, fused copy, pinned layer)."""
+        return (self.decode_target == "gpu" and self._copy_fused_ok and not self.is_cpu_layer(layer_id)
+                and layer_id not in self._unpinned_layers)
+
+    def copy_missing_async(self) -> None:
+        """``copy_missing`` on a side stream that forks from the current one (FREETOKEN_MOE_COPY_OVERLAP): the
+        caller issues independent work (the shared expert) and then ``wait_copy`` before the expert GEMM reads
+        the slots. CUDA-graph capturable (the fork and join are captured as graph edges)."""
+        cur = torch.cuda.current_stream(self.device)
+        if self._copy_side_stream is None:
+            self._copy_side_stream = torch.cuda.Stream(device=self.device)
+        self._copy_side_stream.wait_stream(cur)
+        with torch.cuda.stream(self._copy_side_stream):
+            self.copy_missing()
+
+    def wait_copy(self) -> None:
+        torch.cuda.current_stream(self.device).wait_stream(self._copy_side_stream)
 
     def copy_missing(self) -> None:
         assert self.banks, "set_bank_sources must register the banks first"

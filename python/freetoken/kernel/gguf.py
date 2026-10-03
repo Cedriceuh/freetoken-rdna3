@@ -1,7 +1,8 @@
 """Borrowed llama.cpp GGUF dequant/GEMM CUDA kernels, JIT-compiled on first use.
 
-The ``.cu``/``.cuh`` under ``csrc/gguf/`` are vendored verbatim from sgl-kernel
-(``csrc/quantization/gguf/``), which are themselves ports of llama.cpp. We compile
+The ``.cu``/``.cuh`` under ``csrc/gguf/`` are vendored from sgl-kernel
+(``csrc/quantization/gguf/``), which are themselves ports of llama.cpp; their torch
+wrappers moved to a host-only ``gguf_bind.cpp`` so that they also build on ROCm. We compile
 them through ``torch.utils.cpp_extension.load`` (the same toolchain sglang/vllm use)
 into a torch-op module and expose the handful of ops the GGUF path needs. This is a
 separate, torch-native extension that sits alongside FreeToken's tvm-ffi kernels.
@@ -47,28 +48,60 @@ def _c_compiler_for(cxx: str) -> str:
     cc = base.replace("g++", "gcc")
     return shutil.which(cc) or cc
 
+def _rocm_sdk_paths() -> tuple[list[str], list[str]]:
+    """Include and link flags the ROCm pip SDK needs for this extension: torch's ROCM_HOME may not hold the HIP headers
+    (7.14 wheels point it at the venv), and the SDK ships only libamdhip64.so.N, which the shared JIT link flags
+    (``kernel.utils._rocm_link_flags``) expose under the -lamdhip64 name torch links with."""
+    import importlib.util
+    from torch.utils.cpp_extension import ROCM_HOME
+
+    from freetoken.kernel.utils import _rocm_link_flags
+
+    roots = [ROCM_HOME] if ROCM_HOME else []
+    spec = importlib.util.find_spec("_rocm_sdk_core")
+    if spec is not None and spec.submodule_search_locations:
+        roots += list(spec.submodule_search_locations)
+    root = next((r for r in roots if os.path.isfile(os.path.join(r, "include", "hip", "hip_runtime.h"))), None)
+    try:
+        ldflags = _rocm_link_flags()
+    except RuntimeError:  # no libamdhip64 found: leave the link to torch's defaults
+        ldflags = []
+    return ([os.path.join(root, "include")] if root is not None else []), ldflags
+
+
 @functools.cache
 def _module():
     from torch.utils.cpp_extension import load
 
-    extra_cuda_cflags = ["-O3", "--expt-relaxed-constexpr"]
+    extra_cuda_cflags = ["-O3"]
+    # nvcc-only flags: on ROCm the device compiler is clang (called directly by torch's ROCm wheels, which reject them),
+    # its own host compiler, and it treats constexpr functions as host + device already
+    is_hip = torch.version.hip is not None
+    if not is_hip:
+        extra_cuda_cflags.append("--expt-relaxed-constexpr")
     host_cxx = _host_compiler()
     if host_cxx is not None:
         # Point both nvcc's host pass (-ccbin) and torch's C++ compile (CXX) at a
         # libtorch/nvcc-compatible compiler. Force (not setdefault): the system
         # default (CXX unset -> g++) can be a gcc too new for the torch headers.
         cxx_path = shutil.which(host_cxx) or host_cxx
-        extra_cuda_cflags += ["-ccbin", cxx_path]
+        if not is_hip:
+            extra_cuda_cflags += ["-ccbin", cxx_path]
         os.environ["CXX"] = cxx_path
         os.environ["CC"] = _c_compiler_for(cxx_path)
 
-    # gguf_kernel.cu carries its own PYBIND11_MODULE (appended at the end), so a
-    # plain `load` of the single source compiles + binds the ggml_* ops.
+    # gguf_kernel.cu holds the kernels and their launchers; gguf_bind.cpp the torch wrappers and the PYBIND11_MODULE,
+    # compiled as host code (torch's headers under HIP need rocThrust, which the ROCm pip SDK lacks).
+    include_paths, ldflags = [str(_CSRC)], []
+    if is_hip:  # the host compile of gguf_bind.cpp and the link need the SDK's own paths
+        sdk_includes, ldflags = _rocm_sdk_paths()
+        include_paths += sdk_includes
     return load(
         name="freetoken_gguf_kernels",
-        sources=[str(_CSRC / "gguf_kernel.cu")],
-        extra_include_paths=[str(_CSRC)],
+        sources=[str(_CSRC / "gguf_kernel.cu"), str(_CSRC / "gguf_bind.cpp")],
+        extra_include_paths=include_paths,
         extra_cuda_cflags=extra_cuda_cflags,
+        extra_ldflags=ldflags,
         verbose=True,
     )
 

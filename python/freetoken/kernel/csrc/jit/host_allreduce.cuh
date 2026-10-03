@@ -24,12 +24,15 @@
 // Layout of the shared region: [0, 64) rank 0 flag, [64, 128) rank 1 flag, then from
 // kDataOffset four slots of `slot_bytes`: slot (rank * 2 + parity).
 // A peer that never arrives (desynchronized ranks) traps after `timeout_ticks` of the
-// 100 MHz wall clock instead of hanging the server.
+// 100 MHz wall clock instead of hanging the server. With a `wait_log` (debug, see
+// FREETOKEN_HOST_ALLREDUCE_WAITLOG), each call stores how long it waited for the peer, in ticks, at
+// wait_log[seq % kWaitLogLen].
 
 namespace {
 
 constexpr int kThreads = 512;
 constexpr int64_t kDataOffset = 4096;
+constexpr unsigned long long kWaitLogLen = 1ull << 16;
 
 __device__ __forceinline__ uint64_t load_system(const uint64_t* p) {
 #if FREETOKEN_USE_ROCM
@@ -67,7 +70,7 @@ template <> __device__ __forceinline__ bf16_bits from_f<bf16_bits>(float v) {
 template <typename T>
 __global__ void host_allreduce_kernel(
     T* __restrict__ x, int64_t n, char* base, int rank, int64_t slot_bytes,
-    unsigned long long* counter, int64_t timeout_ticks) {
+    unsigned long long* counter, int64_t timeout_ticks, unsigned long long* wait_log) {
     __shared__ unsigned long long seq_s;
     if (threadIdx.x == 0) seq_s = *counter + 1;
     __syncthreads();
@@ -106,6 +109,7 @@ __global__ void host_allreduce_kernel(
 #endif
             if (wall_ticks() - t0 > timeout_ticks) __builtin_trap();
         }
+        if (wait_log != nullptr) wait_log[seq % kWaitLogLen] = static_cast<unsigned long long>(wall_ticks() - t0);
         *counter = seq;
     }
     __syncthreads();
@@ -149,7 +153,8 @@ struct HostAllReduce {
         int64_t base_ptr,
         int64_t rank,
         int64_t slot_bytes,
-        int64_t timeout_ticks
+        int64_t timeout_ticks,
+        int64_t wait_log_ptr
     ) {
         using namespace host;
         auto device = SymbolicDevice{};
@@ -167,13 +172,14 @@ struct HostAllReduce {
         RuntimeCheck(rank == 0 || rank == 1, "host all-reduce: two ranks only");
         auto* base = reinterpret_cast<char*>(base_ptr);
         auto* ctr = static_cast<unsigned long long*>(counter.data_ptr());
+        auto* wait_log = reinterpret_cast<unsigned long long*>(wait_log_ptr);
         auto launch = LaunchKernel(1, kThreads, device.unwrap());
         if (is_f32) {
             launch(host_allreduce_kernel<float>, static_cast<float*>(x.data_ptr()), n, base,
-                   static_cast<int>(rank), slot_bytes, ctr, timeout_ticks);
+                   static_cast<int>(rank), slot_bytes, ctr, timeout_ticks, wait_log);
         } else {
             launch(host_allreduce_kernel<bf16_bits>, static_cast<bf16_bits*>(x.data_ptr()), n, base,
-                   static_cast<int>(rank), slot_bytes, ctr, timeout_ticks);
+                   static_cast<int>(rank), slot_bytes, ctr, timeout_ticks, wait_log);
         }
     }
 };

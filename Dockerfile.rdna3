@@ -3,15 +3,18 @@
 #   docker build -f Dockerfile.rdna3 -t freetoken-rdna3:latest .       (from a git clone: the build records the commit)
 #   rdna3/serve.sh <profile> --model DIR                               (docs/rdna3/getting-started.md)
 #
-# Builds THE TREE YOU HAVE CHECKED OUT; nothing is fetched or patched. Derived from a community ROCm port's
+# Builds THE TREE YOU HAVE CHECKED OUT; nothing is cloned; the install lifts pyproject's CUDA version ceilings and Triton 3.7.1 is copied from the 7.14 image. Derived from a community ROCm port's
 # Dockerfile.gfx1201 (see docs/rdna3/credits.md).
 #
 # Run-time settings the engine does not check for you (rdna3/serve.sh sets them; docs/rdna3/options.md):
-#   PYTORCH_ALLOC_CONF=expandable_segments:False, OMP_WAIT_POLICY=PASSIVE, HIP_VISIBLE_DEVICES set explicitly,
+#   PYTORCH_ALLOC_CONF=expandable_segments:True, OMP_WAIT_POLICY=PASSIVE, HIP_VISIBLE_DEVICES set explicitly,
 #   --ulimit memlock=-1, --ipc=host, FREETOKEN_TP_ALLOW_IMBALANCE=1 for unequal cards, --ple-backend disk.
 
-# The base is pinned by DIGEST: the tag is mutable on someone else's registry.
-FROM rocm/pytorch@sha256:a223aee17aef5d21c3b9f63436dd19d27d1c665ec8b2f40011c9546cabae2a80
+# The bases are pinned by DIGEST: the tags are mutable on someone else's registry.
+# ROCm 7.14 / PyTorch 2.11 (rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.11.0): only its Triton 3.7.1 is used, below.
+FROM rocm/pytorch@sha256:a223aee17aef5d21c3b9f63436dd19d27d1c665ec8b2f40011c9546cabae2a80 AS triton37
+# ROCm 10.0 / PyTorch 2.13 (rocm10.0_ubuntu24.04_py3.12_pytorch_release_2.13.0)
+FROM rocm/pytorch@sha256:bbdaba66029f905321be3bbc95206a2d9a56a2bc5300877d146ad24d40db9a12
 
 ARG GPU_ARCH=gfx1100
 ENV PYTORCH_ROCM_ARCH=${GPU_ARCH} \
@@ -34,11 +37,25 @@ RUN set -eux; \
     printf '%s\n' "commit ${COMMIT}" "tree   ${TREE}" > /opt/FreeToken-BUILD-PROVENANCE.txt
 
 # --no-build-isolation keeps the base image's ROCm torch for the C++/HIP extensions; [accel] is
-# CUDA-only (flashinfer, sgl_kernel) and gated off on ROCm anyway.
+# CUDA-only (flashinfer, sgl_kernel) and gated off on ROCm anyway. pyproject's ceilings are the CUDA ones
+# (sglang-kernel links torch 2.11 only); ROCm 10 ships torch 2.13 / torchvision 0.28 / Triton 3.8, so the image lifts
+# them where it installs (after the provenance above: the recorded tree is the repository's).
 RUN set -eux; \
     cd /opt/FreeToken; \
+    sed -i -e 's/"torch>=2.11,<2.12"/"torch>=2.11,<2.14"/g' -e 's/"torchvision>=0.26,<0.27"/"torchvision>=0.26,<0.29"/' \
+        -e 's/"triton>=3.6,<3.8;/"triton>=3.6,<3.9;/' pyproject.toml; \
+    test "$(grep -c '"torch>=2.11,<2.14"' pyproject.toml)" = 2; grep -q '"torchvision>=0.26,<0.29"' pyproject.toml; \
+    grep -q '"triton>=3.6,<3.9;' pyproject.toml; \
     python -m pip install --no-cache-dir "setuptools>=77" wheel; \
     python -m pip install --no-cache-dir --no-build-isolation -e .
+
+# ROCm 10's Triton 3.8.0 miscompiles these kernels (an illegal memory access in the fused MoE kernel, a hang in the
+# first prefill); the 7.14 image's Triton 3.7.1 runs them correctly with ROCm 10's torch. Swapped after the install:
+# torch 2.13 requires its 3.8.0, and pip, finding 3.7.1, would replace that torch with a CUDA one from PyPI.
+RUN rm -rf /opt/venv/lib/python3.12/site-packages/triton /opt/venv/lib/python3.12/site-packages/triton-*.dist-info
+COPY --from=triton37 /opt/venv/lib/python3.12/site-packages/triton /opt/venv/lib/python3.12/site-packages/triton
+COPY --from=triton37 /opt/venv/lib/python3.12/site-packages/triton-3.7.1+git0263a6a6.rocm7.14.0.dist-info \
+     /opt/venv/lib/python3.12/site-packages/triton-3.7.1+git0263a6a6.rocm7.14.0.dist-info
 
 # One cache directory per image: AITER / Triton key their caches on the directory, not the image.
 ENV XDG_CACHE_HOME=/root/.cache/freetoken-rdna3 \
@@ -46,7 +63,8 @@ ENV XDG_CACHE_HOME=/root/.cache/freetoken-rdna3 \
     FREETOKEN_KERNEL_CACHE_DIR=/root/.cache/freetoken-rdna3/freetoken/kernels
 RUN mkdir -p /root/.cache/freetoken-rdna3/triton /root/.cache/freetoken-rdna3/freetoken/kernels
 
-RUN python -c 'import torch, triton; print("torch", torch.__version__, "| hip", torch.version.hip, "| triton", triton.__version__); assert torch.version.hip and torch.version.cuda is None'
+# the ROCm torch and the copied Triton 3.7.1 are the ones in place
+RUN python -c 'import torch, triton; print("torch", torch.__version__, "| hip", torch.version.hip, "| triton", triton.__version__); assert torch.version.hip and torch.version.cuda is None; assert triton.__version__.startswith("3.7.1"), triton.__version__'
 
 # The port, checked by content (absence gates use `if grep; then exit 1`, never `! grep`).
 RUN set -eux; \

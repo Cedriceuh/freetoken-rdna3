@@ -87,14 +87,42 @@ bool cumemop_resolve() {
   return resolved;
 }
 
+// ROCm: the HIP runtime's own memops (hipStreamWaitValue64 takes a mask the CUDA one does not). The library is the
+// one torch already loaded (the pip ROCm SDK keeps it off the default loader path): RTLD_NOLOAD finds it by soname.
+using HipWait64Fn = int (*)(void *stream, void *ptr, uint64_t value, unsigned int flags, uint64_t mask);
+using HipWrite64Fn = int (*)(void *stream, void *ptr, uint64_t value, unsigned int flags);
+HipWait64Fn g_hip_wait64 = nullptr;
+HipWrite64Fn g_hip_write64 = nullptr;
+constexpr unsigned kHipWaitValueGte = 0x0;
+constexpr unsigned kHipWriteDefault = 0x0;
+
+bool hipmemop_resolve() {
+  static bool resolved = [] {
+    void *h = dlopen("libamdhip64.so.7", RTLD_LAZY | RTLD_LOCAL | RTLD_NOLOAD);
+    if (h == nullptr) h = dlopen("libamdhip64.so", RTLD_LAZY | RTLD_LOCAL | RTLD_NOLOAD);
+    if (h == nullptr) return false;
+    g_hip_wait64 = reinterpret_cast<HipWait64Fn>(dlsym(h, "hipStreamWaitValue64"));
+    g_hip_write64 = reinterpret_cast<HipWrite64Fn>(dlsym(h, "hipStreamWriteValue64"));
+    return g_hip_wait64 != nullptr && g_hip_write64 != nullptr;
+  }();
+  return resolved;
+}
+
 int memop_write(uintptr_t stream, uintptr_t addr, uint64_t value) {
-  if (!cumemop_resolve()) return -1;
-  return g_cu_write64(reinterpret_cast<void *>(stream), addr, value, kCuWriteDefault);
+  if (cumemop_resolve())
+    return g_cu_write64(reinterpret_cast<void *>(stream), addr, value, kCuWriteDefault);
+  if (hipmemop_resolve())
+    return g_hip_write64(reinterpret_cast<void *>(stream), reinterpret_cast<void *>(addr), value, kHipWriteDefault);
+  return -1;
 }
 
 int memop_wait_geq(uintptr_t stream, uintptr_t addr, uint64_t value) {
-  if (!cumemop_resolve()) return -1;
-  return g_cu_wait64(reinterpret_cast<void *>(stream), addr, value, kCuWaitValueGeq);
+  if (cumemop_resolve())
+    return g_cu_wait64(reinterpret_cast<void *>(stream), addr, value, kCuWaitValueGeq);
+  if (hipmemop_resolve())
+    return g_hip_wait64(reinterpret_cast<void *>(stream), reinterpret_cast<void *>(addr), value, kHipWaitValueGte,
+                        ~uint64_t{0});
+  return -1;
 }
 
 // WAIT(>=1) then RESET: resetting first would race a fast host signal and deadlock the stream.

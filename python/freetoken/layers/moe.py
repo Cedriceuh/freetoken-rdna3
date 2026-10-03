@@ -253,6 +253,41 @@ class OffloadMoELayer(MoELayer):
         )
         return self._prefill_routed(hidden_states, topk_weights, topk_ids)
 
+    def can_overlap_copy(self) -> bool:
+        """Decode on the GPU with the fused miss copy: ``decode_select`` / ``decode_finish`` may split the call."""
+        cache = self.offload_cache
+        return cache is not None and cache.can_copy_async(self.layer_id)
+
+    def decode_select(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+        """First half of a decode call (FREETOKEN_MOE_COPY_OVERLAP): route, map to cache slots and start copying
+        the missing experts on a side stream. Work issued before ``decode_finish`` overlaps the copy."""
+        topk_weights, topk_ids = fused_topk(
+            hidden_states=hidden_states,
+            gating_output=router_logits,
+            topk=self.top_k,
+            renormalize=self.renormalize,
+        )
+        cache = self.offload_cache
+        cache.ensure_experts(self.layer_id, topk_ids)
+        cache.copy_missing_async()
+        return topk_weights, topk_ids
+
+    def decode_finish(self, hidden_states: torch.Tensor, topk_weights: torch.Tensor, topk_ids: torch.Tensor):
+        """Second half: wait for the copy, then the expert GEMM (same kernels and inputs as ``forward``)."""
+        cache = self.offload_cache
+        cache.wait_copy()
+        out = self._expert_gemm(
+            cache,
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            views=cache.bank_views(),
+            n=None,
+            alphas=cache.alphas_for_slots(self.layer_id),
+            is_prefill=False,
+        )
+        return self._maybe_all_reduce(out)
+
     # ------------------------------------------------------------------
     # Data movement -- one decision tree for every quant format (the banks
     # registry makes the cache machinery bank-count agnostic). Decode loads

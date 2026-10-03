@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 import os
 
 import torch
+from freetoken.core import get_global_ctx
 from freetoken.distributed import DistributedCommunicator, get_tp_info
 from freetoken.distributed.split import intermediate_partition, is_uneven
 from freetoken.kernel.triton.moe_shared_gate import shared_gate_mul_add, shared_gate_sigmoid
@@ -12,6 +13,10 @@ from freetoken.models.qwen3_5_moe.moe import Qwen3_5MoE, _SharedExpert
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
+
+# FREETOKEN_MOE_COPY_OVERLAP=1: in decode, the missing experts are copied on a side stream while the shared expert and
+# its gate run (offload backend, GPU decode); same kernels and inputs, so the same bits
+_COPY_OVERLAP = os.environ.get("FREETOKEN_MOE_COPY_OVERLAP", "0") == "1"
 
 
 class Qwen4ExpMoE(Qwen3_5MoE):
@@ -45,9 +50,16 @@ class Qwen4ExpMoE(Qwen3_5MoE):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         router_logits = self.gate.forward(hidden_states)
+        split = (_COPY_OVERLAP and not get_global_ctx().batch.is_prefill
+                 and getattr(self.experts, "can_overlap_copy", lambda: False)())
+        if split:
+            topk_weights, topk_ids = self.experts.decode_select(hidden_states, router_logits)
         shared = self.shared_expert.forward(hidden_states)
         gate = shared_gate_sigmoid(hidden_states, self.shared_expert_gate.weight.view(-1))
-        routed = self.experts.forward(hidden_states=hidden_states, router_logits=router_logits)
+        if split:
+            routed = self.experts.decode_finish(hidden_states, topk_weights, topk_ids)
+        else:
+            routed = self.experts.forward(hidden_states=hidden_states, router_logits=router_logits)
         out = shared_gate_mul_add(routed, shared, gate)
         if self._comm is not None:
             out = self._comm.all_reduce(out)

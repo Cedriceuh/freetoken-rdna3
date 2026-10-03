@@ -14,6 +14,10 @@ Env:
   FREETOKEN_HOST_ALLREDUCE_TIMEOUT_S  a peer missing for this long traps the kernel (default 300; 0 = never).
                                       Generous on purpose: on a cold kernel cache the two ranks (different
                                       shapes under an uneven split) JIT-compile at different times.
+  FREETOKEN_HOST_ALLREDUCE_WAITLOG    debug, 1: every call stores how long it waited for the peer (100 MHz
+                                      ticks) in the shared region, which then stays in /dev/shm
+                                      (freetoken-hostar-*-waitlog) for a reader: int64 [rank][seq % 65536]
+                                      after the four slots; each rank's last seq is its flag (offset rank * 64)
 """
 from __future__ import annotations
 
@@ -30,6 +34,7 @@ from .utils import load_jit
 ENABLE_ENV = "FREETOKEN_HOST_ALLREDUCE"
 MAX_ENV = "FREETOKEN_HOST_ALLREDUCE_MAX"
 _DATA_OFFSET = 4096
+_WAIT_LOG_LEN = 1 << 16
 _HIP_REGISTER_MAPPED = 0x2
 _HIP_REGISTER_UNCACHED = 0x80000000
 
@@ -46,7 +51,7 @@ def max_bytes() -> int:
 def _module():
     return load_jit(
         "host_allreduce",
-        "v2",  # v2: alignas(16) out buffer
+        "v3",  # v2: alignas(16) out buffer; v3: optional wait log
         cuda_files=["host_allreduce.cuh"],
         cuda_wrappers=[("run", "&HostAllReduce::run")],
     )
@@ -88,8 +93,10 @@ class HostAllReduce:
         self.rank = rank
         self.slot_bytes = int(slot_bytes or max_bytes())
         self.slot_bytes = (self.slot_bytes + 4095) // 4096 * 4096
-        size = _DATA_OFFSET + 4 * self.slot_bytes
-        name = [f"/dev/shm/freetoken-hostar-{os.getpid()}-{secrets.token_hex(6)}" if rank == 0 else None]
+        self._wait_log = os.environ.get("FREETOKEN_HOST_ALLREDUCE_WAITLOG", "0") == "1"
+        size = _DATA_OFFSET + 4 * self.slot_bytes + (2 * 8 * _WAIT_LOG_LEN if self._wait_log else 0)
+        suffix = "-waitlog" if self._wait_log else ""
+        name = [f"/dev/shm/freetoken-hostar-{os.getpid()}-{secrets.token_hex(6)}{suffix}" if rank == 0 else None]
         dist.broadcast_object_list(name, src=0, group=cpu_group)
         path = name[0]
         if rank == 0:
@@ -101,8 +108,9 @@ class HostAllReduce:
         self._map = mmap.mmap(fd, size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
         os.close(fd)
         dist.barrier(group=cpu_group)
-        if rank == 0:
+        if rank == 0 and not self._wait_log:
             os.unlink(path)  # both ranks hold the mapping; nothing is left in /dev/shm
+        self._wait_log_path = path if rank == 0 and self._wait_log else None
         self._host = ctypes.addressof(ctypes.c_char.from_buffer(self._map))
         flags = _HIP_REGISTER_MAPPED
         if os.environ.get("FREETOKEN_HOST_ALLREDUCE_UNCACHED", "1") == "1":
@@ -116,6 +124,7 @@ class HostAllReduce:
         if err != 0:
             raise RuntimeError(f"hipHostGetDevicePointer failed ({err})")
         self.base = int(dev.value)
+        self.wait_log = (self.base + _DATA_OFFSET + 4 * self.slot_bytes + rank * 8 * _WAIT_LOG_LEN) if self._wait_log else 0
         self.counter = torch.zeros(1, dtype=torch.int64, device=torch.cuda.current_device())
         timeout_s = float(os.environ.get("FREETOKEN_HOST_ALLREDUCE_TIMEOUT_S", "300"))
         # wall_clock64 ticks at 100 MHz on gfx9 / gfx11; 0 or less: effectively never
@@ -132,6 +141,12 @@ class HostAllReduce:
         _hip().hipHostUnregister(ctypes.c_void_p(self._host))
         self._map.close()
         self._map = None
+        if getattr(self, "_wait_log_path", None) is not None:  # a clean shutdown removes the debug region
+            try:
+                os.unlink(self._wait_log_path)
+            except FileNotFoundError:
+                pass
+            self._wait_log_path = None
 
     def supports(self, x: torch.Tensor) -> bool:
         """Rank-invariant choice (dtype, size, layout only): both ranks must take the same path."""
@@ -139,5 +154,5 @@ class HostAllReduce:
                 and x.numel() * x.element_size() <= self.slot_bytes)
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        self._run(x.view(-1), self.counter, self.base, self.rank, self.slot_bytes, self.timeout_ticks)
+        self._run(x.view(-1), self.counter, self.base, self.rank, self.slot_bytes, self.timeout_ticks, self.wait_log)
         return x

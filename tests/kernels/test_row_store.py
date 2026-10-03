@@ -85,3 +85,35 @@ def test_geometry_and_bounds_are_checked_up_front(tmp_path):
     with pytest.raises(RuntimeError, match="exceeds a page"):
         _row_store.RowStore(paths=[str(path)], extent_file=[0], extent_base=[0], rows_per_extent=1,
                             row_bytes=4097, row_stride=4097, use_io_uring=False)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_wait_sync_probe_only_accepts_a_captured_wait_that_holds():
+    """probe_wait_sync says True only where a WAIT captured in a graph blocks every replay until the host signals
+    (ROCm 10 on gfx1100; ROCm 7.14 captures one that the second replay runs through, so the probe says False)."""
+    import threading
+    import time
+
+    from freetoken.kernel.pinned import alloc_pinned_tensor
+    from freetoken.kernel.row_store import probe_wait_sync, signal, wait_reset
+
+    dev = torch.device("cuda", torch.cuda.current_device())
+    if not probe_wait_sync("auto", dev):
+        pytest.skip("stream memops unusable in capture on this stack: launch-gating (the safe fallback)")
+    flag = alloc_pinned_tensor(1, dtype=torch.int64)
+    flag.zero_()
+    x = torch.zeros(1, device=dev)
+    side = torch.cuda.Stream(dev)
+    side.wait_stream(torch.cuda.current_stream(dev))
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(side), torch.cuda.graph(g, stream=side):
+        wait_reset(side, flag)
+        x.add_(1.0)
+    for i in range(3):
+        threading.Timer(0.05, lambda: signal(flag)).start()
+        t0 = time.perf_counter()
+        g.replay()
+        torch.cuda.synchronize(dev)
+        assert time.perf_counter() - t0 >= 0.04, f"replay {i} did not wait for the host signal"
+        assert int(flag[0]) == 0
+    assert int(x.item()) == 3
