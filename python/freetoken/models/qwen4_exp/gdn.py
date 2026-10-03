@@ -9,6 +9,28 @@ from freetoken.distributed.split import gdn_head_partition
 from freetoken.layers import BaseOP, GatedRMSNorm, LinearColParallelMerged, LinearRowParallel
 from freetoken.layers.quantization import QuantConfig
 from freetoken.models.qwen3_5_moe.gdn_kernels import gdn_decode_fla, gdn_prefill_chunk_fla
+from freetoken.spec_decode import SPEC_M, RollbackTarget, register, rows_of
+
+
+_SPEC_BUFS: list = []  # [(recurrent [layers, reqs, m-1, ...], conv [layers, m-1, reqs, ...])] once allocated
+_SPEC_ROWS: list = []
+
+
+def _spec_buffers(pool, reqs: int, device):
+    """spec_decode buffers shared by every GDN layer (one slice each): the recurrent kernel's per-step states and the
+    conv state after each row but the last; one rollback target per pool tensor covers all the layers."""
+    if not _SPEC_BUFS or _SPEC_BUFS[0][0].shape[1] < reqs:
+        assert not torch.cuda.is_current_stream_capturing(), "spec buffers must exist before the capture"
+        m = SPEC_M
+        rec, conv = pool.recurrent_states, pool.conv_states  # [layers, slots, ...]
+        inter = rec.new_empty((rec.shape[0], reqs, m - 1, *rec.shape[2:]))
+        snaps = conv.new_empty((conv.shape[0], m - 1, reqs, *conv.shape[2:]))
+        _SPEC_BUFS[:] = [(inter, snaps)]
+        _SPEC_ROWS[:] = [torch.arange(reqs, dtype=torch.int32, device=device)]
+        pad = pool.padding_slot
+        register("gdn.recurrent", RollbackTarget(rec, lambda step, b: inter[:, b, step], dim=1, padding_slot=pad))
+        register("gdn.conv", RollbackTarget(conv, lambda step, b: snaps[:, step, b], dim=1, padding_slot=pad))
+    return _SPEC_BUFS[0]
 
 
 class _DepthwiseConv1d(BaseOP):
@@ -136,6 +158,23 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         li = pool.local_index(self.layer_id)
         return causal_conv1d_decode(conv_in, pool.conv_states[li], self._conv_weight(), table_idx)
 
+    def _spec_conv_decode(self, conv_in: torch.Tensor, slots: torch.Tensor, pool, li: int, m: int):
+        """``m`` rows per request: one conv launch over the rows, the conv state after every row but the last saved,
+        and the recurrent kernel's per-step buffer. Returns ``(mixed [B*m, conv_dim], intermediate [reqs, SPEC_M-1,
+        HV, V, K])``. Buffers are sized for SPEC_M rows and allocated at the first (largest) decode forward with
+        several rows, which runs eagerly before any capture."""
+        reqs = conv_in.shape[0] // m
+        conv = pool.conv_states[li]
+        inter_all, conv_all = _spec_buffers(pool, reqs, conv_in.device)
+        self._spec_inter, self._spec_conv = inter_all[li], conv_all[li]
+        self._spec_rows = _SPEC_ROWS[0]
+        from freetoken.kernel.triton.causal_conv1d_triton import causal_conv1d_decode_rows
+
+        # one launch for the m rows, the state after each row but the last written into the rollback snapshots
+        mixed = causal_conv1d_decode_rows(conv_in.view(reqs, m, -1), conv, self._conv_weight(), slots,
+                                          snapshots=self._spec_conv[:, :reqs])
+        return mixed.view(reqs * m, -1), self._spec_inter[:reqs]
+
     def _write_track_snapshot(self, pool, li: int, conv_in: torch.Tensor,
                               h: torch.Tensor, fla) -> None:
         """Snapshot this layer's recurrent + conv state at the chunk-aligned track boundary
@@ -182,7 +221,12 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
             # Fused fla decode kernel: gating + in-kernel l2norm + recurrent update +
             # per-request state read/write-by-index, all in one kernel (no gather/scatter,
             # no clone, no external l2norm). q/k stay at num_k_heads (kernel handles GQA).
-            mixed = self._conv_decode(conv_in, fla.cache_indices, pool)  # [B, conv_dim]
+            inter = None
+            m = rows_of(batch)
+            if m > 1:  # m rows per request (spec_decode): one conv launch, states kept for the rollback
+                mixed, inter = self._spec_conv_decode(conv_in, fla.cache_indices, pool, li, m)
+            else:
+                mixed = self._conv_decode(conv_in, fla.cache_indices, pool)  # [B, conv_dim]
             B = mixed.shape[0]
             qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
             q = qf.reshape(1, B, self.num_k_heads, self.head_k_dim).to(dtype)
@@ -192,6 +236,7 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
                 q, k, v, a, b, A_log=self.A_log, dt_bias=self.dt_bias,
                 state_source=pool.recurrent_states[li], indices=fla.cache_indices,
                 cu_seqlens=fla.cu_seqlens, scale=self.head_k_dim ** -0.5,
+                intermediate_states=inter, intermediate_indices=None if inter is None else self._spec_rows[: inter.shape[0]],
             )
         else:
             mixed = self._conv_prefill(
@@ -223,7 +268,8 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
 
         core_out = core_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)
-        out = self.norm.forward(core_out, z).reshape(total, -1)
+        # decode: one row per norm program, so a verify step's rows (and a batch's) get their single-row bits
+        out = self.norm.forward(core_out, z, rows_per_block=1 if batch.is_decode else None).reshape(total, -1)
         return self.out_proj.forward(out)
 
 

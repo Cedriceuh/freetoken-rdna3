@@ -92,7 +92,9 @@ class QSAKVCache(MHAKVCache):
                 f"QSA needs page_size ({page_size}) divisible by index_ratio ({index_ratio})"
             )
         if ring_capacity is None:
-            ring_capacity = self.ring_capacity_for(index_ratio)
+            from freetoken.spec_decode import SPEC_M
+
+            ring_capacity = self.ring_capacity_for(index_ratio, SPEC_M - 1)
         if ring_capacity < index_ratio:
             # A closing group reads up to index_ratio - 1 past members plus this forward's.
             raise ValueError(
@@ -211,7 +213,9 @@ class QSAKVCache(MHAKVCache):
             if spec.attn_type is AttnType.QSA:
                 # One index-key row = all index layers at one position.
                 row = spec.index_head_dim * spec.num_index_layers * _INDEX_DTYPE_BYTES
-                fixed += num_req_slots * row * (cls.ring_capacity_for(spec.index_ratio) + 1)
+                from freetoken.spec_decode import SPEC_M
+
+                fixed += num_req_slots * row * (cls.ring_capacity_for(spec.index_ratio, SPEC_M - 1) + 1)
                 if config.model_config.model_is_mrope:
                     per_token += _ROPE_POS_BYTES
         return per_token * config.page_size, fixed, config.page_size, 0

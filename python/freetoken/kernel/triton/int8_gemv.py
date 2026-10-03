@@ -91,6 +91,40 @@ def _gemv_splitk_int8(a_ptr, w_ptr, scale_ptr, out_ptr, part_ptr, N, K, stride_w
 
 
 @triton.jit
+def _gemv_int8_row_group(a_ptr, w_ptr, scale_ptr, out_ptr, N, K, stride_wn, k_per, stride_am, stride_om,
+                         BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, ROWS: tl.constexpr):
+    """2..4 rows, SPLIT == 1, K wider than one BLOCK_K: the general path's arithmetic per row (acc = 0; acc += w * a
+    over the K blocks in order; sum(acc) * scale), with each weight tile loaded once for all the rows instead of
+    once per row. Bit-identical to a batch of one (GPU check: every shape of the model, both cards). Measured in a
+    graph at 4 rows: HC down 336 x 10240 17.7 -> 12.1 us, LM head 124160 x 2560 704 -> 499 us (7900 XT)."""
+    pid_n = tl.program_id(0)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    n_mask = offs_n < N
+    acc0 = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
+    acc1 = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
+    acc2 = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
+    acc3 = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
+    for kk in range(0, k_per, BLOCK_K):
+        offs_k = kk + tl.arange(0, BLOCK_K)
+        k_mask = offs_k < K
+        w = tl.load(w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :],
+                    mask=n_mask[:, None] & k_mask[None, :], other=0).to(tl.float32)
+        acc0 += w * tl.load(a_ptr + offs_k, mask=k_mask, other=0.0).to(tl.float32)[None, :]
+        acc1 += w * tl.load(a_ptr + stride_am + offs_k, mask=k_mask, other=0.0).to(tl.float32)[None, :]
+        if ROWS > 2:
+            acc2 += w * tl.load(a_ptr + 2 * stride_am + offs_k, mask=k_mask, other=0.0).to(tl.float32)[None, :]
+        if ROWS > 3:
+            acc3 += w * tl.load(a_ptr + 3 * stride_am + offs_k, mask=k_mask, other=0.0).to(tl.float32)[None, :]
+    sc = tl.load(scale_ptr + offs_n, mask=n_mask, other=0.0)
+    tl.store(out_ptr + offs_n, (tl.sum(acc0, axis=1) * sc).to(tl.bfloat16), mask=n_mask)
+    tl.store(out_ptr + stride_om + offs_n, (tl.sum(acc1, axis=1) * sc).to(tl.bfloat16), mask=n_mask)
+    if ROWS > 2:
+        tl.store(out_ptr + 2 * stride_om + offs_n, (tl.sum(acc2, axis=1) * sc).to(tl.bfloat16), mask=n_mask)
+    if ROWS > 3:
+        tl.store(out_ptr + 3 * stride_om + offs_n, (tl.sum(acc3, axis=1) * sc).to(tl.bfloat16), mask=n_mask)
+
+
+@triton.jit
 def _reduce_scale_bf16(part_ptr, scale_ptr, out_ptr, N, stride_pk, SPLIT: tl.constexpr, BLOCK: tl.constexpr):
     offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offs < N
@@ -104,6 +138,8 @@ def _reduce_scale_bf16(part_ptr, scale_ptr, out_ptr, N, stride_pk, SPLIT: tl.con
 # FREETOKEN_INT8_ROWS_MAX (default 8): decode batches up to this many rows (concurrent requests) use the row-looped
 # GEMV below instead of dequantizing the whole weight per call; each row is bit-identical to a batch of one.
 ROWS_MAX = max(1, int(os.environ.get("FREETOKEN_INT8_ROWS_MAX", "8")))
+# FREETOKEN_INT8_ROW_GROUPS=1 (default): several rows of a K-blocked shape share each weight tile (_gemv_int8_row_group)
+_ROW_GROUPS = os.environ.get("FREETOKEN_INT8_ROW_GROUPS", "1") == "1"
 
 
 def gemv_int8(x: torch.Tensor, qweight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
@@ -115,12 +151,28 @@ def gemv_int8(x: torch.Tensor, qweight: torch.Tensor, scale: torch.Tensor) -> to
     block_n, block_k, split, warps = _CONFIGS.get((N, K)) or _default_config(N, K)
     k_per = triton.cdiv(triton.cdiv(K, split), block_k) * block_k
     out = torch.empty((M, N), dtype=torch.bfloat16, device=x.device)
+    one_pass = split == 1 and k_per >= K and block_k >= K
+    if M > 1 and split == 1 and not one_pass and _ROW_GROUPS:
+        # several rows, K in several blocks: the weight tile read once per group of up to 4 rows (one-pass shapes keep
+        # the kernel below: holding 4 one-pass accumulators spills, measured 4-10x slower)
+        for r0 in range(0, M, 4):
+            rows = min(4, M - r0)
+            if rows == 1:
+                _gemv_splitk_int8[(triton.cdiv(N, block_n), 1)](
+                    x2[r0:], qweight, scale, out[r0:], out[r0:], N, K, qweight.stride(0), 0, k_per, SPLIT=1,
+                    BLOCK_N=block_n, BLOCK_K=block_k, ROWS=1, stride_am=x2.stride(0), stride_om=out.stride(0),
+                    ONE_PASS=False, num_warps=warps)
+            else:
+                _gemv_int8_row_group[(triton.cdiv(N, block_n),)](
+                    x2[r0:], qweight, scale, out[r0:], N, K, qweight.stride(0), k_per, x2.stride(0), out.stride(0),
+                    BLOCK_N=block_n, BLOCK_K=block_k, ROWS=rows, num_warps=warps)
+        return out
     part = torch.empty((M, split, N), dtype=torch.float32, device=x.device) if split > 1 else out
     _gemv_splitk_int8[(triton.cdiv(N, block_n), split)](
         x2, qweight, scale, out, part, N, K, qweight.stride(0), part.stride(1) if split > 1 else 0, k_per,
         SPLIT=split, BLOCK_N=block_n, BLOCK_K=block_k, ROWS=M, stride_am=x2.stride(0),
         stride_om=part.stride(0) if split > 1 else out.stride(0),
-        ONE_PASS=M > 1 and split == 1 and k_per >= K and block_k >= K, num_warps=warps,
+        ONE_PASS=M > 1 and one_pass, num_warps=warps,
     )
     if split > 1:
         for r in range(M):

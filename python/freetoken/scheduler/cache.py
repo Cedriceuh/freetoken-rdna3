@@ -332,11 +332,12 @@ class CacheManager:
         needed_pages = 0
         allocation_info: List[Tuple[int, int, int]] = []
         for req in reqs:
-            first_page = div_ceil(req.cached_len, self.page_size)
+            first_page = div_ceil(max(req.cached_len, req.alloc_len), self.page_size)
             last_page = div_ceil(req.device_len, self.page_size)
             if last_page > first_page:
                 needed_pages += last_page - first_page
                 allocation_info.append((req.table_idx, first_page, last_page))
+            req.alloc_len = max(req.alloc_len, req.device_len)
         if needed_pages > 0:
             allocated = self._page_to_token(self._allocate(needed_pages))
             if self.swa_paged:
@@ -350,6 +351,8 @@ class CacheManager:
             _write_page_table(self.page_table, allocated, allocation_info, self.page_size)
 
     def cache_req(self, req: Req, *, finished: bool) -> None:
+        if finished:
+            self._free_ahead(req)
         if self.is_swa:
             return self._cache_req_swa(req, finished=finished)
         if self.is_hybrid:
@@ -438,7 +441,8 @@ class CacheManager:
             # remain as reuse points).
             insert_len = align_down(req.cached_len, self.page_size)
             keep_live = False
-            if insert_len == req.cached_len and insert_len > 0:
+            # spec_decode: a request that finished inside a verify step's kept rows has its live state past cached_len
+            if insert_len == req.cached_len and insert_len > 0 and not getattr(req, "state_ahead", False):
                 prefix_len, mamba_exist = self.prefix_cache.insert(
                     req.input_ids[:insert_len], page_indices[:insert_len], req.linear_slot_idx)
                 self.unlock(old_handle)
@@ -572,6 +576,15 @@ class CacheManager:
                 self.page_table[req.table_idx, : m.cached_len].copy_(m.kv_indices)
             req.cache_handle = SWACacheHandle(m.cached_len, m.node, m.kv_indices)
             self.lock(req.cache_handle)
+
+    def _free_ahead(self, req: Req) -> None:
+        """Return the pages a spec_decode verify step allocated past page_ceil(cached_len) for draft rows (the
+        finish paths only see the row up to cached_len)."""
+        start = div_ceil(req.cached_len, self.page_size) * self.page_size
+        end = div_ceil(req.alloc_len, self.page_size) * self.page_size
+        if end > start:
+            self._free(self.page_table[req.table_idx, start:end])
+        req.alloc_len = req.cached_len
 
     def _padded_tail(self, req: Req, start: int) -> torch.Tensor:
         """The request's OWN slice [start, page_ceil(cached_len)) of the page table. A finish

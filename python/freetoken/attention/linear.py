@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from freetoken.spec_decode import rows_of
+
 if TYPE_CHECKING:
     from freetoken.core import Batch
 
@@ -65,7 +67,8 @@ def build_fla_metadata(batch: "Batch", device: torch.device) -> FLAMetadata:
 
     if batch.is_decode:
         bs = len(reqs)
-        cu_seqlens = torch.arange(bs + 1, dtype=torch.int32, device=device)
+        # spec_m rows per request (spec_decode; 1 = plain decode)
+        cu_seqlens = torch.arange(bs + 1, dtype=torch.int32, device=device) * rows_of(batch)
         # the scheduler stages linear_table_idx from gdn_slot (decode), reused as-is here
         assert batch.linear_table_idx is not None
         return FLAMetadata(cu_seqlens=cu_seqlens, cache_indices=batch.linear_table_idx)

@@ -2,7 +2,7 @@
 
 Pool tensors at the real Qwen3.8-Flash-Next per-rank shapes (TP=2, XTX share): 12 QSA layers of
 1 KV head x 256 bf16, the compressed index slab (12 layers, ratio 4, 128 dims), 36 GDN layers of
-conv (5632 x 3 bf16) + recurrent (26 heads x 128 x 128 fp32) state.
+conv (5760 x 3 bf16) + recurrent (27 heads x 128 x 128 fp32) state (9 k / 27 v heads on the XTX).
 
 1. pages: random device pages -> host -> OTHER device pages, bit-exact, both directions timed;
 2. snapshots: GDN slot -> host -> other slot, bit-exact, timed;
@@ -39,8 +39,8 @@ def main() -> int:
     kv._cmp_k_buffer = torch.randn(12, kv.cmp_scratch_base + 5, 128, device=dev, dtype=torch.bfloat16, generator=g)
     kv._rope_positions = None
     lin = Pool()
-    lin.conv_states = torch.randn(36, S, 5632, 3, device=dev, dtype=torch.bfloat16, generator=g)
-    lin.recurrent_states = torch.randn(36, S, 26, 128, 128, device=dev, dtype=torch.float32, generator=g)
+    lin.conv_states = torch.randn(36, S, 5760, 3, device=dev, dtype=torch.bfloat16, generator=g)
+    lin.recurrent_states = torch.randn(36, S, 27, 128, 128, device=dev, dtype=torch.float32, generator=g)
     lin.slot_states = {}
 
     host = HostKVPool(kv, lin, PS, num_pages=600, num_snaps=4, device=dev)

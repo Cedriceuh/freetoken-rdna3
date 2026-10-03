@@ -22,6 +22,7 @@ from freetoken.core import get_global_ctx
 from freetoken.distributed import get_tp_info
 from freetoken.layers import BaseOP, OPList, ParallelLMHead, VocabParallelEmbedding
 from freetoken.models.blocks import BaseLLMModel
+from freetoken.spec_decode import MTP_ENABLED
 from freetoken.utils import nvtx_annotate
 
 from .attention import Qwen4ExpAttention
@@ -125,7 +126,32 @@ class Qwen4ExpModel(BaseOP):
             # single writer: the layers only read the context, so a second PLE layer's
             # prefetch sees the un-rolled window
             commit_ngram_context(meta, getattr(batch, "fla_metadata", None))
+        if MTP_ENABLED:
+            self._keep_streams(hidden, batch)
         return self.hyper_connection_mixer.mix(hidden)[0]
+
+    def _keep_streams(self, hidden: torch.Tensor, batch: Batch) -> None:
+        """The streams the MTP draft head reads: a prefill's by reference, a decode step's in a static buffer (the
+        captured graphs write it; the engine slices it by the replayed row count)."""
+        if not batch.is_decode:
+            self.last_streams = hidden
+            return
+        buf = getattr(self, "streams_buf", None)
+        if buf is None:
+            assert not torch.cuda.is_current_stream_capturing(), "spec buffers must exist before the capture"
+            buf = self.streams_buf = torch.empty_like(hidden)
+        if buf.shape[0] < hidden.shape[0]:
+            # an eager step with more rows than any captured graph: its own streams (the graphs keep writing the buffer)
+            self.last_streams = hidden
+            return
+        buf[: hidden.shape[0]].copy_(hidden)
+        self.last_streams = buf[: hidden.shape[0]]
+
+    def decode_streams(self, rows: int) -> torch.Tensor:
+        """The streams of the decode step just run: ``rows`` rows of the buffer the captured graphs write, or an eager
+        step's own when it ran more rows than the buffer holds."""
+        buf = self.streams_buf
+        return buf[:rows] if buf.shape[0] >= rows else self.last_streams
 
 
 class Qwen4ExpForCausalLM(BaseLLMModel):
@@ -140,6 +166,10 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             quant_config=config.quant,
             prefix="lm_head",
         )
+        if config.mtp_layers:
+            from .mtp import Qwen4ExpMTP
+
+            self.mtp = Qwen4ExpMTP(config)  # the draft head (spec_decode.MTP_ENABLED)
         super().__init__()
 
     def load_host_tables(self, engine_config) -> int:

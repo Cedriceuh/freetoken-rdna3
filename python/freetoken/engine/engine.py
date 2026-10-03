@@ -9,6 +9,7 @@ from datetime import timedelta
 from typing import Any, Dict, Iterable, NamedTuple, Tuple
 
 import torch
+from freetoken.spec_decode import MTP_ENABLED, SPEC_M, apply_rollback
 from freetoken.attention import AttnType, attention_backend_info, create_attention_backend
 from freetoken.core import Batch, Context, Req, set_global_ctx
 from freetoken.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
@@ -76,6 +77,35 @@ def _startup_kv_budget(memory_ratio: float, init_free_memory: int, new_free_memo
     what the resident model consumed. Kept as a pure function so the composition with the
     pool families' ``solve_num_pages`` stays CPU-testable."""
     return int(memory_ratio * init_free_memory) - (init_free_memory - new_free_memory)
+
+
+def _lock_memory() -> None:
+    """FREETOKEN_MLOCK (default on): lock this process's pages once the model is loaded (mlockall, current and future
+    pages, on fault). The GPU driver maps the registered host memory (expert banks, RAM tier, the runtime's pinned
+    buffers) without pinning it: when the kernel compacts memory and moves one of its pages, the driver stops every GPU
+    queue of the process for seconds while it revalidates. With vm.compact_unevictable_allowed=0, compaction leaves
+    locked pages where they are (docs/rdna3/troubleshooting.md)."""
+    import ctypes
+    import resource
+
+    if os.environ.get("FREETOKEN_MLOCK", "1") == "0":
+        return
+    if resource.getrlimit(resource.RLIMIT_MEMLOCK)[0] != resource.RLIM_INFINITY:
+        # with a finite limit, locking future pages would make allocations fail once it is reached
+        logger.info_rank0("memory not locked: RLIMIT_MEMLOCK is finite (rdna3/serve.sh runs with --ulimit memlock=-1)")
+        return
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.mlockall(1 | 2 | 4) != 0:  # MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT
+        logger.warning(f"mlockall failed ({os.strerror(ctypes.get_errno())}): memory compaction can stall the GPUs "
+                       "for seconds (docs/rdna3/troubleshooting.md)")
+        return
+    try:
+        allowed = open("/proc/sys/vm/compact_unevictable_allowed").read().strip()
+    except OSError:
+        return
+    if allowed != "0":
+        logger.warning_rank0("vm.compact_unevictable_allowed is 1: memory compaction can still move this process's "
+                             "pages and stall the GPUs for seconds (docs/rdna3/troubleshooting.md)")
 
 
 def _page_table_width(max_seq_len: int, page_size: int) -> int:
@@ -324,6 +354,11 @@ class ForwardOutput(NamedTuple):
     next_tokens_gpu: torch.Tensor
     next_tokens_cpu: torch.Tensor
     copy_done_event: torch.cuda.Event
+    # spec_decode with the MTP head: each request's draft for the position after its last kept token
+    drafts_gpu: torch.Tensor | None = None
+    # spec_decode verify step: rows kept per request (next_tokens are then [B, m], the first n_acc valid)
+    n_acc_gpu: torch.Tensor | None = None
+    n_acc_cpu: torch.Tensor | None = None
 
 
 class Engine:
@@ -360,6 +395,9 @@ class Engine:
         set_rope_device(self.device)
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
+        if MTP_ENABLED and getattr(self.model, "mtp", None) is None:
+            raise ValueError("FREETOKEN_MTP=1, but this model has no MTP head (only Qwen3.8-Flash-Next has one here): "
+                             "unset it, or start with rdna3/serve.sh --no-mtp")
         self._load_weights(config)
         if config.active_encoders:
             from freetoken.models.blocks import SupportsMultimodal
@@ -500,6 +538,7 @@ class Engine:
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
             self._warmup_prefill()
+        _lock_memory()
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         use_pynccl = config.use_pynccl
@@ -986,6 +1025,11 @@ class Engine:
             # cross-rank-min baseline with this rank's own sizes, so the ranks could disagree and one would tear
             # down (and hit collectives) while the other rejects. Same env on every rank: all reject together.
             raise CacheRebuildRejected("runtime cache rebuild is not supported with FREETOKEN_TP_SPLIT")
+        if SPEC_M > 1:
+            # spec_decode registers its rollback targets on the GDN, conv and PLE state tensors once, before the first
+            # capture: a rebuild that replaced those pools would leave every rollback writing into the old tensors.
+            raise CacheRebuildRejected("runtime cache rebuild is not supported with FREETOKEN_SPEC_VERIFY_M > 1 "
+                                       "(the MTP head); restart the server with the new sizes instead")
 
         # 0a. Geometry prevalidation BEFORE any destructive free. An invalid target (moe
         #     slots on a model with no offload cache, moe below num_experts / above the
@@ -1120,6 +1164,15 @@ class Engine:
         if batch.mm_gather_plan:
             self._run_mm_encoder(batch)
         use_graph = self.graph_runner.can_use_cuda_graph(batch)
+        timer = self.__dict__.get("_spec_timer")
+        if timer is None:
+            from freetoken.spec_decode import SpecTimer
+
+            timer = self._spec_timer = SpecTimer(self.stream)
+        if batch.is_decode:
+            timer.mark("start")
+        else:
+            timer.prefill()
         prof = self.__dict__.get("_ftprof")
         if prof is None:
             from freetoken.engine.ftprof import DecodeProfiler
@@ -1130,14 +1183,30 @@ class Engine:
         with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph):
             logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
         prof.end(counted)
+        if batch.is_decode:
+            timer.mark("forward")
         if self.cpu_moe_executor is not None:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.
             self.cpu_moe_executor.raise_if_unhealthy()
 
+        verify = batch.is_decode and batch.spec_m > 1 and MTP_ENABLED
+        if verify:
+            # spec_decode verify step with the MTP head: the scheduler advances each request by the rows it
+            # keeps once they are known (non-overlap scheduling)
+            out = self._verify_step(batch, logits, args)
+            timer.end((batch.size, batch.spec_m))
+            return out
         for req in batch.reqs:
             req.complete_one()
 
+        if batch.is_decode and batch.spec_m > 1:
+            # spec_decode verify step without a draft model: keep each request's first row, roll the
+            # recurrent states back to it (every padded request, so the dummy slot stays consistent too)
+            logits = logits.view(-1, batch.spec_m, logits.shape[-1])[:, 0]
+            slots = batch.linear_table_idx
+            apply_rollback(slots, torch.ones(slots.numel(), dtype=torch.int64, device=slots.device), self._spec_pad_slot(),
+                           batch.spec_m)
         batch_logits = logits[: batch.size]
         next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
         if args.temperatures is not None and getattr(self, "_sync_sampled_tokens", False):
@@ -1150,10 +1219,223 @@ class Engine:
                     logger.warning(f"TP ranks sampled different tokens in {diff} row(s) of this step "
                                    f"({self._sampled_disagreements} so far); rank 0's are kept")
             torch.distributed.broadcast(next_tokens_gpu, src=0)  # greedy (argmax) needs no sync
+        drafts = None
+        if batch.is_decode:
+            timer.mark("sample")
+        # the sampled tokens go to the host before the MTP head runs (as in _verify_step): a prompt's first token
+        # streams without waiting for the head's pass over the prompt
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
-        return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+        if MTP_ENABLED and getattr(self.model, "mtp", None) is not None:
+            drafts = self._mtp_drafts(batch, next_tokens_gpu, args=args)
+        if batch.is_decode:
+            timer.end((batch.size, batch.spec_m))
+        return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event, drafts)
+
+    @torch.inference_mode()
+    def _verify_step(self, batch: Batch, logits: torch.Tensor, args: BatchSamplingArgs) -> ForwardOutput:
+        """Verification of each request's drafts: rows 0..n_acc-1 are kept. Greedy requests keep the draft prefix that
+        matches the target's argmax; sampling ones accept each draft with the target's probability for it (exact
+        speculative sampling, spec_sample.py). Then the states roll back to the kept rows and the MTP head drafts
+        again from the last kept row. No host sync: n_acc and the tokens go to the host with the step's copy (the
+        acceptance log reads its running sum once every 512 steps)."""
+        m, reqs, real = batch.spec_m, batch.padded_size, batch.size
+        rows = logits.view(reqs, m, logits.shape[-1])
+        tokens = rows.argmax(-1)  # [reqs, m]: the target's choice after each row
+        drafts_in = batch.input_ids.view(reqs, m)[:, 1:].to(tokens.dtype)
+        n_acc = 1 + (tokens[:, :-1] == drafts_in).to(torch.int64).cumprod(-1).sum(-1)
+        if args.temperatures is not None:  # sampled requests: speculative sampling (exact, spec_sample.py)
+            from freetoken.engine.spec_sample import spec_sample
+
+            s_tok, s_acc = spec_sample(rows[:real], drafts_in[:real], args.temperatures, args.top_k, args.top_p,
+                                       args.top_k_max, q=self._draft_q(batch, drafts_in[:real], rows.shape[-1]))
+            if args.greedy_mask is not None:
+                sampled = ~args.greedy_mask.to(torch.bool)[:real]
+            else:
+                sampled = torch.ones(real, dtype=torch.bool, device=tokens.device)
+            tokens[:real] = torch.where(sampled.unsqueeze(-1), s_tok.to(tokens.dtype), tokens[:real])
+            n_acc[:real] = torch.where(sampled, s_acc, n_acc[:real])
+            if getattr(self, "_sync_sampled_tokens", False):  # rank 0's draws, before anything reads them
+                torch.distributed.broadcast(tokens, src=0)
+                torch.distributed.broadcast(n_acc, src=0)
+        apply_rollback(batch.linear_table_idx, n_acc, self._spec_pad_slot(), m)
+        # the kept tokens go to the host before the draft head runs: the scheduler streams them and builds the next
+        # step while the GPU drafts (the next step's kernels queue behind the drafts on this stream)
+        kept, kept_n = tokens[:real].to(torch.int32), n_acc[:real]
+        tokens_cpu, n_acc_cpu = kept.to("cpu", non_blocking=True), kept_n.to("cpu", non_blocking=True)
+        done = torch.cuda.Event()
+        done.record(self.stream)
+        self._spec_timer.mark("verify")
+        drafts = self._mtp_drafts(batch, tokens, n_acc=n_acc, args=args)
+        self._mtp_tally_accept(kept_n)
+        return ForwardOutput(kept, tokens_cpu, done, drafts, kept_n, n_acc_cpu)
+
+    @staticmethod
+    def _draft_q(batch: Batch, drafts: torch.Tensor, vocab: int) -> torch.Tensor | None:
+        """``[reqs, m-1, V]``: the distributions this step's drafts were drawn from (``Req.spec_q``, kept by the
+        drafting step), a point mass for a request whose drafts were its argmax; None when every one was."""
+        m1 = drafts.shape[1]
+        if all(getattr(r, "spec_q", None) is None for r in batch.reqs):
+            return None
+        qs = []
+        for i, req in enumerate(batch.reqs):
+            q = getattr(req, "spec_q", None)
+            if q is None or q.shape[0] < m1:
+                q = torch.zeros(m1, vocab, dtype=torch.float32, device=drafts.device).scatter_(
+                    -1, drafts[i].unsqueeze(-1).to(torch.int64), 1.0)
+            qs.append(q[:m1])
+        return torch.stack(qs)
+
+    def _pick_draft(self, logits: torch.Tensor, real: int, args: BatchSamplingArgs | None
+                    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Each row's draft from the head's ``logits``: its argmax, or for the sampled requests of ``args`` a draw
+        under the request's sampling params, returned with that distribution ``q [real, V]`` (rank 0's draws)."""
+        from freetoken.spec_decode import SPEC_SAMPLED_DRAFTS
+
+        tok = logits.argmax(-1)
+        if args is None or args.temperatures is None or not SPEC_SAMPLED_DRAFTS:
+            return tok, None
+        from freetoken.engine.spec_sample import draft_distribution
+
+        s_tok, q = draft_distribution(logits[:real], args.temperatures, args.top_k, args.top_p, args.top_k_max)
+        if args.greedy_mask is not None:
+            s_tok = torch.where(args.greedy_mask.to(torch.bool)[:real], tok[:real], s_tok)
+        tok = tok.clone()
+        tok[:real] = s_tok
+        if getattr(self, "_sync_sampled_tokens", False):
+            torch.distributed.broadcast(tok, src=0)
+        return tok, q
+
+    def _spec_pad_slot(self) -> int:
+        """The GDN state slot padded rows use: the dummy request's (hybrid: the pool's padding slot; naive: its
+        table row), which no live request owns."""
+        d = self.dummy_req
+        # the dummy always carries the pool's padding slot, but naive mode keys the states by table row
+        if getattr(self.config, "cache_type", None) == "hybrid_radix" and d.linear_slot_idx is not None:
+            return d.linear_slot_idx
+        return d.table_idx
+
+    def _mtp_tally_accept(self, n_acc: torch.Tensor) -> None:
+        acc = self.__dict__.get("_mtp_acc")
+        if acc is None:
+            acc = self._mtp_acc = torch.zeros(2, dtype=torch.int64, device=n_acc.device)
+        acc[0] += n_acc.sum()
+        acc[1] += n_acc.numel()
+        self._mtp_steps = getattr(self, "_mtp_steps", 0) + 1
+        if self._mtp_steps % 512 == 0:
+            kept, n = (int(x) for x in acc.tolist())
+            logger.info_rank0(f"[mtp] {kept / max(n, 1):.3f} tokens per request step over the last 512 steps")
+            acc.zero_()
+
+    @torch.inference_mode()
+    def _mtp_drafts(self, batch: Batch, next_tokens: torch.Tensor, n_acc: torch.Tensor | None = None,
+                    args: BatchSamplingArgs | None = None) -> torch.Tensor | None:
+        """Run the MTP draft head (eagerly, on this forward's metadata) and return each request's guesses for the
+        positions after its last kept token ``[reqs, k]``, k = ``Req.spec_drafts`` (set here). Prefill: over every
+        prompt row, so the head's KV covers the prompt, one guess. Decode: over the step's rows, the guesses chained
+        from the last kept row, as many as the next step may verify (spec_decode.draft_depth); none (None) while more
+        than SPEC_BS_MAX requests decode -- the head then only writes its KV. A sampled request's drafts are draws
+        (``_pick_draft``), their distributions kept in ``Req.spec_q`` for the next verify step."""
+        from freetoken.spec_decode import draft_depth
+
+        model = self.model.model
+        mtp = self.model.mtp
+        streams = model.last_streams
+        ids = batch.input_ids.to(torch.int64)
+        if batch.is_decode:
+            m, reqs = batch.spec_m, batch.padded_size
+            if n_acc is None:  # a plain decode step (one row per request): its sampled token, nothing to verify
+                tok = torch.zeros(reqs, 1, dtype=torch.int64, device=ids.device)
+                tok[: batch.size, 0] = next_tokens.to(torch.int64)
+                next_tokens, n_acc = tok, torch.ones(reqs, dtype=torch.int64, device=ids.device)
+            # row j reads the target's token after row j (valid for j < n_acc)
+            streams = model.decode_streams(reqs * m)
+            next_ids = next_tokens.reshape(-1).to(torch.int64)
+            depth = draft_depth(batch.reqs, m)
+            for req in batch.reqs:
+                req.spec_drafts, req.spec_q = depth, None
+            if depth == 0:
+                with self.ctx.forward_batch(batch):
+                    mtp.forward(streams, model.embed_tokens.forward(next_ids), batch, kv_only=True)
+                self._spec_timer.mark("mtp_kv")
+                return None
+            pick = torch.arange(reqs, device=ids.device) * m + n_acc - 1
+            with self.ctx.forward_batch(batch):
+                # the MoE and the head on each request's last kept row only (one row per request)
+                head_in, streams = mtp.forward(streams, model.embed_tokens.forward(next_ids), batch,
+                                               keep=pick if m > 1 else None)
+                tok, q = self._pick_draft(self.model.lm_head.forward(head_in), batch.size, args)
+                drafts, qs = [tok], [q]
+            self._spec_timer.mark("mtp")
+            # chained guesses: the head's own streams at the last kept row stand for the next position's, one row
+            # per request at the last kept position + j
+            last = batch.positions.view(reqs, m)[:, 0].to(torch.int64) + n_acc - 1
+            for j in range(1, depth):
+                chain = self._chain_batch(batch, last + j)
+                with self.ctx.forward_batch(chain):
+                    head_in, streams = mtp.forward(streams, model.embed_tokens.forward(drafts[-1]), chain)
+                    tok, q = self._pick_draft(self.model.lm_head.forward(head_in), batch.size, args)
+                    drafts.append(tok)
+                    qs.append(q)
+            if depth > 1:
+                self._spec_timer.mark("chain")
+            if qs[0] is not None:
+                q_all = torch.stack(qs, dim=1)  # [real, depth, V]
+                for i, req in enumerate(batch.reqs):
+                    req.spec_q = q_all[i]
+            return torch.stack(drafts, dim=-1).to(torch.int32)[: batch.size]
+        else:
+            last = batch.attn_metadata.get_last_indices(batch.size).to(torch.int64)
+            next_ids = torch.cat([ids[1:], ids[:1]])
+            next_ids[last] = next_tokens.to(torch.int64)
+            # an intermediate chunk's last row reads the prompt token after it, not a sampled one
+            cut = [(i, r.mtp_next_token) for i, r in enumerate(batch.reqs) if getattr(r, "mtp_next_token", None) is not None]
+            if cut:
+                rows = torch.tensor([i for i, _ in cut], dtype=torch.int64, device=ids.device)
+                next_ids[last[rows]] = torch.tensor([t for _, t in cut], dtype=torch.int64, device=ids.device)
+            pick = last
+        embed = model.embed_tokens
+        with self.ctx.forward_batch(batch):
+            if batch.mm_embeds is not None:
+                # image rows carry pad ids above the vocab: unchecked at TP=1, so clamp them and give those rows
+                # zeros, as the vocab-sharded lookup does at TP > 1
+                pad = (next_ids >= embed.num_embeddings).unsqueeze(-1)
+                next_embeds = embed.forward(next_ids.clamp(max=embed.num_embeddings - 1)).masked_fill_(pad, 0)
+            else:
+                next_embeds = embed.forward(next_ids)
+            # every prompt row writes its KV; the MoE and the head run on each prompt's last row only
+            head_in, _ = mtp.forward(streams, next_embeds, batch, keep=pick)
+            model.last_streams = None  # the prompt's streams (~335 MB for a 16k chunk): not kept to the next forward
+            draft_logits = self.model.lm_head.forward(head_in)
+        tok, q = self._pick_draft(draft_logits, batch.size, args)
+        for i, req in enumerate(batch.reqs):
+            req.spec_drafts = 1  # one guess after a prompt: its first decode step verifies at most 2 rows
+            req.spec_q = None if q is None else q[i : i + 1]
+        return tok.to(torch.int32)[: batch.size].unsqueeze(-1)
+
+    def _chain_batch(self, batch: Batch, pos: torch.Tensor) -> Batch:
+        """``batch`` as a one-row-per-request decode step at ``pos [reqs]`` (a chained MTP guess): the same requests,
+        pages and blocks, fresh per-row addressing (the first QSA layer re-plans its index writes)."""
+        import copy
+
+        from freetoken.attention.qsa_sparse import QSASparseMetadata
+
+        reqs = pos.numel()
+        pos32 = pos.to(torch.int32)
+        chain = copy.copy(batch)
+        chain.positions = pos32
+        if batch.mrope_positions is not None:  # past a prompt's image columns: sequence index + the request's delta
+            delta = torch.tensor([r.mrope_delta for r in batch.padded_reqs], dtype=torch.int32, pin_memory=True)
+            chain.mrope_positions = (pos32 + delta.to(pos.device, non_blocking=True)).unsqueeze(0).expand(3, -1).contiguous()
+        chain.out_loc = self.page_table[batch.active_table_idx.to(torch.int64), pos]
+        md = batch.attn_metadata
+        rows = torch.arange(reqs, dtype=torch.int32, device=pos.device)
+        chain.attn_metadata = QSASparseMetadata(
+            is_decode=True, last_indices=rows, qo_indptr_cpu=md.qo_indptr_cpu, kv_len_cpu=md.kv_len_cpu,
+            token_to_req=rows, cu_seqlens=torch.arange(reqs + 1, dtype=torch.int32, device=pos.device),
+            seq_lens=pos32 + 1, ring_slots=md.ring_slots, block_table=md.block_table)
+        return chain
 
     @torch.inference_mode()
     def _warmup_prefill(self) -> None:

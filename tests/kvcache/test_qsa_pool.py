@@ -202,7 +202,7 @@ def test_resolve_pool_class_and_factory():
     spec = _spec()
     mc = SimpleNamespace(
         model_is_mrope=False,
-        num_layers=8, has_swa_attention=False, has_linear_attention=True,
+        num_layers=8, mtp_layers=0, has_swa_attention=False, has_linear_attention=True,
         num_kv_heads=2, head_dim=64, dsv4_args=None,
     )
     mc.kv_cache_group_specs = lambda: (spec,)

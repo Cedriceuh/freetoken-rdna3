@@ -278,6 +278,13 @@ def _causal_conv1d_update_kernel(
     NP2_STATELEN: tl.constexpr,
     USE_PAD_SLOT: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    # spec_decode: the conv state after every token but the last, at snap[token, seq, feature, column]
+    snap_ptr=None,
+    stride_snap_tok=0,
+    stride_snap_seq=0,
+    stride_snap_dim=0,
+    stride_snap_col=0,
+    HAS_SNAP: tl.constexpr = False,
 ):
     idx_seq = tl.program_id(0)
     if idx_seq >= batch:
@@ -403,6 +410,15 @@ def _causal_conv1d_update_kernel(
             col0 = col1
             col1 = col2
             col2 = matrix_x
+
+        if HAS_SNAP:
+            if idx_token < seqlen - 1:
+                snap_base = snap_ptr + idx_token * stride_snap_tok + idx_seq * stride_snap_seq + idx_feats * stride_snap_dim
+                tl.store(snap_base, col0.to(snap_ptr.dtype.element_ty), mask=mask_w)
+                if KERNEL_WIDTH >= 3:
+                    tl.store(snap_base + stride_snap_col, col1.to(snap_ptr.dtype.element_ty), mask=mask_w)
+                if KERNEL_WIDTH >= 4:
+                    tl.store(snap_base + 2 * stride_snap_col, col2.to(snap_ptr.dtype.element_ty), mask=mask_w)
 
         if SILU_ACTIVATION:
             acc = acc / (1 + tl.exp(-acc))
@@ -587,6 +603,47 @@ def causal_conv1d_decode(
     return out.squeeze(-1)
 
 
+def causal_conv1d_decode_rows(
+    x: torch.Tensor,                # [batch, rows, conv_dim]: each request's tokens, in order
+    conv_state: torch.Tensor,       # [num_slots, conv_dim, state_len>=kernel-1] (in place: after the last row)
+    weight: torch.Tensor,           # [conv_dim, kernel]
+    conv_state_indices: torch.Tensor,  # [batch] int32
+    snapshots: torch.Tensor | None = None,  # [rows-1, batch, conv_dim, state_len]: the state after each row but the last
+) -> torch.Tensor:
+    """Several tokens per request in one launch (a spec_decode verify step), each computed exactly as a single-token
+    update would (the same taps in the same order), silu applied. Returns ``[batch, rows, conv_dim]``."""
+    conv_state_indices = conv_state_indices.to(torch.int32)
+    batch, rows, dim = x.shape
+    _, width = weight.shape
+    assert 2 <= width <= 4, f"causal_conv1d triton fallback supports width 2..4, got {width}"
+    num_cache_lines, _, _ = conv_state.size()
+    xt = x.permute(0, 2, 1)  # [batch, dim, rows] view: the kernel's token axis
+    out = torch.empty_like(x)
+    ot = out.permute(0, 2, 1)
+    snap_args = {}
+    if snapshots is not None and rows > 1:
+        snap_args = dict(snap_ptr=snapshots, stride_snap_tok=snapshots.stride(0), stride_snap_seq=snapshots.stride(1),
+                         stride_snap_dim=snapshots.stride(2), stride_snap_col=snapshots.stride(3), HAS_SNAP=True)
+
+    def grid(META):
+        return (batch, triton.cdiv(dim, META["BLOCK_N"]))
+
+    _causal_conv1d_update_kernel[grid](
+        xt, weight, None, conv_state, conv_state_indices, ot,
+        batch, dim, rows, width - 1, num_cache_lines,
+        xt.stride(0), xt.stride(1), xt.stride(2),
+        weight.stride(0), weight.stride(1),
+        conv_state.stride(0), conv_state.stride(1), conv_state.stride(2),
+        conv_state_indices.stride(0),
+        ot.stride(0), ot.stride(1), ot.stride(2),
+        PAD_SLOT_ID,
+        HAS_BIAS=False, KERNEL_WIDTH=width, SILU_ACTIVATION=True, IS_CONTINUOUS_BATCHING=True,
+        NP2_STATELEN=triton.next_power_of_2(width - 1), USE_PAD_SLOT=True, BLOCK_N=128,
+        num_warps=4, num_stages=2, **snap_args,
+    )
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Public fallback API (names/signatures kept exactly as kernel/causal_conv1d.py
 # expects; thin adapters over the tuned varlen / decode entrypoints).
@@ -677,5 +734,6 @@ __all__ = [
     "causal_conv1d_update",
     "causal_conv1d_varlen",
     "causal_conv1d_decode",
+    "causal_conv1d_decode_rows",
     "PAD_SLOT_ID",
 ]

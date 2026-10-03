@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Dict, List
 import torch
 from freetoken.core import Batch, Req, get_global_ctx
 from freetoken.distributed import get_tp_info
+from freetoken.spec_decode import SPEC_BS_MAX, SPEC_M, SPEC_MS
 from freetoken.utils import init_logger, mem_GB
 from freetoken.utils.progress import emit_progress
 from tqdm import tqdm
@@ -28,50 +29,51 @@ class GraphCaptureBuffer:
     mrope_positions: torch.Tensor | None
     logits: torch.Tensor
     table_idx: torch.Tensor  # per-request slot id for GatedDeltaNet state gather/scatter
-    # Decode GDN query indptr = arange(bs+1); a constant per captured bs, filled once.
-    fla_cu_seqlens: torch.Tensor
+    # Decode GDN query indptr = arange(bs+1) * rows per request; one constant per captured row count, filled once.
+    fla_cu_seqlens: dict
 
     @classmethod
     def init(
         cls, bs: int, vocab_size: int, device: torch.device, mrope: bool = False
     ) -> GraphCaptureBuffer:
+        rows = bs * SPEC_M  # token rows: SPEC_M per request (spec_decode; 1 = plain decode)
         return GraphCaptureBuffer(
-            input_ids=torch.zeros(bs, dtype=torch.int32, device=device),
-            out_loc=torch.zeros(bs, dtype=torch.int32, device=device),
-            positions=torch.zeros(bs, dtype=torch.int32, device=device),
+            input_ids=torch.zeros(rows, dtype=torch.int32, device=device),
+            out_loc=torch.zeros(rows, dtype=torch.int32, device=device),
+            positions=torch.zeros(rows, dtype=torch.int32, device=device),
             mrope_positions=(
-                torch.zeros(3, bs, dtype=torch.int32, device=device) if mrope else None
+                torch.zeros(3, rows, dtype=torch.int32, device=device) if mrope else None
             ),
-            logits=torch.empty(bs, vocab_size, dtype=torch.float32, device=device),
+            logits=torch.empty(rows, vocab_size, dtype=torch.float32, device=device),
             table_idx=torch.zeros(bs, dtype=torch.int32, device=device),
-            fla_cu_seqlens=torch.arange(bs + 1, dtype=torch.int32, device=device),
+            fla_cu_seqlens={m: torch.arange(bs + 1, dtype=torch.int32, device=device) * m for m in SPEC_MS},
         )
 
     def set_batch(self, batch: Batch) -> None:
         from freetoken.attention.linear import FLAMetadata
 
-        _slice = slice(batch.padded_size)
-        bs = batch.padded_size
-        batch.input_ids = self.input_ids[_slice]
-        batch.out_loc = self.out_loc[_slice]
-        batch.positions = self.positions[_slice]
+        bs, m = batch.padded_size, batch.spec_m
+        _slice, _rows = slice(bs), slice(bs * m)
+        batch.input_ids = self.input_ids[_rows]
+        batch.out_loc = self.out_loc[_rows]
+        batch.positions = self.positions[_rows]
         if self.mrope_positions is not None:
-            batch.mrope_positions = self.mrope_positions[:, _slice]
+            batch.mrope_positions = self.mrope_positions[:, _rows]
         batch.linear_table_idx = self.table_idx[_slice]
         # Decode GDN metadata reads the persistent cu_seqlens (constant arange) and the
         # persistent table_idx slot map, so the captured kernels see stable addresses.
         batch.fla_metadata = FLAMetadata(
-            cu_seqlens=self.fla_cu_seqlens[: bs + 1], cache_indices=self.table_idx[_slice]
+            cu_seqlens=self.fla_cu_seqlens[m][: bs + 1], cache_indices=self.table_idx[_slice]
         )
 
     def copy_from(self, batch: Batch) -> None:
-        _slice = slice(batch.padded_size)
-        self.input_ids[_slice] = batch.input_ids
+        _slice, _rows = slice(batch.padded_size), slice(batch.padded_size * batch.spec_m)
+        self.input_ids[_rows] = batch.input_ids
         if batch.out_loc is not None:
-            self.out_loc[_slice] = batch.out_loc
-        self.positions[_slice] = batch.positions
+            self.out_loc[_rows] = batch.out_loc
+        self.positions[_rows] = batch.positions
         if self.mrope_positions is not None:
-            self.mrope_positions[:, _slice] = batch.mrope_positions
+            self.mrope_positions[:, _rows] = batch.mrope_positions
         if batch.linear_table_idx is not None:
             self.table_idx[_slice] = batch.linear_table_idx
 
@@ -149,9 +151,14 @@ class GraphRunner:
         # reads it as an indeterminate phase and animates the bar. Must precede the
         # graphs-disabled early return so that config gets the phase too.
         emit_progress("Capturing CUDA graphs / warming up", 0, 0)
-        self.graph_map: Dict[int, torch.cuda.CUDAGraph] = {}
+        self.graph_map: Dict[tuple[int, int], torch.cuda.CUDAGraph] = {}  # (batch size, rows per request)
         if self.max_graph_bs == 0:
             return logger.info_rank0("CUDA graph is disabled.")
+        if SPEC_M > 1 and SPEC_BS_MAX > self.max_graph_bs:
+            # the verify steps' rollback buffers are sized by the captures: a larger eager verify step would move
+            # them away from the addresses the graphs write
+            raise ValueError(f"FREETOKEN_SPEC_BS_MAX={SPEC_BS_MAX} exceeds the largest CUDA graph batch size "
+                             f"({self.max_graph_bs}): lower it or raise --cuda-graph-max-bs")
 
         self.attn_backend.init_capture_graph(max_seq_len=max_seq_len, bs_list=self.graph_bs_list)
 
@@ -168,20 +175,28 @@ class GraphRunner:
         )
         self._reset_moe_offload_cache()
 
+        # spec_decode: one graph per (batch size, rows per request); the capture batch carries m rows per request.
+        # Steps of more than SPEC_BS_MAX requests run SPEC_MS[0] rows (rows_for), so the other row counts only need
+        # the batch sizes up to SPEC_BS_MAX's padded one. The most rows first (then the most rows per request): the
+        # eager forward before the first capture of each kind sizes the spec_decode buffers for all of them.
+        verify_bs = next((bs for bs in self.graph_bs_list if bs >= SPEC_BS_MAX), self.max_graph_bs)
+        shapes = [(m, bs) for m in SPEC_MS for bs in self.graph_bs_list if m == SPEC_MS[0] or bs <= verify_bs]
         pbar = tqdm(
-            sorted(self.graph_bs_list, reverse=True),
+            sorted(shapes, key=lambda s: (s[0] * s[1], s[0]), reverse=True),
             desc="Preparing for capturing CUDA graphs...",
-            unit="batch",
+            unit="graph",
             disable=not get_tp_info().is_primary(),  # disable for non-primary ranks
         )
         pool = None
-        for bs in pbar:
+        for m, bs in pbar:
+            self.dummy_req.device_len += m - 1
             free_memory = get_free_memory(self.device)
             pbar.desc = f"Capturing graphs: bs = {bs:<3} | avail_mem = {mem_GB(free_memory)}"
             pbar.refresh()
             graph = torch.cuda.CUDAGraph()
             batch = Batch(reqs=[self.dummy_req] * bs, phase="decode")
             batch.padded_reqs = batch.reqs
+            batch.spec_m = m
             self.attn_backend.prepare_for_capture(batch)
             self.buffer.set_batch(batch)
             # capture on the dummy linear-state slot so GatedDeltaNet gather/scatter
@@ -192,30 +207,33 @@ class GraphRunner:
                           else self.dummy_req.table_idx)
             self.buffer.table_idx[:bs].fill_(dummy_slot)
             with get_global_ctx().forward_batch(batch):
-                self.buffer.logits[:bs] = model.forward()
+                self.buffer.logits[: bs * m] = model.forward()
                 # Keep the offload cache warmed for capture. Resetting here forces
                 # CUDA graph capture to replay cold-cache expert copies.
                 with torch.cuda.graph(graph, pool=pool, stream=self.stream):
-                    self.buffer.logits[:bs] = model.forward()
+                    self.buffer.logits[: bs * m] = model.forward()
                 self._reset_moe_offload_cache()
             if pool is None:
                 pool = graph.pool()  # reuse cuda graph handle to reduce memory
-            self.graph_map[bs] = graph
+            self.graph_map[(bs, m)] = graph
+            self.dummy_req.device_len -= m - 1
 
         self._reset_moe_offload_cache()
         free_memory = get_free_memory(self.device)
         logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
 
     def can_use_cuda_graph(self, batch: Batch) -> bool:
-        return batch.is_decode and batch.size <= self.max_graph_bs
+        return batch.is_decode and batch.size <= self.max_graph_bs and any(
+            m == batch.spec_m and bs >= batch.size for bs, m in self.graph_map)
 
     def replay(self, batch: Batch) -> torch.Tensor:
         assert self.can_use_cuda_graph(batch)
         self.buffer.copy_from(batch)
-        g = self.graph_map[batch.padded_size]
+        g = self.graph_map[(batch.padded_size, batch.spec_m)]
         self.attn_backend.prepare_for_replay(batch)
         g.replay()
-        return self.buffer.logits[: batch.size]
+        # a verify step views its logits per padded request ([padded_size, m, V]); a plain step keeps its real rows
+        return self.buffer.logits[: (batch.padded_size if batch.spec_m > 1 else batch.size) * batch.spec_m]
 
     def pad_batch(self, batch: Batch) -> None:
         padded_size = (  # choose the first available batch size

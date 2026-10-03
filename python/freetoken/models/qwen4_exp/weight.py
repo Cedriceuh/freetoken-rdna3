@@ -1,16 +1,18 @@
 """Qwen3.8-Flash-Next checkpoint reader (the NVFP4 and the official block-fp8 releases).
 
-Three separate paths, because the checkpoint's three weight classes live in different places:
+Separate paths, because the checkpoint's weight classes live in different places:
 
 * :func:`iter_weights` -- every dense (non-expert) tensor, with the ``model.language_model.`` prefix stripped and fused where the model expects one buffer. See ``_DenseFuser``.
 * :func:`load_ple_table` -- the 47.7 GiB FP8 n-gram table, 128 checkpoint shards concatenated into one pinned :class:`HostBank`.
 * :func:`nvfp4_expert_spec` -- how the routed NVFP4 experts are named, for the offload cache's expert reader.
+* :func:`iter_expert_pieces` -- with the MTP head (``FREETOKEN_MTP=1``), those experts followed by the head's 512, quantized to NVFP4 from its stacked bf16 ``mtp.layers.0.mlp.experts.*``.
 
-Dropped: ``mtp.*`` (speculative head, including its stacked ``mtp.layers.0.mlp.experts.*``); ``model.visual.*`` is kept only when the model built the tower.
+Dropped: ``mtp.*`` unless the MTP head is built; ``model.visual.*`` is kept only when the model built the tower.
 """
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import re
@@ -91,7 +93,12 @@ _ELEM_DTYPES = {"e4m3": torch.float8_e4m3fn}
 def _rename(raw_name: str) -> str | None:
     """Checkpoint key -> FreeToken state-dict key, or None to skip."""
     if raw_name.startswith("mtp."):
-        return None
+        from freetoken.spec_decode import MTP_ENABLED
+
+        # the draft head's dense tensors keep their names (Qwen4ExpMTP); its stacked experts go to the banks
+        if not MTP_ENABLED or ".mlp.experts." in raw_name or raw_name.endswith(_SCALE_SUFFIXES):
+            return None
+        return raw_name
     if _PLE_TABLE_INFIX in raw_name:
         return None  # n-gram table + its scale: load_ple_table
     if _EXPERT_RE.search(raw_name):
@@ -578,7 +585,71 @@ def nvfp4_expert_spec(model_path: str, config):
     return _NVFP4_SOURCE_SPEC
 
 
+class _CheckpointMoELayers:
+    """``config`` as the checkpoint's own expert reader sees it: without the MTP head's extra bank layers."""
+
+    def __init__(self, config) -> None:
+        self._config = config
+        self.num_moe_layers = config.num_moe_layers - config.mtp_layers
+
+    def __getattr__(self, name):
+        return getattr(self._config, name)
+
+
+def iter_expert_pieces(model_path: str, config, kind, *, parallel: bool = False, workers: int = 8,
+                       chunk: int = 8 << 20):
+    """The family hook of moe/expert_pieces.iter_expert_pieces: None (the generic readers) unless the MTP head is
+    built, in which case the checkpoint's NVFP4 experts are followed by the MTP's 512, quantized to NVFP4 here."""
+    from freetoken.layers.quantization import QuantKind
+    from freetoken.models.nvfp4_banks import iter_nvfp4_expert_pieces
+
+    if getattr(config, "mtp_layers", 0) and kind is not QuantKind.NVFP4:
+        raise ValueError("FREETOKEN_MTP=1 needs an NVFP4 checkpoint (the MTP experts join its NVFP4 expert banks)")
+    if not getattr(config, "mtp_layers", 0):
+        # official FP8 checkpoints share qwen3_5_moe's block-fp8 expert layout; None leaves the generic readers
+        from freetoken.models.qwen3_5_moe.weight import iter_expert_pieces as qwen3_5_pieces
+
+        return qwen3_5_pieces(model_path, config, kind, parallel=parallel, workers=workers, chunk=chunk)
+    main = iter_nvfp4_expert_pieces(model_path, _CheckpointMoELayers(config), _NVFP4_SOURCE_SPEC,
+                                    parallel=parallel, workers=workers, chunk=chunk)
+    return itertools.chain(main, _mtp_expert_pieces(model_path, bank_layer=config.num_moe_layers - 1))
+
+
+def _mtp_expert_pieces(model_path: str, *, bank_layer: int):
+    """One piece per MTP expert in the checkpoint experts' form (``gate`` / ``up`` / ``down`` e2m1 codes, their e4m3
+    ``_scale`` and fp16 ``_global``), quantized from the stacked bf16 ``mtp.layers.0.mlp.experts.*`` (on the GPU)."""
+    from freetoken.models.loader import safetensors_weight_map
+
+    from .mtp import quantize_nvfp4
+
+    folder = download_hf_weight(model_path)
+    weight_map = safetensors_weight_map(folder)
+    names = {leaf: f"mtp.layers.0.mlp.experts.{leaf}" for leaf in ("gate_up_proj", "down_proj")}
+    device = torch.device("cuda", torch.cuda.current_device())
+    stacked = {}
+    for leaf, name in names.items():
+        if name not in weight_map:
+            raise ValueError(f"FREETOKEN_MTP=1: no {name} in this checkpoint (the head's experts are read as stacked "
+                             f"bf16, as RadixArk/Qwen3.8-Flash-Next-NVFP4 ships them)")
+        with safetensors.safe_open(os.path.join(folder, weight_map[name]), framework="pt", device="cpu") as f:
+            stacked[leaf] = f.get_tensor(name)
+        if stacked[leaf].dtype is not torch.bfloat16:
+            raise ValueError(f"FREETOKEN_MTP=1: {name} is {stacked[leaf].dtype}, the head's experts are read as bf16")
+    gate_up, down = stacked["gate_up_proj"], stacked["down_proj"]
+    inter = gate_up.shape[1] // 2
+    for e in range(gate_up.shape[0]):
+        piece = {}
+        gu = gate_up[e].to(device)
+        for role, w in (("gate", gu[:inter]), ("up", gu[inter:]), ("down", down[e].to(device))):
+            codes, scale, glob = quantize_nvfp4(w)
+            piece[role] = codes.cpu().unsqueeze(0)
+            piece[role + "_scale"] = scale.cpu().unsqueeze(0)
+            piece[role + "_global"] = glob.to(torch.float16).cpu().reshape(1, 1)
+        yield bank_layer, e, e + 1, piece
+
+
 __all__ = [
+    "iter_expert_pieces",
     "nvfp4_expert_spec",
     "PleTable",
     "iter_weights",

@@ -184,12 +184,14 @@ class GatedRMSNorm(BaseOP):
         self.eps = eps
         self.activation = activation
 
-    def forward(self, x: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, z: torch.Tensor, rows_per_block: int | None = None) -> torch.Tensor:
+        """``rows_per_block``: rows per kernel program (None: sized by the row count); decode passes 1 so a row's
+        bits do not depend on the rows beside it."""
         from freetoken.kernel.fla import rms_norm_gated
 
         return rms_norm_gated(
             x=x, weight=self.weight, bias=None, z=z, eps=self.eps,
-            is_rms_norm=True, norm_before_gate=True, activation=self.activation,
+            is_rms_norm=True, norm_before_gate=True, activation=self.activation, rows_per_block=rows_per_block,
         )
 
 

@@ -6,6 +6,7 @@ Hash windows are pure functions of ``req.input_ids`` + ``device_len`` (prefix hi
 from __future__ import annotations
 
 import os
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Sequence
@@ -16,7 +17,26 @@ import torch
 from freetoken.mm import MM_PAD_SHIFT_VALUE, restore_placeholder
 
 from freetoken.core import Batch
+
+# FREETOKEN_PLE_FILL_TIMING=N (bench runs): every N decode steps, log the host's mean wait for the step's token
+# readback and the mean fill time after it (wait-sync: the captured graph waits on the fill's flag at the PLE layer;
+# launch-gating: the GPU idles through both, the forward launches after the fill)
+_FILL_TIMING = int(os.environ.get("FREETOKEN_PLE_FILL_TIMING", "0"))
+_FILL_ACC: dict = {}
+
+
+def _fill_tally(m: int, wait: float, fill: float) -> None:
+    w, f, n = _FILL_ACC.get(m, (0.0, 0.0, 0))
+    _FILL_ACC[m] = (w + wait, f + fill, n + 1)
+    if sum(v[2] for v in _FILL_ACC.values()) >= _FILL_TIMING:
+        from freetoken.utils import init_logger
+
+        for rows, (w, f, n) in sorted(_FILL_ACC.items()):
+            init_logger(__name__).info_rank0(f"[ple-fill] {rows} rows, {n} steps: readback wait {w / n * 1e3:.2f} ms, "
+                                             f"fill {f / n * 1e3:.2f} ms")
+        _FILL_ACC.clear()
 from freetoken.kernel.pinned import alloc_pinned_tensor
+from freetoken.spec_decode import rows_of
 from freetoken.utils import init_logger
 
 from .weight import (
@@ -196,18 +216,24 @@ class DiskRowTable:
         eos = self.eos_token_id
         if batch.is_decode:
             reqs = list(batch.reqs)
+            m = rows_of(batch)  # rows per request (spec_decode): the request's token, then its drafts
             if use_graph and self._wait_sync:
                 bs = batch.padded_size
-                self._token_readback[:bs].copy_(batch.input_ids, non_blocking=True)
+                self._token_readback[: bs * m].copy_(batch.input_ids, non_blocking=True)
                 self._readback_event.record(torch.cuda.current_stream(self._device))
 
                 def _complete() -> None:
                     try:
+                        t0 = time.perf_counter() if _FILL_TIMING else 0.0
                         self._readback_event.synchronize()
-                        tokens = self._token_readback[:bs].to(torch.int64).tolist()
-                        runs = [torch.tensor([*self._ple_context(r.input_ids, r.device_len - 1), t], dtype=torch.int64)
-                                for r, t in zip(reqs, tokens)]
+                        t1 = time.perf_counter() if _FILL_TIMING else 0.0
+                        tokens = self._token_readback[: bs * m].to(torch.int64).tolist()
+                        runs = [torch.tensor([*self._ple_context(r.input_ids, r.device_len - 1), *tokens[i * m:(i + 1) * m]],
+                                             dtype=torch.int64)
+                                for i, r in enumerate(reqs)]
                         self.fill(runs, graph=True)
+                        if _FILL_TIMING:
+                            _fill_tally(m, t1 - t0, time.perf_counter() - t1)
                     except BaseException:
                         from freetoken.kernel.row_store import signal
 
@@ -217,10 +243,15 @@ class DiskRowTable:
 
                 return _complete
             # launch-gating: this D2H is the step's readback and orders the fill after sampling
+            t0 = time.perf_counter() if _FILL_TIMING else 0.0
             tokens = batch.input_ids.to("cpu").to(torch.int64).tolist()
-            runs = [torch.tensor([*self._ple_context(r.input_ids, r.device_len - 1), t], dtype=torch.int64)
-                    for r, t in zip(reqs, tokens)]
+            t1 = time.perf_counter() if _FILL_TIMING else 0.0
+            runs = [torch.tensor([*self._ple_context(r.input_ids, r.device_len - 1), *tokens[i * m:(i + 1) * m]],
+                                 dtype=torch.int64)
+                    for i, r in enumerate(reqs)]
             self.fill(runs, graph=use_graph)
+            if _FILL_TIMING:
+                _fill_tally(m, t1 - t0, time.perf_counter() - t1)
             return None
         runs = [
             torch.cat((

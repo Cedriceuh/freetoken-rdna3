@@ -207,7 +207,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
 
         # Cache intermediate states if enabled
         if CACHE_INTERMEDIATE_STATES:
-            if cache_idx >= 0:
+            # steps past the buffer's depth are not kept (spec_decode keeps m-1: the last one is the final state)
+            if cache_idx >= 0 and step_idx < cache_steps:
                 step_offset = step_idx * HV * K * V
                 cache_ptr = (
                     intermediate_states_buffer

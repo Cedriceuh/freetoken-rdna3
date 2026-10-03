@@ -73,10 +73,11 @@ def main() -> None:
     base = {"model": a.model, **nothink}
     tag = f"[run {rng.getrandbits(32):08x}]"  # makes every prompt new to the prefix cache
 
-    # warm-up: the first use of a new image compiles and autotunes kernels, for decode and for prefill
+    # warm-up: the first use of a new image compiles and autotunes kernels, for decode and for prefill, and with the MTP
+    # head a server's first prompt of the cold read's size takes ~1 s more (measured on xtx-xt: 5.4 s, then 4.1)
     post(a.url, {**base, "messages": [{"role": "user", "content": f"{tag} Say hello."}], "max_tokens": 8}, True)
     post(a.url, {**base, "max_tokens": 8, "messages": [
-        {"role": "user", "content": f"{tag} warm-up\n{text(1500, rng)}\nOne word."}]}, True)
+        {"role": "user", "content": f"{tag} warm-up\n{text(8300, rng)}\nOne word."}]}, True)
 
     ttft, tlast, n, _ = post(a.url, {**base, "max_tokens": 512, "messages": [
         {"role": "user", "content": f"{tag} Write a long, detailed technical story about a database migration."}]}, True)

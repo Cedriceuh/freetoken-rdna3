@@ -31,6 +31,8 @@ from freetoken.layers import BaseOP, LinearReplicated
 from freetoken.mm import restore_placeholder
 from freetoken.utils import div_even
 
+from freetoken.spec_decode import SPEC_M, RollbackTarget, register, rows_of
+
 from .config import PLE_CONV_STATE, PLE_NGRAM_STATE
 from .hc import GroupedPlusOneRMSNorm
 
@@ -301,6 +303,7 @@ class PLEMetadata:
     state_slots: torch.Tensor
     fresh_slots: torch.Tensor | None
     is_decode: bool
+    rows_per_req: int = 1  # decode: rows per request (spec_decode verify steps run SPEC_M)
 
 
 def _state_slot(req) -> int:
@@ -351,12 +354,13 @@ def build_ple_metadata(
         bs = slots.numel()
         return PLEMetadata(
             input_ids=input_ids,
-            cu_seqlens=torch.arange(bs + 1, dtype=torch.int32, device=device),
-            seq_lens=(1,) * bs,
+            cu_seqlens=torch.arange(bs + 1, dtype=torch.int32, device=device) * rows_of(batch),
+            seq_lens=(rows_of(batch),) * bs,
             ngram_context=context_pool.index_select(0, slots).long(),
             state_slots=slots,
             fresh_slots=None,
             is_decode=True,
+            rows_per_req=rows_of(batch),
         )
 
     lens = [r.extend_len for r in reqs]
@@ -382,6 +386,24 @@ def build_ple_metadata(
     )
 
 
+_SPEC_WINDOW: list = []  # [the static [reqs, ctx_len + SPEC_M] window buffer] once allocated
+
+
+def _spec_context_window(context_pool: torch.Tensor, window: torch.Tensor) -> None:
+    """Keep this forward's context window where the spec_decode rollback reads it (static buffer)."""
+    reqs, width = window.shape
+    if not _SPEC_WINDOW or _SPEC_WINDOW[0].shape[0] < reqs:
+        assert not torch.cuda.is_current_stream_capturing(), "spec buffers must exist before the capture"
+        # wide enough for SPEC_M rows; a step with fewer fills the first columns (the rollback reads no further)
+        buf = torch.empty((reqs, context_pool.shape[-1] + SPEC_M), dtype=context_pool.dtype, device=window.device)
+        _SPEC_WINDOW[:] = [buf]
+        ctx_len = context_pool.shape[-1]
+        cols = torch.arange(ctx_len, device=window.device)
+        register("ple.ngram_ctx", RollbackTarget(
+            context_pool, lambda step, b: buf[b].gather(1, (step + 1).unsqueeze(1) + cols)))
+    _SPEC_WINDOW[0][:reqs, :width].copy_(window)
+
+
 def commit_ngram_context(meta: PLEMetadata, fla, context_pool: torch.Tensor | None = None) -> None:
     """Roll each request's ``ple_ngram_ctx`` forward past this forward's tokens.
 
@@ -394,7 +416,12 @@ def commit_ngram_context(meta: PLEMetadata, fla, context_pool: torch.Tensor | No
     ids = meta.input_ids.long()
     ctx_len = meta.ngram_context.shape[1]
     steps = torch.arange(ctx_len, device=ids.device)
-    if meta.is_decode:
+    if meta.is_decode and meta.rows_per_req > 1:
+        # m rows per request: the context after row j is window[:, j+1 : j+1+ctx_len]; spec_decode rolls back to it
+        window = torch.cat([meta.ngram_context, ids.view(-1, meta.rows_per_req)], dim=1)
+        _spec_context_window(context_pool, window)
+        nxt = window[:, -ctx_len:]
+    elif meta.is_decode:
         nxt = torch.cat([meta.ngram_context[:, 1:], ids.view(-1, 1)], dim=1)
     else:
         cu = meta.cu_seqlens.long()
@@ -451,6 +478,9 @@ class NGramEmbedding(BaseOP):
         """The hash window as ``(packed [B, W], select)``, where ``select`` picks this forward's tokens."""
         ids = meta.input_ids.long()
         ctx_len = self.ngram_size - 1
+        if meta.is_decode and meta.rows_per_req > 1:
+            m = meta.rows_per_req
+            return torch.cat([meta.ngram_context, ids.view(-1, m)], dim=1), lambda t: t[:, -m:].reshape(-1)
         if meta.is_decode:
             # a window of exactly ngram_size columns holds every shift the hash can reach
             return torch.cat([meta.ngram_context, ids.view(-1, 1)], dim=1), lambda t: t[:, -1]
@@ -759,6 +789,8 @@ class PLELayer(BaseOP):
     ) -> torch.Tensor:
         """Batched tap read: taps t-9, t-6, t-3 come off the state slab, tap t from this token."""
         state = self._read_state(meta, states, x.dtype)
+        if meta.rows_per_req > 1:
+            return self._spec_decode_conv(x, meta, states, state)
         column = x.unsqueeze(-1)
         # fp32 products, like the conv1d the prefill path runs
         window = torch.cat([state[..., :: self.dilation], column], dim=-1).float()
@@ -767,6 +799,28 @@ class PLELayer(BaseOP):
             0, meta.state_slots, torch.cat([state[..., 1:], column], dim=-1).to(states.dtype)
         )
         return F.silu(out.to(x.dtype))
+
+    def _spec_decode_conv(self, x, meta: PLEMetadata, states: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
+        """``m`` rows per request: the 4-tap step row by row, the state kept after every row but the last."""
+        m = meta.rows_per_req
+        reqs = x.shape[0] // m
+        rows = x.view(reqs, m, -1)
+        snaps = getattr(self, "_spec_snaps", None)
+        if snaps is None or snaps.shape[1] < reqs:
+            assert not torch.cuda.is_current_stream_capturing(), "spec buffers must exist before the capture"
+            snaps = self._spec_snaps = states.new_empty((SPEC_M - 1, reqs, *states.shape[1:]))  # any step's rows
+            register(f"ple{self.layer_id}.conv", RollbackTarget(states, lambda step, b: snaps[step, b]))
+        weight = self.conv1d.weight.squeeze(1).float()
+        outs = []
+        for j in range(m):
+            column = rows[:, j].unsqueeze(-1)
+            window = torch.cat([state[..., :: self.dilation], column], dim=-1).float()
+            outs.append((window * weight).sum(-1))
+            state = torch.cat([state[..., 1:], column], dim=-1)
+            if j < m - 1:
+                snaps[j, :reqs].copy_(state.to(states.dtype))
+        states.index_copy_(0, meta.state_slots, state.to(states.dtype))
+        return F.silu(torch.stack(outs, dim=1).reshape(reqs * m, -1).to(x.dtype))
 
     def _prefill_conv(
         self, x: torch.Tensor, meta: PLEMetadata, states: torch.Tensor

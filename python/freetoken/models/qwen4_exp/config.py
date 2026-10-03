@@ -169,6 +169,16 @@ def parse_config(hf_config: Any) -> ModelConfig:
         ),
         mrope_layout=mrope_layout_from_rope_params(rope_params),
     )
+    from freetoken.spec_decode import MTP_ENABLED, MTP_REQUESTED
+
+    if MTP_REQUESTED and not MTP_ENABLED:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "FREETOKEN_MTP=1 without FREETOKEN_SPEC_VERIFY_M > 1: nothing would verify the drafts, the MTP head is not loaded")
+    # the MTP draft head is one more full-attention layer, numbered after the decoder stack
+    mtp_layers = 1 if MTP_ENABLED else 0
+    full_ids = full_ids + tuple(range(text.num_hidden_layers, text.num_hidden_layers + mtp_layers))
     full_group = FullAttentionGroupConfig(
         name="full",
         layer_ids=full_ids,
@@ -258,6 +268,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         expert_quant=expert_quant,
         qwen4_args=qwen4_args,
         slot_states=ple_slot_states(qwen4_args),
+        mtp_layers=mtp_layers,
     )
 
 

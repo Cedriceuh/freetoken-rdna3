@@ -64,6 +64,10 @@ class Req:
     # handler must not free resources under an in-flight forward; it sets this flag and
     # _process_last_data frees the request when the batch drains (after copy_done.synchronize).
     aborted: bool = False
+    # Pages are allocated through page_ceil(max(cached_len, alloc_len)), alloc_len being the longest length pages were
+    # allocated for: a spec_decode verify step allocates its draft rows ahead of device_len, so the next step must not
+    # allocate those pages again.
+    alloc_len: int = 0
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
@@ -154,6 +158,8 @@ class Batch:
     # _prepare_batch succeeds. Continuation chunks leave this empty, so accounting is
     # exactly-once.
     prompt_admissions: List[Tuple[int, int, int]] = field(default_factory=list, init=False)
+    # decode: rows per request (spec_decode verify steps run several; set by the scheduler / the graph capture)
+    spec_m: int = field(default=1, init=False)
 
     @property
     def is_prefill(self) -> bool:

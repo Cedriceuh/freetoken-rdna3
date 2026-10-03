@@ -291,6 +291,9 @@ class ModelConfig:
     # sparse MoE block (GLM-4: 3). Experts (and the offload cache) therefore only exist
     # for layers ``[first_k_dense_replace, num_layers)``.
     first_k_dense_replace: int = 0
+    # Extra MoE layers after the decoder stack (qwen4_exp's MTP draft head, spec_decode.MTP_ENABLED): their
+    # experts are offload-cache bank layers num_layers .. num_layers + mtp_layers - 1.
+    mtp_layers: int = 0
     # Always-on shared expert(s) added to every MoE layer's output (GLM-4: 1).
     n_shared_experts: int = 0
     # Selected-expert weights are multiplied by this after renormalization (GLM-4: 2.5).
@@ -355,7 +358,7 @@ class ModelConfig:
         Models with leading dense layers (``first_k_dense_replace`` > 0, e.g. GLM-4)
         only store experts for the trailing layers; everything else has all layers MoE.
         """
-        return self.num_layers - self.first_k_dense_replace
+        return self.num_layers - self.first_k_dense_replace + self.mtp_layers
 
     @property
     def is_multimodal(self) -> bool:

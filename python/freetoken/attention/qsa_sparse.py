@@ -39,6 +39,8 @@ import torch
 from freetoken.core import Batch, get_global_ctx
 from freetoken.utils import init_logger
 
+from freetoken.spec_decode import SPEC_M, SPEC_MS, rows_of
+
 from .base import AttentionSpec, BaseAttnBackend, BaseAttnMetadata
 
 logger = init_logger(__name__)
@@ -232,7 +234,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
             torch.int32
         )
 
-    def _stage_decode(self, md: QSASparseMetadata, bs: int, table_idx: torch.Tensor) -> None:
+    def _stage_decode(self, md: QSASparseMetadata, bs: int, table_idx: torch.Tensor, m: int = 1) -> None:
         """Copy this step's addressing into the static graph buffers and point the metadata
         at them (restage-per-replay, m3/dsa precedent)."""
         self._graph["block_table"][:bs].copy_(
@@ -243,8 +245,8 @@ class QSASparseAttnBackend(BaseAttnBackend):
         md.block_table = self._graph["block_table"][:bs]
         md.seq_lens = self._graph["kvlen"][:bs]
         md.ring_slots = self._graph["table_idx"][:bs]
-        md.token_to_req = self._graph["token_to_req"][:bs]
-        md.cu_seqlens = self._graph["cu_seqlens"][: bs + 1]
+        md.token_to_req = self._graph[f"token_to_req{m}"][: bs * m]
+        md.cu_seqlens = self._graph[f"cu_seqlens{m}"][: bs + 1]
 
     def _snapshot_decode(self, md: QSASparseMetadata, batch: Batch) -> None:
         """Eager decode (not graph-staged): this step's rows, once per forward. The live
@@ -255,8 +257,10 @@ class QSASparseAttnBackend(BaseAttnBackend):
         md.ring_slots = table_idx.to(self.device, non_blocking=True)
         md.block_table = self._block_table(md.ring_slots.to(torch.int64))
         md.seq_lens = md.kv_len_cpu.to(self.device, non_blocking=True)
-        md.token_to_req = torch.arange(bs, dtype=torch.int32, device=self.device)
-        md.cu_seqlens = torch.arange(bs + 1, dtype=torch.int32, device=self.device)
+        rows = torch.arange(bs, dtype=torch.int32, device=self.device)
+        m = rows_of(batch)
+        md.token_to_req = rows.repeat_interleave(m) if m > 1 else rows
+        md.cu_seqlens = torch.arange(bs + 1, dtype=torch.int32, device=self.device) * m
 
     # ----- dense layers -------------------------------------------------------------------
     def forward(
@@ -310,6 +314,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
             torch.empty_like(q),
             k_scale=self.kvcache.k_scale(layer_id) if int8 else None,
             v_scale=self.kvcache.v_scale(layer_id) if int8 else None,
+            decode=md.is_decode,
         )
 
     def _plan_index_writes(self, md: QSASparseMetadata, batch: Batch) -> None:
@@ -495,7 +500,8 @@ class QSASparseAttnBackend(BaseAttnBackend):
     # ----- CUDA graph (decode) --------------------------------------------------------------
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
         self.capture_bs = sorted(bs_list)
-        max_bs = max(bs_list)
+        max_reqs = max(bs_list)
+        max_bs = max_reqs * SPEC_M  # query rows: SPEC_M per request (spec_decode)
         width = get_global_ctx().page_table.shape[1]
         pages = -(-width // self.page_size)
         columns = pages * self.cmp_page_size
@@ -506,11 +512,14 @@ class QSASparseAttnBackend(BaseAttnBackend):
             return torch.empty(shape, dtype=dtype, device=self.device)
 
         self._graph = {
-            "block_table": torch.zeros((max_bs, pages), dtype=torch.int32, device=self.device),
-            "kvlen": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
-            "table_idx": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
-            "token_to_req": torch.arange(max_bs, dtype=torch.int32, device=self.device),
-            "cu_seqlens": torch.arange(max_bs + 1, dtype=torch.int32, device=self.device),
+            "block_table": torch.zeros((max_reqs, pages), dtype=torch.int32, device=self.device),
+            "kvlen": torch.zeros(max_reqs, dtype=torch.int32, device=self.device),
+            "table_idx": torch.zeros(max_reqs, dtype=torch.int32, device=self.device),
+            # one set per row count a decode step may run (1 always: a batch without spec rows runs one)
+            **{f"token_to_req{m}": torch.arange(max_reqs, dtype=torch.int32, device=self.device).repeat_interleave(m)
+               for m in sorted(set(SPEC_MS) | {1})},
+            **{f"cu_seqlens{m}": torch.arange(max_reqs + 1, dtype=torch.int32, device=self.device) * m
+               for m in sorted(set(SPEC_MS) | {1})},
             "logits": empty(chunk, columns, dtype=torch.float32),
             "visible": empty(max_bs, dtype=torch.int32),
             "blocks": empty(max_bs, self.block_topk, dtype=torch.int32),
@@ -530,13 +539,13 @@ class QSASparseAttnBackend(BaseAttnBackend):
         dummy = torch.full(
             (bs,), batch.padded_reqs[0].table_idx, dtype=torch.int64, device=self.device
         )
-        self._stage_decode(md, bs, dummy)
+        self._stage_decode(md, bs, dummy, rows_of(batch))
 
     def prepare_for_replay(self, batch: Batch) -> None:
         md = batch.attn_metadata
         assert isinstance(md, QSASparseMetadata)
         assert batch.active_table_idx is not None, "decode batch is missing its page-table rows"
-        self._stage_decode(md, batch.padded_size, batch.active_table_idx.to(torch.int64))
+        self._stage_decode(md, batch.padded_size, batch.active_table_idx.to(torch.int64), rows_of(batch))
 
     def reset_capture(self) -> None:
         super().reset_capture()

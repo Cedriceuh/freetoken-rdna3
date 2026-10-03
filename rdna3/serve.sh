@@ -19,6 +19,8 @@
 #   --vision           accept image input: builds the vision tower on rank 0 (measured on xtx-xt, xtx and xt:
 #                      docs/rdna3/benchmarks.md); images are scaled down to 1024 tokens (one per 32x32 pixels),
 #                      `-- --image-max-tokens N` changes it
+#   --no-mtp           decode without the MTP draft head the profiles turn on (it speeds up one request at a time;
+#                      docs/rdna3/limits.md)
 #   --dry-run          print the docker command instead of running it
 #
 # The kernel cache (JIT + autotune results) lives in a docker volume named after the image id, so it is built once
@@ -27,7 +29,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DOCKER="$(command -v docker || echo docker)"
 image="freetoken-rdna3:latest" name="freetoken-rdna3" served="qwen3.8-flash-next" host=127.0.0.1 port=1919
-model="" ctx="" gpus="" memory="" dry="" profile="" extra=() mm_args=(--text-model-only)
+model="" ctx="" gpus="" memory="" dry="" no_mtp="" profile="" extra=() mm_args=(--text-model-only)
 
 list_gpus() {  # "hip_index vram_bytes pci_address" per GPU, from the kernel's KFD topology (no GPU context opened):
   # HIP numbers the GPU nodes in topology order
@@ -56,6 +58,7 @@ while [ $# -gt 0 ]; do
     --memory) need "$@"; memory="$2"; shift 2 ;;
     --vision) mm_args=(--image-max-tokens 1024); shift ;;
     --dry-run) dry=1; shift ;;
+    --no-mtp) no_mtp=1; shift ;;
     --list)
       for f in "$HERE"/profiles/*.env; do printf '%-9s %s\n' "$(basename "$f" .env)" "$(sed -n '1s/^# //p' "$f")"; done
       exit 0 ;;
@@ -90,6 +93,7 @@ while IFS= read -r line || [ -n "$line" ]; do
     MEMORY) p_memory="$val" ;;
     TUNABLEOP) p_tunableop="$val" ;;
     FT_ARGS) read -r -a ft_args <<< "$val" ;;
+    FREETOKEN_MTP|FREETOKEN_SPEC_*) [ -n "$no_mtp" ] || envs+=(-e "$key=$val") ;;  # --no-mtp drops the head's settings
     *) envs+=(-e "$key=$val") ;;
   esac
 done < "$pfile"
@@ -115,7 +119,7 @@ if [ -z "$gpus" ]; then
   echo "GPUs: $(printf '%s\n' "${pick[@]}" | LC_ALL=C awk '{printf "%sHIP %s (PCI %s, %.0f GiB)", (NR > 1 ? ", " : ""), $1, $3, $2 / 1073741824}')" >&2
 fi
 mounts=(-v "$model:/models/m:ro")
-if [ "$p_tunableop" = 1 ]; then  # GEMM choices tuned for this image on 7900 XTX / XT (read-only, never tuned online)
+if [ "$p_tunableop" = 1 ]; then  # GEMM choices tuned on 7900 XTX / XT for the ROCm 7.14 image (read-only, never tuned online)
   mounts+=(-v "$HERE/tunableop:/tunableop:ro")
   envs+=(-e PYTORCH_TUNABLEOP_ENABLED=1 -e PYTORCH_TUNABLEOP_TUNING=0 -e PYTORCH_TUNABLEOP_FILENAME=/tunableop/tunableop_results%d.csv)
 fi
@@ -138,9 +142,11 @@ gpu_flags=(--device=/dev/kfd --device=/dev/dri --group-add "$video_gid" --group-
            --security-opt seccomp=unconfined)
 mounts+=(-v "freetoken-rdna3-kcache-$short:/root/.cache/freetoken-rdna3")
 
+# expandable segments: without them the allocator's cache filled the VRAM left free and every 14-16k-token prefill
+# chunk past ~26k of context failed once and retried (xtx-xt, 2026-10-03; none with them, same speed)
 cmd=("$DOCKER" run --rm --init --name "$name" --network host --ipc=host "${gpu_flags[@]}"
      --ulimit memlock=-1 --memory "$memory"
-     -e PYTORCH_ALLOC_CONF=expandable_segments:False -e OMP_WAIT_POLICY=PASSIVE -e "HIP_VISIBLE_DEVICES=$gpus"
+     -e PYTORCH_ALLOC_CONF=expandable_segments:True -e OMP_WAIT_POLICY=PASSIVE -e "HIP_VISIBLE_DEVICES=$gpus"
      "${envs[@]}" "${mounts[@]}"
      "$image_id" ft serve --model /models/m --host "$host" --port "$port" --served-model-name "$served" "${mm_args[@]}"
      --max-seq-len-override "$ctx" --kv-reserve-tokens "$ctx" "${ft_args[@]}" "${extra[@]}")

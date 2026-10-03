@@ -19,9 +19,9 @@ from .weight import (
     load_ple_table,
 )
 
-# Official FP8 checkpoints share qwen3_5_moe's block-fp8 expert layout (same
-# model.language_model.layers.* keys), so reuse its expert reader.
-from freetoken.models.qwen3_5_moe.weight import iter_expert_pieces
+# The MTP head's experts when it is built; otherwise qwen3_5_moe's reader (official FP8 checkpoints share its
+# block-fp8 expert layout, same model.language_model.layers.* keys).
+from .weight import iter_expert_pieces
 
 __all__ = [
     "ftw_side_files",

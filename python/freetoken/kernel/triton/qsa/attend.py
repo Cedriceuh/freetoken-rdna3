@@ -258,9 +258,14 @@ def qsa_sparse_paged_attention(
     out: torch.Tensor | None = None,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
+    decode: bool = False,
 ) -> torch.Tensor:
     """Run sparse GQA directly over paged BF16 K/V caches, or int8 ones with ``[pages, page_size, kv_heads]``
-    fp32 scales (``k_scale`` / ``v_scale``, see kvcache/qsa_pool.py FREETOKEN_QSA_KV_INT8)."""
+    fp32 scales (``k_scale`` / ``v_scale``, see kvcache/qsa_pool.py FREETOKEN_QSA_KV_INT8).
+
+    ``decode``: pick the tile profile as for one query row, whatever the row count, so each decode row gets the
+    bits it would get alone (the split count changes the merge order). Up to 4 rows per rank this is the profile
+    the row count picks anyway; it matters for spec_decode verify steps of several requests."""
 
     if q.ndim != 3 or k_cache.ndim != 4 or v_cache.shape != k_cache.shape:
         raise ValueError("QSA sparse attention received invalid Q/K/V shapes")
@@ -294,7 +299,7 @@ def qsa_sparse_paged_attention(
 
     group_size = q.shape[1] // k_cache.shape[2]
     block_m = triton.next_power_of_2(group_size)
-    base_programs = q.shape[0] * k_cache.shape[2]
+    base_programs = (1 if decode else q.shape[0]) * k_cache.shape[2]
     small_profile_limit = 8 if block_m <= 8 else 4
 
     # Tuned on GB300 for the Qwen-Air TP1, TP2, and TP4 attention shapes.
