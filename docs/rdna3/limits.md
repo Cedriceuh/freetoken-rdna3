@@ -4,13 +4,13 @@
 
 | Profile | RAM used while serving | Machine |
 |---|---:|---|
-| `xtx-xt` | 81 GiB (measured) | 128 GB |
-| `xtx-xtx`, `xt-xt` *(untested)* | ~81 GiB (estimated) | 128 GB |
+| `xtx-xt` | 82 GiB (measured) | 128 GB |
+| `xtx-xtx`, `xt-xt` *(untested)* | ~82 GiB (estimated) | 128 GB |
 | `xtx`, `xt` | ~75 GiB (estimated) | 96 GB is tight, 128 GB comfortable |
 | `gre` *(untested)* | ~72 GiB (estimated) | 96 GB |
 
 Where it goes, for Qwen3.8-Flash-Next: ~63 GiB of experts (the engine keeps **every** expert in pinned RAM, each rank
-its own share of each one; the GPUs cache the most used ones), the RAM tier for conversations (9.0 GiB on two cards,
+its own share of each one; the GPUs cache the most used ones), the RAM tier for conversations (9.5 GiB on two cards,
 ~5 GiB on one; `FREETOKEN_HOST_KV=0` removes it), and a few GiB for the processes. The 51 GB of n-gram tables stay on
 disk and only use the free page cache.
 
@@ -87,11 +87,39 @@ With `--vision`:
 - **Speed on one card.** The tower shares the only card, so the expert cache holds ~165 fewer experts and decode is
   ~1.5-2 % slower. Use `--vision` there only if you send images.
 
+## Speculative decoding (MTP)?
+
+On in the profiles (`FREETOKEN_MTP=1 FREETOKEN_SPEC_VERIFY_M=4`); `rdna3/serve.sh --no-mtp` serves without it
+([options.md](options.md#speculative-decoding-with-the-mtp-head-qwen38-flash-next-experimental)). Measured on `xtx-xt`,
+`xtx` and `xt` with Qwen3.8-Flash-Next ([benchmarks.md](benchmarks.md#speculative-decoding-mtp-head)):
+
+- **One request at a time gains, several do not.** On `xtx-xt`, a request alone decodes 34 % faster at the model's
+  sampling and 30-61 % faster greedy along a sweep to 248k of context (earlier runs: +11-39 % on chat, agent turns, a
+  108k-token context and a 1500-token answer; x1.38 on 60 code and math items). With 2 or more decoding at once, steps
+  run one row per request: from the send to the last token, 2 requests take the same time, 3-4 requests 3-4 % longer.
+- **One card gains less**: +7-8 % at the model's sampling and +6-12 % greedy on `xtx` or `xt`, -8 % time on code and
+  math; one of six sampled test prompts (a long story) is 3-4 % slower. Its step costs keep the verify steps mostly at 2
+  rows: the extra rows' missing experts cross PCIe there.
+- **Greedy answers are unchanged**: identical to plain decode on every profile under ROCm 10 (chat prompts, 60 code and
+  math items, 108k-token turns, the functional checks) and on the 120-item precision set under ROCm 7.14; with the
+  default fp32 GDN state (`FREETOKEN_MAMBA_SSM_DTYPE`). Sampled requests use exact speculative sampling: the same
+  distribution, not the same draws.
+- **Reading a prompt is 0-4 % slower** (the head reads it too; 4-5 % on a 108k-token prompt), and the head takes room
+  in the expert cache (7,127 experts per card on `xtx-xt` instead of 7,395).
+- **Agentic benchmark**: 12 and 18 of 29 in two runs on `xtx-xt` (ROCm 10), in line with the builds before it (12-14).
+- **Not covered**: other cards (`FREETOKEN_SPEC_COSTS` holds the step costs measured on `xtx-xt` and on `xt`), images.
+- **Tool-call snapshots**: the GDN state saved at a tool-call opener for the next turn's prefix reuse is skipped when a
+  verify step jumps over that token; the next turn then reuses less of its prefix. Likewise the state at the end of an
+  answer is not kept when the step that wrote its last token kept rows after it (then the next turn reads that answer
+  again); over 6 turns ending on their own, the reuse was the same as without the head.
+
 ## Anything else to know?
 
 - **No authentication**: the API accepts any request. Keep `--host 127.0.0.1`, or put an authenticating proxy in front
   before serving a network.
-- **Runtime cache rebuild** (`/v1/cache/rebuild`) is refused under an uneven split (the ranks could disagree).
-- **An occasional decode stall**, from a few seconds up to ~21 s, seen on the reference machine in about one run in
-  three on every build measured since 2026-09-28; not understood yet.
+- **Runtime cache rebuild** (`/v1/cache/rebuild`) is refused under an uneven split (the ranks could disagree) and
+  with the MTP head (its rollback holds the state pools): change the sizes by restarting the server.
+- **Host settings matter**: unless `vm.compact_unevictable_allowed=0` keeps memory compaction off the engine's locked
+  memory, the GPU queues stop for 5-22 s each time it moves registered host memory; with the default power profile,
+  the first request after a pause waits ~10 s for the VRAM clock ([troubleshooting.md](troubleshooting.md#long-pauses-in-the-middle-of-a-run)).
 - **Linux only** (the ROCm container needs `/dev/kfd`); no Windows or WSL support.

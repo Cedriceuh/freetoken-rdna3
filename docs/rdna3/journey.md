@@ -1,8 +1,8 @@
 # The journey
 
-How this build came about: five days of measured experiments (2026-09-25 to 2026-09-29) on one machine, an RX 7900
+How this build came about: measured experiments from 2026-09-25 to 2026-10-03 on one machine, an RX 7900
 XTX 24 GB + RX 7900 XT 20 GB (gfx1100, no GPU peer-to-peer), a Threadripper 3970X and 128 GB of DDR4, serving
-Qwen3.8-Flash-Next NVFP4 to the author's coding agent (OpenCode) with a 262k-token context. Every number was measured
+Qwen3.8-Flash-Next NVFP4 to the author's coding agent (OpenCode) with a ~250k-token context (262k until 2026-10-03). Every number was measured
 on that machine (changes in interleaved A/B runs), except the few marked as estimates. The choices and their
 trade-offs are summed up in [decisions.md](decisions.md).
 
@@ -181,7 +181,32 @@ decode -0.5 % (noise), prefill ~1 % faster. The published image itself was measu
 - **Default cap.** 1024 image tokens: a full-HD screenshot of 16-pixel text stays readable, with half the prompt
   tokens of a 2048 cap (1.6 s instead of 1.9 s). Numbers: [benchmarks.md](benchmarks.md#images---vision-xtx-xt).
 
-## 15. Dropped along the way
+## 15. Speculative decoding with the MTP head (2026-10-01)
+
+- **The head.** `mtp.*` is one more decoder layer (full attention, 512 bf16 experts, its own hyper-connection mixer,
+  the main LM head). Replayed offline, its guess matched the next greedy token 0.875 of the time, the same with its
+  experts quantized to NVFP4, so they ride the existing expert banks.
+- **Verify inside the captured step.** A decode step runs m rows per request (the last token, then m - 1 drafts) and
+  keeps the matching prefix. The recurrent states roll back to the last kept row from copies the kernels write after
+  every row (GDN state, conv and PLE windows); attention KV needs nothing.
+- **Where the gain is.** One request, greedy: 55.9 -> 76.9 tok/s at 3 rows once the head chained its own guesses and
+  the kept tokens went to the host before drafting. Then the head's MoE, mixer and LM head ran on the kept row only, and
+  each request picks 2-4 rows from its measured acceptance and the step costs. Up to 4 rows share each int8 weight
+  tile in the GEMVs that loop over K (`FREETOKEN_INT8_ROW_GROUPS`, bit-exact).
+- **Several requests.** Fixed 3 rows at 4 requests: -26 %. So it verifies only while one request decodes; with more,
+  the head only writes its KV and the scheduler overlaps steps as without it.
+- **Bugs found on the way.** The detokenizer repeated text when a request got several tokens in one step; the LM head
+  gathered prompt rows twice (a GPU memory fault). 4 rows were not bit-exact: the GDN output norm picked its rows per
+  program from the row count (also for 4 requests decoding together), and the QSA attention its tile profile; decode
+  now pins both to the one-row choice. A review after the merge (2026-10-03): within a few tokens of the context's end
+  the verify rows and the chained drafts indexed past the page table (now capped by the tokens left), image pad ids
+  reached the head's embedding unchecked at TP=1, and a verify step in flight could let a finishing request donate an
+  over-advanced GDN state to the prefix cache.
+- **Validated.** Greedy answers identical to plain decode on the 120-item precision set (657 -> 426 s), a 124k-token
+  conversation, a 35k-token read and a 1500-token answer. Sampled requests use exact speculative sampling. Numbers:
+  [benchmarks.md](benchmarks.md#speculative-decoding-mtp-head).
+
+## 16. Dropped along the way
 
 | Idea | Why not |
 |---|---|
@@ -192,15 +217,40 @@ decode -0.5 % (noise), prefill ~1 % faster. The published image itself was measu
 | Interleaving decode steps between prefill chunks | hurts the short prefills of agent turns |
 | Even split of the GDN heads under the uneven split | -2.5 % decode |
 | Grouped int8, int8 KV | precision (sections 6 and 8) |
-| Speculative decoding (MTP) | acceptance ~0.6 on real traffic, about break-even |
+| Speculative decoding (MTP), first estimate | acceptance ~0.6 on real traffic, about break-even; measured since (section 15) |
+| Verifying drafts for several requests at once | 2 requests: 60.5 ms a step for 8 rows against 23.7 ms for one row each; 4 requests: 133 against 41.5 ms |
 | Online TunableOp | retunes every new prompt length |
+| TunableOp for the full 16k prefill chunks (ROCm 10) | the dense GEMMs gain 1.5-1.7 % (some shapes lose) and are 5-10 % of a chunk (~0.85 s of GEMMs at 16k rows on rank 0): < 0.2 % on prompt reading |
+| Decoding the NVFP4 codes with integer ops instead of the 16-entry table | exact, but 0.59-0.89x: the expert GEMV is sensitive to every extra instruction (at 4 rows it already reads 764 GB/s, 80 % of the XTX's peak) |
+| Missing experts copied by the expert GEMV itself (the route reads its host bank and fills its slot) | exact, but slower: the GEMV's tiles read PCIe at ~15-19 GB/s against 28 for the copy kernel (64-byte rows for `down`), and no other tile is bit-exact; per layer 1 miss 126 against 99 µs, 3 misses 339 against 207 |
+| HIP graph segment scheduling (`DEBUG_HIP_GRAPH_SEGMENT_SCHEDULING=1`) | a captured graph's independent branches run one after the other by default; with it they overlap a little in a microbenchmark, not measurably on the server |
+| Thread trace (ATT) of the expert GEMV under ROCm 10 | the image's profiler could not load its aqlprofile library, and with it on the loader path the traced process spun for 20 min without a trace |
+| Fusing kernels to save launches | the kernels of a captured step overlap (median gap -2.6 µs); the real bubbles are ~0.26 ms a step |
+| Moving a verify step's PLE fill off its critical path | the ~2 ms wait seen under the profiler is probably its own doing (~30 ms steps under trace against ~16), and busy-waiting on the token readback changed nothing (70.9-85.5 against 71.0-85.5 tok/s) |
+| A bigger tensor-parallel share for the XTX | in decode the XTX waits ~0.9 ms a step for the XT (the all-reduce wait log), but 0.575 and 0.6 overload it in prefill: 0.55 stays |
+| Pinning the registered host memory from the engine (io_uring buffers) against the stall below | the pages stayed put, but compaction kept retrying around them and moved the runtime's own buffers: worse |
+| A larger VRAM margin (`--memory-ratio 0.77`) against the prefill out-of-memory retries | the allocator's cache grew into it: the same retry at the same chunk (expandable segments removed them) |
 
-## 16. Still open
+The stall seen since 2026-09-28 (the GPU stopping for seconds mid-step, in bursts) was found on 2026-10-03: the
+kernel's memory compaction moving host pages the GPU driver maps without pinning, which stops every GPU queue of the
+process for 5-22 s. Turning off proactive compaction was not enough (background reclaim still woke the compaction
+daemon: three stops in nine minutes, once 140 s and a dead server); the engine now locks its memory and
+`vm.compact_unevictable_allowed=0` keeps compaction off it (a forced compaction during decoding: no stop). The prefill
+out-of-memory retries at 14-16k-token chunks past ~26k of context (seen on the ROCm 10 image; 7.14 was not checked) went away with
+expandable segments. After a pause, the VRAM clock stayed at 96 MHz for ~10 s under the default power profile. The
+host settings: [troubleshooting.md](troubleshooting.md#long-pauses-in-the-middle-of-a-run).
 
-- An occasional decode stall (a few seconds, up to ~21 s), in about one run in three, on every build measured since
-  2026-09-28: not understood yet.
+## 17. Still open
+
 - The model needs ~63 GiB of RAM for its experts alone (the engine keeps every expert in RAM, and NVFP4 is the smallest
   format it runs for this model): no 64 GB machine can serve it ([limits.md](limits.md)).
+- ROCm 10 / PyTorch 2.13, the image's base since 2026-10-02: its Triton 3.8 miscompiles these kernels, so the image
+  carries the 7.14 image's Triton 3.7.1. On two cards decode and prompt reading match or beat 7.14, and the PLE
+  wait-sync (`FREETOKEN_PLE_SYNC`) adds 3.5-4 % decode; on one card the same depth sweep gives the same decode on both
+  images (29.5 against 29.1 tok/s at 124k on `xtx`). Greedy answers differ from 7.14 on 2 of 5 prompts; with the MTP head it scored 12 and 18 of 29 on the agentic benchmark. Its `F.linear`
+  changes its sums with the row count for some shapes ((3072, 256), (6656, 2560)): serving does not use it for them
+  (int8 or table GEMVs), but `test_qsa_spec_rows`' toy projections did, which made it fail on 3-4 rows; computed a row
+  at a time they pass (the test now does so).
 - More than two GPUs, other RDNA3 cards, RDNA4 and NVIDIA are untested.
 - Image input (`serve.sh --vision`) is measured on `xtx-xt`, `xtx` and `xt` only. The derived profiles (`xtx-xtx`,
   `xt-xt`, `gre`) are untested with it, as they are without it.

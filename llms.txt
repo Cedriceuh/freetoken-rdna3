@@ -2,9 +2,10 @@
 
 > A tuned build of the FreeToken Mixture-of-Experts inference engine for AMD Radeon RX 7900 XTX / 7900 XT (RDNA3,
 > gfx1100, ROCm), serving Qwen3.8-Flash-Next (125B-parameter MoE, NVFP4) on one or two consumer GPUs with an
-> OpenAI- and Anthropic-compatible API. On an RX 7900 XTX + RX 7900 XT: 55 tok/s decode, 48-53 tok/s up to 255k tokens
-> of context, 4.1-4.5 s to read a cold 8.4k-token prompt (~1870-2050 tok/s), up to 4 concurrent requests (105 tok/s in
-> total); uses ~81 GiB of system RAM for this model.
+> OpenAI- and Anthropic-compatible API. On an RX 7900 XTX + RX 7900 XT, with the model's MTP head drafting tokens (on
+> by default): 77 tok/s decode at the model's sampling (57.5 without the head), 72-86 tok/s greedy up to 248k tokens of
+> context, 4.1 s to read a cold 8.3k-token prompt (~2020 tok/s), up to 4 concurrent requests; uses ~82 GiB of system
+> RAM for this model.
 
 Key facts: the engine keeps every expert in pinned system RAM (~63 GiB for this model in NVFP4, the smallest format it
 runs for it; each rank pins its own share) and caches the most used experts in VRAM; two cards run tensor-parallel
@@ -17,7 +18,7 @@ no measurable cost on two cards and ~1.5-2 % of decode on one. The tuning is
 switched by environment variables (docs/rdna3/options.md gives each default): most of it is off unless a profile turns
 it on; what is on by default is bit-exact, agent-validated, or (the release's sampler rework, exact by kernel tests,
 and its token broadcast, checked in `check`-mode server runs) new and not agent-validated. Precision rule: a change is either bit-exact (identical greedy answers) or validated on an
-agentic benchmark; an int8 KV cache that passed every short test cut the agentic score from 12-14 to 8-9 and is off in
+agentic benchmark (the ROCm 10 base with the MTP head scored 12 and 18 of 29 there); an int8 KV cache that passed every short test cut the agentic score from 12-14 to 8-9 and is off in
 every profile (kept as an experimental option). Tested only on RX 7900 XTX + XT; NVIDIA, RDNA4 and TP>2 untested (this
 model cannot run above TP=2 in this build).
 

@@ -33,6 +33,7 @@ For every `ft serve` flag, see upstream's [CLI reference](../cli.md); the flags 
 | `FREETOKEN_HOST_ALLREDUCE_MAX` | `262144` | Largest message (bytes) that takes the host path; bigger ones stay on RCCL. |
 | `FREETOKEN_HOST_ALLREDUCE_UNCACHED` | `1` | Register the shared pages as uncached fine-grained memory (`0`: default registration). |
 | `FREETOKEN_HOST_ALLREDUCE_TIMEOUT_S` | `300` | How long a rank waits for its peer before trapping (a desynchronized pair must not hang forever); `0` = wait forever. |
+| `FREETOKEN_HOST_ALLREDUCE_WAITLOG` | unset | Debug, `1`: each call stores how long its rank waited for the other one (100 MHz ticks, `[rank][seq % 65536]` after the four slots), and the shared region stays in `/dev/shm` (`freetoken-hostar-*-waitlog`) for a reader inside the container until a clean shutdown (a killed container leaves it: `--ipc=host` puts it in the host's `/dev/shm`, owned by root). Same speed. On `xtx-xt` it showed the XTX waiting ~0.9 ms a decode step for the XT, at every all-reduce. |
 | `FREETOKEN_TP_SYNC_TOKENS` | `1` | `1` broadcasts rank 0's sampled tokens to the other ranks after each sampled step (~15 µs per step). `0` = off; `check` also compares the ranks' draws and logs each disagreement (one sync per step). |
 | `FREETOKEN_FUSE_MOE_ALLREDUCE` | `1` | qwen4_exp at TP>1: one all-reduce per MoE block (routed + shared experts) instead of two. +2.7 % decode, -4.5 % prefill time. Reorders sums, *agent-validated*. |
 | `FREETOKEN_RELAY_HANDSHAKE_MAX_HELLOS` | `2400` | TP>1: how many 50 ms hellos the rank-0 relay sends while the other ranks subscribe (2 minutes). |
@@ -59,6 +60,8 @@ disagreements over ~8k sampled tokens in `check` mode). It is on the torch.distr
 | `FREETOKEN_INT8_DENSE_SKIP` | empty | Comma-separated module names to keep in bf16. |
 | `FREETOKEN_INT8_COMPACT` | `1` | Compact the device allocator after the conversion; without it the freed VRAM stays fragmented and is lost to the expert cache. |
 | `FREETOKEN_INT8_ROWS_MAX` | `8` | Decode batches up to this many rows (concurrent requests) use the row-looped GEMVs (the int8 one and the bf16 Triton one), each row bit-identical to a batch of one; bigger batches dequantize the int8 weight per call (bf16 layers use `F.linear`). |
+| `FREETOKEN_INT8_ROW_GROUPS` | `1` | With several rows (a speculative verify step, or requests decoding together), the int8 GEMVs whose input is longer than one tile (hyper-connection down projections, shared expert gate/up, index projection, LM head) read each weight tile once for up to 4 rows instead of once per row; same arithmetic per row, bit-exact. At 4 rows on the XT: HC down 17.7 -> 12.1 µs, LM head 704 -> 499 µs. `0`: each program runs the rows one after the other, reloading the tile for each. |
+| `FREETOKEN_MOE_COPY_OVERLAP` | unset | `1`: in decode, the copy of the missing experts goes to a side stream ahead of the shared expert and its gate; the expert GEMVs wait for it (offload backend, GPU decode, Qwen3.8-Flash-Next). Bit-exact, but slower: measured end to end on 2026-10-03 (one request, agent turns at 77-99k of context, MTP head on), 47.5 tok/s decode against 71.1 without it (-33 %; 48.9 with `expandable_segments:False`) and cold reads 13 % longer. At short context it does save ~0.5 ms a step (GPU time, as measured before), but in the MTP verify steps at 77-88k of context the forward's GPU time grows from 30-35 to 40-48 ms with the same expert misses (cause not found). Leave it off. |
 | `FREETOKEN_TRITON_GEMV` | `1` on gfx11 | Split-K Triton GEMVs for the bf16 decode shapes of RDNA3 (other GPUs: off). +3.5 % decode on the bf16 build; with `FREETOKEN_INT8_DENSE=1` only the routers are still bf16 and use it. Reorders sums (split-K), *agent-validated*. |
 
 ## Experts (MoE)
@@ -75,8 +78,28 @@ disagreements over ~8k sampled tokens in `check` mode). It is on the torch.distr
 
 | Variable | Default | Effect |
 |---|---|---|
+| `FREETOKEN_PLE_SYNC` | `auto` | How a captured decode step gets its PLE disk rows. `auto` probes the stream memops once at start: `wait-sync` (the step waits inside the graph for the host fill) where a captured wait holds three replays in a row, which on these cards is ROCm 10 and not 7.14; else `launch-gating` (the host fills before each launch). The log says which. `wait`: require memops, `gate`: never use them. ROCm 10 + wait-sync: +3.5-4 % decode, bit-exact. |
 | `FREETOKEN_PLE_CONV_BLOCK` | `4096` | The per-layer-embedding (PLE) convolution runs 4096 tokens at a time, for one or several requests. Keeps big prefill chunks and batched prefills within memory (3 requests prefilled together, 16k tokens, needed 2.6 GiB of temporaries, now 0.7 GiB). Reorders sums; *agent-validated* for one request, identical to the unblocked path in a GPU check with several. |
 | `FREETOKEN_QSA_KV_INT8` | unset | **Experimental, not recommended.** `1`: int8 KV cache for the attention (QSA) layers, 3.19 -> 1.71 GiB per card. Short benchmarks and 227k-token needle tests looked fine, but the agentic benchmark fell from 12-14 to 8-9 bugs fixed and the agent stopped exploring early. |
+
+## Speculative decoding with the MTP head (Qwen3.8-Flash-Next, experimental)
+
+The checkpoint ships a multi-token-prediction head (`mtp.*`: one decoder layer with its own 512 experts). With it, a
+decode step of one request verifies the head's guesses in the same forward: m rows (the last token, then m - 1
+drafts), of which it keeps the matching prefix. How it works and what it costs:
+[decisions.md](decisions.md#speculative-decoding-with-the-mtp-head), measurements:
+[benchmarks.md](benchmarks.md#speculative-decoding-mtp-head). The profiles turn it on (`FREETOKEN_MTP=1`,
+`FREETOKEN_SPEC_VERIFY_M=4`); `rdna3/serve.sh --no-mtp` serves without it.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `FREETOKEN_MTP` | unset (`1` in the profiles) | `1`: load the MTP head (its bf16 experts are quantized to NVFP4 at load and share the expert cache) and draft with it. Only with `FREETOKEN_SPEC_VERIFY_M` > 1 (else a warning, and no head) and an NVFP4 checkpoint whose head experts are stacked bf16 (RadixArk's; others are refused). |
+| `FREETOKEN_SPEC_VERIFY_M` | `1` (`4` in the profiles) | The most rows a verify step runs (1 + drafts). With the head, `4` is the measured setting (the adaptive depth then picks 2-4 rows per request); greedy answers stay identical to plain decode with `FREETOKEN_INT8_DENSE=1`, as every profile sets (bf16 dense layers outside the GEMV table go through `F.linear`, whose sums can change with the row count) and the default fp32 GDN state (`FREETOKEN_MAMBA_SSM_DTYPE`). Without the head, `m` > 1 runs placeholder rows (a cost measurement only). |
+| `FREETOKEN_SPEC_VERIFY_MS` | `1,2,..,M` with the head | The row counts a step may run, each with its CUDA graphs (counts above the smallest only for the batch sizes a verify step can have). Near a request's length limit a step runs no more rows than tokens left. |
+| `FREETOKEN_SPEC_DYNAMIC` | `1` | Each request picks its rows per step (2 to M; with `FREETOKEN_SPEC_BS_MAX` > 1, the most any of the step's requests wants) from its running acceptance per draft position and the step costs below: the count with the most expected tokens per millisecond (with two or more row counts above 1, as by default). `0`: always M. |
+| `FREETOKEN_SPEC_COSTS` | measured, by card count | Step time per row count (ms; only the ratios matter): two cards (`xtx-xt`) `1:17.7,2:25.3,3:30.7,4:35.5`, one card (`xt`) `1:31,2:53,3:78,4:102`, where the extra rows' missing experts cross PCIe and the adaptive depth mostly keeps to 2 rows. Entries given here override. |
+| `FREETOKEN_SPEC_BS_MAX` | `1` | Verify only while at most this many requests decode (at most `--cuda-graph-max-bs`, checked at start). With more, steps run one row per request, the head only writes its KV (so drafts stay good when a request is alone again) and scheduling overlaps as without the head. `2` on two cards, measured 2026-10-03: two agents at ~100k of context decode 33.6-34.4 tok/s each instead of 30.8-31.1, 2-3 short requests finish 3-4 % sooner, 1 and 4 requests take the same time, a sweep to 248k runs without an out-of-memory retry (one of six 3-request rounds took 10.1 s instead of ~8, unexplained; greedy answers as with `1`: two at once identical to each alone, four at once 2 of 4 prompts differ in both, the batched-prefill rounding of [benchmarks.md](benchmarks.md#several-requests-and-agents-at-once-xtx-xt)). Before the adaptive depth, a fixed 4 rows for 2 requests cost 60.5 ms against 23.7 ms for one row each, for 4 requests 133 ms against 41.5 ms; past 8 rows per step answers can change. |
+| `FREETOKEN_SPEC_SAMPLED_DRAFTS` | unset | `1`: a sampled request's drafts are draws from the head under the request's own temperature / top-k / top-p, verified against that distribution, instead of the head's argmax (both exact speculative sampling). Measured: 2-7 % more tokens kept per step, the same speed (120 items at the model's T 1.0: 439 s against 434 s). |
 
 ## Sampling
 
@@ -104,7 +127,7 @@ conversations checked). Added after the agentic benchmark runs.
 | Variable | Default | Effect |
 |---|---|---|
 | `FREETOKEN_HOST_KV` | unset | `1`: enable. Four agents with 82-117k-token contexts, 3 turns each: after the first reads, 35 s instead of 599 s, time to first token ~2 s instead of ~47 s. |
-| `FREETOKEN_HOST_KV_TOKENS` | `262144` | RAM tier size in tokens (Qwen3.8-Flash-Next, TP=2: 4.64 + 4.32 GiB pinned for the two ranks, with the snapshots below). |
+| `FREETOKEN_HOST_KV_TOKENS` | `262144` | RAM tier size in tokens (Qwen3.8-Flash-Next, TP=2: 4.91 + 4.59 GiB pinned for the two ranks with the MTP head, 4.64 + 4.32 without, with the snapshots below). |
 | `FREETOKEN_HOST_KV_SNAPSHOTS` | `24` | GatedDeltaNet state snapshots kept in RAM (50-65 MB each at TP=2). |
 | `FREETOKEN_HOST_KV_LOG` | unset | `1`: log every move to and from RAM. |
 
@@ -115,6 +138,7 @@ Beyond the GPU pool + the RAM tier, the least recently used conversations are dr
 | Variable | Default | Effect |
 |---|---|---|
 | `FREETOKEN_DECODE_INTERLEAVE` | `0` | `N`: after each prefill chunk, the requests already decoding get up to N decode steps before the next chunk. Keeps other agents moving during a long read, but measured to hurt the short prefills of agent turns: keep `0`. |
+| `FREETOKEN_MLOCK` | `1` | Lock the process's memory once the model is loaded (`mlockall`, current and future pages, on fault), so that with `vm.compact_unevictable_allowed=0` the kernel's memory compaction leaves the pages the GPU driver maps alone; each move stopped the GPU queues for seconds ([troubleshooting.md](troubleshooting.md#long-pauses-in-the-middle-of-a-run)). Skipped, with a log line, under a finite `RLIMIT_MEMLOCK`. `0`: off. |
 
 ## Diagnostics (off by default)
 
@@ -124,6 +148,9 @@ Beyond the GPU pool + the RAM tier, the least recently used conversations are dr
 | `FT_MOE_STATS=1` | With `FT_STATS_EVERY`: also the expert-cache miss counters. |
 | `FT_PROF_STEPS=N`, `FT_PROF_START=S` | torch.profiler over N decode steps from step S; tables and a chrome trace in `FT_PROF_DIR`. |
 | `FT_PROF_EAGER=1` | Also profile eager decode (run with `--cuda-graph-max-bs 0`): ROCm's profiler does not see kernels replayed from a CUDA graph. |
+| `FREETOKEN_SPEC_TIMING=N` | Every N decode steps, the GPU and host time of each phase (forward, verify, MTP head, draft chain) per (requests, rows); one stream sync per report. |
+| `FREETOKEN_SPEC_STALL_MS` | `500`; with `FREETOKEN_SPEC_TIMING`, every decode step whose GPU or host time, or distance to the previous step, exceeds it is logged on its own with its phases and the time of day (every rank): to catch the occasional stall. |
+| `FREETOKEN_PLE_FILL_TIMING=N` | Every N decode steps, the host's wait for the step's tokens and the PLE disk fill time after it (the GPU idles through the fill when stream memops are unavailable, as on ROCm 7.14). |
 
 `FT_PROF_DIR` defaults to `./ftprof`, i.e. `/opt/FreeToken/ftprof` inside the container, which is lost when the
 container stops: set `FT_PROF_DIR=/root/.cache/freetoken-rdna3/ftprof` to keep it in the kernel-cache volume, or
@@ -131,16 +158,20 @@ container stops: set `FT_PROF_DIR=/root/.cache/freetoken-rdna3/ftprof` to keep i
 
 ## PyTorch TunableOp
 
-The profiles mount `rdna3/tunableop/` read-only with `PYTORCH_TUNABLEOP_ENABLED=1`, `PYTORCH_TUNABLEOP_TUNING=0`:
-the GEMM algorithm for each of the 89 dense shapes is taken from a file tuned once on these cards (+27 % decode on the
-bf16 build, mostly superseded by int8 but still used by the remaining bf16 GEMMs). Never enable tuning in service
+`TUNABLEOP=1` in a profile mounts `rdna3/tunableop/` read-only with `PYTORCH_TUNABLEOP_ENABLED=1`,
+`PYTORCH_TUNABLEOP_TUNING=0`, and the GEMM algorithm for each of the 89 dense shapes is taken from a file tuned once on
+these cards (+27 % decode on the bf16 ROCm 7.14 build, mostly superseded by int8 since). The profiles set `TUNABLEOP=0`
+since the ROCm 10 image: the files are 7.14's, and tuning for ROCm 10 gained < 0.2 % on prompt reading. Never enable tuning in service
 (`PYTORCH_TUNABLEOP_TUNING=1`): each new prompt length would be tuned on the spot (16 s prefills). The files are tied to
-the image's PyTorch / HIP / hipBLASLt versions, written in their header; to tune for another image, run a
+a PyTorch / HIP / hipBLASLt version, written in their header (ROCm 7.14's: the ROCm 10 image rejects them,
+[troubleshooting.md](troubleshooting.md#warnings-about-tunableop)); to tune for another image, run a
 representative workload once with `PYTORCH_TUNABLEOP_TUNING=1` and a writable `PYTORCH_TUNABLEOP_FILENAME`, then
 freeze.
 
 ## Container settings the engine does not check
 
-`PYTORCH_ALLOC_CONF=expandable_segments:False` and `OMP_WAIT_POLICY=PASSIVE` (set by `serve.sh`), an explicit
+`PYTORCH_ALLOC_CONF=expandable_segments:True` and `OMP_WAIT_POLICY=PASSIVE` (set by `serve.sh`; without expandable
+segments the allocator's cache filled the free VRAM and every 14-16k-token prefill chunk past ~26k of context failed
+once and retried after emptying it, with or without the MTP head and with a larger margin too), an explicit
 `HIP_VISIBLE_DEVICES` (rank 0 first), `--ulimit memlock=-1` (pinned RAM for the experts and the RAM tier) and
 `--ipc=host` (shared memory between the two ranks).

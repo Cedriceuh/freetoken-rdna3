@@ -1,0 +1,30 @@
+<!doctype html>
+<!-- Source of social-preview.png (1280x640, the README banner and the repository's social preview). Every figure comes
+     from docs/rdna3/benchmarks.md; update both together, then render:
+       google-chrome --headless=new --hide-scrollbars --window-size=1280,640 \
+         --screenshot=docs/rdna3/assets/social-preview.png docs/rdna3/assets/social-preview.html -->
+<html><head><meta charset="utf-8"><style>
+  html, body { margin: 0; width: 1280px; height: 640px; background: #1c1d1f; overflow: hidden; }
+  body { font-family: "Noto Sans", "DejaVu Sans", sans-serif; color: #f2f2f2; box-sizing: border-box; padding: 58px 72px; }
+  h1 { font-size: 78px; font-weight: 700; margin: 0; letter-spacing: -1px; }
+  .sub { font-size: 34px; color: #c9cbcf; margin-top: 16px; }
+  .tags { font-size: 27px; color: #8e9196; margin-top: 10px; }
+  .bar { width: 96px; height: 6px; border-radius: 3px; background: #3f86e8; margin: 26px 0 34px; }
+  .tiles { display: flex; gap: 32px; }
+  .tile { flex: 1; min-width: 0; border: 1px solid #3a3c40; border-radius: 14px; background: #232427; padding: 26px 23px 24px; }
+  .num { font-size: 43px; font-weight: 700; white-space: nowrap; }
+  .cap { font-size: 22px; color: #a9acb1; margin-top: 16px; line-height: 1.4; }
+  .foot { position: absolute; left: 72px; bottom: 34px; font-size: 21px; color: #7c7f84; }
+</style></head><body>
+  <h1>freetoken-rdna3</h1>
+  <div class="sub">Big MoE models on AMD Radeon RX 7900 XTX / XT</div>
+  <div class="tags">ROCm &nbsp;·&nbsp; one or two consumer GPUs &nbsp;·&nbsp; OpenAI / Anthropic API</div>
+  <div class="bar"></div>
+  <div class="tiles">
+    <div class="tile"><div class="num">77 tok/s</div><div class="cap">decode, 125B MoE<br>on two cards</div></div>
+    <div class="tile"><div class="num">2.0k tok/s</div><div class="cap">prompt reading:<br>8.3k tokens in 4.1 s</div></div>
+    <div class="tile"><div class="num">250k</div><div class="cap">tokens of context,<br>72-86 tok/s to 248k</div></div>
+    <div class="tile"><div class="num">4 requests</div><div class="cap">decoding at once<br>(parallel sub-agents)</div></div>
+  </div>
+  <div class="foot">A tuned build of the FreeToken engine &nbsp;·&nbsp; Apache-2.0 &nbsp;·&nbsp; measured on RX 7900 XTX + RX 7900 XT</div>
+</body></html>

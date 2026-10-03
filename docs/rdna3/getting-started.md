@@ -7,14 +7,15 @@ From a fresh Linux machine to an OpenAI-compatible endpoint serving Qwen3.8-Flas
 | | Two cards (`xtx-xt`) | One card (`xtx` or `xt`) |
 |---|---|---|
 | GPUs | RX 7900 XTX 24 GB + RX 7900 XT 20 GB | one RX 7900 XTX 24 GB or RX 7900 XT 20 GB |
-| System RAM | 81 GiB used while serving: **128 GB** machine | ~75 GiB used (estimated): **96 GB** is tight, 128 GB comfortable |
-| Disk | ~135 GB for the model, ~30 GB for the image (its ~29 GB base included) | same |
+| System RAM | 82 GiB used while serving: **128 GB** machine | ~75 GiB used (estimated): **96 GB** is tight, 128 GB comfortable |
+| Disk | ~135 GB for the model, ~33 GB for the image (its ROCm 10 base included), ~29 GB more while building | same |
 | Software | Linux x86_64 with the in-kernel `amdgpu` driver (`/dev/kfd` present), Docker | same |
 | Tested on | Ubuntu 26.04 LTS, kernel 7.0 (older kernels untested) | same |
 
-The ROCm user space (7.14), PyTorch and Triton are inside the image: nothing ROCm-related has to be installed on the
+The ROCm user space (10.0), PyTorch and Triton are inside the image: nothing ROCm-related has to be installed on the
 host. Your user must be allowed to run Docker and be in the `video` and `render` groups. Why so much RAM, and what to
-do with less: [limits.md](limits.md).
+do with less: [limits.md](limits.md). Two host settings avoid pauses of several seconds (memory compaction kept off
+the engine's locked memory, the `COMPUTE` power profile): [troubleshooting.md](troubleshooting.md#long-pauses-in-the-middle-of-a-run).
 
 ## 2. Build the image
 
@@ -24,8 +25,9 @@ docker build -f Dockerfile.rdna3 -t freetoken-rdna3:latest .
 ```
 
 Build from a git clone, not from a downloaded archive: the build records the commit it was made from
-(`/opt/FreeToken-BUILD-PROVENANCE.txt` in the image) and fails without `.git`. The first build pulls the ROCm PyTorch
-base image (~29 GB, pinned by digest); after that a rebuild takes a couple of minutes. `--build-arg GPU_ARCH=gfx1100`
+(`/opt/FreeToken-BUILD-PROVENANCE.txt` in the image) and fails without `.git`. The first build pulls two ROCm PyTorch
+images, pinned by digest: the ROCm 10.0 base (31 GB) and the ROCm 7.14 one (29 GB), only for its Triton 3.7.1, which
+`docker image rm` can drop after the build; after that a rebuild takes a couple of minutes. `--build-arg GPU_ARCH=gfx1100`
 is the default and the only architecture tested. Do not use `install.sh` or `scripts/`: they install and build
 upstream's NVIDIA / CUDA wheels.
 
@@ -59,7 +61,8 @@ a choice, `--dry-run` prints the full `docker run` command instead of running it
 (default 1919), `--host` (default 127.0.0.1; 0.0.0.0 serves your network, and the API has no authentication:
 [limits.md](limits.md#anything-else-to-know)), `--ctx`, `--served-name`, `--name`,
 `--image`, `--memory`, `--vision` (image input, off by default:
-[limits.md](limits.md#images-vision)), and `-- <extra ft serve flags>`.
+[limits.md](limits.md#images-vision)), `--no-mtp` (decode without the MTP draft head the profiles turn on:
+[limits.md](limits.md#speculative-decoding-mtp)), and `-- <extra ft serve flags>`.
 
 Loading takes about 2.5 minutes on the reference machine (it reads ~68 GB of experts). The very first start of a new image also compiles and autotunes GPU kernels for a few
 more minutes; the results are kept in a Docker volume (`freetoken-rdna3-kcache-<image id>`), so later starts are fast.
@@ -101,7 +104,7 @@ Anthropic-compatible `/v1/messages`. The API key is not checked (use any string)
 - **Anthropic-compatible clients** (Claude Code, Anthropic SDKs) add `/v1/messages` themselves: base URL
   `http://127.0.0.1:1919` (for Claude Code: `ANTHROPIC_BASE_URL=http://127.0.0.1:1919`, any API key).
 
-For a coding agent, set the context window to the profile's context (262144 for the two-card profiles, 131072 for
+For a coding agent, set the context window to the profile's context (250000 for the two-card profiles, 131072 for
 `xtx` / `xt`, 65536 for `gre`, or your `--ctx`) so the agent compacts at the right time.
 
 ## 7. Run it as a service (optional)

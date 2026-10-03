@@ -91,6 +91,39 @@ the reason. Line counts are `added/removed`. Who wrote what: [credits.md](credit
 | `python/freetoken/attention/qsa_sparse.py`, `kernel/triton/qsa/kv_int8.py` | 3/0, 67/0 | experimental int8 QSA K/V (not recommended) |
 | `tests/kvcache/test_host_kv_tier.py`, `tests/kvcache/test_qsa_kv_int8.py` | new | |
 
+## Speculative decoding with the MTP head
+
+Line counts in this section and the next are relative to `d72e5cb` (0.1.0 plus image input), not to upstream.
+
+| File | Lines | Change |
+|---|---:|---|
+| `python/freetoken/spec_decode.py` | 274/0 | new: rows per step (capped by the tokens a request may still emit), the rollback targets, the adaptive depth with step costs per card count, the phase timing and stall probe |
+| `python/freetoken/models/qwen4_exp/mtp.py` | 106/0 | new: the MTP head, and the NVFP4 quantizer for its bf16 experts |
+| `python/freetoken/models/qwen4_exp/model.py`, `config.py`, `weight.py`, `__init__.py`, `models/config.py` | 30/0, 11/0, 74/3, 3/3, 4/1 | the head built and loaded as layer 48 (not without verify rows; unsupported head layouts refused); the streams it reads kept in buffers stable after capture |
+| `python/freetoken/engine/engine.py` | 253/1 | the verify step, the drafts (chained), the rollback; the first token streamed before the head; image pad ids kept out of the head's lookup; the runtime cache rebuild refused while verify rows are on (the rollback holds the state pools); `FREETOKEN_MTP=1` on a model without the head refused at start |
+| `python/freetoken/engine/spec_sample.py` | 106/0 | new: exact speculative sampling, with each sampler's own truncation |
+| `python/freetoken/engine/graph.py` | 48/30 | a graph set per row count; `FREETOKEN_SPEC_BS_MAX` checked against them |
+| `python/freetoken/scheduler/scheduler.py`, `scheduler/cache.py`, `scheduler/prefill.py`, `scheduler/status.py`, `core.py` | 134/40, 15/2, 2/0, 5/1, 6/0 | rows per step, pages allocated ahead, several kept tokens per step, the overlap loop with the head, no donated state from a verify step in flight; decode throughput counted in tokens |
+| `python/freetoken/models/qwen4_exp/gdn.py`, `ple.py`, `ple_disk.py`, `models/qwen3_5_moe/gdn_kernels.py` | 48/2, 57/3, 37/6, 3/0 | m rows per request, with the states after each row saved; one row per norm program in decode; the PLE fill probe |
+| `python/freetoken/kernel/triton/causal_conv1d_triton.py`, `kernel/fla/fused_sigmoid_gating_recurrent.py`, `kernel/fla/layernorm_gated.py`, `layers/norm.py` | 58/0, 2/1, 7/1, 4/2 | the conv over m rows in one launch; intermediate states; rows per norm program settable |
+| `python/freetoken/kernel/triton/int8_gemv.py` | 53/1 | up to 4 rows share each weight tile (`FREETOKEN_INT8_ROW_GROUPS`) |
+| `python/freetoken/attention/qsa_sparse.py`, `kernel/triton/qsa/attend.py`, `attention/linear.py`, `kvcache/qsa_pool.py`, `kvcache/__init__.py` | 22/13, 7/2, 4/1, 6/2, 2/1 | m rows per request in the attention metadata; decode keeps the one-row tile profile; the index ring sized for the drafts; the head's KV layer |
+| `python/freetoken/layers/embedding.py` | 2/2 | the LM head's one-row shortcut keyed on rows; no second last-row gather |
+| `python/freetoken/tokenizer/detokenize.py` | 20/0 | several tokens of one request in a step |
+| `tests/test_spec_decode.py`, `tests/engine/test_spec_sample.py`, `tests/kernels/test_conv1d_decode_rows.py`, `tests/models/qwen4_exp/test_mtp.py`, `test_qsa_spec_rows.py`, `test_gdn.py`, `tests/scheduler/test_spec_alloc_ahead.py`, `test_scheduler_status.py`, `tests/tokenizer/test_detokenize_multi_token.py`, `tests/layers/test_int8_weight_only.py`, `tests/kvcache/test_qsa_pool.py` | new, except `test_gdn.py` 88/0, `test_scheduler_status.py` 11/0, `test_int8_weight_only.py` 18/0, `test_qsa_pool.py` 1/1 | tests of the above (`test_qsa_spec_rows.py` computes its toy projections a row at a time: ROCm 10's `F.linear` changes its sums with the row count for such shapes) |
+
+## ROCm 10 image, PLE wait-sync, GGUF on ROCm, memory lock
+
+| File | Lines | Change |
+|---|---:|---|
+| `Dockerfile.rdna3` | 23/5 | ROCm 10.0 / PyTorch 2.13 base; installs against its Triton 3.8, then copies the 7.14 image's Triton 3.7.1 over it (3.8 miscompiles these kernels; before the install, pip would replace torch 2.13, which requires its 3.8, with a CUDA one); pyproject's CUDA ceilings lifted at install |
+| `python/freetoken/kernel/gguf.py`, `kernel/csrc/gguf/gguf_kernel.cu`, `dispatch.h`, `gguf_bind.cpp` | 41/8, 249/328, 37/9, new | the GGUF kernels build on ROCm: the torch wrappers in a host-only file (under HIP torch's headers include rocThrust, which the pip SDK lacks), nvcc-only flags for CUDA only, HIP's shuffles for the full-mask ones, the SDK's HIP headers, the shared ROCm link flags |
+| `python/freetoken/kernel/csrc/row_store/row_store_ext.cpp`, `kernel/row_store.py` | 32/4, 40/1 | HIP stream memops for the PLE wait-sync (the probe used to look for the CUDA driver's only); a captured wait must hold three replays with the PLE copy behind it (`FREETOKEN_PLE_SYNC`) |
+| `python/freetoken/kernel/host_allreduce.py`, `kernel/csrc/jit/host_allreduce.cuh` | 20/5, 11/5 | the optional wait log (`FREETOKEN_HOST_ALLREDUCE_WAITLOG`), removed at a clean shutdown |
+| `python/freetoken/layers/moe.py`, `moe/offload_cache.py`, `models/qwen4_exp/moe.py` | 35/0, 20/0, 13/1 | the optional side-stream copy of the missing experts (`FREETOKEN_MOE_COPY_OVERLAP`) |
+| `python/freetoken/engine/engine.py` | 30/0 | the process's memory locked once loaded (`FREETOKEN_MLOCK`) so that, with `vm.compact_unevictable_allowed=0`, memory compaction leaves the pages the GPU driver maps alone; a warning while it is 1 |
+| `tests/kernels/test_row_store.py`, `tests/engine/test_lock_memory.py` | 32/0, new | the captured-wait probe; when the memory lock applies |
+
 ## Tooling and documentation
 
 | File | Change |
@@ -98,6 +131,6 @@ the reason. Line counts are `added/removed`. Who wrote what: [credits.md](credit
 | `python/freetoken/engine/ftprof.py` (93/0) | env-gated decode profiling (`FT_STATS_EVERY`, `FT_PROF_*`) |
 | `python/freetoken/server/args.py` (3/1) | `--cuda-graph-max-bs` help |
 | `Dockerfile.rdna3`, `.dockerignore` | the ROCm image |
-| `rdna3/` | profiles, `serve.sh`, GPU checks, micro-benchmarks, TunableOp files, maintenance tools |
-| `README.md`, `NOTICE`, `CHANGELOG.md`, `llms.txt`, `llms-full.txt`, `AGENTS.md`, `CONTRIBUTING.md`, `SECURITY.md`, `docs/rdna3/` | this repository's documentation; upstream's README moved to `docs/FREETOKEN_UPSTREAM_README.md` |
+| `rdna3/` | profiles (the MTP head on, TunableOp off), `serve.sh` (`--no-mtp`), GPU checks, micro-benchmarks and `bench/depth_sweep.py`, the ROCm 7.14 TunableOp files, maintenance tools |
+| `README.md`, `NOTICE`, `CHANGELOG.md`, `llms.txt`, `llms-full.txt`, `AGENTS.md`, `CONTRIBUTING.md`, `SECURITY.md`, `docs/rdna3/` | this repository's documentation (the banner rendered from `docs/rdna3/assets/social-preview.html`); upstream's README moved to `docs/FREETOKEN_UPSTREAM_README.md` |
 | `.github/` | upstream's release workflows and issue templates replaced by this repository's |

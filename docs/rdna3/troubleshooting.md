@@ -32,11 +32,57 @@ first; one-card profiles take the smallest card with enough VRAM. Force a choice
 - The container needs `--ulimit memlock=-1` (pinned RAM for the experts and the RAM tier) and enough RAM under its
   `--memory` limit (default 110g); an OOM kill shows as exit code 137.
 
-## Long pauses (a few seconds, up to ~21 s) in the middle of a run
+## Long pauses in the middle of a run
 
-A known, not yet understood decode stall, seen on the reference machine in about one run in three on every build
-measured since 2026-09-28. If you catch one with `FT_STATS_EVERY=40` set, the log around it is very welcome in an
-issue.
+Two host settings, both measured on the reference machine on 2026-10-03:
+
+- **Memory compaction.** The GPU driver maps the host memory the engine registers (the expert banks, the RAM tier, the
+  runtime's pinned buffers) without pinning its pages. When the kernel compacts memory and moves one of them, the driver
+  stops every GPU queue of the process while it revalidates the ranges: 5-22 s, on both cards (`echo 1 >
+  /proc/sys/vm/compact_memory` reproduces it). Turning off proactive compaction is not enough: with RAM this full, the
+  kernel's background reclaim wakes the compaction daemon on its own (three stops in nine minutes of benchmark, one cold
+  read taking 17 s instead of 4; once 140 s, and the server died on a collective timeout). The engine locks its memory
+  (`FREETOKEN_MLOCK`, on by default; it needs `--ulimit memlock=-1`, which `serve.sh` passes); this setting keeps
+  compaction off locked pages:
+
+  ```bash
+  printf 'vm.compaction_proactiveness=0\nvm.compact_unevictable_allowed=0\n' | sudo tee /etc/sysctl.d/99-llm-gpu.conf
+  sudo sysctl --system
+  ```
+
+  Then, on `xtx-xt`: the compaction daemon still ran (39 times) but moved none of the engine's pages, and a forced
+  compaction during decoding moved 45k other pages with no stopped queue (longest gap between two tokens 75 ms). Until
+  it is set, the server logs a warning at start. The lock comes once the model is loaded: heavy memory use on the host
+  during the load (another big process starting) can still stop the GPUs for seconds then, which only delays the start. The driver's own count is `evicted_ms` in
+  `/sys/class/kfd/kfd/proc/<pid>/stats_<gpu id>/`.
+- **The VRAM clock after a pause.** With the default power profile the memory clock stayed at 96 MHz for ~10 s after
+  the GPU woke up: the first request after 15 s or more of idle waited 9-13 s for its first token. The `COMPUTE` power
+  profile raises it at once (1.4-1.6 s after each of 16 pauses of 20-90 s) and still lets it drop when idle (13-27 W per
+  card); pinning the clock at its maximum works too but costs ~40 W per card at idle. As root, on every card (LACT's
+  power profile setting keeps it across reboots):
+
+  ```bash
+  echo 5 | sudo tee /sys/class/drm/card*/device/pp_power_profile_mode   # 5 = COMPUTE in that file's list
+  ```
+
+The first request after the server starts still takes ~11 s (host-side warm-up, once). Undervolting, GFXOFF and the
+display's memory power saving were ruled out on 2026-10-02.
+
+## Answers stop mid-sentence
+
+Deep in a long conversation (70-110k tokens of context) the model sometimes ends an answer in the middle of a sentence,
+or of a word, and the later answers of that conversation then often stop early too (the model follows its own history).
+Measured on 2026-10-04 on `xtx-xt`, turns on this repository's code with thinking off and temperature 0.6: 4 of 90
+conversations with the MTP head, 2 of 28 without it. At the stop the end-of-text token had 26-75 % of the probability
+(first or second candidate), so no sampling setting avoids it: the model card's non-thinking settings (temperature 0.7,
+top-p 0.8) give it 29-83 % at the same places, its thinking ones (1.0, top-p 0.95) 35-56 %. Replayed token for token,
+one stop kept a large end-of-text probability from a fresh prefill as from the prefix cache, with
+`FREETOKEN_QSA_TORCH_TOPK=1` and with `FREETOKEN_INT8_DENSE=0`: 34-98 % depending on the path (that sensitive to
+rounding). So it is not the MTP head, the prefix cache or the RAM tier, the attention's block selection kernel, the int8
+dense layers or the sampler (320k draws checked, and the speculative sampling's own tests); whether the unquantized
+model does the same was not checked. With thinking on, as the reference machine's agent client sends it (temperature
+0.6, the reasoning kept in the history), 15 conversations and 90 turns of ~1800 tokens had no such stop, too few to say
+it does not happen there. When it happens, ask the agent to go on, or start a new conversation.
 
 ## Sampling hangs
 
@@ -47,8 +93,10 @@ for that card (GPU 0 otherwise; each mode is killed after 90 s). Always smoke-te
 
 ## Warnings about TunableOp
 
-The files in `rdna3/tunableop/` match this image's PyTorch / HIP / hipBLASLt versions. With another base image, set
-`TUNABLEOP=0` in your profile (or tune once, see [options.md](options.md#pytorch-tunableop)).
+Only with `TUNABLEOP=1` in a profile (off in the shipped ones): the files in `rdna3/tunableop/` were tuned on the ROCm
+7.14 image, and the ROCm 10 image rejects them at start (`Failed validator: ROCBLAS_VERSION`); the remaining bf16 GEMMs
+then use hipBLASLt's own choices. Harmless: tuning for ROCm 10 gained < 0.2 % on prompt reading. Set `TUNABLEOP=0`, or
+tune for your image once ([options.md](options.md#pytorch-tunableop)).
 
 ## `FREETOKEN_NVFP4_DECODE_TUNED: no tuned tiles for (N, K) = ...` in the log
 

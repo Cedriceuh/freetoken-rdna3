@@ -40,7 +40,7 @@ Dockerfile.rdna3       the ROCm image
 
 ## Development
 
-Everything runs in the image (ROCm 7.14, PyTorch 2.11, Triton). The command below tests the tree the image was built
+Everything runs in the image (ROCm 10.0, PyTorch 2.13, Triton 3.7.1). The command below tests the tree the image was built
 from; to test your working tree without rebuilding, mount it as [testing.md](docs/rdna3/testing.md#cpu-test-suite)
 shows:
 

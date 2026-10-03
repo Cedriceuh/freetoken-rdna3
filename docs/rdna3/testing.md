@@ -12,8 +12,9 @@ python3 rdna3/bench/quick_bench.py --label "2x RX 7900 XT, xt-xt"
 ```
 
 About a minute; it measures decode speed, a cold ~8.3k-token read, an agent turn on the cached conversation and a
-tool call, on text the server has never seen, and prints a Markdown table for an issue. For comparison, the release
-build on `xtx-xt` gives ~53-54 tok/s, ~4.1 s and ~1.25 s, tool call parsed. On a fresh image the first run can be
+tool call, on text the server has never seen, and prints a Markdown table for an issue. For comparison, `xtx-xt` on
+the ROCm 10 image gives ~60-67 tok/s with the MTP head (a sampled answer, so it varies; ~55-56 with `--no-mtp`),
+~4.15 s and ~1.3 s, tool call parsed. On a fresh image the first run can be
 slower (one-time kernel preparation): run it twice.
 
 ## CPU test suite

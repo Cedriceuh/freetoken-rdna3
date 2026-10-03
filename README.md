@@ -1,6 +1,6 @@
 # freetoken-rdna3
 
-![freetoken-rdna3: 55 tok/s on RX 7900 XTX + XT](docs/rdna3/assets/social-preview.png)
+![freetoken-rdna3: 77 tok/s on RX 7900 XTX + XT](docs/rdna3/assets/social-preview.png)
 
 **Fast local inference of big Mixture-of-Experts models on AMD Radeon RX 7900 XTX / 7900 XT (RDNA3, ROCm), on one or
 two consumer GPUs** (Linux, ~96-128 GB of system RAM, ~135 GB of disk for the model). A tuned build of the [FreeToken](https://github.com/FlashML-org/FreeToken) MoE engine: tensor
@@ -13,14 +13,19 @@ a coding agent (OpenCode), with an OpenAI- and Anthropic-compatible API. Image i
 (`rdna3/serve.sh --vision`). It costs no measurable speed on two cards and ~1.5-2 % of decode on one
 ([limits](docs/rdna3/limits.md#images-vision)).
 
-| On an RX 7900 XTX + RX 7900 XT | freetoken-rdna3 (`xtx-xt`) | FreeToken ported to ROCm, TP=2, TunableOp only |
-|---|---:|---:|
-| Decode (TG), short context | **55 tok/s** | 36 tok/s |
-| Decode (TG), 10k to 255k tokens of context | **48-53 tok/s** | 33-35 tok/s |
-| Reading a cold 8.4k-token prompt (prompt processing, PP) | **4.1-4.5 s, ~1870-2050 tok/s** | 6.3 s, ~1330 tok/s |
-| Reading a new 6-42k-token block at 10k to 255k of context (PP) | **1400-1850 tok/s** | 1290-1620 tok/s |
-| Agent turn (~1k new tokens), time to first token, 10k to 255k | **1.2-1.9 s** | 1.4-2.0 s |
-| Requests decoding at once | **4** (105 tok/s in total) | 1 (as configured) |
+| On an RX 7900 XTX + RX 7900 XT (`xtx-xt`) | freetoken-rdna3, MTP head on (default) | same, `--no-mtp` | FreeToken ported to ROCm, TP=2, TunableOp only |
+|---|---:|---:|---:|
+| Decode (TG), one request, short context, the model's sampling | **77 tok/s** | 57.5 tok/s | 36 tok/s |
+| Decode (TG), greedy, 9k to 248k tokens of context | **72-86 tok/s** | 52-57 tok/s | 33-35 tok/s |
+| Reading a cold 8.3k-token prompt (prompt processing, PP) | **4.1 s, ~2020 tok/s** | 4.2 s, ~2010 tok/s | 6.3 s, ~1330 tok/s |
+| Reading a new 6-41k-token block at 9k to 248k of context (PP) | **1670-1990 tok/s** | 1730-1990 tok/s | 1290-1620 tok/s |
+| Agent turn (~1k new tokens), time to first token, 9k to 248k | **1.3-2.0 s** | 1.3-2.0 s | 1.4-2.0 s |
+| Requests decoding at once | **4** | 4 | 1 (as configured) |
+
+The MTP head (the model's own draft layer) guesses the next tokens and one step checks them; greedy answers are
+identical with and without it. With 3-4 requests at once it costs 3-4 %; `rdna3/serve.sh --no-mtp` turns it off.
+On real agent turns (~90k-token contexts of code, temperature 0.6): 71 tok/s for a request alone, ~31 tok/s each when
+two sub-agents decode at once ([benchmarks](docs/rdna3/benchmarks.md#agent-turns-on-real-code-xtx-xt)). The baseline column was measured on the earlier ROCm 7.14 image.
 
 Four agents with 82-117k-token conversations, 3 turns each: after the first reads, the three rounds of turns take
 **35 s instead of 599 s** without the RAM tier, because a conversation pushed off the GPUs is kept in system RAM and resumes in ~2 s instead of being
@@ -36,7 +41,7 @@ upstream's NVIDIA / CUDA installer and is not used here.
 
 ```bash
 git clone https://github.com/Cedriceuh/freetoken-rdna3 && cd freetoken-rdna3
-docker build -f Dockerfile.rdna3 -t freetoken-rdna3:latest .          # pulls the ~29 GB ROCm + PyTorch base image
+docker build -f Dockerfile.rdna3 -t freetoken-rdna3:latest .          # pulls two ROCm + PyTorch bases, ~60 GB
 mkdir -p ~/models      # model download (~135 GB), with the image's own `hf`
 docker run --rm --user "$(id -u):$(id -g)" -e HF_HOME=/models/.cache/huggingface -v ~/models:/models \
   --entrypoint hf freetoken-rdna3:latest download RadixArk/Qwen3.8-Flash-Next-NVFP4 \
@@ -54,14 +59,14 @@ OpenAI-compatible client at `http://127.0.0.1:1919/v1` (model `qwen3.8-flash-nex
 One ready-made profile per hardware setup, measured for the tested ones and derived for those marked untested
 ([details](docs/rdna3/profiles.md)):
 
-| Profile | GPUs | Context | Decode | Requests at once |
+| Profile | GPUs | Context | Decode (MTP head on / off) | Requests at once |
 |---|---|---:|---:|---:|
-| `xtx-xt` | RX 7900 XTX 24 GB + RX 7900 XT 20 GB | 262k | 55 tok/s | 4 |
-| `xtx` | one RX 7900 XTX 24 GB | 131k | 36.5 tok/s | 1 |
-| `xt` | one RX 7900 XT 20 GB | 131k | 28.5 tok/s | 1 |
-| `xtx-xtx` *(untested)* | two RX 7900 XTX 24 GB | 262k | expected >= 55 tok/s | 4 |
-| `xt-xt` *(untested)* | two RX 7900 XT 20 GB | 262k | expected ~50 tok/s | 4 |
-| `gre` *(untested)* | one RX 7900 GRE 16 GB | 65k | expected ~20 tok/s at best | 1 |
+| `xtx-xt` | RX 7900 XTX 24 GB + RX 7900 XT 20 GB | 250k | 77 / 57.5 tok/s | 4 |
+| `xtx` | one RX 7900 XTX 24 GB | 131k | 39 / 36 tok/s | 1 |
+| `xt` | one RX 7900 XT 20 GB | 131k | 32 / 29.5 tok/s | 1 |
+| `xtx-xtx` *(untested)* | two RX 7900 XTX 24 GB | 250k | expected >= `xtx-xt` | 4 |
+| `xt-xt` *(untested)* | two RX 7900 XT 20 GB | 250k | expected a little below `xtx-xt` | 4 |
+| `gre` *(untested)* | one RX 7900 GRE 16 GB | 65k | expected ~20 tok/s at best (head off) | 1 |
 
 Untested profiles are derived from the measured ones and the engine's memory plans; the script says so when you start
 one. Measured something? Please open an issue with your numbers.
@@ -85,8 +90,8 @@ For LLM agents: [`llms.txt`](llms.txt) indexes everything, [`AGENTS.md`](AGENTS.
 
 ## Status
 
-Tested on one machine: RX 7900 XTX + RX 7900 XT (gfx1100), Threadripper 3970X, 128 GB DDR4, ROCm 7.14 in the
-container. Other RDNA3 cards, RDNA4, more than two GPUs and NVIDIA are untested ([limits](docs/rdna3/limits.md)).
+Tested on one machine: RX 7900 XTX + RX 7900 XT (gfx1100), Threadripper 3970X, 128 GB DDR4, ROCm 10.0 in the
+container (7.14 until 2026-10-02). Other RDNA3 cards, RDNA4, more than two GPUs and NVIDIA are untested ([limits](docs/rdna3/limits.md)).
 Reports from other setups are very welcome.
 
 ## Credits and license

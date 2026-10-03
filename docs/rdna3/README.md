@@ -33,7 +33,7 @@ Upstream FreeToken's own documentation is in the parent directory ([install](../
 | KV cache | the attention layers' keys and values for every token of a conversation |
 | PLE | per-layer n-gram embeddings: big lookup tables (51 GB) read from disk |
 | NVFP4 | 4-bit floating-point weights with shared scales, the experts' format |
-| MTP | multi-token prediction, the model's speculative-decoding head (not used) |
+| MTP | multi-token prediction, the model's speculative-decoding head (on in the profiles, `rdna3/serve.sh --no-mtp` turns it off: [options.md](options.md#speculative-decoding-with-the-mtp-head-qwen38-flash-next-experimental)) |
 | LDS | the GPU's on-chip shared memory (64 KiB per work group on RDNA3) |
 | FTW | FreeToken's own weight format |
 | RAM tier | this build's copy of evicted conversations in system RAM (`FREETOKEN_HOST_KV`) |
