@@ -79,6 +79,13 @@ def _startup_kv_budget(memory_ratio: float, init_free_memory: int, new_free_memo
     return int(memory_ratio * init_free_memory) - (init_free_memory - new_free_memory)
 
 
+def _moe_prefill_workspace(config, method) -> int:
+    """Bytes the offload expert kernel's prefill allocates for a full chunk beyond the activation headroom
+    (``MoEKernel.prefill_workspace_bytes``); every rank keeps them out of its cache budget."""
+    workspace = getattr(method, "prefill_workspace_bytes", None)
+    return int(workspace(config.max_extend_tokens)) if workspace is not None else 0
+
+
 def _lock_memory() -> None:
     """FREETOKEN_MLOCK (default on): lock this process's pages once the model is loaded (mlockall, current and future
     pages, on fault). The GPU driver maps the registered host memory (expert banks, RAM tier, the runtime's pinned
@@ -420,6 +427,7 @@ class Engine:
         self._post_weights_free = post_weights_free
         self.moe_offload_cache = None
         self.cpu_moe_executor = None
+        self._moe_workspace_bytes = 0  # the offload expert kernel's prefill temporaries, set with the cache
         # Host-side auxiliary stores (qwen4_exp's pinned PLE table): after the weights so a
         # load failure is not masked, before the MoE offload cache so the bank residency
         # planning sees the pin quota the table already spent.
@@ -458,7 +466,7 @@ class Engine:
         # The engine measures the budget and settles the sibling GDN state pool's bytes
         # off it; the KV pool family owns every geometry-specific formula behind the rest.
         available_memory = _startup_kv_budget(config.memory_ratio, init_free_memory, new_free)
-        available_memory -= state_pool_bytes(config)
+        available_memory -= state_pool_bytes(config) + self._moe_workspace_bytes
         self.num_pages = self._pool_cls.solve_num_pages(config, available_memory)
         num_tokens = self.num_pages * config.page_size
         self.ctx.kv_cache = self.kv_cache = create_kv_pool(
@@ -695,6 +703,7 @@ class Engine:
 
         cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
         fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
+        fixed_cache_size += _moe_prefill_workspace(config, method)
         num_experts = config.model_config.num_experts
         total_experts = config.model_config.num_moe_layers * num_experts
         baseline_free, weights_bytes = self._baseline_free, self._weights_bytes
@@ -734,6 +743,12 @@ class Engine:
 
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
         method = shared_offload_method(self.model)
+        self._moe_workspace_bytes = _moe_prefill_workspace(config, method)
+        if self._moe_workspace_bytes:
+            logger.info(
+                f"MoE prefill temporaries (rank {config.tp_info.rank}): {mem_GB(self._moe_workspace_bytes)} "
+                f"for {config.max_extend_tokens}-token chunks, kept out of the cache budget"
+            )
         num_moe_layers = config.model_config.num_moe_layers
         cpu_layer_ids = _resolve_cpu_layers(config, num_moe_layers, reserved=self._host_tables_bytes, method=method)
         _check_pin_budget(config, reserved=self._host_tables_bytes, method=method)
@@ -1094,7 +1109,7 @@ class Engine:
             weights_bytes=self._weights_bytes, current_num_pages=self.num_pages,
             extra_fixed_bytes=(
                 state_pool_bytes(config, target_mamba) if target_mamba is not None else 0
-            ),
+            ) + self._moe_workspace_bytes,
             extra_note=(
                 f", mamba={target_mamba - 1} slots" if target_mamba is not None else ""
             ),

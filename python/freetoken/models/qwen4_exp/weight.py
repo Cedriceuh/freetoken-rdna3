@@ -90,8 +90,30 @@ _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 _ELEM_DTYPES = {"e4m3": torch.float8_e4m3fn}
 
 
+# EXL3 checkpoints keep the n-gram hash constants in their ngram_embedding.safetensors, under the table's prefix
+_EXL3_PLE_CONSTANTS = {
+    "ngram_embedding.head_offsets": "ngram_heads_offsets",
+    "ngram_embedding.head_vocab_sizes": "ngram_heads_vocab_sizes",
+    "ngram_embedding.layer_multipliers": "layer_multipliers",
+}
+
+
+_EXL3_VISION_QKV = re.compile(r"^model\.visual\.blocks\.\d+\.attn\.[qkv]_proj\.")
+
+
+def _is_exl3() -> bool:
+    try:
+        quant = get_quant_config()
+    except RuntimeError:  # no engine config installed (offline tools): not an EXL3 load
+        return False
+    return quant is not None and quant.dialect == "exl3"
+
+
 def _rename(raw_name: str) -> str | None:
     """Checkpoint key -> FreeToken state-dict key, or None to skip."""
+    for exl3_leaf, leaf in _EXL3_PLE_CONSTANTS.items():
+        if raw_name.endswith(".ple.ple_embedding." + exl3_leaf):
+            return rename_vl_prefix(raw_name[: -len(exl3_leaf)] + leaf)
     if raw_name.startswith("mtp."):
         from freetoken.spec_decode import MTP_ENABLED
 
@@ -101,6 +123,8 @@ def _rename(raw_name: str) -> str | None:
         return raw_name
     if _PLE_TABLE_INFIX in raw_name:
         return None  # n-gram table + its scale: load_ple_table
+    if _EXL3_VISION_QKV.search(raw_name) and _is_exl3():
+        return None  # EXL3 checkpoints add quantized q/k/v next to the tower's bf16 qkv, which the model reads
     if _EXPERT_RE.search(raw_name):
         return None  # routed experts: offload source banks
     if raw_name.endswith(_SCALE_SUFFIXES):
@@ -350,6 +374,23 @@ def _shard_for_rank(name: str, tensor: torch.Tensor, *, config: ModelConfig) -> 
     return local
 
 
+# exllamav3 zero-pads a linear to multiples of 128 on both axes (its bias too); the vision tower's MLP intermediate
+# (4304 -> 4352) is the only padded axis in this model
+_EXL3_VISION_MLP = re.compile(r"^visual\.blocks\.\d+\.mlp\.linear_fc(?P<fc>[12])\.(?P<leaf>weight|bias)$")
+
+
+def _exl3_unpad(name: str, tensor: torch.Tensor, config) -> torch.Tensor:
+    match = _EXL3_VISION_MLP.match(name)
+    if match is None or config.vision_config is None:
+        return tensor
+    inter = config.vision_config.intermediate_size
+    if match.group("fc") == "1":  # [inter, hidden] weight, [inter] bias
+        return tensor[:inter].contiguous() if tensor.shape[0] > inter else tensor
+    if match.group("leaf") == "weight":  # fc2 [hidden, inter]; its bias is on the unpadded hidden axis
+        return tensor[:, :inter].contiguous() if tensor.shape[1] > inter else tensor
+    return tensor
+
+
 def iter_weights(
     model_path: str,
     device: torch.device,
@@ -375,7 +416,28 @@ def iter_weights(
     hf_config = cached_load_hf_config(model_path)
     config = parse_config(hf_config)
     spec = get_model_spec(hf_config.architectures[0])
-    fuser = _DenseFuser(get_quant_config(), spec.packed_modules_mapping)
+    quant = get_quant_config()
+    # EXL3: every dense linear is a trellis, served bf16 (only the routed experts stay EXL3)
+    exl3 = None
+    if quant is not None and quant.dialect == "exl3":
+        from freetoken.models.exl3_weights import Exl3DenseReconstructor, checkpoint_tensor_names
+
+        # codebook markers from every file: a module whose marker is not seen would decode with the wrong codebook
+        exl3 = Exl3DenseReconstructor(checkpoint_tensor_names(download_hf_weight(model_path)), rename=_rename)
+        quant = None  # the reconstructed weights are bf16: nothing for the fuser to check against the dialect
+    fuser = _DenseFuser(quant, spec.packed_modules_mapping)
+
+    def place(name: str, tensor: torch.Tensor):
+        if exl3 is not None:
+            tensor = _exl3_unpad(name, tensor, config)
+        tensor = _shard_for_rank(name, tensor, config=config)
+        fused = fuser.fuse(name, tensor)
+        if fused is None:
+            fuser.check_unfused(name, tensor)
+            yield name, tensor
+        else:
+            yield from fused
+
     for file in tqdm(
         iter_weight_files(model_path),
         desc="Loading weights",
@@ -388,19 +450,23 @@ def iter_weights(
                     continue
                 if not include_vision and name.startswith(VISION_KEY_PREFIXES):
                     continue
-                tensor = _shard_for_rank(name, f.get_tensor(raw_name), config=config)
-                fused = fuser.fuse(name, tensor)
-                if fused is None:
-                    fuser.check_unfused(name, tensor)
-                    yield name, tensor
+                tensor = f.get_tensor(raw_name)
+                rebuilt = exl3.feed(name, tensor) if exl3 is not None else None
+                if rebuilt is None:
+                    yield from place(name, tensor)
                 else:
-                    yield from fused
+                    for weight_name, weight in rebuilt:
+                        yield from place(weight_name, weight)
 
+    if exl3 is not None:
+        exl3.check_done()
     assert not fuser.buf, f"Incomplete projection fusions: {sorted(k[0] + k[1] for k in fuser.buf)}"
 
 
 def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
     """The vision tower alone, named as iter_weights names it."""
+    if _is_exl3():
+        raise NotImplementedError("the encoder-only reader does not decode EXL3 tensors; load the whole checkpoint")
     for file in iter_weight_files(model_path):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
             for raw_name in f.keys():
@@ -517,6 +583,8 @@ def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
     table is ~47.7 GiB and must not also sit in the page cache while the bank holds the same bytes.
     """
     folder = download_hf_weight(model_path)
+    if os.path.exists(os.path.join(folder, "ngram_embedding.safetensors")):
+        raise ValueError("this EXL3 checkpoint's n-gram table is trellis-coded: serve it with --ple-backend disk")
     parts: dict[int, tuple[str, int, int]] = {}  # shard index -> (path, file offset, bytes)
     scale: torch.Tensor | None = None
     rows = cols = 0
@@ -603,6 +671,8 @@ def iter_expert_pieces(model_path: str, config, kind, *, parallel: bool = False,
     from freetoken.layers.quantization import QuantKind
     from freetoken.models.nvfp4_banks import iter_nvfp4_expert_pieces
 
+    if kind is QuantKind.EXL3:
+        return _exl3_expert_pieces(model_path, config, parallel=parallel, workers=workers, chunk=chunk)
     if getattr(config, "mtp_layers", 0) and kind is not QuantKind.NVFP4:
         raise ValueError("FREETOKEN_MTP=1 needs an NVFP4 checkpoint (the MTP experts join its NVFP4 expert banks)")
     if not getattr(config, "mtp_layers", 0):
@@ -613,6 +683,37 @@ def iter_expert_pieces(model_path: str, config, kind, *, parallel: bool = False,
     main = iter_nvfp4_expert_pieces(model_path, _CheckpointMoELayers(config), _NVFP4_SOURCE_SPEC,
                                     parallel=parallel, workers=workers, chunk=chunk)
     return itertools.chain(main, _mtp_expert_pieces(model_path, bank_layer=config.num_moe_layers - 1))
+
+
+_EXL3_EXPERT_RE = re.compile(
+    r"^(?:model\.language_model\.layers\.(?P<layer>\d+)|mtp\.layers\.(?P<mtp>\d+))\.mlp\.experts\.(?P<expert>\d+)\."
+    r"(?P<proj>gate_proj|up_proj|down_proj)\.\w+$"
+)
+
+
+def _exl3_expert_pieces(model_path: str, config, *, parallel: bool, workers: int, chunk: int):
+    """EXL3 checkpoints store every expert per tensor, the MTP head's 512 too; with the head built they fill its bank
+    layer (the last one), as quantized: no NVFP4 requantization."""
+    from freetoken.models.exl3_weights import iter_exl3_expert_pieces
+
+    mtp_bank = config.num_moe_layers - 1 if getattr(config, "mtp_layers", 0) else None
+    roles = {"gate_proj": "gate", "up_proj": "up", "down_proj": "down"}
+
+    def locate(name: str):
+        match = _EXL3_EXPERT_RE.match(name)
+        if match is None:
+            return None
+        if match.group("mtp") is not None:
+            if mtp_bank is None or int(match.group("mtp")) != 0:
+                return None
+            layer = mtp_bank
+        else:
+            layer = int(match.group("layer"))
+        return layer, int(match.group("expert")), roles[match.group("proj")]
+
+    return iter_exl3_expert_pieces(model_path, locate, expected_experts=config.num_moe_layers * config.num_experts,
+                                   parallel=parallel, workers=workers, chunk=chunk,
+                                   desc="Qwen3.8-Flash-Next EXL3 experts")
 
 
 def _mtp_expert_pieces(model_path: str, *, bank_layer: int):

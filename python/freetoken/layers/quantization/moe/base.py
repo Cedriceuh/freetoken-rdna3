@@ -160,6 +160,11 @@ class MoEKernel(ABC):
         """Most GPU cache slots the kernel can address for ``cfg``; None for no limit."""
         return self.max_slots
 
+    def prefill_workspace_bytes(self, cfg: MoEConfig, tokens: int) -> int:
+        """GPU temporaries one layer's prefill of ``tokens`` allocates beyond what the generic ``(1 - memory_ratio)``
+        activation headroom covers; the cache planner keeps them out of the expert slots."""
+        return 0
+
     def _common_reject(self, cfg: MoEConfig, *, resident_ok: bool, tp_ok: bool, cpu_ok: bool, plain_silu_only: bool) -> str | None:
         if not resident_ok and cfg.strategy == "resident":
             return "not served resident; use --moe-strategy offload or cpu"
@@ -195,6 +200,9 @@ class MoEMethod(QuantMethod):
 
     def slot_limit(self) -> int | None:
         return self.kernel.slot_limit(self.cfg)
+
+    def prefill_workspace_bytes(self, tokens: int) -> int:
+        return self.kernel.prefill_workspace_bytes(self.cfg, tokens)
 
     def apply(self, x: torch.Tensor, topk_weights: torch.Tensor, topk_ids: torch.Tensor, view: ExpertView, *, layer: Any, is_prefill: bool) -> torch.Tensor:
         return self.kernel.apply(layer, x, topk_weights, topk_ids, view, is_prefill=is_prefill)

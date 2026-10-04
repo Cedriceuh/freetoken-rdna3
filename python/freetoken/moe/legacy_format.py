@@ -34,6 +34,7 @@ LEGACY_FORMAT = {
     (QuantKind.NVFP4, "b12x"): "nvfp4_b12x",
     (QuantKind.MXFP4, "triton_gptoss"): "mxfp4_triton",
     (QuantKind.MXFP4, "triton"): "ds_fp4",
+    (QuantKind.EXL3, "triton"): "exl3",
 }
 _KIND_KERNEL = {fmt: kk for kk, fmt in LEGACY_FORMAT.items()}
 

@@ -100,6 +100,18 @@ done < "$pfile"
 ctx="${ctx:-$p_ctx}" memory="${memory:-$p_memory}"
 [ "$p_tested" = 1 ] || echo "note: profile $profile is UNTESTED (derived from measured profiles, see its header); please report what you measure" >&2
 
+# EXL3 checkpoints (experimental) on two cards: the expert slices round to 384 / 256, so the card holding 384 bounds the
+# expert cache, and at the profiles' 0.80 the 7900 XTX peaked 200 MiB under full VRAM (two agents at 50k tokens: 24,341
+# of 24,560 MiB at 0.78 with 4.05 bpw); 0.77 / 0.76 keep ~0.5 GiB free (xtx-xt, 2026-10-04). `-- --memory-ratio X` wins.
+cfg="$(tr -d ' \t\n' < "$model/config.json" 2>/dev/null || true)"
+if [[ "$cfg" == *'"quant_method":"exl3"'* ]] && [ "$p_gpus" = 2 ]; then
+  bits="$(grep -o '"bits":[0-9.]*' <<< "$cfg" | head -1 | cut -d: -f2)"
+  ratio=0.77
+  awk -v b="${bits:-0}" 'BEGIN { exit !(b >= 4) }' && ratio=0.76
+  ft_args+=(--memory-ratio "$ratio")
+  echo "note: EXL3 checkpoint (${bits:-?} bpw) on two cards: --memory-ratio $ratio instead of the profile's ('-- --memory-ratio X' overrides)" >&2
+fi
+
 if [ -z "$gpus" ]; then
   # one GPU: the smallest card with the profile's VRAM (keeps a bigger card free); several: the largest ones, largest
   # first (the uneven split gives rank 0 the bigger share)

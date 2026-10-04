@@ -20,6 +20,7 @@ class QuantKind(Enum):
     MXFP8 = "mxfp8"
     NVFP4 = "nvfp4"
     MXFP4 = "mxfp4"
+    EXL3 = "exl3"
 
     def __str__(self) -> str:
         return self.value
@@ -95,3 +96,19 @@ def nvfp4_scheme(*, input_scale: bool) -> QuantScheme:
 
 def mxfp4_scheme() -> QuantScheme:
     return QuantScheme(QuantKind.MXFP4, WeightDesc("e2m1", (1, MX_GROUP), "e8m0"), {"weight", "weight_scale"})
+
+
+EXL3_TILE = 16
+
+
+def exl3_scheme(bits: int, codebook: int) -> QuantScheme:
+    """exllamav3 trellis: K bits per weight in 16x16 tiles, fp16 input/output channel scales; the element names both
+    (``exl3:<K>:<codebook>``, codebook ids from exl3_codec)."""
+    return QuantScheme(QuantKind.EXL3, WeightDesc(f"exl3:{bits}:{codebook}", (EXL3_TILE, EXL3_TILE), "fp16"),
+                       {"trellis", "suh", "svh"})
+
+
+def exl3_params(scheme: QuantScheme) -> tuple[int, int]:
+    """(bits per weight, codebook) of an EXL3 scheme."""
+    _, bits, codebook = scheme.weight.elem.split(":")
+    return int(bits), int(codebook)

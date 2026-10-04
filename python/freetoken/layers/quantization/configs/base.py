@@ -55,6 +55,8 @@ class QuantConfig(ABC):
         # modules the family serves in bf16 regardless of the dialect (glob patterns on checkpoint names)
         self.unquantized: Matcher = name_set(tuple(unquantized))
         self._schemes: dict[str, QuantScheme | None] = {}
+        # the checkpoint folder or repo, for dialects whose schemes depend on tensor shapes (EXL3 bitrates)
+        self.model_path: str | None = None
 
     @classmethod
     def claims(cls, q: dict[str, Any]) -> bool:
@@ -98,6 +100,7 @@ class QuantConfig(ABC):
         *,
         name_map: NameMap | None = None,
         unquantized: tuple[str, ...] = (),
+        model_path: str | None = None,
     ) -> "QuantConfig":
         """``unquantized`` lists the modules the family keeps bf16 when the checkpoint's config does not (DeepSeek-V4's compressors).
 
@@ -107,7 +110,9 @@ class QuantConfig(ABC):
             return NoQuantConfig(name_map, unquantized)
         for cls in dialects():
             if cls.claims(q):
-                return cls(q, hf_config, name_map=name_map, unquantized=unquantized)
+                config = cls(q, hf_config, name_map=name_map, unquantized=unquantized)
+                config.model_path = model_path
+                return config
         raise NotImplementedError(f"quantization method {q.get('quant_method')!r} is not supported")
 
 

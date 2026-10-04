@@ -117,10 +117,18 @@ def gdn_head_partition(
 # Qwen3.8-Flash-Next's 640 at 0.55 -> 352/288 (7900 XTX + 7900 XT). The routed-expert split applies where the expert
 # kernel slices by rank range (NVFP4 Triton, layers/quantization/moe/nvfp4.py); the GDN-head and shared-expert splits to the models that ask for them
 INTERMEDIATE_UNIT = 16
+_intermediate_unit = INTERMEDIATE_UNIT
+
+
+def set_intermediate_unit(unit: int) -> None:
+    """A coarser intermediate split unit for expert formats with wider blocks (EXL3: the 128-wide Hadamard blocks);
+    set by the checkpoint's QuantConfig before the model sizes anything."""
+    global _intermediate_unit
+    _intermediate_unit = max(INTERMEDIATE_UNIT, unit)
 
 
 def intermediate_partition(total: int, *, rank: int | None = None, world_size: int | None = None) -> tuple[int, int]:
-    return tp_partition(total, INTERMEDIATE_UNIT, rank=rank, world_size=world_size)
+    return tp_partition(total, _intermediate_unit, rank=rank, world_size=world_size)
 
 
 __all__ = [
@@ -129,6 +137,7 @@ __all__ = [
     "gdn_head_partition",
     "intermediate_partition",
     "is_uneven",
+    "set_intermediate_unit",
     "tp_partition",
     "tp_shares",
 ]

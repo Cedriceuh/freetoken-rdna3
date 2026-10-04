@@ -146,8 +146,12 @@ def parse_config(hf_config: Any) -> ModelConfig:
     linear_ids = tuple(i for i, t in enumerate(layer_types) if t == "linear_attention")
 
     # the engine reads this flag for its MoE strategy decisions; every module takes its own scheme from the QuantConfig when it is built
-    expert_scheme = QuantConfig.from_hf(hf_config).scheme_for_name("model.language_model.layers.0.mlp.experts.0.gate_proj")
-    expert_quant = "none" if expert_scheme is None else str(expert_scheme.kind)
+    quant = QuantConfig.from_hf(hf_config)
+    if quant.dialect == "exl3":
+        expert_quant = "exl3"  # the expert bitrate is read from the checkpoint by the engine's QuantConfig
+    else:
+        expert_scheme = quant.scheme_for_name("model.language_model.layers.0.mlp.experts.0.gate_proj")
+        expert_quant = "none" if expert_scheme is None else str(expert_scheme.kind)
 
     # HF stores ple_layer_ids one-indexed (validated upstream as [1, num_layers]).
     ple_layer_ids = tuple(int(i) - 1 for i in (getattr(text, "ple_layer_ids", None) or ()))

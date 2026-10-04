@@ -328,6 +328,7 @@ def checkpoint_quant_config(model_path: str, hf_config: Any, spec: ModelSpec):
         hf_config,
         name_map=NameMap(roots=spec.checkpoint_roots, segments=spec.checkpoint_segments, packed=spec.packed_modules_mapping),
         unquantized=spec.unquantized_modules,
+        model_path=model_path,
     )
 
 

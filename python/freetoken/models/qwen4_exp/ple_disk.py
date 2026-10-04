@@ -6,6 +6,7 @@ Hash windows are pure functions of ``req.input_ids`` + ``device_len`` (prefix hi
 from __future__ import annotations
 
 import os
+import re
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -70,6 +71,11 @@ class PleRowSource:
     row_bytes: int
     row_stride: int
     scale: float
+    # EXL3 n-gram rings (exllamav3 exl3_ngram_trellis): K bits per element, row_dim elements per row, a bias per hash head;
+    # exl3_bits == 0 is the fp8 table, one byte per element
+    exl3_bits: int = 0
+    row_dim: int = 0
+    head_bias: torch.Tensor | None = None
 
     @property
     def total_rows(self) -> int:
@@ -115,8 +121,54 @@ def source_from_safetensors(folder: str) -> PleRowSource:
     return PleRowSource(paths, [f for f, _ in order], [b for _, b in order], rows, cols, cols, float(scale))
 
 
+_EXL3_NGRAM_FILE = "ngram_embedding.safetensors"
+# split in shards (``shard_<i>.trellis``) or one ``trellis`` tensor, depending on the exllamav3 release that wrote it
+_EXL3_SHARD_RE = re.compile(r"\.ple\.ple_embedding\.ngram_embedding(?:\.shard_(?P<shard>\d+))?\.trellis$")
+_EXL3_HEAD_BIAS_SUFFIX = ".ple.ple_embedding.ngram_embedding.head_bias"
+
+
+def source_from_exl3_ngram(path: str) -> PleRowSource:
+    """exllamav3's ``ngram_embedding.safetensors``: ``shard_<i>.trellis`` (or a single ``trellis``) int16
+    ``[rows, 1 + dim*K/16]`` rings mapped in place, plus the per-head bias the decode adds."""
+    header, base = _safetensors_header(path)
+    meta = header.get("__metadata__") or {}
+    if meta.get("format") != "exl3_ngram_trellis" or meta.get("codebook", "mul1") != "mul1":
+        raise ValueError(f"{path}: not an exllamav3 mul1 n-gram table (metadata {meta})")
+    K, dim = int(meta["K"]), int(meta["row_dim"])
+    rows = words = 0
+    shards: dict[int, int] = {}
+    head_bias = None
+    for key, info in header.items():
+        if key == "__metadata__":
+            continue
+        if key.endswith(_EXL3_HEAD_BIAS_SUFFIX):
+            with safetensors.safe_open(path, framework="pt", device="cpu") as f:
+                head_bias = f.get_tensor(key).to(torch.float16)
+            continue
+        match = _EXL3_SHARD_RE.search(key)
+        if match is None:
+            continue
+        if info["dtype"] != "I16" or (rows and tuple(info["shape"]) != (rows, words)):
+            raise ValueError(f"EXL3 n-gram shard {key} is {info['dtype']} {info['shape']}, expected I16 {[rows, words]}")
+        rows, words = info["shape"]
+        idx = int(match.group("shard") or 0)
+        if idx in shards:
+            raise ValueError(f"duplicate EXL3 n-gram shard {idx} in {path} ({key})")
+        shards[idx] = base + info["data_offsets"][0]
+    if not shards or sorted(shards) != list(range(len(shards))):
+        raise ValueError(f"EXL3 n-gram shard indices are not contiguous 0..N-1: {sorted(shards)[:8]}")
+    if head_bias is None or head_bias.shape[1] != dim or (words - 1) * 16 != dim * K:
+        raise ValueError(f"EXL3 n-gram table: {words} words per row do not hold {dim} x {K} bits, or no head_bias")
+    order = [shards[i] for i in range(len(shards))]
+    return PleRowSource([path], [0] * len(order), order, rows, 2 * words, 2 * words, 1.0,
+                        exl3_bits=K, row_dim=dim, head_bias=head_bias)
+
+
 def resolve_row_source(folder: str) -> PleRowSource:
     """Pick the row source for a checkpoint; the seam where a repacked format would plug in."""
+    exl3 = os.path.join(folder, _EXL3_NGRAM_FILE)
+    if os.path.exists(exl3):
+        return source_from_exl3_ngram(exl3)
     return source_from_safetensors(folder)
 
 
@@ -139,7 +191,9 @@ class DiskRowTable:
         from freetoken.kernel.row_store import PleStore
 
         self.num_rows = source.total_rows
-        self.head_dim = source.row_bytes  # fp8: one byte per element
+        self.head_dim = source.row_dim or source.row_bytes  # fp8: one byte per element
+        self._row_bytes = source.row_bytes
+        self._exl3_bits = source.exl3_bits
         self.dtype = dtype
         self.heads = int(hash_constants["num_ngram_heads"])
         self.scale = source.scale
@@ -166,7 +220,10 @@ class DiskRowTable:
             use_io_uring=os.getenv(_IO_URING_ENV, "1") != "0",
         )
         self._device = torch.device("cuda", torch.cuda.current_device())
-        self._token_bytes = self.heads * self.head_dim
+        self._token_bytes = self.heads * self._row_bytes
+        self._head_bias = None if source.head_bias is None else source.head_bias.to(self._device)
+        if self._head_bias is not None and self._head_bias.shape[0] != self.heads:
+            raise ValueError(f"EXL3 n-gram table has {self._head_bias.shape[0]} head biases, the model hashes {self.heads} heads")
         # allocated up front: pinned alloc inside stream capture is illegal; one replay consumes it at a time
         self._graph_pinned = alloc_pinned_tensor(max_graph_rows * self._token_bytes, dtype=torch.uint8)
         self._graph_pinned.zero_()  # padded decode lanes read whatever sits here
@@ -286,9 +343,16 @@ class DiskRowTable:
         )
         nbytes = rows * self._token_bytes
         dev[:nbytes].copy_(pinned[:nbytes], non_blocking=True)
-        values = dev[:nbytes].view(torch.float8_e4m3fn).to(self.dtype)
-        if self.scale != 1.0:
-            values = values * self.scale
+        if self._exl3_bits:
+            from freetoken.kernel.triton.exl3 import exl3_ngram_dequant
+
+            packed = dev[:nbytes].view(torch.int16).view(rows * self.heads, self._row_bytes // 2)
+            values = exl3_ngram_dequant(packed, self._exl3_bits, self._head_bias,
+                                        torch.empty((rows * self.heads, self.head_dim), dtype=self.dtype, device=self._device))
+        else:
+            values = dev[:nbytes].view(torch.float8_e4m3fn).to(self.dtype)
+            if self.scale != 1.0:
+                values = values * self.scale
         values = values.view(*row_ids.shape[:-1], -1)
         if out is None:
             return values

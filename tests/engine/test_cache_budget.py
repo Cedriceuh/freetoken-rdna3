@@ -337,6 +337,19 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
     size, _, _ = engine._resolve_auto_moe_cache_size(StubConfig(), StubBanks(), StubMethod())
     assert size == 5
 
+    class WorkspaceMethod:
+        def slot_limit(self):
+            return None
+
+        def prefill_workspace_bytes(self, tokens):
+            return tokens * 1000
+
+    # the expert kernel's prefill temporaries leave the cache budget: 2 MB fewer for the pools
+    config = StubConfig()
+    config.max_extend_tokens = 2000
+    _, pages_ws, _ = engine._resolve_auto_moe_cache_size(config, StubBanks(), WorkspaceMethod())
+    assert (pages - pages_ws) * cache_per_page >= 2_000_000 - cache_per_page
+
 
 # ---------------------------------------------------------------------------
 # offload-cache sizing guard + auto-resolution (_require_offload_cache_size / _adjust_config),
