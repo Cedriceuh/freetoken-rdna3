@@ -194,7 +194,8 @@ decode -0.5 % (noise), prefill ~1 % faster. The published image itself was measu
   each request picks 2-4 rows from its measured acceptance and the step costs. Up to 4 rows share each int8 weight
   tile in the GEMVs that loop over K (`FREETOKEN_INT8_ROW_GROUPS`, bit-exact).
 - **Several requests.** Fixed 3 rows at 4 requests: -26 %. So it verifies only while one request decodes; with more,
-  the head only writes its KV and the scheduler overlaps steps as without it.
+  the head only writes its KV and the scheduler overlaps steps as without it. With the adaptive depth, two requests
+  verifying together later paid on `xtx-xt` (+8-15 % each for two agents, 2026-10-04): `FREETOKEN_SPEC_BS_MAX=2` there.
 - **Bugs found on the way.** The detokenizer repeated text when a request got several tokens in one step; the LM head
   gathered prompt rows twice (a GPU memory fault). 4 rows were not bit-exact: the GDN output norm picked its rows per
   program from the row count (also for 4 requests decoding together), and the QSA attention its tile profile; decode

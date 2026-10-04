@@ -6,7 +6,9 @@
   `rdna3/serve.sh --no-mtp` turns it off): a decode step of one request verifies up to 3 drafted tokens, with an
   adaptive depth from step costs measured per card count; greedy answers identical to plain decode, exact speculative
   sampling. One request on `xtx-xt`: +34 % decode at the model's sampling, +30-61 % greedy up to 248k of context; one
-  card: +7-8 % (+6-12 % greedy). Several requests at once: 3-4 % slower at 3-4 requests. With the ROCm 10 base, 12 and
+  card: +7-8 % (+6-12 % greedy). The `xtx-xt` profile verifies drafts for two requests at once too
+  (`FREETOKEN_SPEC_BS_MAX=2`): two agents at ~100k of context decode 8-15 % faster each. Several requests at once:
+  3-4 % slower at 3-4 requests. With the ROCm 10 base, 12 and
   18 of 29 on the agentic benchmark (two runs).
 - The image moves to ROCm 10.0 / PyTorch 2.13, with the ROCm 7.14 image's Triton 3.7.1 (3.8 miscompiles these
   kernels). HIP stream memops make the PLE wait-sync work there (`FREETOKEN_PLE_SYNC`, +3.5-4 % decode). TunableOp is

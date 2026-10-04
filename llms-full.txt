@@ -34,7 +34,7 @@ a coding agent (OpenCode), with an OpenAI- and Anthropic-compatible API. Image i
 
 The MTP head (the model's own draft layer) guesses the next tokens and one step checks them; greedy answers are
 identical with and without it. With 3-4 requests at once it costs 3-4 %; `rdna3/serve.sh --no-mtp` turns it off.
-On real agent turns (~90k-token contexts of code, temperature 0.6): 71 tok/s for a request alone, ~31 tok/s each when
+On real agent turns (~90k-token contexts of code, temperature 0.6): 71 tok/s for a request alone, ~34 tok/s each when
 two sub-agents decode at once ([benchmarks](docs/rdna3/benchmarks.md#agent-turns-on-real-code-xtx-xt)). The baseline column was measured on the earlier ROCm 7.14 image.
 
 Four agents with 82-117k-token conversations, 3 turns each: after the first reads, the three rounds of turns take
@@ -317,7 +317,7 @@ A comment may follow a value on the same line. Copy a file to make your own prof
 | `FREETOKEN_HOST_ALLREDUCE` | `1` | small all-reduces through shared host memory instead of RCCL's proxies (no GPU peer-to-peer here): +2.5-4.8 % decode, bit-exact |
 | `FREETOKEN_NVFP4_PREFILL_TUNED` / `_DECODE_TUNED` | `1` | expert GEMM tiles swept on these cards for this model (the decode ones for this split's shapes): long prompts -11 %, decode GEMMs ~13 % faster in the kernel sweep, bit-exact |
 | `FREETOKEN_HOST_KV` | `1` | conversations evicted from the GPUs go to RAM (9.5 GiB locked) and come back in ~2 s; exact |
-| `FREETOKEN_MTP` / `FREETOKEN_SPEC_VERIFY_M` | `1` / `4` | the checkpoint's MTP head drafts up to 3 tokens a step for a request decoding alone: +34 % decode at the model's sampling (+7-8 % on one card), greedy answers unchanged; `rdna3/serve.sh --no-mtp` turns it off ([limits.md](limits.md#speculative-decoding-mtp)) |
+| `FREETOKEN_MTP` / `FREETOKEN_SPEC_VERIFY_M` | `1` / `4` | the checkpoint's MTP head drafts up to 3 tokens a step for a request decoding alone (two at once in `xtx-xt`, `FREETOKEN_SPEC_BS_MAX=2`: +8-15 % each): +34 % decode at the model's sampling (+7-8 % on one card), greedy answers unchanged; `rdna3/serve.sh --no-mtp` turns it off ([limits.md](limits.md#speculative-decoding-mtp)) |
 | `--moe-strategy offload --moe-cache-auto` | | experts live in RAM; every byte of VRAM left after the dense weights and the KV is an expert cache (7.1k of the 24,576 experts, on each card) |
 | `--expert-load parallel` | | reads the expert files into RAM with parallel readers; `auto` (the engine's default) does the same but falls back to a slower serial read when free RAM is short: use `auto` on a machine with little RAM to spare |
 | `--quant-backend moe.nvfp4=triton` | | the Triton NVFP4 expert kernels (the other backends need NVIDIA hardware) |
@@ -497,7 +497,7 @@ drafts), of which it keeps the matching prefix. How it works and what it costs:
 | `FREETOKEN_SPEC_VERIFY_MS` | `1,2,..,M` with the head | The row counts a step may run, each with its CUDA graphs (counts above the smallest only for the batch sizes a verify step can have). Near a request's length limit a step runs no more rows than tokens left. |
 | `FREETOKEN_SPEC_DYNAMIC` | `1` | Each request picks its rows per step (2 to M; with `FREETOKEN_SPEC_BS_MAX` > 1, the most any of the step's requests wants) from its running acceptance per draft position and the step costs below: the count with the most expected tokens per millisecond (with two or more row counts above 1, as by default). `0`: always M. |
 | `FREETOKEN_SPEC_COSTS` | measured, by card count | Step time per row count (ms; only the ratios matter): two cards (`xtx-xt`) `1:17.7,2:25.3,3:30.7,4:35.5`, one card (`xt`) `1:31,2:53,3:78,4:102`, where the extra rows' missing experts cross PCIe and the adaptive depth mostly keeps to 2 rows. Entries given here override. |
-| `FREETOKEN_SPEC_BS_MAX` | `1` | Verify only while at most this many requests decode (at most `--cuda-graph-max-bs`, checked at start). With more, steps run one row per request, the head only writes its KV (so drafts stay good when a request is alone again) and scheduling overlaps as without the head. `2` on two cards, measured 2026-10-03: two agents at ~100k of context decode 33.6-34.4 tok/s each instead of 30.8-31.1, 2-3 short requests finish 3-4 % sooner, 1 and 4 requests take the same time, a sweep to 248k runs without an out-of-memory retry (one of six 3-request rounds took 10.1 s instead of ~8, unexplained; greedy answers as with `1`: two at once identical to each alone, four at once 2 of 4 prompts differ in both, the batched-prefill rounding of [benchmarks.md](benchmarks.md#several-requests-and-agents-at-once-xtx-xt)). Before the adaptive depth, a fixed 4 rows for 2 requests cost 60.5 ms against 23.7 ms for one row each, for 4 requests 133 ms against 41.5 ms; past 8 rows per step answers can change. |
+| `FREETOKEN_SPEC_BS_MAX` | `1`; `2` in `xtx-xt` | Verify only while at most this many requests decode (at most `--cuda-graph-max-bs`, checked at start). With more, steps run one row per request, the head only writes its KV (so drafts stay good when a request is alone again) and scheduling overlaps as without the head. `2` on `xtx-xt` (the other two-card profiles keep `1`: not measured there), measured 2026-10-03: two agents at ~100k of context decode 33.6-34.4 tok/s each instead of 30.8-31.1, 2-3 short requests finish 3-4 % sooner, 1 and 4 requests take the same time, a sweep to 248k runs without an out-of-memory retry (one of six 3-request rounds took 10.1 s instead of ~8, unexplained; greedy answers as with `1`: two at once identical to each alone, four at once 2 of 4 prompts differ in both, the batched-prefill rounding of [benchmarks.md](benchmarks.md#several-requests-and-agents-at-once-xtx-xt)); on 2026-10-04 with the reference machine's launcher settings (image input on), two agents 36.4 against 31.6 tok/s each (thinking on: 38.8 against 34.2 on the turns they decode together), and conversations of 115k and 121k tokens decoding together without an out-of-memory retry. The one crash seen during these loads (an illegal memory access while the weights loaded, once) happened before this setting is read. Before the adaptive depth, a fixed 4 rows for 2 requests cost 60.5 ms against 23.7 ms for one row each, for 4 requests 133 ms against 41.5 ms; past 8 rows per step answers can change. |
 | `FREETOKEN_SPEC_SAMPLED_DRAFTS` | unset | `1`: a sampled request's drafts are draws from the head under the request's own temperature / top-k / top-p, verified against that distribution, instead of the head's argmax (both exact speculative sampling). Measured: 2-7 % more tokens kept per step, the same speed (120 items at the model's T 1.0: 439 s against 434 s). |
 
 ## Sampling
@@ -620,8 +620,9 @@ the same within 4 % (`xtx` 33.1-43.2, `xt` 27.1-34.9 tok/s). Sections marked ROC
 
 With the head, one request decodes 34 % faster on two cards at the model's sampling (+30 to +61 % greedy along the
 sweep) and 7-8 % faster on one card (+6 to +12 % greedy); reading a prompt costs 0-4 % more, since the head reads it
-too. On one card one of the six sampled prompts (a long story) is 3-4 % slower with it. With several requests
-decoding, the head only writes its KV: see the table further down.
+too. On one card one of the six sampled prompts (a long story) is 3-4 % slower with it. With more requests
+decoding than `FREETOKEN_SPEC_BS_MAX` (2 in `xtx-xt`, 1 in the other profiles), the head only writes its KV: see
+the table further down.
 
 Decode loses 4-9 % from 9k to 248k on two cards and 20-24 % from 9k to 124k on one card. The ROCm 7.14 image
 (code 3a380bd, TunableOp on) measured the same way on `xtx` without the head: 36.9 / 32.3 / 30.2 / 29.1 tok/s at
@@ -685,13 +686,17 @@ result and a ~250-token answer, temperature 0.6 (what the reference machine's ag
 |---|---:|---:|
 | One conversation: decode | 71.1 tok/s | 55.8 tok/s |
 | One conversation: time to the first token of a turn | 1.75 s | 1.73 s |
-| Two conversations at once (sub-agents): decode | 31.1 tok/s | 33.2 tok/s |
+| Two conversations at once (sub-agents), `FREETOKEN_SPEC_BS_MAX=1`: decode | 31.1 tok/s | 33.2 tok/s |
+| Same, `FREETOKEN_SPEC_BS_MAX=2` (the profile's since 2026-10-04): decode | 33.6-34.4 tok/s | |
 | Two conversations at once: time to the first token | 1.96 s | 1.95 s |
 
-Two requests share each decode step and the head then only writes its KV, so each gets ~31-33 tok/s at ~100k of
-context, with or without it.
+Two requests share each decode step. With `FREETOKEN_SPEC_BS_MAX=1` the head then only writes its KV, so each gets
+~31-33 tok/s at ~100k of context, with or without it; with `2` it keeps verifying drafts for both. On the reference
+machine's own launcher settings (image input on, 2026-10-04): 36.4 against 31.6 tok/s each, and with thinking on 38.8
+against 34.2 on the turns the two decode together; two conversations of 115k and 121k tokens decoded together with no
+out-of-memory retry.
 
-Endurance, 2026-10-04: 2 h 07 of rounds of this load as shipped (one conversation, then two at once, 6 turns each, then
+Endurance, 2026-10-04: 2 h 07 of rounds of this load as shipped then (`FREETOKEN_SPEC_BS_MAX=1`; one conversation, then two at once, 6 turns each, then
 4 short requests and `quick_bench.py`; 90 conversations at 70-121k tokens, 540 turns). One conversation decoded at 69.3
 tok/s median over the 30 rounds (65.9-76.9), turns of two at once at 31.3 each (204 turns timed from round 12 on), its
 cold read (68-93k tokens) at 1860 tok/s, 4 short requests took 10.1-10.3 s; no GPU queue stop, no out-of-memory retry,
@@ -713,8 +718,8 @@ The PP row is the second pass: the first one, right after start, took 6.0 s alon
 preparation). Four requests share each decode step, so each gets ~26 tok/s; real agents also wait for each other's
 prefills.
 
-With the head, only a request decoding alone verifies drafts: with two or more, steps run one row per request and the
-head only writes its KV, an eager pass that costs 3-4 % at 3-4 requests; a lone request finishes 13 % sooner.
+With the head and `FREETOKEN_SPEC_BS_MAX=1`, only a request decoding alone verifies drafts: with two or more, steps run
+one row per request and the head only writes its KV, an eager pass that costs 3-4 % at 3-4 requests; a lone request finishes 13 % sooner.
 
 A request's decode is computed the same way alone or batched (per-row kernels); prompts prefilled in the same batch can
 differ at rounding level, as they already do with prefix caching.
@@ -769,7 +774,7 @@ rows, answers identical to plain decode:
 | The 120-item set at the model's default sampling (the drawn answers differ: 24.6k / 24.0k tokens) | 600 s | 434 s (x1.34 per token) | |
 | Cold 6.8k-token prompt (PP) | ~1990 tok/s | ~1960 tok/s | |
 
-| Several requests (the head only writes its KV; greedy texts identical to each request alone in both) | Without the head | With the head |
+| Several requests (`FREETOKEN_SPEC_BS_MAX=1`: the head only writes its KV; greedy texts identical to each request alone in both) | Without the head | With the head |
 |---|---:|---:|
 | 2 requests at once, greedy, 200 + 96 tokens: time from the send to the last token | 6.10-6.22 s | 5.98-5.99 s (-3 %) |
 | 4 requests at once, greedy, 200 tokens: time from the send to the last token | 9.23-9.36 s | 9.63-9.74 s (+4 %) |
@@ -1201,10 +1206,10 @@ benchmark with the MTP head: 12 and 18 of 29 in two runs.
 
 | | |
 |---|---|
-| Choice | On in the profiles (`FREETOKEN_MTP=1 FREETOKEN_SPEC_VERIFY_M=4`; `rdna3/serve.sh --no-mtp` turns it off). The checkpoint's MTP layer drafts up to 3 tokens (chained on its own streams); the next decode step verifies them in the same captured forward, 2-4 rows chosen per request from its measured acceptance and the step costs measured for the card count (mostly 2 on one card; 1 near a request's length limit). Rejected rows are undone by restoring the GDN, conv and PLE states saved after each row; attention KV needs nothing (rejected positions are rewritten before any query sees them). Sampled requests use exact speculative sampling. Only while one request decodes: with more, steps run one row each and the head only writes its KV |
+| Choice | On in the profiles (`FREETOKEN_MTP=1 FREETOKEN_SPEC_VERIFY_M=4`; `rdna3/serve.sh --no-mtp` turns it off). The checkpoint's MTP layer drafts up to 3 tokens (chained on its own streams); the next decode step verifies them in the same captured forward, 2-4 rows chosen per request from its measured acceptance and the step costs measured for the card count (mostly 2 on one card; 1 near a request's length limit). Rejected rows are undone by restoring the GDN, conv and PLE states saved after each row; attention KV needs nothing (rejected positions are rewritten before any query sees them). Sampled requests use exact speculative sampling. Only while at most `FREETOKEN_SPEC_BS_MAX` requests decode (2 in `xtx-xt`, 1 in the other profiles): with more, steps run one row each and the head only writes its KV |
 | Alternatives | Plain decode; a fixed draft depth; verifying several requests at once; the head's own forward captured in a graph |
 | For | Agentic benchmark on ROCm 10 with the head: 12 and 18 of 29 (two runs). One request on `xtx-xt` (release, ROCm 10): +34 % decode at the model's sampling, +30-61 % greedy up to 248k of context (earlier runs: +11-39 % on chat, agent turns, a 108k-token context; +20-49 % on ROCm 7.14), x1.38 on 60 code and math items; one card +7-8 % (+6-12 % greedy); greedy answers identical to plain decode (bit-exact: 120/120 on ROCm 7.14, every check on ROCm 10) |
-| Against | 3-4 % slower with 3-4 requests at once (the head still writes its KV every step); prompt reading 0-4 % slower (4-5 % on a 108k-token prompt; the head reads it too); the head's 512 experts compete for the expert cache; a CUDA graph per row count (they are captured for one request only) |
+| Against | 3-4 % slower with 3-4 requests at once (the head still writes its KV every step); prompt reading 0-4 % slower (4-5 % on a 108k-token prompt; the head reads it too); the head's 512 experts compete for the expert cache; a CUDA graph per row count (captured up to `FREETOKEN_SPEC_BS_MAX` requests: 2 in `xtx-xt`) |
 | Evidence | Step costs 17.7 / 25.3 / 30.7 / 35.5 ms at 1-4 rows on two cards, 31 / 53 / 78 / 102 ms on one (the extra rows' missing experts cross PCIe), 2.4-2.6 tokens kept per step on chat; a fixed 3 rows at 4 requests was -26 % before the head ran on the kept rows only ([benchmarks.md](benchmarks.md#speculative-decoding-mtp-head)) |
 
 ## Not done, on purpose
@@ -1425,7 +1430,8 @@ decode -0.5 % (noise), prefill ~1 % faster. The published image itself was measu
   each request picks 2-4 rows from its measured acceptance and the step costs. Up to 4 rows share each int8 weight
   tile in the GEMVs that loop over K (`FREETOKEN_INT8_ROW_GROUPS`, bit-exact).
 - **Several requests.** Fixed 3 rows at 4 requests: -26 %. So it verifies only while one request decodes; with more,
-  the head only writes its KV and the scheduler overlaps steps as without it.
+  the head only writes its KV and the scheduler overlaps steps as without it. With the adaptive depth, two requests
+  verifying together later paid on `xtx-xt` (+8-15 % each for two agents, 2026-10-04): `FREETOKEN_SPEC_BS_MAX=2` there.
 - **Bugs found on the way.** The detokenizer repeated text when a request got several tokens in one step; the LM head
   gathered prompt rows twice (a GPU memory fault). 4 rows were not bit-exact: the GDN output norm picked its rows per
   program from the row count (also for 4 requests decoding together), and the QSA attention its tile profile; decode
@@ -1586,10 +1592,12 @@ On in the profiles (`FREETOKEN_MTP=1 FREETOKEN_SPEC_VERIFY_M=4`); `rdna3/serve.s
 ([options.md](options.md#speculative-decoding-with-the-mtp-head-qwen38-flash-next-experimental)). Measured on `xtx-xt`,
 `xtx` and `xt` with Qwen3.8-Flash-Next ([benchmarks.md](benchmarks.md#speculative-decoding-mtp-head)):
 
-- **One request at a time gains, several do not.** On `xtx-xt`, a request alone decodes 34 % faster at the model's
+- **One request at a time gains (two in `xtx-xt`), more do not.** On `xtx-xt`, a request alone decodes 34 % faster at the model's
   sampling and 30-61 % faster greedy along a sweep to 248k of context (earlier runs: +11-39 % on chat, agent turns, a
-  108k-token context and a 1500-token answer; x1.38 on 60 code and math items). With 2 or more decoding at once, steps
-  run one row per request: from the send to the last token, 2 requests take the same time, 3-4 requests 3-4 % longer.
+  108k-token context and a 1500-token answer; x1.38 on 60 code and math items). With more decoding at once than
+  `FREETOKEN_SPEC_BS_MAX` (2 in `xtx-xt`, 1 in the other profiles), steps run one row per request: from the send to the
+  last token, 3-4 requests take 3-4 % longer; two agents at ~100k of context decode 8-15 % faster each with `2` than
+  with `1`.
 - **One card gains less**: +7-8 % at the model's sampling and +6-12 % greedy on `xtx` or `xt`, -8 % time on code and
   math; one of six sampled test prompts (a long story) is 3-4 % slower. Its step costs keep the verify steps mostly at 2
   rows: the extra rows' missing experts cross PCIe there.
@@ -1773,8 +1781,9 @@ slower (one-time kernel preparation): run it twice.
 docker run --rm -w /opt/FreeToken --entrypoint python3 freetoken-rdna3:latest -m pytest -q -p no:cacheprovider tests
 ```
 
-About 5 minutes, no GPU needed, on the tree the image was built from: 1481 passed, 501 skipped and 3 failures that
-come from the environment (they need flashinfer, an NVIDIA-only package) and fail the same way on upstream
+About 2.5 minutes (147 s on the reference machine), no GPU needed, on the tree the image was built from: 1504 passed,
+541 skipped and 3 failures that come from the environment (they need flashinfer, an NVIDIA-only package) and fail the
+same way on upstream
 (`test_cache_budget.py::test_adjust_config_defaults_moe_cache_auto_for_auto_resolved_offload_backend`,
 `test_cache_budget.py::test_adjust_config_resolves_num_tokens_generic`,
 `test_offload.py::test_adjust_config_converts_moe_cache_rate_to_cache_size`).

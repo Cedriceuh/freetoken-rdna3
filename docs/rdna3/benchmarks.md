@@ -38,8 +38,9 @@ the same within 4 % (`xtx` 33.1-43.2, `xt` 27.1-34.9 tok/s). Sections marked ROC
 
 With the head, one request decodes 34 % faster on two cards at the model's sampling (+30 to +61 % greedy along the
 sweep) and 7-8 % faster on one card (+6 to +12 % greedy); reading a prompt costs 0-4 % more, since the head reads it
-too. On one card one of the six sampled prompts (a long story) is 3-4 % slower with it. With several requests
-decoding, the head only writes its KV: see the table further down.
+too. On one card one of the six sampled prompts (a long story) is 3-4 % slower with it. With more requests
+decoding than `FREETOKEN_SPEC_BS_MAX` (2 in `xtx-xt`, 1 in the other profiles), the head only writes its KV: see
+the table further down.
 
 Decode loses 4-9 % from 9k to 248k on two cards and 20-24 % from 9k to 124k on one card. The ROCm 7.14 image
 (code 3a380bd, TunableOp on) measured the same way on `xtx` without the head: 36.9 / 32.3 / 30.2 / 29.1 tok/s at
@@ -103,13 +104,17 @@ result and a ~250-token answer, temperature 0.6 (what the reference machine's ag
 |---|---:|---:|
 | One conversation: decode | 71.1 tok/s | 55.8 tok/s |
 | One conversation: time to the first token of a turn | 1.75 s | 1.73 s |
-| Two conversations at once (sub-agents): decode | 31.1 tok/s | 33.2 tok/s |
+| Two conversations at once (sub-agents), `FREETOKEN_SPEC_BS_MAX=1`: decode | 31.1 tok/s | 33.2 tok/s |
+| Same, `FREETOKEN_SPEC_BS_MAX=2` (the profile's since 2026-10-04): decode | 33.6-34.4 tok/s | |
 | Two conversations at once: time to the first token | 1.96 s | 1.95 s |
 
-Two requests share each decode step and the head then only writes its KV, so each gets ~31-33 tok/s at ~100k of
-context, with or without it.
+Two requests share each decode step. With `FREETOKEN_SPEC_BS_MAX=1` the head then only writes its KV, so each gets
+~31-33 tok/s at ~100k of context, with or without it; with `2` it keeps verifying drafts for both. On the reference
+machine's own launcher settings (image input on, 2026-10-04): 36.4 against 31.6 tok/s each, and with thinking on 38.8
+against 34.2 on the turns the two decode together; two conversations of 115k and 121k tokens decoded together with no
+out-of-memory retry.
 
-Endurance, 2026-10-04: 2 h 07 of rounds of this load as shipped (one conversation, then two at once, 6 turns each, then
+Endurance, 2026-10-04: 2 h 07 of rounds of this load as shipped then (`FREETOKEN_SPEC_BS_MAX=1`; one conversation, then two at once, 6 turns each, then
 4 short requests and `quick_bench.py`; 90 conversations at 70-121k tokens, 540 turns). One conversation decoded at 69.3
 tok/s median over the 30 rounds (65.9-76.9), turns of two at once at 31.3 each (204 turns timed from round 12 on), its
 cold read (68-93k tokens) at 1860 tok/s, 4 short requests took 10.1-10.3 s; no GPU queue stop, no out-of-memory retry,
@@ -131,8 +136,8 @@ The PP row is the second pass: the first one, right after start, took 6.0 s alon
 preparation). Four requests share each decode step, so each gets ~26 tok/s; real agents also wait for each other's
 prefills.
 
-With the head, only a request decoding alone verifies drafts: with two or more, steps run one row per request and the
-head only writes its KV, an eager pass that costs 3-4 % at 3-4 requests; a lone request finishes 13 % sooner.
+With the head and `FREETOKEN_SPEC_BS_MAX=1`, only a request decoding alone verifies drafts: with two or more, steps run
+one row per request and the head only writes its KV, an eager pass that costs 3-4 % at 3-4 requests; a lone request finishes 13 % sooner.
 
 A request's decode is computed the same way alone or batched (per-row kernels); prompts prefilled in the same batch can
 differ at rounding level, as they already do with prefix caching.
@@ -187,7 +192,7 @@ rows, answers identical to plain decode:
 | The 120-item set at the model's default sampling (the drawn answers differ: 24.6k / 24.0k tokens) | 600 s | 434 s (x1.34 per token) | |
 | Cold 6.8k-token prompt (PP) | ~1990 tok/s | ~1960 tok/s | |
 
-| Several requests (the head only writes its KV; greedy texts identical to each request alone in both) | Without the head | With the head |
+| Several requests (`FREETOKEN_SPEC_BS_MAX=1`: the head only writes its KV; greedy texts identical to each request alone in both) | Without the head | With the head |
 |---|---:|---:|
 | 2 requests at once, greedy, 200 + 96 tokens: time from the send to the last token | 6.10-6.22 s | 5.98-5.99 s (-3 %) |
 | 4 requests at once, greedy, 200 tokens: time from the send to the last token | 9.23-9.36 s | 9.63-9.74 s (+4 %) |

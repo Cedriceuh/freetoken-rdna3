@@ -47,7 +47,7 @@ shows:
 ```bash
 docker build -f Dockerfile.rdna3 -t freetoken-rdna3:latest .
 docker run --rm -w /opt/FreeToken --entrypoint python3 freetoken-rdna3:latest \
-  -m pytest -q -p no:cacheprovider tests          # CPU suite, ~5 min, 3 known environment failures (testing.md)
+  -m pytest -q -p no:cacheprovider tests          # CPU suite, ~2.5 min, 3 known environment failures (testing.md)
 ```
 
 GPU checks and benchmarks: [docs/rdna3/testing.md](docs/rdna3/testing.md). A bug fix comes with a test that fails

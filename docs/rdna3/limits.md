@@ -93,10 +93,12 @@ On in the profiles (`FREETOKEN_MTP=1 FREETOKEN_SPEC_VERIFY_M=4`); `rdna3/serve.s
 ([options.md](options.md#speculative-decoding-with-the-mtp-head-qwen38-flash-next-experimental)). Measured on `xtx-xt`,
 `xtx` and `xt` with Qwen3.8-Flash-Next ([benchmarks.md](benchmarks.md#speculative-decoding-mtp-head)):
 
-- **One request at a time gains, several do not.** On `xtx-xt`, a request alone decodes 34 % faster at the model's
+- **One request at a time gains (two in `xtx-xt`), more do not.** On `xtx-xt`, a request alone decodes 34 % faster at the model's
   sampling and 30-61 % faster greedy along a sweep to 248k of context (earlier runs: +11-39 % on chat, agent turns, a
-  108k-token context and a 1500-token answer; x1.38 on 60 code and math items). With 2 or more decoding at once, steps
-  run one row per request: from the send to the last token, 2 requests take the same time, 3-4 requests 3-4 % longer.
+  108k-token context and a 1500-token answer; x1.38 on 60 code and math items). With more decoding at once than
+  `FREETOKEN_SPEC_BS_MAX` (2 in `xtx-xt`, 1 in the other profiles), steps run one row per request: from the send to the
+  last token, 3-4 requests take 3-4 % longer; two agents at ~100k of context decode 8-15 % faster each with `2` than
+  with `1`.
 - **One card gains less**: +7-8 % at the model's sampling and +6-12 % greedy on `xtx` or `xt`, -8 % time on code and
   math; one of six sampled test prompts (a long story) is 3-4 % slower. Its step costs keep the verify steps mostly at 2
   rows: the extra rows' missing experts cross PCIe there.

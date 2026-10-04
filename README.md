@@ -24,7 +24,7 @@ a coding agent (OpenCode), with an OpenAI- and Anthropic-compatible API. Image i
 
 The MTP head (the model's own draft layer) guesses the next tokens and one step checks them; greedy answers are
 identical with and without it. With 3-4 requests at once it costs 3-4 %; `rdna3/serve.sh --no-mtp` turns it off.
-On real agent turns (~90k-token contexts of code, temperature 0.6): 71 tok/s for a request alone, ~31 tok/s each when
+On real agent turns (~90k-token contexts of code, temperature 0.6): 71 tok/s for a request alone, ~34 tok/s each when
 two sub-agents decode at once ([benchmarks](docs/rdna3/benchmarks.md#agent-turns-on-real-code-xtx-xt)). The baseline column was measured on the earlier ROCm 7.14 image.
 
 Four agents with 82-117k-token conversations, 3 turns each: after the first reads, the three rounds of turns take
