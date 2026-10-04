@@ -124,6 +124,23 @@ Line counts in this section and the next are relative to `d72e5cb` (0.1.0 plus i
 | `python/freetoken/engine/engine.py` | 30/0 | the process's memory locked once loaded (`FREETOKEN_MLOCK`) so that, with `vm.compact_unevictable_allowed=0`, memory compaction leaves the pages the GPU driver maps alone; a warning while it is 1 |
 | `tests/kernels/test_row_store.py`, `tests/engine/test_lock_memory.py` | 32/0, new | the captured-wait probe; when the memory lock applies |
 
+## EXL3 checkpoints (experimental)
+
+Line counts here are on top of the lines listed in the sections above.
+
+| File | Lines | Change |
+|---|---:|---|
+| `python/freetoken/layers/quantization/exl3_codec.py` | new | the EXL3 format in plain torch (trellis rings, codebooks, tile order, Hadamard reconstruction, n-gram rings): the reference the kernels are checked against |
+| `python/freetoken/kernel/triton/exl3.py` | new | gfx1100 Triton kernels: tile dequant, split-K decode GEMV, grouped prefill GEMM, Hadamard rotations, n-gram row decode |
+| `python/freetoken/layers/quantization/configs/exl3.py`, `configs/__init__.py`, `configs/base.py` | new, 4/3, 6/1 | the `exl3` dialect: routed experts stay EXL3 (bitrate read from the checkpoint), every other linear unquantized; dialects can see the checkpoint path |
+| `python/freetoken/layers/quantization/scheme.py`, `moe/exl3.py`, `moe/__init__.py` | 17/0, new, 4/3 | the EXL3 kind and expert method: bank layout, per-rank slicing on 128-blocks, forward |
+| `python/freetoken/moe/fused_exl3.py`, `moe/legacy_format.py` | new, 1/0 | the expert forward (decode GEMVs, blocked prefill GEMMs) and its bank tag |
+| `python/freetoken/models/exl3_weights.py` | new | dense EXL3 linears decoded to bf16 at load; the expert reader |
+| `python/freetoken/models/qwen4_exp/weight.py`, `config.py`, `ple_disk.py` | 108/7, 6/2, 69/5 | qwen4_exp reads EXL3 checkpoints: hash constants, expert and MTP-expert pieces, the trellis n-gram table in the disk PLE backend |
+| `python/freetoken/distributed/split.py`, `models/register.py` | 10/1, 1/0 | a format can widen the intermediate split unit (EXL3: 128); the checkpoint path reaches the dialect |
+| `python/freetoken/layers/quantization/moe/base.py`, `engine/engine.py`, `tests/engine/test_cache_budget.py` | 8/0, 17/2, 13/0 | an expert kernel can declare the temporaries of a prefill chunk (EXL3: 0.6 GiB per card at 16k tokens); the cache planner keeps them out of the expert cache and the KV pages on every rank |
+| `tests/layers/test_exl3_codec.py`, `rdna3/tests/exl3_check.py`, `rdna3/tests/exl3_moe_check.py`, `rdna3/bench/exl3_gemv_bench.py`, `rdna3/bench/exl3_moe_bench.py` | new | CPU tests, GPU checks, micro-benchmarks |
+
 ## Tooling and documentation
 
 | File | Change |
@@ -131,6 +148,6 @@ Line counts in this section and the next are relative to `d72e5cb` (0.1.0 plus i
 | `python/freetoken/engine/ftprof.py` (93/0) | env-gated decode profiling (`FT_STATS_EVERY`, `FT_PROF_*`) |
 | `python/freetoken/server/args.py` (3/1) | `--cuda-graph-max-bs` help |
 | `Dockerfile.rdna3`, `.dockerignore` | the ROCm image |
-| `rdna3/` | profiles (the MTP head on, TunableOp off), `serve.sh` (`--no-mtp`), GPU checks, micro-benchmarks and `bench/depth_sweep.py`, the ROCm 7.14 TunableOp files, maintenance tools |
+| `rdna3/` | profiles (the MTP head on, TunableOp off), `serve.sh` (`--no-mtp`; a lower `--memory-ratio` for EXL3 on two cards), GPU checks, micro-benchmarks and `bench/depth_sweep.py`, the ROCm 7.14 TunableOp files, maintenance tools |
 | `README.md`, `NOTICE`, `CHANGELOG.md`, `llms.txt`, `llms-full.txt`, `AGENTS.md`, `CONTRIBUTING.md`, `SECURITY.md`, `docs/rdna3/` | this repository's documentation (the banner rendered from `docs/rdna3/assets/social-preview.html`); upstream's README moved to `docs/FREETOKEN_UPSTREAM_README.md` |
 | `.github/` | upstream's release workflows and issue templates replaced by this repository's |

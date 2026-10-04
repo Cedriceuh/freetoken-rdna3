@@ -29,6 +29,11 @@ first; one-card profiles take the smallest card with enough VRAM. Force a choice
   and decode fell to 1.9 tok/s (the allocator thrashes).
 - Lower the context (`--ctx 131072` on two cards, `--ctx 65536` on one), then the memory ratio
   (`-- --memory-ratio 0.75`).
+- A prefill peak above the card's VRAM does not always fail an allocation: the driver evicts memory and stops the
+  process's GPU queues for seconds (the `evicted_ms` counter of [Long pauses](#long-pauses-in-the-middle-of-a-run)),
+  and a rank has died on an illegal memory access that way. `/sys/class/drm/card*/device/mem_info_vram_used` sampled
+  during the first long prompt shows how close the peak comes; the card driving the display also holds the
+  desktop's buffers. On `xtx-xt`, `--memory-ratio` 0.80 -> 0.78 lowered the 7900 XTX's peak by 350 MiB.
 - The container needs `--ulimit memlock=-1` (pinned RAM for the experts and the RAM tier) and enough RAM under its
   `--memory` limit (default 110g); an OOM kill shows as exit code 137.
 

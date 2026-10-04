@@ -23,7 +23,7 @@ slower (one-time kernel preparation): run it twice.
 docker run --rm -w /opt/FreeToken --entrypoint python3 freetoken-rdna3:latest -m pytest -q -p no:cacheprovider tests
 ```
 
-About 2.5 minutes (147 s on the reference machine), no GPU needed, on the tree the image was built from: 1504 passed,
+About 2 minutes (131 s on the reference machine), no GPU needed, on the tree the image was built from: 1534 passed,
 541 skipped and 3 failures that come from the environment (they need flashinfer, an NVIDIA-only package) and fail the
 same way on upstream
 (`test_cache_budget.py::test_adjust_config_defaults_moe_cache_auto_for_auto_resolved_offload_backend`,
@@ -52,6 +52,8 @@ docker run --rm --device=/dev/kfd --device=/dev/dri --security-opt seccomp=uncon
 | `gemv_check.py` | the bf16 split-K GEMVs against `F.linear`, eager and under CUDA-graph capture |
 | `int8_gemv_check.py` | the int8 GEMV against a dequantized reference, eager and in a graph |
 | `int8_rows_check.py` | several rows at once give each row exactly what a batch of one gives, for every tuned shape |
+| `exl3_check.py` | the EXL3 tile dequant bit-exact with the torch reference (K = 1-8, three codebooks), the split-K GEMV, the n-gram row decode |
+| `exl3_moe_check.py` | the EXL3 routed-expert path (rotations + products) against a dense reference: decode, prefill, a 384 / 256 two-rank split, prefill token blocks bit-identical to one pass, a CUDA-graph replay |
 | `moe_block_check.py` | the token-blocked NVFP4 prefill MoE returns exactly what the one-shot call returns |
 | `host_allreduce_check.py` (2 GPUs: `HIP_VISIBLE_DEVICES=0,1`) | the host-memory all-reduce against RCCL |
 | `host_kv_check.py` | the RAM-tier copies (device -> RAM -> device) are exact |
@@ -66,6 +68,7 @@ docker run --rm --device=/dev/kfd --device=/dev/dri --security-opt seccomp=uncon
 | `sampling_topp_bench.py` | the ROCm sorted-threshold sampler against float64 and upstream's kernels (kept sets, seeded draws, distribution, speed) |
 | `sampling_topk_bench.py` | the top-k-first sampler against the full-vocabulary path |
 | `nvfp4_decode_sweep.py`, `nvfp4_prefill_sweep.py` | tile sweeps of the NVFP4 expert GEMMs (how the tuned tables were made) |
+| `exl3_gemv_bench.py`, `exl3_moe_bench.py` | the EXL3 decode GEMV tile sweep against the NVFP4 GEMV, and the 48-layer decode MoE step of both formats |
 | `dense_gemv_bench.py` | decode dense projections, bf16 vs int8 |
 | `router_topk_bench.py` | the MoE router softmax + top-k |
 | `allreduce_bench.py` | tiny all-reduce latency between two GPUs (`torchrun --nproc-per-node 2`) |

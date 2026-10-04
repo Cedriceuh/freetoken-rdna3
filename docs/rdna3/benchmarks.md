@@ -1,13 +1,15 @@
 # Benchmarks
 
-Everything here was measured on one machine: RX 7900 XTX 24 GB + RX 7900 XT 20 GB (gfx1100, PCIe 4.0 x16 each, no
-GPU peer-to-peer), Threadripper 3970X, 128 GB DDR4-3200, Qwen3.8-Flash-Next NVFP4 (RadixArk checkpoint). The numbers
-from the summary to the one-card sweeps were taken on 2026-10-03 on the ROCm 10.0 / PyTorch 2.13 image as released:
-each profile as shipped (MTP head on) and the same with `--no-mtp`, one server per configuration, with the host
-settings of [troubleshooting.md](troubleshooting.md#long-pauses-in-the-middle-of-a-run). The one-card
-sweeps with the head ran with a variant of the adaptive depth dropped before the release; the released image itself gave
-the same within 4 % (`xtx` 33.1-43.2, `xt` 27.1-34.9 tok/s). Sections marked ROCm 7.14 were measured on the earlier image (PyTorch 2.11): the baseline, the 0.1.0 release build
-("release build" rows, image `rdna3-v0.1.0`) and the MTP head's development.
+Everything here was measured on one machine: RX 7900 XTX 24 GB + RX 7900 XT 20 GB (gfx1100, PCIe 4.0 x16 each, no GPU
+peer-to-peer), Threadripper 3970X, 128 GB DDR4-3200, Qwen3.8-Flash-Next NVFP4 (RadixArk checkpoint; the experimental
+EXL3 checkpoints are measured in
+[how-it-works.md](how-it-works.md#exl3-checkpoints)). The numbers from the summary to
+the one-card sweeps were taken on 2026-10-03 on the ROCm 10.0 / PyTorch 2.13 image as released: each profile as
+shipped (MTP head on) and the same with `--no-mtp`, one server per configuration, with the host settings of
+[troubleshooting.md](troubleshooting.md#long-pauses-in-the-middle-of-a-run). The one-card sweeps with the head ran
+with a variant of the adaptive depth dropped before the release; the released image itself gave the same within 4 %
+(`xtx` 33.1-43.2, `xt` 27.1-34.9 tok/s). Sections marked ROCm 7.14 were measured on the earlier image (PyTorch 2.11):
+the 0.1.0 release build ("release build" rows, image `rdna3-v0.1.0`) and the MTP head's development.
 
 ## How the numbers are taken
 
@@ -20,9 +22,6 @@ the same within 4 % (`xtx` 33.1-43.2, `xt` 27.1-34.9 tok/s). Sections marked ROC
   256 tokens, **PP** = speed of reading that block, **agent turn** = time to the first token of a following ~1k-token
   turn. Median of two passes, each with its own text. With the MTP head, TG follows how many of its guesses the text
   lets it keep (1.6-3.5 tokens per step): the spread between steps is the text, not noise.
-- **Baseline** (ROCm 7.14): the same checkpoint on FreeToken ported to ROCm, TP=2, with PyTorch TunableOp (read-only)
-  and memory ratio 0.85 but none of this build's other changes (bf16 dense layers, even split, one request at a time),
-  same cards.
 
 ## Summary
 
@@ -34,7 +33,18 @@ the same within 4 % (`xtx` 33.1-43.2, `xt` 27.1-34.9 tok/s). Sections marked ROC
 | `xtx --no-mtp` | 35.8 / 35-38 tok/s | 29.5-39 tok/s | 7.6 s, ~1095 tok/s | 1140-1500 tok/s | 2.3 -> 2.7 s | 124k |
 | `xt` | 31.7 / 30-36 tok/s | 27-34 tok/s | 8.3 s, ~1000 tok/s | 1040-1340 tok/s | 2.5 -> 2.8 s | 124k |
 | `xt --no-mtp` | 29.5 / 28-32 tok/s | 25-32 tok/s | 8.2 s, ~1020 tok/s | 1070-1340 tok/s | 2.5 -> 2.8 s | 124k |
-| baseline, 2 cards (ROCm 7.14) | 35.9 tok/s | 33-35 tok/s | 6.3 s, ~1330 tok/s | 1290-1620 tok/s | 1.4 -> 2.0 s | 255k |
+| `xtx-xt`, EXL3 3.05 bpw | 82.2 / 78-98 tok/s | 83-107 tok/s | 4.05 s, ~2060 tok/s | 1730-2050 tok/s | 0.9 -> 1.6 s | 248k |
+| `xtx-xt`, EXL3 4.05 bpw | 73.4 / 68-84 tok/s | 76-87 tok/s | 4.05 s, ~2060 tok/s | 1710-2050 tok/s | 1.2 -> 1.9 s | 248k |
+| `xtx`, EXL3 3.05 bpw | 50.0 / 48-54 tok/s | 42-52 tok/s | 6.7 s, ~1245 tok/s | 1280-1590 tok/s | 1.5 -> 1.9 s | 124k |
+| `xtx`, EXL3 4.05 bpw | 40.5 / 38-45 tok/s | 36-44 tok/s | 7.3 s, ~1140 tok/s | 1200-1590 tok/s | 2.1 -> 2.4 s | 124k |
+| `xt`, EXL3 3.05 bpw | 38.7 / 37-43 tok/s | 33-42 tok/s | 7.3 s, ~1145 tok/s | 1200-1420 tok/s | 1.6 -> 2.0 s | 124k |
+| `xt`, EXL3 4.05 bpw | 32.0 / 30-35 tok/s | 28-35 tok/s | 7.9 s, ~1055 tok/s | 1120-1420 tok/s | 2.2 -> 2.6 s | 124k |
+
+The EXL3 rows ([how-it-works.md](how-it-works.md#exl3-checkpoints)) were measured on 2026-10-04 with this branch's
+code on the same image, one server per row started by `rdna3/serve.sh` (on two cards it lowers `--memory-ratio` to
+0.77 / 0.76 for EXL3), MTP head on, the same scripts: the 12 sampled and 3 greedy answers, `quick_bench.py` for the
+cold read, the depth sweep. The checkpoints answer differently, so the MTP head keeps a different share of its
+guesses: read the decode columns across checkpoints as an order of magnitude.
 
 With the head, one request decodes 34 % faster on two cards at the model's sampling (+30 to +61 % greedy along the
 sweep) and 7-8 % faster on one card (+6 to +12 % greedy); reading a prompt costs 0-4 % more, since the head reads it
@@ -66,19 +76,6 @@ an answer, so it is not the prefill evicting the cache), and attention itself ad
 | 206.9k | 72.1 / 52.7 | 1717 / 1774 | 1.88 / 1.83 s |
 | 248.4k | 71.5 / 52.0 | 1669 / 1728 | 2.01 / 1.95 s |
 
-## Depth sweep, baseline (2 cards, TunableOp only, ROCm 7.14)
-
-| Depth | TG tok/s | PP new tok/s | Agent turn |
-|---:|---:|---:|---:|
-| 10.6k | 34.5 | 1606 | 1.42 s |
-| 37.3k | 34.8 | 1608 | 1.49 s |
-| 104.6k | 34.3 | 1290 | 1.61 s |
-| 167.7k | 33.8 | 1499 | 1.78 s |
-| 233.6k | 33.6 | 1467 | 1.96 s |
-| 254.9k | 34.4 (one pass) | 1370 | 2.04 s |
-
-The baseline also leaves 4.6 GiB of the XTX unused (the even split sizes everything for the smaller card).
-
 ## Depth sweep, one card
 
 | Depth | `xtx` TG with / without the head | `xtx` PP new | `xtx` turn | `xt` TG with / without | `xt` PP new | `xt` turn |
@@ -94,6 +91,38 @@ The baseline also leaves 4.6 GiB of the XTX unused (the even split sizes everyth
 PP is the same with and without the head within 4 %; one card reads 8k-token chunks (16k on two). On ROCm 7.14 the XT
 ended at 124k with 0.8 GiB of VRAM free (131k is its limit), and a 60k-token prompt read from scratch took 45 s on the
 XTX (then 30.5 tok/s), 48 s on the XT (then 26.7 tok/s).
+
+## Depth sweep, EXL3 checkpoints
+
+Median of two passes, MTP head on (2026-10-04):
+
+| Depth | `xtx-xt` 3.05 bpw TG / PP new / turn | `xtx-xt` 4.05 bpw TG / PP new / turn |
+|---:|---:|---:|
+| 8.8k | 87.1 / 2054 / 0.88 s | 74.9 / 2054 / 1.21 s |
+| 16.0k | 103.6 / 1956 / 0.90 s | 83.6 / 1933 / 1.23 s |
+| 25.0k | 102.7 / 1984 / 0.91 s | 82.2 / 1963 / 1.25 s |
+| 40.0k | 85.7 / 2013 / 0.93 s | 81.7 / 2005 / 1.30 s |
+| 60.0k | 100.6 / 1967 / 0.98 s | 86.6 / 1923 / 1.33 s |
+| 86.9k | 87.5 / 1948 / 1.05 s | 79.9 / 1931 / 1.43 s |
+| 122.9k | 107.3 / 1898 / 1.16 s | 85.2 / 1858 / 1.50 s |
+| 164.9k | 86.1 / 1841 / 1.30 s | 78.0 / 1826 / 1.64 s |
+| 206.9k | 83.2 / 1777 / 1.41 s | 77.2 / 1759 / 1.75 s |
+| 247.9k | 84.3 / 1727 / 1.61 s | 75.8 / 1707 / 1.94 s |
+
+| Depth | `xtx` 3.05 bpw | `xtx` 4.05 bpw | `xt` 3.05 bpw | `xt` 4.05 bpw |
+|---:|---:|---:|---:|---:|
+| 8.8k | 52.4 / 1284 / 1.51 s | 44.2 / 1201 / 2.07 s | 41.7 / 1201 / 1.64 s | 34.6 / 1117 / 2.20 s |
+| 16.0k | 49.4 / 1594 / 1.53 s | 41.4 / 1569 / 2.10 s | 39.0 / 1413 / 1.65 s | 32.5 / 1395 / 2.21 s |
+| 25.0k | 44.0 / 1574 / 1.55 s | 37.5 / 1594 / 2.12 s | 34.5 / 1419 / 1.68 s | 29.2 / 1423 / 2.23 s |
+| 40.0k | 43.9 / 1522 / 1.60 s | 36.7 / 1524 / 2.16 s | 34.2 / 1379 / 1.71 s | 28.8 / 1396 / 2.28 s |
+| 60.0k | 44.9 / 1478 / 1.64 s | 36.3 / 1441 / 2.21 s | 35.0 / 1342 / 1.77 s | 28.4 / 1322 / 2.34 s |
+| 86.9k | 44.4 / 1414 / 1.75 s | 36.5 / 1378 / 2.31 s | 35.4 / 1292 / 1.87 s | 28.3 / 1259 / 2.44 s |
+| 123.9k | 41.8 / 1428 / 1.88 s | 35.8 / 1427 / 2.43 s | 33.2 / 1298 / 2.00 s | 27.8 / 1289 / 2.57 s |
+
+Each cell: TG (tok/s) / PP of the new block (tok/s) / agent turn. The agent turns get their first token sooner than
+with NVFP4 (0.9-1.6 s against 1.3-2.0 s on two cards at 3.05 bpw), consistent with a turn's prefill streaming every
+expert of a layer over PCIe ([how-it-works.md](how-it-works.md#prefill)) and a 3.05 bpw expert weighing 1.86 MB
+against 2.76 MB.
 
 ## Agent turns on real code (`xtx-xt`)
 
@@ -217,34 +246,23 @@ step choose ~20 distinct experts per layer instead of 10, and the ones missing f
 at 3 rows, against 0.4-1.3 at one) are copied from RAM over PCIe. The head itself, run eagerly while the GPU still
 executes the forward's graph, adds ~3 ms.
 
-## How the speed was reached (2 cards, decode)
-
-| Step | Decode |
-|---|---:|
-| FreeToken ported to ROCm, TP=2, first working build | 27.0 tok/s |
-| + PyTorch TunableOp (read-only) + memory ratio 0.85 (the baseline) | 35.9 |
-| + int8 dense layers, split-K GEMVs, one MoE all-reduce per block | 52.4 |
-| + top-k-first sampler, uneven 0.55 split (measured with the int8 KV, dropped later) | 55.5 |
-| + 16k prefill chunks at ratio 0.80, expert reuse in prefill, host-memory all-reduce, tuned NVFP4 prefill tiles, bf16 attention KV | 56-57 |
-| + up to 4 requests, tuned decode tiles, conversations kept in RAM (`xtx-xt`, release build) | 55 alone, 105 at 4 |
-
-Details of every step, including what did not work: [journey.md](journey.md).
-
 ## Precision
 
 - **Scored benchmark** (671 items: HumanEval 164, MBPP 257, GSM8K 250; greedy, thinking off): the community ROCm port
-  (bf16) 636, the baseline of these tables (bf16) 632, the int8-dense builds 635. Two bf16 builds already differ by 4
-  items: no measurable loss.
+  (bf16) 636, the ROCm port this build started from (bf16) 632, the int8-dense builds 635. Two bf16 builds already
+  differ by 4 items: no measurable loss.
 - **Agentic benchmark** (the author's, private: a coding agent in OpenCode fixing 29 bugs planted in a ~50k-line
   codebase, long sessions, single runs): builds with the int8 attention KV cache fixed 8-9 bugs, builds with the bf16 KV
   12-14. The int8 KV is out of every profile ([options.md](options.md)).
-- **What the agentic benchmark covered**: the two-card builds that scored 12-13 had the uneven split, int8 dense layers,
-  one MoE all-reduce per block, the split-K GEMVs, the top-k-first sampler, 16k chunks with blocked PLE, expert reuse in
-  prefill, the host-memory all-reduce and the tuned prefill tiles. Added after the last scored build, and checked for
-  exactness instead: the tuned decode tiles, up to 4 concurrent requests (a request's decode is identical alone or
-  batched; prompts prefilled together can differ at rounding level), the RAM tier, the sampler rework for requests
-  without a small `top_k`, and rank 0's token broadcast. The one-card profiles were not run on it. The ROCm 10 image
-  with the MTP head (`xtx-xt`; greedy answers differ from ROCm 7.14 on 2 of 5 prompts) scored 12 and 18 in two runs.
+- **What the agentic benchmark covered**: the two-card builds that scored 12-13 had the uneven split, int8 dense
+  layers, one MoE all-reduce per block, the split-K GEMVs, the top-k-first sampler, 16k chunks with blocked PLE,
+  expert reuse in prefill, the host-memory all-reduce and the tuned prefill tiles. Added after the last scored build,
+  and checked for exactness instead: the tuned decode tiles, up to 4 concurrent requests (a request's decode is
+  identical alone or batched; prompts prefilled together can differ at rounding level), the RAM tier, the sampler
+  rework for requests without a small `top_k`, and rank 0's token broadcast. The one-card profiles were not run on it.
+  The ROCm 10 image with the MTP head (`xtx-xt`; greedy answers differ from ROCm 7.14 on 2 of 5 prompts) scored 12 and
+  18 in two runs; the same build with the EXL3 checkpoints ([how-it-works.md](how-it-works.md#exl3-checkpoints))
+  scored 13 at 3.05 bpw and 12 at 4.05 bpw, one run each.
 - **Exactness checks**: a fixed set of 120 greedy prompts (not published) gave identical answers for the host-memory
   all-reduce, the tuned NVFP4 tiles (prefill and decode), expert reuse in prefill, a single request on the 4-request
   build, and the review-fix branch against the swept one. Kernel checks prove the blocked prefill MoE and batched decode
@@ -350,5 +368,21 @@ passes (first token in 3.2-3.3 s).
 VRAM is the driver's count (`mem_info_vram_used`) sampled twice a second over a depth sweep to 248k: the ~2 GiB left
 free per card while decoding is the prefill's working memory, which a deep 16k-token chunk uses almost entirely (56 MiB
 left on the XT). Host RAM is the kernel's `Mlocked` count after start.
+
+**Every profile and checkpoint** (2026-10-04, one server each, `rdna3/serve.sh`): RAM is the growth of the kernel's
+`Mlocked` count from before the start to after it; the expert cache is the planned size (the same on both cards); VRAM
+is the highest `mem_info_vram_used` sampled every 50 ms over an agent-like first turn (a title request decoding while
+a ~21k-token prompt is read), the decode answers, `quick_bench.py` and the depth sweep, the desktop's share included.
+
+| | NVFP4 | EXL3 3.05 bpw | EXL3 4.05 bpw |
+|---|---:|---:|---:|
+| RAM locked, `xtx-xt` / `xtx` / `xt` | 81 / 72 / 72 GiB | 59 / 51 / 51 GiB | 74 / 65 / 65 GiB |
+| Expert cache, `xtx-xt` / `xtx` / `xt` | 7,127 / 3,567 / 2,328 | 9,900 / 4,871 / 3,026 | 7,312 / 3,663 / 2,276 |
+| VRAM peak, `xtx-xt` (XTX / XT of 24,560 / 20,464 MiB) | 23,524 / 20,291 MiB | 24,284 / 19,228 MiB | 24,035 / 19,197 MiB |
+| VRAM peak, `xtx` / `xt` | 23,506 / 19,367 MiB | 22,943 / 19,072 MiB | 22,868 / 19,081 MiB |
+
+No GPU queue was stopped by a full VRAM in these runs; the two 4.05 bpw one-card servers stopped their queues once,
+for 47-59 ms, on their first request (the VRAM was 1.7 GiB from full; the cause was not traced). The NVFP4 servers ran
+on the same build as the EXL3 ones, for their memory only.
 
 How to reproduce or check a change: [testing.md](testing.md).

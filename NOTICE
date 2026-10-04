@@ -8,5 +8,9 @@ or added since is listed, with the reason, in docs/rdna3/changes-from-upstream.m
 It includes ROCm support contributed to FreeToken by zihaomu (upstream pull requests #133, #134, #135) and pieces of a
 community ROCm port of FreeToken by lukascechovic; see docs/rdna3/credits.md.
 
+Its EXL3 support reads the format of exllamav3 by turboderp (https://github.com/turboderp-org/exllamav3, MIT License):
+the reference codec and the RDNA3 kernels were written from that project's description and CUDA sources; no exllamav3
+code runs in this product.
+
 Model weights (e.g. Qwen3.8-Flash-Next and its NVFP4 conversions) are not part of this product and are covered by
 their own licenses.

@@ -31,8 +31,9 @@ Upstream FreeToken's own documentation is in the parent directory ([install](../
 | GDN | GatedDeltaNet, the linear-attention layers (36 of the model's 48) with a fixed-size recurrent state |
 | QSA | the model's full-attention layers (12 of 48), which keep a KV cache |
 | KV cache | the attention layers' keys and values for every token of a conversation |
-| PLE | per-layer n-gram embeddings: big lookup tables (51 GB) read from disk |
-| NVFP4 | 4-bit floating-point weights with shared scales, the experts' format |
+| PLE | per-layer n-gram embeddings: big lookup tables (51 GB; 33 GB in EXL3 3.05 bpw) read from disk |
+| NVFP4 | 4-bit floating-point weights with shared scales, the experts' format in the RadixArk checkpoint |
+| EXL3 | exllamav3's trellis format (3 or 4 bits per weight here), read by this build for experimental checkpoints ([how-it-works.md](how-it-works.md#exl3-checkpoints)) |
 | MTP | multi-token prediction, the model's speculative-decoding head (on in the profiles, `rdna3/serve.sh --no-mtp` turns it off: [options.md](options.md#speculative-decoding-with-the-mtp-head-qwen38-flash-next-experimental)) |
 | LDS | the GPU's on-chip shared memory (64 KiB per work group on RDNA3) |
 | FTW | FreeToken's own weight format |

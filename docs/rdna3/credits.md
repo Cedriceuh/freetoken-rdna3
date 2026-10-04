@@ -13,9 +13,13 @@
   rewritten from, and the `Dockerfile.gfx1201` (in that port) that `Dockerfile.rdna3` derives from.
 - **flash-linear-attention**, vendored under `python/freetoken/kernel/fla` as upstream does.
 - **Qwen3.8-Flash-Next** by the Qwen team and its NVFP4 checkpoint by RadixArk; their licenses apply to the weights.
+- **exllamav3** by turboderp ([turboderp-org/exllamav3](https://github.com/turboderp-org/exllamav3), MIT License): the
+  EXL3 format and its checkpoints (e.g. turboderp/Qwen3.8-Flash-Next-exl3). The reference codec and the RDNA3 kernels
+  here are written from its format description and CUDA sources (bit layout, codebooks, tile order, n-gram rings); no
+  exllamav3 code runs in this build.
 
 Original to this repository: the uneven tensor-parallel split and unequal-card planning, weight-only int8 dense layers
 and their GEMVs, the split-K bf16 GEMVs, the host-memory all-reduce, the top-k-first sampler and the sorted-threshold
 sampling path for ROCm, rank-0 token broadcast, the tuned NVFP4 tiles, the blocked PLE and prefill MoE paths, expert
-reuse in prefill on ROCm, batch-invariant multi-request decoding, the RAM tier for conversations, the profiles and
-tooling, and the measurements in these docs.
+reuse in prefill on ROCm, batch-invariant multi-request decoding, the RAM tier for conversations, the EXL3 reader and its
+RDNA3 kernels, the profiles and tooling, and the measurements in these docs.

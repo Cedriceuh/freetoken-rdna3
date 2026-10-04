@@ -2,24 +2,26 @@
 
 ## How much RAM do I need?
 
-| Profile | RAM used while serving | Machine |
-|---|---:|---|
-| `xtx-xt` | 82 GiB (measured) | 128 GB |
-| `xtx-xtx`, `xt-xt` *(untested)* | ~82 GiB (estimated) | 128 GB |
-| `xtx`, `xt` | ~75 GiB (estimated) | 96 GB is tight, 128 GB comfortable |
-| `gre` *(untested)* | ~72 GiB (estimated) | 96 GB |
+| Profile | NVFP4 | EXL3 3.05 bpw | EXL3 4.05 bpw | Machine (NVFP4) |
+|---|---:|---:|---:|---|
+| `xtx-xt` | 82 GiB | 59 GiB | 74 GiB | 128 GB |
+| `xtx-xtx`, `xt-xt` *(untested)* | ~82 GiB (estimated) | ~59 GiB (estimated) | ~74 GiB (estimated) | 128 GB |
+| `xtx`, `xt` | 72 GiB | 51 GiB | 65 GiB | 96 GB is tight, 128 GB comfortable |
+| `gre` *(untested)* | ~70 GiB (estimated) | | | 96 GB |
 
 Where it goes, for Qwen3.8-Flash-Next: ~63 GiB of experts (the engine keeps **every** expert in pinned RAM, each rank
 its own share of each one; the GPUs cache the most used ones), the RAM tier for conversations (9.5 GiB on two cards,
-~5 GiB on one; `FREETOKEN_HOST_KV=0` removes it), and a few GiB for the processes. The 51 GB of n-gram tables stay on
-disk and only use the free page cache.
+~5 GiB on one; `FREETOKEN_HOST_KV=0` removes it), and a few GiB for the processes. The n-gram tables (51 GB; 33 GB
+in EXL3 3.05 bpw) stay on disk and only use the free page cache.
 
 ## Can it run with 64 GB of RAM?
 
-Not with Qwen3.8-Flash-Next. The experts alone need ~63 GiB of RAM: NVFP4 (4.5 bits per weight) is the smallest
-format this engine runs for this model (MXFP4 would save ~4 GB but has no checkpoint), and the engine has no mode that
-reads experts from disk. Getting there would take engine work (not keeping a RAM copy of the experts the GPUs already
-hold, plus a 3-bit expert format, or streaming experts from an SSD), with a precision cost to measure.
+Not with the NVFP4 checkpoint: its experts alone need ~63 GiB of RAM, and the engine has no mode that reads experts
+from disk. An **EXL3 checkpoint at 3 bits per weight** (experimental, [how-it-works.md](how-it-works.md#exl3-checkpoints))
+needs 42.6 GiB for its experts (63.3 in NVFP4; 43.5 and 68.0 with the MTP head's experts): on `xtx-xt`, with the RAM
+tier off and the experts loaded one file at a time, the server ran under a 56 GiB container limit at 52.3 GiB used
+(`FREETOKEN_HOST_KV=0` in the profile file, then `rdna3/serve.sh xtx-xt --model DIR --memory 56g -- --expert-load
+serial`; the parallel loader was killed under a 52 GiB limit). A real 64 GB machine is untested. On the agentic benchmark the 3.05 bpw checkpoint fixed 13 of 29 bugs (one run; NVFP4: 12 and 18 in two runs).
 
 ## How much VRAM?
 

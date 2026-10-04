@@ -123,6 +123,16 @@ benchmark with the MTP head: 12 and 18 of 29 in two runs.
 | Against | 3-4 % slower with 3-4 requests at once (the head still writes its KV every step); prompt reading 0-4 % slower (4-5 % on a 108k-token prompt; the head reads it too); the head's 512 experts compete for the expert cache; a CUDA graph per row count (captured up to `FREETOKEN_SPEC_BS_MAX` requests: 2 in `xtx-xt`) |
 | Evidence | Step costs 17.7 / 25.3 / 30.7 / 35.5 ms at 1-4 rows on two cards, 31 / 53 / 78 / 102 ms on one (the extra rows' missing experts cross PCIe), 2.4-2.6 tokens kept per step on chat; a fixed 3 rows at 4 requests was -26 % before the head ran on the kept rows only ([benchmarks.md](benchmarks.md#speculative-decoding-mtp-head)) |
 
+## EXL3 checkpoints: experts in EXL3, the rest in bf16
+
+| | |
+|---|---|
+| Choice | Keep the routed experts in EXL3 (host banks and GPU cache) behind gfx1100 Triton kernels; decode every other linear to bf16 at load (then int8 like NVFP4's); expert slices cut on whole 128-wide Hadamard blocks (384 / 256 on two cards); the expert kernel declares its prefill temporaries and the cache planner keeps them free |
+| Alternatives | Converting the experts to NVFP4 (loses the 3-bit size); serving every linear in EXL3; cutting the slices inside a Hadamard block (would need re-encoding); a bigger generic VRAM headroom |
+| For | 42.6 GiB of experts instead of 63.3 at 3.05 bpw, 9.9k experts cached per card instead of 7.1k; at 3.05 bpw decode 83-107 tok/s up to 248k on `xtx-xt` (NVFP4 72-86), agent turns 0.9-1.6 s (1.3-2.0), 59 GiB of RAM instead of 82; the dense layers keep the tested int8 path |
+| Against | One agentic-benchmark run per checkpoint so far (13 and 12 of 29; NVFP4 12 and 18 in two runs); the 60 / 40 split NVFP4 avoids; the even split of two equal cards refused; 0.6 GiB per card of prefill temporaries; more kernels to maintain (rotations per routed expert) |
+| Evidence | [how-it-works.md](how-it-works.md#exl3-checkpoints), [journey.md](journey.md#16-exl3-checkpoints-2026-10-04) (the first agent test crashed on a full 7900 XTX before the temporaries were kept free) |
+
 ## Not done, on purpose
 
 | Idea | Why |

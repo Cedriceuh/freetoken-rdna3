@@ -7,8 +7,8 @@ From a fresh Linux machine to an OpenAI-compatible endpoint serving Qwen3.8-Flas
 | | Two cards (`xtx-xt`) | One card (`xtx` or `xt`) |
 |---|---|---|
 | GPUs | RX 7900 XTX 24 GB + RX 7900 XT 20 GB | one RX 7900 XTX 24 GB or RX 7900 XT 20 GB |
-| System RAM | 82 GiB used while serving: **128 GB** machine | ~75 GiB used (estimated): **96 GB** is tight, 128 GB comfortable |
-| Disk | ~135 GB for the model, ~33 GB for the image (its ROCm 10 base included), ~29 GB more while building | same |
+| System RAM (NVFP4; EXL3 3.05 / 4.05 bpw) | 82 GiB used while serving: **128 GB** machine (59 / 74 GiB) | 72 GiB used: **96 GB** is tight, 128 GB comfortable (51 / 65 GiB) |
+| Disk | 135 GB for the NVFP4 model (85 / 108 GB in EXL3 3.05 / 4.05 bpw), ~33 GB for the image (its ROCm 10 base included), ~29 GB more while building | same |
 | Software | Linux x86_64 with the in-kernel `amdgpu` driver (`/dev/kfd` present), Docker | same |
 | Tested on | Ubuntu 26.04 LTS, kernel 7.0 (older kernels untested) | same |
 
@@ -46,6 +46,11 @@ already installed (`pipx install huggingface_hub`), `hf download RadixArk/Qwen3.
 
 About 135 GB: 68 GB of NVFP4 experts, 51 GB of n-gram embedding tables (read from disk on demand, they never have to
 fit in RAM), 16 GB of the other weights and the tokenizer files.
+
+The EXL3 checkpoints load the same way, from `turboderp/Qwen3.8-Flash-Next-exl3` with `--revision 3.05bpw_h5_ng5` (85
+GB) or `--revision 4.05bpw_h6_ng6` (108 GB): nothing to switch on
+([how-it-works.md](how-it-works.md#exl3-checkpoints)). On the agentic benchmark they fixed 13 and 12 of 29 bugs (one
+run each; NVFP4: 12 and 18 in two runs).
 
 ## 4. Start the server
 

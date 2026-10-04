@@ -1,30 +1,112 @@
 <!doctype html>
 <!-- Source of social-preview.png (1280x640, the README banner and the repository's social preview). Every figure comes
-     from docs/rdna3/benchmarks.md; update both together, then render:
-       google-chrome --headless=new --hide-scrollbars --window-size=1280,640 \
+     from docs/rdna3/benchmarks.md: decode = the depth sweep's TG range (one request, MTP head on, greedy, from 9k
+     tokens to the profile's maximum context), PP = the same sweep's new blocks, RAM = memory locked while serving;
+     update both together, then render (fonts: Ubuntu Sans, Ubuntu Sans Mono):
+       google-chrome --headless=new --disable-gpu --hide-scrollbars --window-size=1280,640 \
          --screenshot=docs/rdna3/assets/social-preview.png docs/rdna3/assets/social-preview.html -->
 <html><head><meta charset="utf-8"><style>
-  html, body { margin: 0; width: 1280px; height: 640px; background: #1c1d1f; overflow: hidden; }
-  body { font-family: "Noto Sans", "DejaVu Sans", sans-serif; color: #f2f2f2; box-sizing: border-box; padding: 58px 72px; }
-  h1 { font-size: 78px; font-weight: 700; margin: 0; letter-spacing: -1px; }
-  .sub { font-size: 34px; color: #c9cbcf; margin-top: 16px; }
-  .tags { font-size: 27px; color: #8e9196; margin-top: 10px; }
-  .bar { width: 96px; height: 6px; border-radius: 3px; background: #3f86e8; margin: 26px 0 34px; }
-  .tiles { display: flex; gap: 32px; }
-  .tile { flex: 1; min-width: 0; border: 1px solid #3a3c40; border-radius: 14px; background: #232427; padding: 26px 23px 24px; }
-  .num { font-size: 43px; font-weight: 700; white-space: nowrap; }
-  .cap { font-size: 22px; color: #a9acb1; margin-top: 16px; line-height: 1.4; }
-  .foot { position: absolute; left: 72px; bottom: 34px; font-size: 21px; color: #7c7f84; }
+  :root { --bg: #111214; --card: #1a1b1f; --line: #2c2e34; --text: #f4f4f5; --dim: #a1a1aa; --mute: #71717a;
+          --red: #ff3d3d; --orange: #ff8a3d; --amber: #ffb340; }
+  html, body { margin: 0; width: 1280px; height: 640px; overflow: hidden; background: var(--bg); }
+  body { position: relative; box-sizing: border-box; padding: 40px 56px 0; color: var(--text);
+         font-family: "Ubuntu Sans", "Noto Sans", "DejaVu Sans", sans-serif; }
+  body::before { content: ""; position: absolute; inset: 0; pointer-events: none;
+         background: radial-gradient(900px 420px at 100% -10%, rgba(255, 61, 61, .20), transparent 60%),
+                     radial-gradient(700px 380px at -10% 110%, rgba(255, 138, 61, .10), transparent 60%); }
+  .mono { font-family: "Ubuntu Sans Mono", "Noto Sans Mono", monospace; }
+  header { display: flex; justify-content: space-between; align-items: flex-start; position: relative; }
+  h1 { font-size: 60px; font-weight: 800; letter-spacing: -1.5px; margin: 0; line-height: 1; }
+  h1 span { background: linear-gradient(90deg, var(--red), var(--amber)); -webkit-background-clip: text; color: transparent; }
+  .sub { font-size: 25px; color: var(--dim); margin-top: 12px; }
+  .chips { display: flex; flex-direction: column; align-items: flex-end; gap: 9px; margin-top: 2px; }
+  .chip { font-size: 18px; color: var(--text); border: 1px solid var(--line); background: rgba(255, 255, 255, .03);
+          border-radius: 999px; padding: 6px 15px; }
+  .chip b { color: var(--orange); font-weight: 700; }
+  .model { position: relative; margin: 22px 0 13px; font-size: 19px; color: var(--dim); letter-spacing: .3px; }
+  .model b { color: var(--text); font-weight: 700; }
+  .cards { display: flex; gap: 22px; position: relative; }
+  .card { flex: 1; min-width: 0; background: var(--card); border: 1px solid var(--line); border-radius: 18px;
+          padding: 19px 22px 16px; box-shadow: 0 18px 50px -24px rgba(255, 61, 61, .35); }
+  .fmt { font-size: 26px; font-weight: 800; }
+  .size { font-size: 16px; color: var(--mute); margin-top: 4px; }
+  .big { margin-top: 12px; font-size: 54px; font-weight: 800; letter-spacing: -1px; line-height: 1; }
+  .big small { font-size: 22px; font-weight: 600; color: var(--dim); letter-spacing: 0; margin-left: 4px; }
+  .big.pending { color: var(--mute); }
+  .rows { margin-top: 16px; display: grid; grid-template-columns: 58px 1fr 92px; column-gap: 10px; row-gap: 3px;
+          align-items: center; font-size: 16px; }
+  .rows .k { color: var(--dim); font-size: 15px; }
+  .rows .v { text-align: right; font-weight: 700; white-space: nowrap; }
+  .rows .v small { font-weight: 400; font-size: 12px; color: var(--dim); }
+  .rows .sub { grid-column: 1 / span 3; font-size: 12.5px; color: var(--mute); margin-bottom: 12px; white-space: nowrap;
+               font-family: "Ubuntu Sans", sans-serif; }
+  .rows .sub b { color: var(--dim); font-weight: 600; font-family: "Ubuntu Sans Mono", monospace; }
+  .track { position: relative; height: 12px; border-radius: 6px; background: #24262b; overflow: hidden; }
+  .ext { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 6px; background: rgba(255, 138, 61, .38); }
+  .fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 6px; background: linear-gradient(90deg, var(--red), var(--orange)); }
+  .todo { height: 100%; background: repeating-linear-gradient(45deg, #2b2d33 0 6px, #24262b 6px 12px); }
+  .card { padding: 20px 20px 16px; }
+  .legal span { white-space: nowrap; }
+  .ref { margin-top: 2px; font-size: 14px; }
+  .ref { margin-top: 2px; font-size: 14px; }
+  .ref { margin-top: 2px; font-size: 14px; }
+  .ref { margin-top: 2px; font-size: 14px; }
+  .ref { margin-top: 2px; font-size: 14px; }
+  .ref { margin-top: 18px; font-size: 15px; }
+  .ref { margin-top: 11px; font-size: 14px; line-height: 1.45; color: var(--orange); }
+  .ref span { color: var(--mute); }
+  .legal { position: absolute; left: 56px; right: 56px; bottom: 18px; display: flex; justify-content: space-between;
+           font-size: 15px; color: var(--mute); }
 </style></head><body>
-  <h1>freetoken-rdna3</h1>
-  <div class="sub">Big MoE models on AMD Radeon RX 7900 XTX / XT</div>
-  <div class="tags">ROCm &nbsp;·&nbsp; one or two consumer GPUs &nbsp;·&nbsp; OpenAI / Anthropic API</div>
-  <div class="bar"></div>
-  <div class="tiles">
-    <div class="tile"><div class="num">77 tok/s</div><div class="cap">decode, 125B MoE<br>on two cards</div></div>
-    <div class="tile"><div class="num">2.0k tok/s</div><div class="cap">prompt reading:<br>8.3k tokens in 4.1 s</div></div>
-    <div class="tile"><div class="num">250k</div><div class="cap">tokens of context,<br>72-86 tok/s to 248k</div></div>
-    <div class="tile"><div class="num">4 requests</div><div class="cap">decoding at once<br>(parallel sub-agents)</div></div>
+  <header>
+    <div>
+      <h1>freetoken<span>-rdna3</span></h1>
+      <div class="sub">Big MoE models on AMD Radeon RX 7900 XTX / XT, one or two cards</div>
+    </div>
+    <div class="chips">
+      <div class="chip"><b>250k</b> context on two cards, <b>131k</b> on one</div>
+      <div class="chip"><b>4</b> requests decoding at once</div>
+      <div class="chip">OpenAI / Anthropic API</div>
+    </div>
+  </header>
+
+  <div class="model"><b>Qwen3.8-Flash-Next</b> &nbsp;·&nbsp; 125B MoE, 6B active</div>
+
+  <div class="cards">
+    <div class="card">
+      <div class="fmt">NVFP4</div>
+      <div class="size">4-bit experts &nbsp;·&nbsp; 135 GB</div>
+      <div class="rows mono">
+        <div class="k">XTX+XT</div><div class="track"><div class="ext" style="width: 78.2%"></div><div class="fill" style="width: 65.5%"></div></div><div class="v">72–86<small> tok/s</small></div><div class="sub">PP <b>1.7–2.0k</b> tok/s &nbsp;·&nbsp; RAM <b>82</b> GiB &nbsp;·&nbsp; max context <b>250k</b></div>
+        <div class="k">XTX</div><div class="track"><div class="ext" style="width: 38.2%"></div><div class="fill" style="width: 30.0%"></div></div><div class="v">33–42<small> tok/s</small></div><div class="sub">PP <b>1.1–1.5k</b> tok/s &nbsp;·&nbsp; RAM <b>72</b> GiB &nbsp;·&nbsp; max context <b>131k</b></div>
+        <div class="k">XT</div><div class="track"><div class="ext" style="width: 30.9%"></div><div class="fill" style="width: 24.5%"></div></div><div class="v">27–34<small> tok/s</small></div><div class="sub">PP <b>1.0–1.3k</b> tok/s &nbsp;·&nbsp; RAM <b>72</b> GiB &nbsp;·&nbsp; max context <b>131k</b></div>
+      </div>
+      <div class="ref mono">RadixArk/Qwen3.8-Flash-Next-NVFP4</div>
+    </div>
+
+    <div class="card">
+      <div class="fmt">EXL3 3.05 bpw</div>
+      <div class="size">3-bit experts &nbsp;·&nbsp; 85 GB</div>
+      <div class="rows mono">
+        <div class="k">XTX+XT</div><div class="track"><div class="ext" style="width: 97.3%"></div><div class="fill" style="width: 75.5%"></div></div><div class="v">83–107<small> tok/s</small></div><div class="sub">PP <b>1.7–2.1k</b> tok/s &nbsp;·&nbsp; RAM <b>59</b> GiB &nbsp;·&nbsp; max context <b>250k</b></div>
+        <div class="k">XTX</div><div class="track"><div class="ext" style="width: 47.3%"></div><div class="fill" style="width: 38.2%"></div></div><div class="v">42–52<small> tok/s</small></div><div class="sub">PP <b>1.3–1.6k</b> tok/s &nbsp;·&nbsp; RAM <b>51</b> GiB &nbsp;·&nbsp; max context <b>131k</b></div>
+        <div class="k">XT</div><div class="track"><div class="ext" style="width: 38.2%"></div><div class="fill" style="width: 30.0%"></div></div><div class="v">33–42<small> tok/s</small></div><div class="sub">PP <b>1.2–1.4k</b> tok/s &nbsp;·&nbsp; RAM <b>51</b> GiB &nbsp;·&nbsp; max context <b>131k</b></div>
+      </div>
+      <div class="ref mono">turboderp/Qwen3.8-Flash-Next-exl3</div>
+    </div>
+
+    <div class="card">
+      <div class="fmt">EXL3 4.05 bpw</div>
+      <div class="size">4-bit experts &nbsp;·&nbsp; 108 GB</div>
+      <div class="rows mono">
+        <div class="k">XTX+XT</div><div class="track"><div class="ext" style="width: 79.1%"></div><div class="fill" style="width: 69.1%"></div></div><div class="v">76–87<small> tok/s</small></div><div class="sub">PP <b>1.7–2.1k</b> tok/s &nbsp;·&nbsp; RAM <b>74</b> GiB &nbsp;·&nbsp; max context <b>250k</b></div>
+        <div class="k">XTX</div><div class="track"><div class="ext" style="width: 40.0%"></div><div class="fill" style="width: 32.7%"></div></div><div class="v">36–44<small> tok/s</small></div><div class="sub">PP <b>1.2–1.6k</b> tok/s &nbsp;·&nbsp; RAM <b>65</b> GiB &nbsp;·&nbsp; max context <b>131k</b></div>
+        <div class="k">XT</div><div class="track"><div class="ext" style="width: 31.8%"></div><div class="fill" style="width: 25.5%"></div></div><div class="v">28–35<small> tok/s</small></div><div class="sub">PP <b>1.1–1.4k</b> tok/s &nbsp;·&nbsp; RAM <b>65</b> GiB &nbsp;·&nbsp; max context <b>131k</b></div>
+      </div>
+      <div class="ref mono">turboderp/Qwen3.8-Flash-Next-exl3</div>
+    </div>
   </div>
-  <div class="foot">A tuned build of the FreeToken engine &nbsp;·&nbsp; Apache-2.0 &nbsp;·&nbsp; measured on RX 7900 XTX + RX 7900 XT</div>
+
+  <div class="legal"><span>FreeToken engine &nbsp;·&nbsp; ROCm &nbsp;·&nbsp; Apache-2.0</span>
+    <span>bars: decode, one request, MTP head on, greedy &nbsp;·&nbsp; PP: new 6-41k-token blocks &nbsp;·&nbsp; from 9k tokens to the max context</span></div>
 </body></html>

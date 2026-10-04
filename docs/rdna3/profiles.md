@@ -63,7 +63,16 @@ With several requests, each one's decode is computed row by row as if it were al
 batch can differ at rounding level. The 4-request setting, the tuned decode tiles and the RAM tier were added after
 the agentic benchmark runs and are checked for exactness instead ([benchmarks.md](benchmarks.md#precision)).
 
-RAM: 82 GiB while serving, all of it locked (measured: ~63 GiB of experts, 9.5 GiB for the RAM tier, the rest the two processes).
+RAM: 82 GiB while serving, all of it locked (measured: ~63 GiB of experts, 9.5 GiB for the RAM tier, the rest the two processes); 59 GiB with the EXL3 3.05 bpw checkpoint, 74 GiB with 4.05 bpw.
+
+With an experimental EXL3 checkpoint
+([how-it-works.md](how-it-works.md#exl3-checkpoints)) the same profile applies: the
+experts go through the EXL3 kernels (the start log says `MoE experts: exl3 via triton`), so `--quant-backend
+moe.nvfp4=triton` and the `FREETOKEN_NVFP4_*_TUNED` tiles do nothing; the split rounds to whole 128-wide blocks (384 /
+256, i.e. 60 / 40, which NVFP4 avoids; the EXL3 numbers are measured at it); the n-gram tables take 33 GB (3.05 bpw)
+instead of 51. On two cards `serve.sh` lowers `--memory-ratio` to 0.77 (0.76 from 4 bpw): the card holding the
+384-wide slice bounds the expert cache, and at 0.80 the 7900 XTX peaked 200 MiB under full VRAM
+([journey.md](journey.md#16-exl3-checkpoints-2026-10-04)); `-- --memory-ratio X` overrides it.
 
 ## `xtx` and `xt`: one card
 
@@ -79,6 +88,8 @@ verify steps mostly stay at 2 rows, the extra rows' missing experts crossing PCI
 | `FREETOKEN_HOST_KV_TOKENS` / `_SNAPSHOTS` | `131072` / `16` | the RAM tier sized to the context (~5 GiB locked, estimated) |
 | context | 131,072 | what fits: the XT ends a 124k-token conversation with 0.8 GiB of VRAM left |
 
+RAM: 72 GiB while serving, locked (measured on each card; EXL3: 51 GiB at 3.05 bpw, 65 GiB at 4.05 bpw).
+
 The cards are picked by VRAM: `xt` takes the smallest card with at least 20 GiB, `xtx` the smallest with 24 GiB, so a
 machine with both keeps the other card free. The one-card profiles were measured for speed, not run on the agentic
 benchmark.
@@ -89,8 +100,10 @@ Derived from the measured profiles and from the memory plans the engine logged o
 a note when you start one (`TESTED=0` in the file).
 
 - **`xtx-xtx`**: `xtx-xt` with an even split. Both cards plan on 24 GB instead of the XT's 20 GB, each holding half of
-  every expert: ~9k cached experts instead of 7.1k (estimate), so decode at least as fast as `xtx-xt`. The tuned
-  NVFP4 decode tiles are keyed to the 0.55 split, so the even split's decode shapes use default tiles.
+  every expert: ~9k cached experts instead of 7.1k (estimate), so decode at least as fast as `xtx-xt`. The tuned NVFP4
+  decode tiles are keyed to the 0.55 split, so the even split's decode shapes use default tiles. An EXL3 checkpoint
+  refuses the even split (its expert slices must be whole 128-wide blocks): add `FREETOKEN_TP_SPLIT=0.6` to the file
+  for it (untested, as for `xt-xt`).
 - **`xt-xt`**: `xtx-xt` with an even split. Each XT holds half of every expert instead of 45 %: slightly fewer cached
   experts (~6.5k, estimate), and each XT does 50 % of the split work: expect decode a little below `xtx-xt`.
 - **`gre`**: `xt` on 16 GB. From the XT's plan (int8 dense weights 5.7 GiB, KV 3.1 GiB at 131k tokens, 20 % headroom)
@@ -107,13 +120,15 @@ Nothing below has been measured; treat it as a starting point and check with the
   copy one and set `VRAM_GIB`. `FREETOKEN_TP_ALLOW_IMBALANCE=1` is harmless there and needed when one card drives a
   display or runs other work (upstream refuses a free-memory difference above 2 GiB).
 - **Another unequal pair**: set `FREETOKEN_TP_SPLIT` to about rank 0's share of the total VRAM, then try +/-2.5 %;
-  `FREETOKEN_TP_SPLIT=11:9` style weights also work. The tuned NVFP4 decode tiles are keyed to this model's shapes at a
-  0.55 split: other splits fall back to the default tiles (a log line names each untuned shape once).
+  `FREETOKEN_TP_SPLIT=11:9` style weights also work (an EXL3 checkpoint moves in steps of 128 of the 640-wide
+  intermediate, 20 %). The tuned NVFP4 decode tiles are keyed to this model's shapes at a 0.55 split: other splits
+  fall back to the default tiles (a log line names each untuned shape once).
 - **Smaller RDNA3 cards**: the RX 7900 GRE (16 GB) uses this gfx1100 image: start from `gre`. The RX 7800 XT (16 GB,
   gfx1101) needs its own image (`--build-arg GPU_ARCH=gfx1101`) and can start from `gre`; the 7700 XT (12 GB,
   gfx1101) and 7600 (8 GB, gfx1102) have less VRAM than any profile plans for. None of them is tested.
 - **Less RAM**: `FREETOKEN_HOST_KV=0` saves the RAM tier (9.5 GiB on two cards, ~5 GiB on one; evicted conversations
-  are re-read instead). The experts themselves cannot go below ~63 GiB for this model: [limits.md](limits.md).
+  are re-read instead). In NVFP4 the experts themselves cannot go below ~63 GiB; the experimental EXL3 3 bpw
+  checkpoint needs 42.6 GiB: [limits.md](limits.md).
 - **The TunableOp files** in `rdna3/tunableop/` are ROCm 7.14's (their header records PyTorch / HIP / hipBLASLt), so
   the profiles set `TUNABLEOP=0` on the ROCm 10 image; to use TunableOp, tune for your image once and freeze (see
   [options.md](options.md#pytorch-tunableop)).

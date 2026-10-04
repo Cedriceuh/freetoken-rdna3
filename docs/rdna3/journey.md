@@ -207,7 +207,54 @@ decode -0.5 % (noise), prefill ~1 % faster. The published image itself was measu
   conversation, a 35k-token read and a 1500-token answer. Sampled requests use exact speculative sampling. Numbers:
   [benchmarks.md](benchmarks.md#speculative-decoding-mtp-head).
 
-## 16. Dropped along the way
+## 16. EXL3 checkpoints (2026-10-04)
+
+- **Why.** At 3 bits per weight the experts take 42.6 GiB instead of 63.3, the 64 GB question of
+  [limits.md](limits.md#can-it-run-with-64-gb-of-ram); turboderp publishes EXL3 builds of this model. exllamav3's
+  kernels are CUDA with PTX inline (`lop3`, `mma.sync`, `ldmatrix`, `cp.async`), so they were rewritten: first a torch
+  reference of the format, checked on real tensors (5-bit dense layers against the bf16 originals: cosine 0.9993; a
+  3-bit expert against its NVFP4 copy: 0.986; every wrong tile layout tried: ~0), then Triton kernels checked against
+  it (the dequant bit-exact for K = 1-8 and the three codebooks).
+- **Decode GEMV.** First version 1.3-2.9x slower than the NVFP4 one; then a 32-bit window extraction, the reduction
+  moved out of the K loop, `v_dot4_u32_u8` for the codebook's byte sum (inline asm) and split-K: on par with the
+  default NVFP4 tiles or faster, per shape. Skipping the codebook's per-weight fp16 rounding (an affine form of `mul1`)
+  gained nothing once the byte sum was one instruction: dropped.
+- **The rotations cost more than the products.** With the Hadamards as 16-row `tl.dot` tiles, the decode MoE took
+  16.9 ms per step for 48 layers against 2.6 ms for NVFP4 (the step between the two products 164 us, three programs);
+  one program per 128-vector with the matrix built from bit parity brought it to 3.06 ms, and decode to NVFP4's speed
+  with the same settings. In prefill the same rotations went from 14.5 to ~5.4 ms per 2048-token layer (one fp16 dot
+  instead of two, swept tile sizes), and a tile sweep of the grouped GEMM gained 35-42 %.
+- **Prefill, second pass.** 1024-token blocks fed each expert ~20 routes for 64-row tiles: 4096-token blocks with
+  32-row tiles cut the MoE time per token by 36 %. The down GEMM then took the rotation out as its epilogue (a program
+  owns a 128-column block; per-route bf16 rows, then the existing per-token sum): another -15 %. The same epilogue
+  for gate|up plus the step between the products was slower (7.8 against 5.7 + 1.5 ms per 4096-token layer: two
+  accumulators per program, half the programs) and was dropped. Loading the Hadamard matrix once per program and
+  looping over the 128-blocks helps prefill (-25 % on the input rotation) but kept the matrix in registers in decode,
+  where the rotation out also ran on 2 warps: 12 -> 165 us per call, the decode step lost a fifth before the
+  kernel profile caught it; decode now loads the matrix per dot, on 4 warps.
+- **Second checkpoint, two loader bugs.** The 4.05 bpw branch stores its n-gram table as one tensor (not shards) and
+  its vision tower in a file the index does not list, so its codebook markers were missed and the tower would have
+  decoded as 3inst: cosine ~0 against the bf16 originals, no error. Both fixed; three vision linears per branch now
+  at cosine 0.9994-1.0 against the originals. exllamav3 zero-pads the vision MLP to 128-multiples: cut back at load.
+- **The first agent test crashed.** Every check so far had used prompts up to 8.3k tokens; the first opencode turn
+  (a ~21k-token prompt, prefilled in 16k chunks while the title request decodes) killed the 7900 XTX's rank on an
+  illegal memory access, and about one cold start in six hung at a collective in the same place. The driver's
+  `evicted_ms` showed 1-3 s of stopped queues during the first such turn after a start, never later, ~0 for NVFP4.
+  The EXL3 kernels alone in a fresh process stopped nothing. Sampling VRAM every 50 ms found it: the first 16k chunk
+  took the 7900 XTX to 24,539 of its 24,560 MiB, and the queue stops came with it; NVFP4 peaked at 23,243 MiB
+  there. With the expert intermediate cut 384 / 256, the 7900 XTX is the card that bounds the shared cache size for
+  EXL3, so it kept only 2.65 GiB free after the CUDA graphs (3.98 for NVFP4), and an EXL3 layer's prefill needs
+  620 MiB of temporaries (measured; 2048-token blocks would bring them to 350 MiB for +26 % MoE time per token). The expert
+  kernel now declares them and the cache planner keeps them free (5 % fewer cached experts). Then, 10 cold starts
+  (7 on 3.05 bpw, 3 on 4.05), each with that first turn and two agents taking five turns: no stopped queue, no
+  error, the 7900 XTX at 24,360 MiB at most with `--memory-ratio 0.80`, 24,010-24,149 with 0.78.
+- **Where it stands.** [how-it-works.md](how-it-works.md#exl3-checkpoints), measured on every tested profile the same
+  day: at 3.05 bpw, decode 83-107 tok/s up to 248k tokens on `xtx-xt` (NVFP4: 72-86), agent turns 0.9-1.6 s (1.3-2.0),
+  59 GiB of RAM locked instead of 82, 9.9k experts cached per card instead of 7.1k; at 4.05 bpw, NVFP4's speed with 74
+  GiB. On the agentic benchmark (one run each) 13 of 29 at 3.05 bpw and 12 at 4.05, where NVFP4 scored 12 and 18 in
+  two runs.
+
+## 17. Dropped along the way
 
 | Idea | Why not |
 |---|---|
@@ -227,6 +274,10 @@ decode -0.5 % (noise), prefill ~1 % faster. The published image itself was measu
 | HIP graph segment scheduling (`DEBUG_HIP_GRAPH_SEGMENT_SCHEDULING=1`) | a captured graph's independent branches run one after the other by default; with it they overlap a little in a microbenchmark, not measurably on the server |
 | Thread trace (ATT) of the expert GEMV under ROCm 10 | the image's profiler could not load its aqlprofile library, and with it on the loader path the traced process spun for 20 min without a trace |
 | Fusing kernels to save launches | the kernels of a captured step overlap (median gap -2.6 µs); the real bubbles are ~0.26 ms a step |
+| EXL3: the codebook's per-weight fp16 rounding replaced by an affine form | gained nothing once the byte sum was one `v_dot4_u32_u8` |
+| EXL3: the Hadamard rotations as 16-row `tl.dot` tiles in decode | 16.9 ms of decode MoE per step against 3.06 ms for one program per 128-vector |
+| EXL3: gate\|up and the step between the products fused in one epilogue | 7.8 against 5.7 + 1.5 ms per 4096-token layer (two accumulators per program, half the programs) |
+| EXL3: the Hadamard matrix loaded once per program in decode | it stayed in registers: the rotation out went from 12 to 165 us per call |
 | Moving a verify step's PLE fill off its critical path | the ~2 ms wait seen under the profiler is probably its own doing (~30 ms steps under trace against ~16), and busy-waiting on the token readback changed nothing (70.9-85.5 against 71.0-85.5 tok/s) |
 | A bigger tensor-parallel share for the XTX | in decode the XTX waits ~0.9 ms a step for the XT (the all-reduce wait log), but 0.575 and 0.6 overload it in prefill: 0.55 stays |
 | Pinning the registered host memory from the engine (io_uring buffers) against the stall below | the pages stayed put, but compaction kept retrying around them and moved the runtime's own buffers: worse |
@@ -241,10 +292,11 @@ out-of-memory retries at 14-16k-token chunks past ~26k of context (seen on the R
 expandable segments. After a pause, the VRAM clock stayed at 96 MHz for ~10 s under the default power profile. The
 host settings: [troubleshooting.md](troubleshooting.md#long-pauses-in-the-middle-of-a-run).
 
-## 17. Still open
+## 18. Still open
 
-- The model needs ~63 GiB of RAM for its experts alone (the engine keeps every expert in RAM, and NVFP4 is the smallest
-  format it runs for this model): no 64 GB machine can serve it ([limits.md](limits.md)).
+- In NVFP4 the model needs ~63 GiB of RAM for its experts alone (the engine keeps every expert in RAM). The EXL3 3.05
+  bpw checkpoint needs 42.6 GiB and served under a 56 GiB container limit, but a real 64 GB machine is untested
+  ([limits.md](limits.md)).
 - ROCm 10 / PyTorch 2.13, the image's base since 2026-10-02: its Triton 3.8 miscompiles these kernels, so the image
   carries the 7.14 image's Triton 3.7.1. On two cards decode and prompt reading match or beat 7.14, and the PLE
   wait-sync (`FREETOKEN_PLE_SYNC`) adds 3.5-4 % decode; on one card the same depth sweep gives the same decode on both

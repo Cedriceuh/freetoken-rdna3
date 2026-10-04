@@ -1,14 +1,15 @@
 # freetoken-rdna3
 
 > A tuned build of the FreeToken Mixture-of-Experts inference engine for AMD Radeon RX 7900 XTX / 7900 XT (RDNA3,
-> gfx1100, ROCm), serving Qwen3.8-Flash-Next (125B-parameter MoE, NVFP4) on one or two consumer GPUs with an
-> OpenAI- and Anthropic-compatible API. On an RX 7900 XTX + RX 7900 XT, with the model's MTP head drafting tokens (on
-> by default): 77 tok/s decode at the model's sampling (57.5 without the head), 72-86 tok/s greedy up to 248k tokens of
-> context, 4.1 s to read a cold 8.3k-token prompt (~2020 tok/s), up to 4 concurrent requests; uses ~82 GiB of system
-> RAM for this model.
+> gfx1100, ROCm), serving Qwen3.8-Flash-Next (125B-parameter MoE) from its NVFP4 checkpoint or EXL3 checkpoints at
+> 3.05 / 4.05 bits per weight, on one or two consumer GPUs, with an OpenAI- and Anthropic-compatible API. With NVFP4
+> on an RX 7900 XTX + RX 7900 XT and the model's MTP head drafting tokens (on by default): 77 tok/s decode at the
+> model's sampling (57.5 without the head), 72-86 tok/s greedy up to 248k tokens of context, 4.1 s to read a cold
+> 8.3k-token prompt (~2020 tok/s), up to 4 concurrent requests; uses ~82 GiB of system RAM for this model. EXL3 3.05
+> bpw on the same cards: 83-107 tok/s greedy up to 248k tokens, 59 GiB of RAM.
 
-Key facts: the engine keeps every expert in pinned system RAM (~63 GiB for this model in NVFP4, the smallest format it
-runs for it; each rank pins its own share) and caches the most used experts in VRAM; two cards run tensor-parallel
+Key facts: the engine keeps every expert in pinned system RAM (~63 GiB for this model in NVFP4, ~43 GiB with the
+EXL3 3.05 bpw checkpoint; each rank pins its own share) and caches the most used experts in VRAM; two cards run tensor-parallel
 with an uneven 55/45 split; dense layers are int8 (weights only, lossy but agent-validated); small all-reduces go
 through shared host memory (no GPU peer-to-peer on the reference machine, as usual on consumer boards); sampling on
 ROCm uses a top-k-first path for top_k <= 256 and an exact sorted threshold otherwise (upstream's cooperative sampling
@@ -29,10 +30,10 @@ model cannot run above TP=2 in this build).
 - [Profiles](docs/rdna3/profiles.md): every setting of each hardware profile, why, and how to adapt to other cards
 - [Options](docs/rdna3/options.md): every environment variable this build adds, default, measured effect, exactness
 - [Benchmarks](docs/rdna3/benchmarks.md): method, depth sweeps per profile, parallel agents, precision, memory
-- [How it works](docs/rdna3/how-it-works.md): memory layout, decode step, split, all-reduce, prefill, sampler, RAM tier
+- [How it works](docs/rdna3/how-it-works.md): memory layout, decode step, split, all-reduce, prefill, sampler, RAM tier, EXL3 checkpoints
 - [Decisions](docs/rdna3/decisions.md): each design choice with alternatives, pros, cons and the deciding measurement
 - [Journey](docs/rdna3/journey.md): chronological record of what was tried, kept and dropped, with numbers
-- [Limits and FAQ](docs/rdna3/limits.md): RAM (why not 64 GB), VRAM, other GPUs, NVIDIA, TP>2, other models, security
+- [Limits and FAQ](docs/rdna3/limits.md): RAM (64 GB: only with EXL3, untested), VRAM, other GPUs, NVIDIA, TP>2, other models, security
 - [Troubleshooting](docs/rdna3/troubleshooting.md): symptoms, causes, fixes, what to put in a bug report
 - [Testing](docs/rdna3/testing.md): CPU suite, GPU checks, micro-benchmarks, the release validation procedure
 - [Maintaining](docs/rdna3/maintaining.md): relation to upstream, sync and release procedure
@@ -51,6 +52,7 @@ model cannot run above TP=2 in this build).
 - [kernel/triton/sampling_topk.py](python/freetoken/kernel/triton/sampling_topk.py): top-k-first sampler; [kernel/triton/sampling.py](python/freetoken/kernel/triton/sampling.py) `_sorted_threshold`: ROCm exact path
 - [kvcache/host_kv_pool.py](python/freetoken/kvcache/host_kv_pool.py) + [kvcache/hybrid_radix_cache.py](python/freetoken/kvcache/hybrid_radix_cache.py): conversations kept in RAM
 - [moe/fused_nvfp4.py](python/freetoken/moe/fused_nvfp4.py): NVFP4 expert kernels, tuned tiles, blocked prefill
+- [kernel/triton/exl3.py](python/freetoken/kernel/triton/exl3.py) + [layers/quantization/exl3_codec.py](python/freetoken/layers/quantization/exl3_codec.py): EXL3 checkpoints (experimental): trellis kernels for gfx1100 and the torch reference; [models/exl3_weights.py](python/freetoken/models/exl3_weights.py) loads them
 - [models/qwen4_exp/](python/freetoken/models/qwen4_exp/): Qwen3.8-Flash-Next (tensor-parallel port, PLE)
 - [engine/engine.py](python/freetoken/engine/engine.py): memory planning, rank token broadcast, int8 conversion
 - [rdna3/tests/](rdna3/tests/), [rdna3/bench/](rdna3/bench/): GPU checks and micro-benchmarks; `rdna3/bench/quick_bench.py` measures a running server

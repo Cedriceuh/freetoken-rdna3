@@ -43,7 +43,8 @@ or batched.
 Upstream serves Qwen3.8-Flash-Next on one GPU only (its loader and NVFP4 expert kernels refuse TP>1) and refuses TP
 ranks whose free memory differs by more than 2 GiB. This build's tensor-parallel port splits evenly by default. With
 `FREETOKEN_TP_ALLOW_IMBALANCE` the memory plan uses the smaller card, and with `FREETOKEN_TP_SPLIT=0.55` the experts'
-intermediate dimension (routed and shared) is split 55 / 45 and the GDN heads 9 / 7 (key) and 27 / 21 (value): the XTX has 20 % more VRAM and
+intermediate dimension (routed and shared) is split 55 / 45 (60 / 40 with an EXL3 checkpoint, whose slices must be
+whole 128-wide blocks) and the GDN heads 9 / 7 (key) and 27 / 21 (value): the XTX has 20 % more VRAM and
 ~14 % more compute, so both finish together, and the XT's smaller share of each expert lets both cards cache more
 experts (the ranks all use the smallest card's plan). Attention stays even (2 KV heads cannot be split unevenly). The
 vocabulary stays even; the hyper-connection mixers, the PLE projections, the attention indexer, the norms and the
@@ -70,7 +71,7 @@ A prefill chunk runs every token through every layer, so each chunk streams all 
 (~700 MB per layer per card). Bigger chunks mean less streaming: in the A/B test, 16k-token chunks read an 8.4k prompt
 in 4.3 s instead of 5.5 s (4.5 s on the swept build, 4.1 s on the release build: [benchmarks.md](benchmarks.md)), and 54-101k-token reads
 at depth 2-6 % faster. To fit them, the prefill MoE and the PLE layer run 4096 tokens at a time inside the chunk (the
-MoE blocks are bit-identical; the PLE blocks can round differently, checked to tolerance and validated on the agentic
+NVFP4 MoE blocks are bit-identical; the PLE blocks can round differently, checked to tolerance and validated on the agentic
 benchmark for one request), and experts already in the GPU cache are gathered on the GPU instead of crossing PCIe
 again (`--moe-prefill-hit-d2d`, with `hipMemcpyBatchAsync` on ROCm, or one copy per entry on older HIP): a third of
 the experts no longer cross PCIe per chunk, an agent turn's first token 1.55 -> 1.18 s. A single card keeps 8k chunks
@@ -133,6 +134,65 @@ The Qwen3.8 vision tower (27 ViT blocks, ~0.45 B parameters) is upstream's, and 
   the same rotation: greedy answers are identical, and speed is the same up to 255k of context on two cards.
 
 Numbers: [benchmarks.md](benchmarks.md#images---vision-xtx-xt).
+
+## EXL3 checkpoints
+
+[exllamav3](https://github.com/turboderp-org/exllamav3)'s EXL3 format is read directly: a variant of QTIP where each
+16x16 tile of a weight is a tail-biting trellis of K bits per weight, decoded through a procedural codebook, between
+two 128-point Hadamard rotations with per-channel scales (`W = diag(suh) H Wq H diag(svh)`). Nothing to switch on: a
+checkpoint whose `quantization_config` says `quant_method: exl3` selects it, e.g. `turboderp/Qwen3.8-Flash-Next-exl3`,
+branch `3.05bpw_h5_ng5` (routed experts at 3 bits per weight, most other linears at 5, the n-gram table at 5).
+
+- **Routed experts stay EXL3**, in the host banks and in the GPU cache: 1.86 MB per expert against 2.76 MB in NVFP4.
+  Triton kernels written for gfx1100 decode the trellis in registers (the byte sum of the `mul1` codebook is one
+  `v_dot4_u32_u8`): split-K GEMVs in decode, a grouped GEMM over expert-sorted tokens in prefill, and the Hadamard
+  rotations around them. Every expert has its own input scales, so the input is rotated once per routed expert.
+- **Every other linear** (attention, GDN, shared expert, LM head, MTP head, vision tower) is decoded to bf16 on the
+  GPU as it loads (a few seconds), then follows the usual path: `FREETOKEN_INT8_DENSE=1` converts it to int8 as for
+  NVFP4 (the vision tower stays bf16, as it does with NVFP4). exllamav3 zero-pads a linear to 128-multiples (the
+  vision MLP: 4304 -> 4352); the loader cuts it back. Codebook markers are looked up in every file of the checkpoint,
+  the index and the files beside it (4.05 bpw keeps its vision tower in `vision_k6.safetensors`); a linear without a
+  marker is 3inst, as in exllamav3.
+- **The n-gram table** (one 160-wide 5-bit trellis ring per row and a bias per hash head: 33 GB instead of 51 GB) is
+  read by the disk PLE backend (`--ple-backend disk`, the profiles' setting) and decoded on the GPU after each fill.
+- **The MTP head's experts** are EXL3 too and join the bank as they are.
+- A card's slice of the 640-wide expert intermediate must be whole 128-wide Hadamard blocks: two cards get 384 / 256
+  (`FREETOKEN_TP_SPLIT=0.55` rounds to that), the shared expert too; an even split (320 / 320) is refused at start, so
+  the profiles of two equal cards (`xtx-xtx`, `xt-xt`) need `FREETOKEN_TP_SPLIT=0.6` in their file (untested).
+- Prefill rotates the inputs in one kernel, runs the gate|up GEMM, the step between the products, then the down GEMM
+  with the rotation out, the scales and the router weight as its epilogue (a program owns a 128-column block), and a
+  plain per-token sum.
+- **Prefill temporaries are kept out of the cache.** A 4096-token block holds the rotated inputs of both projections
+  per route (fp16) and the gate|up products (fp32): 0.61 GiB on the 384-wide slice, 0.57 on the 256-wide one, for a
+  16k-token chunk, more than the generic `(1 - memory_ratio)` headroom absorbs. The expert kernel declares them
+  (`prefill_workspace_bytes`) and the cache planner leaves them free (`MoE prefill temporaries` in the start log; 5 %
+  fewer cached experts). Without that, the first 16k-token prefill after a start filled the 7900 XTX; on two cards
+  `rdna3/serve.sh` also lowers `--memory-ratio` to 0.77 (0.76 from 4 bpw): see
+  [journey.md](journey.md#16-exl3-checkpoints-2026-10-04).
+- Not supported: half-integer bitrates, mixed expert bitrates across layers, the pinned PLE backend, the CPU expert
+  executor, the encoder-only weight reader. FTW conversion is untested. The vision tower reads the checkpoint's bf16
+  `qkv` (image input checked with one image per branch).
+
+Measured on 2026-10-04 with the profiles as shipped, MTP head on, one request (decode: greedy, from 9k tokens to the
+profile's maximum context; RAM: locked while serving; [benchmarks.md](benchmarks.md#depth-sweep-exl3-checkpoints) has
+every step, the cold reads and the sampled decode):
+
+| | NVFP4 | EXL3 3.05 bpw | EXL3 4.05 bpw |
+|---|---:|---:|---:|
+| download | 135 GB | 85 GB | 108 GB |
+| experts in RAM (without the MTP head's) | 63.3 GiB | 42.6 GiB | 56.7 GiB |
+| decode, `xtx-xt` / `xtx` / `xt` | 72-86 / 33-42 / 27-34 tok/s | 83-107 / 42-52 / 33-42 tok/s | 76-87 / 36-44 / 28-35 tok/s |
+| reading a new block, `xtx-xt` | 1670-1990 tok/s | 1730-2050 tok/s | 1710-2050 tok/s |
+| agent turn, first token, `xtx-xt` | 1.3-2.0 s | 0.9-1.6 s | 1.2-1.9 s |
+| RAM locked, `xtx-xt` / one card | 82 / 72 GiB | 59 / 51 GiB | 74 / 65 GiB |
+| expert cache per card, `xtx-xt` | 7.1k | 9.9k | 7.3k |
+| agentic benchmark (29 bugs) | 12 and 18 (two runs) | 13 (one run) | 12 (one run) |
+
+The NVFP4 speeds are the release image's (2026-10-03). The checkpoints answer differently, so the MTP head keeps a
+different share of its guesses: compare decode rates as an order of magnitude. Greedy answers are identical with and
+without the head. With the RAM tier off and `--expert-load serial`, the 3.05 bpw server started and served under a
+56 GiB container limit at 52.3 GiB used (`quick_bench.py` then: 70.1 tok/s decode at the model's sampling, 8.3k-token
+cold read in 4.41 s, agent turn 0.89 s, tool call parsed); a real 64 GB machine is untested.
 
 ## What stays upstream's
 
