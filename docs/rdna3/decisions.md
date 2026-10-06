@@ -11,7 +11,7 @@ identical outputs) or **validated by the agentic benchmark** (the author's, priv
 bugs over long sessions). Short fidelity tests (scored benchmarks, needle tests, teacher-forced probes) are used to
 reject changes, never to accept them alone. The changes made after the last agentic run are bit-exact or exact by
 kernel tests, except that prompts prefilled together in one batch (up to 4 requests) can differ at rounding level; the
-docs say which. The ROCm 10 base, whose greedy answers differ from ROCm 7.14 on 2 of 5 prompts, was run on the agentic
+docs say which. The ROCm 10 base was run on the agentic
 benchmark with the MTP head: 12 and 18 of 29 in two runs.
 
 - **Gives**: speed that did not cost quality on the agentic benchmark.
@@ -23,7 +23,7 @@ benchmark with the MTP head: 12 and 18 of 29 in two runs.
 |---|---|
 | Choice | Split every layer over the XTX and the XT, both working on every token |
 | Alternatives | One card with more experts offloaded; each card serving its own requests |
-| For | Decode 55 tok/s instead of 36 (ROCm 7.14, before the MTP head); 250k context instead of 131k; 44 GB of VRAM for one expert cache |
+| For | Decode 77 tok/s instead of 39 at the model's sampling (57.5 against 35.8 without the MTP head); 250k context instead of 131k; 44 GB of VRAM for one expert cache |
 | Against | Every layer ends with an all-reduce through system RAM (no GPU peer-to-peer on the reference machine); both cards are busy for every request; more code (uneven split, host all-reduce) |
 | Evidence | Depth sweeps of `xtx-xt` vs `xtx` ([benchmarks.md](benchmarks.md)) |
 
@@ -73,8 +73,8 @@ benchmark with the MTP head: 12 and 18 of 29 in two runs.
 |---|---|
 | Choice | `--max-running-requests 4` with CUDA graphs for every batch size up to 4, per-row decode kernels |
 | Alternatives | One request at a time (the earlier profiles' setting; upstream's default is 4) |
-| For | 55 / 81 / 98 / 105 tok/s in total at 1 / 2 / 3 / 4 requests (ROCm 7.14 release build, without the MTP head); four agents doing the same work finish ~2.7x sooner (97-100 s against 270 s one at a time); a request alone computes exactly as before |
-| Against | Each request decodes slower when others run (~40 tok/s each at 2, ~26 at 4); prompts prefilled in one batch can differ at rounding level; not run on the agentic benchmark; GDN state for 4 requests (too much for one card: one card stays at 1) |
+| For | 1 / 2 / 3 / 4 greedy answers sent at once finish in 3.6 / 5.9 / 8.4-8.6 / 10.1 s; four agents doing the same work finish ~2.7x sooner (97-100 s against 270 s one at a time); a request alone computes exactly as before |
+| Against | Each request decodes slower when others run (two conversations at ~100k tokens: 33.6-34.4 tok/s each, against 71 alone); prompts prefilled in one batch can differ at rounding level; not run on the agentic benchmark; GDN state for 4 requests (too much for one card: one card stays at 1) |
 
 ## Conversations kept in RAM
 
@@ -119,9 +119,9 @@ benchmark with the MTP head: 12 and 18 of 29 in two runs.
 |---|---|
 | Choice | On in the profiles (`FREETOKEN_MTP=1 FREETOKEN_SPEC_VERIFY_M=4`; `rdna3/serve.sh --no-mtp` turns it off). The checkpoint's MTP layer drafts up to 3 tokens (chained on its own streams); the next decode step verifies them in the same captured forward, 2-4 rows chosen per request from its measured acceptance and the step costs measured for the card count (mostly 2 on one card; 1 near a request's length limit). Rejected rows are undone by restoring the GDN, conv and PLE states saved after each row; attention KV needs nothing (rejected positions are rewritten before any query sees them). Sampled requests use exact speculative sampling. Only while at most `FREETOKEN_SPEC_BS_MAX` requests decode (2 in `xtx-xt`, 1 in the other profiles): with more, steps run one row each and the head only writes its KV |
 | Alternatives | Plain decode; a fixed draft depth; verifying several requests at once; the head's own forward captured in a graph |
-| For | Agentic benchmark on ROCm 10 with the head: 12 and 18 of 29 (two runs). One request on `xtx-xt` (release, ROCm 10): +34 % decode at the model's sampling, +30-61 % greedy up to 248k of context (earlier runs: +11-39 % on chat, agent turns, a 108k-token context; +20-49 % on ROCm 7.14), x1.38 on 60 code and math items; one card +7-8 % (+6-12 % greedy); greedy answers identical to plain decode (bit-exact: 120/120 on ROCm 7.14, every check on ROCm 10) |
+| For | Agentic benchmark on ROCm 10 with the head: 12 and 18 of 29 (two runs). One request on `xtx-xt` (release, ROCm 10): +34 % decode at the model's sampling, +30-61 % greedy up to 248k of context (earlier runs: +11-39 % on chat, agent turns, a 108k-token context), x1.38 on 60 code and math items; one card +7-8 % (+6-12 % greedy); greedy answers identical to plain decode (bit-exact on every check) |
 | Against | 3-4 % slower with 3-4 requests at once (the head still writes its KV every step); prompt reading 0-4 % slower (4-5 % on a 108k-token prompt; the head reads it too); the head's 512 experts compete for the expert cache; a CUDA graph per row count (captured up to `FREETOKEN_SPEC_BS_MAX` requests: 2 in `xtx-xt`) |
-| Evidence | Step costs 17.7 / 25.3 / 30.7 / 35.5 ms at 1-4 rows on two cards, 31 / 53 / 78 / 102 ms on one (the extra rows' missing experts cross PCIe), 2.4-2.6 tokens kept per step on chat; a fixed 3 rows at 4 requests was -26 % before the head ran on the kept rows only ([benchmarks.md](benchmarks.md#speculative-decoding-mtp-head)) |
+| Evidence | Step costs 31 / 53 / 78 / 102 ms at 1-4 rows on one card (the extra rows' missing experts cross PCIe); 1.9-3.9 tokens kept per request step ([benchmarks.md](benchmarks.md#speculative-decoding-mtp-head)) |
 
 ## EXL3 checkpoints: experts in EXL3, the rest in bf16
 
@@ -146,6 +146,6 @@ benchmark with the MTP head: 12 and 18 of 29 in two runs.
 
 | Choice | Why | Cost |
 |---|---|---|
-| Build the image locally (`Dockerfile.rdna3`) | the bases are ~31 GB of ROCm 10 + PyTorch and, for its Triton, the ~29 GB ROCm 7.14 one, pinned by digest; the build itself takes minutes; the image records the commit it came from | a first build downloads both bases |
+| Build the image locally (`Dockerfile.rdna3`) | the base is ~31 GB of ROCm 10 + PyTorch, pinned by digest; the build itself takes minutes; the image records the commit it came from | a first build downloads the base |
 | One profile per hardware setup | settings that belong together (chunk size, memory ratio, split, concurrency) travel together, and a profile states what was measured | untested setups start from a derived profile (`TESTED=0`) |
 | Settings as environment variables, most of the tuning off by default | the upstream behavior stays one variable away, for comparisons and bug reports; what is on by default is bit-exact, agent-validated, or new and checked otherwise (the release's sampler rework, exact by kernel tests, and its token broadcast, checked in `check`-mode server runs) ([options.md](options.md)) | long command lines, hence the profiles |

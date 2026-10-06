@@ -3,13 +3,15 @@
 Everything here was measured on one machine: RX 7900 XTX 24 GB + RX 7900 XT 20 GB (gfx1100, PCIe 4.0 x16 each, no GPU
 peer-to-peer), Threadripper 3970X, 128 GB DDR4-3200, Qwen3.8-Flash-Next NVFP4 (RadixArk checkpoint; the experimental
 EXL3 checkpoints are measured in
-[how-it-works.md](how-it-works.md#exl3-checkpoints)). The numbers from the summary to
-the one-card sweeps were taken on 2026-10-03 on the ROCm 10.0 / PyTorch 2.13 image as released: each profile as
-shipped (MTP head on) and the same with `--no-mtp`, one server per configuration, with the host settings of
-[troubleshooting.md](troubleshooting.md#long-pauses-in-the-middle-of-a-run). The one-card sweeps with the head ran
-with a variant of the adaptive depth dropped before the release; the released image itself gave the same within 4 %
-(`xtx` 33.1-43.2, `xt` 27.1-34.9 tok/s). Sections marked ROCm 7.14 were measured on the earlier image (PyTorch 2.11):
-the 0.1.0 release build ("release build" rows, image `rdna3-v0.1.0`) and the MTP head's development.
+[how-it-works.md](how-it-works.md#exl3-checkpoints)). The `xtx-xt` rows of the
+summary, the two-card depth sweeps, the several-request table and the MTP step costs were measured on 2026-10-06 on
+the ROCm 10.0 / PyTorch 2.13 image with its own Triton 3.8: each configuration as shipped (MTP head on) and the same
+with `--no-mtp`, one server per configuration, with the host settings of
+[troubleshooting.md](troubleshooting.md#long-pauses-in-the-middle-of-a-run). The one-card rows and sweeps were taken
+on 2026-10-03/04 with the image's earlier Triton 3.7.1 (on two cards Triton 3.8 decodes within 1 % of it and reads
+prompts ~5 % faster: [journey.md](journey.md#18-rocm-10s-own-triton-2026-10-05)); the one-card sweeps with the head
+ran with a variant of the adaptive depth dropped before the release, and the released image gave the same within
+4 % (`xtx` 33.1-43.2, `xt` 27.1-34.9 tok/s). Other sections give their own date.
 
 ## How the numbers are taken
 
@@ -27,35 +29,32 @@ the 0.1.0 release build ("release build" rows, image `rdna3-v0.1.0`) and the MTP
 
 | Profile | Decode, one request: sampled / greedy | TG, 9k to max depth | Cold 8.3k prompt (PP) | PP of a new block | Agent turn, 9k -> max | Max depth |
 |---|---:|---:|---:|---:|---:|---:|
-| `xtx-xt` | 77.2 / 70-90 tok/s | 72-86 tok/s | 4.1 s, ~2020 tok/s | 1670-1990 tok/s | 1.3 -> 2.0 s | 248k |
-| `xtx-xt --no-mtp` | 57.5 / 57-60 tok/s | 52-57 tok/s | 4.2 s, ~2010 tok/s | 1730-1990 tok/s | 1.3 -> 2.0 s | 248k |
+| `xtx-xt` | 77.9 / 73-85 tok/s | 70-88 tok/s | 4.0 s, ~2070 tok/s | 1740-2050 tok/s | 1.3 -> 2.0 s | 248k |
+| `xtx-xt --no-mtp` | 58.5 / 59-62 tok/s | 53.5-58.5 tok/s | 4.0 s, ~2080 tok/s | 1800-2060 tok/s | 1.3 -> 2.0 s | 248k |
 | `xtx` | 38.8 / 38-44 tok/s | 33-42 tok/s | 7.7 s, ~1080 tok/s | 1130-1510 tok/s | 2.4 -> 2.7 s | 124k |
 | `xtx --no-mtp` | 35.8 / 35-38 tok/s | 29.5-39 tok/s | 7.6 s, ~1095 tok/s | 1140-1500 tok/s | 2.3 -> 2.7 s | 124k |
 | `xt` | 31.7 / 30-36 tok/s | 27-34 tok/s | 8.3 s, ~1000 tok/s | 1040-1340 tok/s | 2.5 -> 2.8 s | 124k |
 | `xt --no-mtp` | 29.5 / 28-32 tok/s | 25-32 tok/s | 8.2 s, ~1020 tok/s | 1070-1340 tok/s | 2.5 -> 2.8 s | 124k |
-| `xtx-xt`, EXL3 3.05 bpw | 82.2 / 78-98 tok/s | 83-107 tok/s | 4.05 s, ~2060 tok/s | 1730-2050 tok/s | 0.9 -> 1.6 s | 248k |
-| `xtx-xt`, EXL3 4.05 bpw | 73.4 / 68-84 tok/s | 76-87 tok/s | 4.05 s, ~2060 tok/s | 1710-2050 tok/s | 1.2 -> 1.9 s | 248k |
+| `xtx-xt`, EXL3 3.05 bpw | 80.5 / 76-89 tok/s | 86-107 tok/s | 3.8 s, ~2190 tok/s | 1830-2170 tok/s | 0.9 -> 1.6 s | 248k |
+| `xtx-xt`, EXL3 4.05 bpw | 74.9 / 70-80 tok/s | 77-90 tok/s | 3.8 s, ~2170 tok/s | 1810-2170 tok/s | 1.2 -> 2.0 s | 248k |
 | `xtx`, EXL3 3.05 bpw | 50.0 / 48-54 tok/s | 42-52 tok/s | 6.7 s, ~1245 tok/s | 1280-1590 tok/s | 1.5 -> 1.9 s | 124k |
 | `xtx`, EXL3 4.05 bpw | 40.5 / 38-45 tok/s | 36-44 tok/s | 7.3 s, ~1140 tok/s | 1200-1590 tok/s | 2.1 -> 2.4 s | 124k |
 | `xt`, EXL3 3.05 bpw | 38.7 / 37-43 tok/s | 33-42 tok/s | 7.3 s, ~1145 tok/s | 1200-1420 tok/s | 1.6 -> 2.0 s | 124k |
 | `xt`, EXL3 4.05 bpw | 32.0 / 30-35 tok/s | 28-35 tok/s | 7.9 s, ~1055 tok/s | 1120-1420 tok/s | 2.2 -> 2.6 s | 124k |
 
-The EXL3 rows ([how-it-works.md](how-it-works.md#exl3-checkpoints)) were measured on 2026-10-04 with this branch's
-code on the same image, one server per row started by `rdna3/serve.sh` (on two cards it lowers `--memory-ratio` to
-0.77 / 0.76 for EXL3), MTP head on, the same scripts: the 12 sampled and 3 greedy answers, `quick_bench.py` for the
+The EXL3 rows ([how-it-works.md](how-it-works.md#exl3-checkpoints)) were measured the same way, one server per row
+started by `rdna3/serve.sh` (on two cards it lowers `--memory-ratio` to 0.77 / 0.76 for EXL3), MTP head on, the same
+scripts: the 12 sampled and 3 greedy answers, `quick_bench.py` for the
 cold read, the depth sweep. The checkpoints answer differently, so the MTP head keeps a different share of its
 guesses: read the decode columns across checkpoints as an order of magnitude.
 
-With the head, one request decodes 34 % faster on two cards at the model's sampling (+30 to +61 % greedy along the
+With the head, one request decodes 33 % faster on two cards at the model's sampling (+29 to +64 % greedy along the
 sweep) and 7-8 % faster on one card (+6 to +12 % greedy); reading a prompt costs 0-4 % more, since the head reads it
 too. On one card one of the six sampled prompts (a long story) is 3-4 % slower with it. With more requests
 decoding than `FREETOKEN_SPEC_BS_MAX` (2 in `xtx-xt`, 1 in the other profiles), the head only writes its KV: see
 the table further down.
 
-Decode loses 4-9 % from 9k to 248k on two cards and 20-24 % from 9k to 124k on one card. The ROCm 7.14 image
-(code 3a380bd, TunableOp on) measured the same way on `xtx` without the head: 36.9 / 32.3 / 30.2 / 29.1 tok/s at
-8.8k / 25k / 60k / 124k against 38.8 / 32.0 / 30.2 / 29.5 here, prompt reading and agent turns alike: the drop with
-depth is the same on both images (the flatter 7.14 one-card numbers this page gave before came from another sweep script). Where the
+Decode loses ~6 % from 9k to 248k on two cards and 20-24 % from 9k to 124k on one card. Where the
 one-card drop comes from (`xtx`, one pass with `FT_STATS_EVERY=64 FT_MOE_STATS=1`): the decode step takes ~27 ms of
 GPU time at 9-16k and ~33 ms from 25k to 124k, flat beyond 25k, while the expert cache misses ~2.2 then 3.0-3.6 of
 the 10 experts a layer reads: the longer context spreads the routing over more experts (the misses do not fall during
@@ -65,16 +64,19 @@ an answer, so it is not the prefill evicting the cache), and attention itself ad
 
 | Depth | TG with the head / without | PP new, with / without | Agent turn, with / without |
 |---:|---:|---:|---:|
-| 8.8k | 74.4 / 57.1 | 1994 / 1992 | 1.28 / 1.27 s |
-| 16.0k | 85.1 / 55.8 | 1864 / 1857 | 1.32 / 1.30 s |
-| 25.0k | 86.3 / 53.8 | 1922 / 1919 | 1.33 / 1.31 s |
-| 40.0k | 73.2 / 52.4 | 1944 / 1943 | 1.35 / 1.33 s |
-| 60.0k | 85.4 / 52.9 | 1870 / 1928 | 1.40 / 1.37 s |
-| 86.9k | 74.8 / 53.0 | 1875 / 1926 | 1.48 / 1.45 s |
-| 122.9k | 83.8 / 53.6 | 1809 / 1873 | 1.57 / 1.56 s |
-| 164.9k | 73.1 / 53.0 | 1779 / 1838 | 1.74 / 1.70 s |
-| 206.9k | 72.1 / 52.7 | 1717 / 1774 | 1.88 / 1.83 s |
-| 248.4k | 71.5 / 52.0 | 1669 / 1728 | 2.01 / 1.95 s |
+| 8.8k | 74.7 / 58.1 | 1323 / 2059 | 1.29 / 1.27 s |
+| 16.0k | 83.8 / 58.5 | 1959 / 1938 | 1.31 / 1.29 s |
+| 25.0k | 87.5 / 54.7 | 2012 / 1996 | 1.33 / 1.30 s |
+| 40.0k | 82.8 / 54.1 | 2046 / 2027 | 1.35 / 1.33 s |
+| 60.0k | 88.4 / 54.0 | 1952 / 2005 | 1.41 / 1.38 s |
+| 86.9k | 78.3 / 53.5 | 1970 / 2008 | 1.48 / 1.46 s |
+| 122.9k | 84.4 / 54.2 | 1899 / 1953 | 1.57 / 1.56 s |
+| 164.9k | 73.6 / 53.5 | 1856 / 1911 | 1.75 / 1.71 s |
+| 206.9k | 72.8 / 53.7 | 1795 / 1852 | 1.92 / 1.94 s |
+| 247.9k | 70.4 / 54.7 | 1744 / 1797 | 2.01 / 2.02 s |
+
+The first step with the head ran right after the server's start (one-time kernel preparation: its PP is low); the
+run without the head came after other measurements on the same server.
 
 ## Depth sweep, one card
 
@@ -88,26 +90,24 @@ an answer, so it is not the prefill evicting the cache), and attention itself ad
 | 86.9k | 33.5 / 29.9 | 1315 / 1349 | 2.59 / 2.54 s | 27.4 / 25.0 | 1200 / 1249 | 2.68 / 2.67 s |
 | 123.9k | 33.1 / 29.5 | 1358 / 1398 | 2.73 / 2.65 s | 27.1 / 24.8 | 1234 / 1280 | 2.82 / 2.81 s |
 
-PP is the same with and without the head within 4 %; one card reads 8k-token chunks (16k on two). On ROCm 7.14 the XT
-ended at 124k with 0.8 GiB of VRAM free (131k is its limit), and a 60k-token prompt read from scratch took 45 s on the
-XTX (then 30.5 tok/s), 48 s on the XT (then 26.7 tok/s).
+PP is the same with and without the head within 4 %; one card reads 8k-token chunks (16k on two).
 
 ## Depth sweep, EXL3 checkpoints
 
-Median of two passes, MTP head on (2026-10-04):
+Median of two passes, MTP head on; two cards on 2026-10-06 (Triton 3.8), one card on 2026-10-04 (Triton 3.7.1):
 
 | Depth | `xtx-xt` 3.05 bpw TG / PP new / turn | `xtx-xt` 4.05 bpw TG / PP new / turn |
 |---:|---:|---:|
-| 8.8k | 87.1 / 2054 / 0.88 s | 74.9 / 2054 / 1.21 s |
-| 16.0k | 103.6 / 1956 / 0.90 s | 83.6 / 1933 / 1.23 s |
-| 25.0k | 102.7 / 1984 / 0.91 s | 82.2 / 1963 / 1.25 s |
-| 40.0k | 85.7 / 2013 / 0.93 s | 81.7 / 2005 / 1.30 s |
-| 60.0k | 100.6 / 1967 / 0.98 s | 86.6 / 1923 / 1.33 s |
-| 86.9k | 87.5 / 1948 / 1.05 s | 79.9 / 1931 / 1.43 s |
-| 122.9k | 107.3 / 1898 / 1.16 s | 85.2 / 1858 / 1.50 s |
-| 164.9k | 86.1 / 1841 / 1.30 s | 78.0 / 1826 / 1.64 s |
-| 206.9k | 83.2 / 1777 / 1.41 s | 77.2 / 1759 / 1.75 s |
-| 247.9k | 84.3 / 1727 / 1.61 s | 75.8 / 1707 / 1.94 s |
+| 8.8k | 85.7 / 2173 / 0.87 s | 77.2 / 2168 / 1.21 s |
+| 16.0k | 97.6 / 2076 / 0.91 s | 81.5 / 2064 / 1.23 s |
+| 25.0k | 95.1 / 2099 / 0.90 s | 89.5 / 2091 / 1.25 s |
+| 40.0k | 90.9 / 2132 / 0.94 s | 82.9 / 2115 / 1.29 s |
+| 60.0k | 102.5 / 2074 / 0.98 s | 88.4 / 2013 / 1.33 s |
+| 86.9k | 91.6 / 2064 / 1.05 s | 80.0 / 2040 / 1.43 s |
+| 122.9k | 107.0 / 2013 / 1.17 s | 86.1 / 1965 / 1.52 s |
+| 164.9k | 90.3 / 1950 / 1.30 s | 79.9 / 1926 / 1.70 s |
+| 206.9k | 87.3 / 1890 / 1.45 s | 79.0 / 1874 / 1.79 s |
+| 247.9k | 87.1 / 1832 / 1.57 s | 79.5 / 1809 / 2.00 s |
 
 | Depth | `xtx` 3.05 bpw | `xtx` 4.05 bpw | `xt` 3.05 bpw | `xt` 4.05 bpw |
 |---:|---:|---:|---:|---:|
@@ -153,17 +153,11 @@ no error, memory and VRAM flat after the first round.
 
 | Workload | Result |
 |---|---|
+| Decode, 1 / 2 / 3 / 4 requests at once, greedy 512-token answers, counted while every request decodes (2026-10-06, Triton 3.8, median of two passes) | with the head 72.3 / 81.9 / 82.2 / 89.2 tok/s in total (72.3 / 40.9 / 27.4 / 22.3 per request); without it 59.5 / 79.2 / 85.6 / 92.3 (59.5 / 39.6 / 28.6 / 23.1) |
 | 1 / 2 / 3 / 4 requests at once, greedy answers of 93-200 tokens, time from the send to the last token (ROCm 10, two rounds) | with the head 3.6 / 5.9 / 8.4-8.6 / 10.1 s; without it 4.1-4.2 / 5.9-6.0 / 8.2-8.3 / 9.8 s |
-| Decode, 1 / 2 / 3 / 4 requests at once (release build, ROCm 7.14) | 55 / 81 / 98 / 105 tok/s in total (55 / 40 / 33 / 26 per request) |
-| Cold 8.3k-token prompts (PP), 1 alone; 4 at once (release build, ROCm 7.14) | 1 alone: 4.1 s, ~2030 tok/s; 4 at once: all four in 15.7 s, ~2120 tok/s in total (the first of them answers after 11.5 s) |
 | 4 agents, 82-117k-token conversations, 3 turns each (together more than the GPUs hold) | the 3 rounds of turns after the first reads: 35 s, first token of each turn 1.9-2.3 s; without the RAM tier 599 s and ~47 s per turn (1.15M tokens recomputed) |
 | 4 agents x 12 short turns, small GPU pool | 94 s instead of 133 s without the RAM tier |
 | 5 requests with different sampling settings (greedy, T=1, top-p only, top-k 1000 + top-p decoding together; top-k 20 + top-p queued behind them), 256-token answers | ~27-28 tok/s for each of the 4 decoding together |
-
-Release-build decode is the median of two passes over 512-token answers, counted only while every request is decoding.
-The PP row is the second pass: the first one, right after start, took 6.0 s alone and 21.5 s for four (one-time kernel
-preparation). Four requests share each decode step, so each gets ~26 tok/s; real agents also wait for each other's
-prefills.
 
 With the head and `FREETOKEN_SPEC_BS_MAX=1`, only a request decoding alone verifies drafts: with two or more, steps run
 one row per request and the head only writes its KV, an eager pass that costs 3-4 % at 3-4 requests; a lone request finishes 13 % sooner.
@@ -173,13 +167,7 @@ differ at rounding level, as they already do with prefix caching.
 
 ## Speculative decoding (MTP head)
 
-`FREETOKEN_MTP=1 FREETOKEN_SPEC_VERIFY_M=4` (adaptive depth) on top of the `xtx-xt` profile, release image (ROCm
-7.14), measured on 2026-10-01/02 against the same build without the head, one server per configuration, before the
-int8 row groups (`FREETOKEN_INT8_ROW_GROUPS`) were added. Decode is per request, after the first token.
-The final code, same image, 2026-10-02: the 3 chat prompts 54.9-56.8 -> 70.4-84.6 tok/s, the 120-item set 585 s
-(release build) -> 412 s, answers identical to the release build with and without the head.
-
-ROCm 10 image with the review fixes, 2026-10-03, each profile without the head against the same plus the head (one server
+`FREETOKEN_MTP=1 FREETOKEN_SPEC_VERIFY_M=4` (adaptive depth), 2026-10-03, each profile without the head against the same plus the head (one server
 per configuration; the odd half of the 120-item set). Greedy answers identical with and without the head on every
 profile (5 chat prompts, the 60 items, the 108k-token turns, the functional checks). The one-card columns ran with
 the two-card step costs, so mostly 4 rows; their 2-row figures follow the table:
@@ -207,44 +195,16 @@ rows, answers identical to plain decode:
 | 108k-token prompt, then a follow-up turn | 35.1 / 35.1 -> 38.0 / 39.0 | 29.1 / 28.8 -> 31.5 / 31.7 |
 | 60 code / math items (time) | 516 -> 473 s | 613 -> 563 s |
 
-| Workload, one request | Without the head | With the head | Answers |
-|---|---:|---:|---|
-| 3 chat prompts (FR prose, EN explanation, FR recipes), 96-256 tokens, two rounds, greedy | 54.5-56.7 tok/s | 66.9-81.9 tok/s | identical |
-| 120-item precision set (40 HumanEval, 40 MBPP, 40 GSM8K; greedy, up to 768 tokens) | 657 s | 426 s (x1.54) | 120/120 identical |
-| 113k-character prompt (35k tokens, three prefill chunks) + 300 tokens | 54.9 tok/s | 76.2 tok/s | identical |
-| One 1500-token answer | 59.1 tok/s | 74.5 tok/s | identical |
-| 124k-token conversation: first answer, then a follow-up turn (300 tokens each) | 54.2 / 55.8 tok/s | 70.8 / 83.2 tok/s | identical |
-| Same, time to first token of the 124k read / of the follow-up | 70.8 / 1.3 s | 73.3 / 1.4 s | |
-| 3 agent turns on a 3.4-3.6k-token prompt (questions on `docs/cli.md`) | 47.5 / 55.8 / 54.5 tok/s | 64.1 / 67.0 / 65.5 tok/s | |
-| Model's default sampling (T 1.0, top-k 20, top-p 0.95), 9 answers of up to 256 tokens | 56.2 (54.1-57.4) tok/s | 72.1 (59.4-81.5) tok/s | |
-| T 0.6, same | 56.3 (55.0-57.1) tok/s | 74.0 (69.6-79.7) tok/s | |
-| The 120-item set at the model's default sampling (the drawn answers differ: 24.6k / 24.0k tokens) | 600 s | 434 s (x1.34 per token) | |
-| Cold 6.8k-token prompt (PP) | ~1990 tok/s | ~1960 tok/s | |
+Step costs on the ROCm 10 image with Triton 3.8 (`xtx-xt`, NVFP4, `FREETOKEN_SPEC_TIMING=64` over the decode, concurrency and
+prompt-reading runs of 2026-10-06, contexts up to ~41k tokens; GPU ms per step, phases summed):
 
-| Several requests (`FREETOKEN_SPEC_BS_MAX=1`: the head only writes its KV; greedy texts identical to each request alone in both) | Without the head | With the head |
-|---|---:|---:|
-| 2 requests at once, greedy, 200 + 96 tokens: time from the send to the last token | 6.10-6.22 s | 5.98-5.99 s (-3 %) |
-| 4 requests at once, greedy, 200 tokens: time from the send to the last token | 9.23-9.36 s | 9.63-9.74 s (+4 %) |
-| Same, GPU time of a 4-request decode step | 40.0-40.8 ms | 41.2-45.3 ms, + 0.8 ms for the head |
-| 4 requests started 1.5 s apart (each prompt read alone), 200 tokens: time to the last token | 12.09-12.10 s | 12.33-12.34 s (+2 %) |
+| Requests x rows | 1 x 2 | 1 x 3 | 1 x 4 | 2 x 2 | 2 x 3 | 2 x 4 | 3 x 1 | 4 x 1 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Step (forward + verify + head + draft chain) | 25.3 | 28.8 | 36.4 | 39.7 | 53.1 | 65.0 | 36.3 | 44.5 |
+| Of which the forward | 21.4 | 25.2 | 31.7 | 35.5 | 48.6 | 59.1 | 35.6 | 43.9 |
+| Steps measured | 1640 | 1745 | 1434 | 25 | 68 | 272 | 1022 | 1022 |
 
-Tokens kept per verify step: 2.4-2.6 on chat (greedy and sampled), 3.6-3.7 on code and math. Drafts drawn from the
-head (`FREETOKEN_SPEC_SAMPLED_DRAFTS=1`) instead of its argmax keep 2-7 % more tokens per step for sampled requests,
-at the same speed: 70.9 / 74.5 tok/s on the chat rows above, 439 s on the 120 items. Where a step's time goes
-(`FREETOKEN_SPEC_TIMING`, one request, a fixed row count, GPU ms):
-
-| Rows | Forward | Verify | Head | Draft chain | Step | Tokens per step | Decode |
-|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1, no head | 17.7 | | | | 17.7 | 1 | 54.5-56.7 tok/s |
-| 2 | 23.2 | 0.51 | 1.6 | | 25.3 | 1.82 | 68-76 tok/s |
-| 3 | 27.2 | 0.54 | 1.56 | 1.43 | 30.7 | 2.41 | 71.5-82 tok/s |
-| 4 | 30.5 | 0.54 | 1.58 | 2.78 | 35.5 | 2.88 | 72-84 tok/s |
-
-Each extra row costs 3.3-5.5 ms in the forward. An eager profile from 1 to 3 rows put it in the dense int8 GEMVs
-(+1.8 ms in a graph), the expert GEMMs (+2.7), the GDN recurrence (+0.7) and expert copies (+0.6): the rows of one
-step choose ~20 distinct experts per layer instead of 10, and the ones missing from the GPU cache (1.7-2.9 per layer
-at 3 rows, against 0.4-1.3 at one) are copied from RAM over PCIe. The head itself, run eagerly while the GPU still
-executes the forward's graph, adds ~3 ms.
+With three or four requests a step runs one row each and the head only writes its KV.
 
 ## Precision
 
@@ -260,7 +220,7 @@ executes the forward's graph, adds ~3 ms.
   and checked for exactness instead: the tuned decode tiles, up to 4 concurrent requests (a request's decode is
   identical alone or batched; prompts prefilled together can differ at rounding level), the RAM tier, the sampler
   rework for requests without a small `top_k`, and rank 0's token broadcast. The one-card profiles were not run on it.
-  The ROCm 10 image with the MTP head (`xtx-xt`; greedy answers differ from ROCm 7.14 on 2 of 5 prompts) scored 12 and
+  The ROCm 10 image with the MTP head (`xtx-xt`) scored 12 and
   18 in two runs; the same build with the EXL3 checkpoints ([how-it-works.md](how-it-works.md#exl3-checkpoints))
   scored 13 at 3.05 bpw and 12 at 4.05 bpw, one run each.
 - **Exactness checks**: a fixed set of 120 greedy prompts (not published) gave identical answers for the host-memory

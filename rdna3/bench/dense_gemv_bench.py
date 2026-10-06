@@ -1,12 +1,11 @@
-"""Decode (M=1) dense projection micro-benchmark on one RDNA3 GPU: bf16 (torch + TunableOp) vs 8-bit weight-only.
+"""Decode (M=1) dense projection micro-benchmark on one RDNA3 GPU: bf16 (torch F.linear) vs 8-bit weight-only.
 
 Shapes and per-token call counts are the per-rank TP=2 decode GEMMs of Qwen3.8-Flash-Next. Every measurement cycles
 over enough weight copies to overflow the 96 MB Infinity Cache, so the numbers are DRAM-bound like real decode.
 Prints per-shape microseconds and the projected per-token dense time of each variant.
 
-Run (one GPU, TunableOp read-only for the bf16 baseline):
-  docker run --rm --device=/dev/kfd --device=/dev/dri -e HIP_VISIBLE_DEVICES=0 -e PYTORCH_TUNABLEOP_ENABLED=1 \
-    -e PYTORCH_TUNABLEOP_TUNING=0 -e PYTORCH_TUNABLEOP_FILENAME=/t/tunableop_results%d.csv -v <tunableop dir>:/t:ro \
+Run (one GPU):
+  docker run --rm --device=/dev/kfd --device=/dev/dri -e HIP_VISIBLE_DEVICES=0 \
     -v <repo>:/src:ro -e PYTHONPATH=/src/python freetoken-rdna3:latest python /src/rdna3/bench/dense_gemv_bench.py
 """
 from __future__ import annotations
@@ -139,7 +138,7 @@ def main():
     torch.manual_seed(0)
     dev = torch.device("cuda")
     props = torch.cuda.get_device_properties(0)
-    print(f"# {props.name}, TunableOp={os.environ.get('PYTORCH_TUNABLEOP_ENABLED', '0')}", flush=True)
+    print(f"# {props.name}", flush=True)
     from freetoken.kernel.triton.fp8_pertensor_linear import _gemv as main_fp8_gemv
 
     totals = {}

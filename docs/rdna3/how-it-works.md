@@ -103,8 +103,7 @@ the draws outside the top-20 on one distribution) and its top-p was approximate.
 
 Up to 4 requests decode together (`--max-running-requests 4`), with CUDA graphs captured for every batch size up to 4.
 The decode GEMVs run their unchanged per-row body once per request (the weight tile loaded once when the reduction fits
-one tile), so batching changes the speed of a request's decode, not its tokens: 55 / 81 / 98 / 105 tok/s in total at
-1 / 2 / 3 / 4 requests (ROCm 7.14 release build, without the MTP head). Prompts prefilled in the same forward can differ at rounding level (the dense GEMMs run at
+one tile), so batching changes the speed of a request's decode, not its tokens. Prompts prefilled in the same forward can differ at rounding level (the dense GEMMs run at
 another size), as prefix caching already makes them. Added after the agentic benchmark runs: a request alone on this
 build gives the same answers as before (120 prompts), batched runs were not scored. Prefills are not mixed with
 decode steps in one batch (estimated at ~3 %, not done); agents naturally overlap their prefills.

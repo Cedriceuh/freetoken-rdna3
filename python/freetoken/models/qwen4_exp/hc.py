@@ -17,6 +17,7 @@ import torch.nn.functional as F
 from freetoken.kernel.triton.hc import (
     grouped_gemma_rmsnorm,
     hc_combine,
+    hc_combine_rmsnorm,
     hc_gate_mix,
     hc_silu,
 )
@@ -120,7 +121,10 @@ class GatedResidual(BaseOP):
         return down[:, : self.lowrank], down[:, self.lowrank : self.lowrank + self.hc_count]
 
     def _mix_kernel(self, R: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor | None]:
-        rn = grouped_gemma_rmsnorm(R, self.hc_norm.weight, self.hc_norm.eps, self.hc_count)
+        return self.mix_normed(grouped_gemma_rmsnorm(R, self.hc_norm.weight, self.hc_norm.eps, self.hc_count))
+
+    def mix_normed(self, rn: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor | None]:
+        """``mix`` from the already normed streams (``combine_norm`` of the block before computed them)."""
         lora, s = self._down(rn)
         gate = self.input_mix_weight_up.forward(hc_silu(lora, self.hc_count))
         return hc_gate_mix(rn, gate, self.hc_count), s
@@ -143,6 +147,10 @@ class GatedResidual(BaseOP):
     def mix(self, R: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor | None]:
         """Return the block input ``x [T, hidden]`` and the inject logits ``s [T, hc_count]`` (None if no combine)."""
         return self._mix_kernel(R) if R.is_cuda else self._mix_torch(R)
+
+    def combine_norm(self, R: torch.Tensor, y: torch.Tensor, s: torch.Tensor, nxt: "GatedResidual"):
+        """``combine``, then the normed streams ``nxt.mix`` starts from, in one kernel: (R', Rn') for ``nxt.mix_normed``."""
+        return hc_combine_rmsnorm(R, y, s, nxt.hc_norm.weight, nxt.hc_norm.eps, self.hc_count)
 
     def combine(self, R: torch.Tensor, y: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
         """Inject the block output ``y [T, hidden]`` back into every stream of ``R``."""

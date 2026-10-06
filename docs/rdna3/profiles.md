@@ -27,7 +27,6 @@ VRAM_GIB="24 20"        # minimum VRAM per rank, used for the automatic choice
 TESTED=0                # derived, not measured: serve.sh says so at start (default 1)
 CTX=250000              # context length (--ctx overrides); passed as --max-seq-len-override and --kv-reserve-tokens
 MEMORY=110g             # container RAM limit (--memory overrides)
-TUNABLEOP=0             # 1: mount rdna3/tunableop (GEMM choices tuned for the ROCm 7.14 image), read-only
 FREETOKEN_...=...       # any other KEY=value line becomes an environment variable of the container
 FT_ARGS="..."           # flags passed to `ft serve` (its --tp-size must match GPUS)
 ```
@@ -51,7 +50,7 @@ A comment may follow a value on the same line. Copy a file to make your own prof
 | `--expert-load parallel` | | reads the expert files into RAM with parallel readers; `auto` (the engine's default) does the same but falls back to a slower serial read when free RAM is short: use `auto` on a machine with little RAM to spare |
 | `--quant-backend moe.nvfp4=triton` | | the Triton NVFP4 expert kernels (the other backends need NVIDIA hardware) |
 | `--ple-backend disk` | | the 51 GB n-gram embedding tables are read from the checkpoint files on demand |
-| `--max-running-requests 4 --cuda-graph-max-bs 4` | | up to 4 requests decoded together (55 / 81 / 98 / 105 tok/s in total at 1 / 2 / 3 / 4 on the ROCm 7.14 release build, without the MTP head) |
+| `--max-running-requests 4 --cuda-graph-max-bs 4` | | up to 4 requests decoded together (1 / 2 / 3 / 4 greedy answers sent at once finish in 3.6 / 5.9 / 8.4-8.6 / 10.1 s) |
 | `--max-prefill-length 16384` | | 16k-token prompt chunks: each chunk streams every expert once, so bigger chunks read long prompts faster (an 8.4k prompt in 4.3 s instead of 5.5 s with 4k chunks) |
 | `--memory-ratio 0.80` | | VRAM budget; 0.80 leaves the headroom 16k chunks need on the 20 GB card |
 | `--moe-prefill-hit-d2d` | | experts already cached on the GPU are reused during prefill instead of crossing PCIe: agent turn 1.55 -> 1.18 s |
@@ -129,9 +128,6 @@ Nothing below has been measured; treat it as a starting point and check with the
 - **Less RAM**: `FREETOKEN_HOST_KV=0` saves the RAM tier (9.5 GiB on two cards, ~5 GiB on one; evicted conversations
   are re-read instead). In NVFP4 the experts themselves cannot go below ~63 GiB; the experimental EXL3 3 bpw
   checkpoint needs 42.6 GiB: [limits.md](limits.md).
-- **The TunableOp files** in `rdna3/tunableop/` are ROCm 7.14's (their header records PyTorch / HIP / hipBLASLt), so
-  the profiles set `TUNABLEOP=0` on the ROCm 10 image; to use TunableOp, tune for your image once and freeze (see
-  [options.md](options.md#pytorch-tunableop)).
 
 Every environment variable in these files is explained in [options.md](options.md); the `ft serve` flags in the tables
 above and in upstream's [CLI reference](../cli.md).

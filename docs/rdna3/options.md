@@ -79,8 +79,10 @@ disagreements over ~8k sampled tokens in `check` mode). It is on the torch.distr
 
 | Variable | Default | Effect |
 |---|---|---|
-| `FREETOKEN_PLE_SYNC` | `auto` | How a captured decode step gets its PLE disk rows. `auto` probes the stream memops once at start: `wait-sync` (the step waits inside the graph for the host fill) where a captured wait holds three replays in a row, which on these cards is ROCm 10 and not 7.14; else `launch-gating` (the host fills before each launch). The log says which. `wait`: require memops, `gate`: never use them. ROCm 10 + wait-sync: +3.5-4 % decode, bit-exact. |
+| `FREETOKEN_PLE_SYNC` | `auto` | How a captured decode step gets its PLE disk rows. `auto` probes the stream memops once at start: `wait-sync` (the step waits inside the graph for the host fill) where a captured wait holds three replays in a row (ROCm 10 on these cards); else `launch-gating` (the host fills before each launch). The log says which. `wait`: require memops, `gate`: never use them. ROCm 10 + wait-sync: +3.5-4 % decode, bit-exact. |
 | `FREETOKEN_PLE_CONV_BLOCK` | `4096` | The per-layer-embedding (PLE) convolution runs 4096 tokens at a time, for one or several requests. Keeps big prefill chunks and batched prefills within memory (3 requests prefilled together, 16k tokens, needed 2.6 GiB of temporaries, now 0.7 GiB). Reorders sums; *agent-validated* for one request, identical to the unblocked path in a GPU check with several. |
+| `FREETOKEN_FUSED_MOE_EPILOGUE` | `1` | The routed experts' sum, the shared expert's gate (a dot product and a sigmoid) and the mul-add of each MoE block in one kernel instead of three; the NVFP4 decode hands over its per-expert outputs. Same arithmetic in the same order on the same tiles: **bit-exact**. Only Triton NVFP4 / EXL3 experts on the GPU decode path, at TP=1 or with `FREETOKEN_FUSE_MOE_ALLREDUCE=1` (the bf16 kernel overwrites its input; hybrid and CPU layers add partial sums; without the block's single all-reduce the experts would reduce each expert's output): others keep the three kernels. NVFP4 `xtx-xt`, greedy decode without the MTP head: 57.8 -> 59.2 tok/s alone, with the MTP head 82.9 -> 83.8. `0`: three kernels. |
+| `FREETOKEN_FUSED_HC_NORM` | `1` | Each hyper-connection combine and the grouped RMSNorm that reads the streams next (the MLP block's, the next layer's, the final mixer's; not into a PLE layer) in one kernel, the normed streams freed as soon as read. **Bit-exact**, two launches fewer per layer. With the epilogue above, `xtx-xt` greedy decode: NVFP4 57.8 -> 59.8-60.0 tok/s (82.9 -> 85.6 with the MTP head), EXL3 3.05 bpw 58.4 -> 59.7 (86.4 -> 89.2), 4.05 bpw 55.3 -> 56.5 (81.6 -> 83.3); prompt reading and VRAM peaks unchanged ([journey.md](journey.md#19-fewer-decode-kernels-2026-10-06)). `0`: separate kernels. |
 | `FREETOKEN_QSA_KV_INT8` | unset | **Experimental, not recommended.** `1`: int8 KV cache for the attention (QSA) layers, 3.19 -> 1.71 GiB per card. Short benchmarks and 227k-token needle tests looked fine, but the agentic benchmark fell from 12-14 to 8-9 bugs fixed and the agent stopped exploring early. |
 
 ## Speculative decoding with the MTP head (Qwen3.8-Flash-Next, experimental)
@@ -151,7 +153,7 @@ Beyond the GPU pool + the RAM tier, the least recently used conversations are dr
 | `FT_PROF_EAGER=1` | Also profile eager decode (run with `--cuda-graph-max-bs 0`): ROCm's profiler does not see kernels replayed from a CUDA graph. |
 | `FREETOKEN_SPEC_TIMING=N` | Every N decode steps, the GPU and host time of each phase (forward, verify, MTP head, draft chain) per (requests, rows); one stream sync per report. |
 | `FREETOKEN_SPEC_STALL_MS` | `500`; with `FREETOKEN_SPEC_TIMING`, every decode step whose GPU or host time, or distance to the previous step, exceeds it is logged on its own with its phases and the time of day (every rank): to catch the occasional stall. |
-| `FREETOKEN_PLE_FILL_TIMING=N` | Every N decode steps, the host's wait for the step's tokens and the PLE disk fill time after it (the GPU idles through the fill when stream memops are unavailable, as on ROCm 7.14). |
+| `FREETOKEN_PLE_FILL_TIMING=N` | Every N decode steps, the host's wait for the step's tokens and the PLE disk fill time after it (the GPU idles through the fill when stream memops are unavailable). |
 
 `FT_PROF_DIR` defaults to `./ftprof`, i.e. `/opt/FreeToken/ftprof` inside the container, which is lost when the
 container stops: set `FT_PROF_DIR=/root/.cache/freetoken-rdna3/ftprof` to keep it in the kernel-cache volume, or
@@ -159,15 +161,9 @@ container stops: set `FT_PROF_DIR=/root/.cache/freetoken-rdna3/ftprof` to keep i
 
 ## PyTorch TunableOp
 
-`TUNABLEOP=1` in a profile mounts `rdna3/tunableop/` read-only with `PYTORCH_TUNABLEOP_ENABLED=1`,
-`PYTORCH_TUNABLEOP_TUNING=0`, and the GEMM algorithm for each of the 89 dense shapes is taken from a file tuned once on
-these cards (+27 % decode on the bf16 ROCm 7.14 build, mostly superseded by int8 since). The profiles set `TUNABLEOP=0`
-since the ROCm 10 image: the files are 7.14's, and tuning for ROCm 10 gained < 0.2 % on prompt reading. Never enable tuning in service
-(`PYTORCH_TUNABLEOP_TUNING=1`): each new prompt length would be tuned on the spot (16 s prefills). The files are tied to
-a PyTorch / HIP / hipBLASLt version, written in their header (ROCm 7.14's: the ROCm 10 image rejects them,
-[troubleshooting.md](troubleshooting.md#warnings-about-tunableop)); to tune for another image, run a
-representative workload once with `PYTORCH_TUNABLEOP_TUNING=1` and a writable `PYTORCH_TUNABLEOP_FILENAME`, then
-freeze.
+Not used: tuning the dense GEMMs of the 16k-token prefill chunks gained 1.5-1.7 % on those GEMMs and < 0.2 % on
+prompt reading ([journey.md](journey.md#17-dropped-along-the-way)). Never enable tuning in service
+(`PYTORCH_TUNABLEOP_TUNING=1`): each new prompt length would be tuned on the spot (16 s prefills).
 
 ## Container settings the engine does not check
 

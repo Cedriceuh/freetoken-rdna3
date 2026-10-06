@@ -45,9 +45,9 @@ def probe_wait_sync(mode: str, device: torch.device) -> bool:
 
 def _captured_wait_holds(device: torch.device, replays: int = 3) -> bool:
     """A WAIT/RESET captured in a graph must hold EVERY replay until the host signals, the copy behind it included.
-    Measured on gfx1100: ROCm 7.14
-    captures it, but the second replay ran straight through (the GPU would read the PLE rows before the fill); ROCm
-    10 holds (its release notes add stream-capture support for hipStreamWaitValue / WriteValue)."""
+    Some HIP runtimes capture it but let the second replay run straight through (the GPU would read the PLE rows
+    before the fill); ROCm 10 holds on gfx1100 (its release notes add stream-capture support for hipStreamWaitValue /
+    WriteValue)."""
     import time
 
     flag = alloc_pinned_tensor(1, dtype=torch.int64)

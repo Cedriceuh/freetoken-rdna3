@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Fewer decode kernels, bit-exact (on by default): the MoE epilogue (routed sum, shared-expert gate, mul-add) in one
+  kernel (`FREETOKEN_FUSED_MOE_EPILOGUE`), each hyper-connection combine fused with the next grouped RMSNorm
+  (`FREETOKEN_FUSED_HC_NORM`), one split-K reduce launch for all the rows of a verify step. `xtx-xt` greedy decode:
+  NVFP4 +3.5 % (+3.3 % with the MTP head), EXL3 +2.1-2.2 % (+2.1-3.2 %); identical answers, same prompt reading.
 - EXL3 checkpoints: Qwen3.8-Flash-Next from `turboderp/Qwen3.8-Flash-Next-exl3` (3.05 and 4.05 bpw) serves with the
   routed experts kept in EXL3 (Triton kernels for gfx1100: split-K decode GEMVs, grouped prefill GEMMs, Hadamard
   rotations) and the other linears decoded to bf16 at load; nothing to switch on. At 3.05 bpw on `xtx-xt`: decode
@@ -20,9 +24,10 @@
   (`FREETOKEN_SPEC_BS_MAX=2`): two agents at ~100k of context decode 8-15 % faster each. Several requests at once:
   3-4 % slower at 3-4 requests. With the ROCm 10 base, 12 and
   18 of 29 on the agentic benchmark (two runs).
-- The image moves to ROCm 10.0 / PyTorch 2.13, with the ROCm 7.14 image's Triton 3.7.1 (3.8 miscompiles these
-  kernels). HIP stream memops make the PLE wait-sync work there (`FREETOKEN_PLE_SYNC`, +3.5-4 % decode). TunableOp is
-  off in the profiles (its files are 7.14's).
+- The image moves to ROCm 10.0 / PyTorch 2.13 and its own Triton 3.8. Triton 3.8's AMD range analysis gives
+  `tl.histogram` an empty range and folds comparisons on its counts to false, which broke `moe_align_block_size`
+  (an illegal memory access in the first prefill, then a hang): the kernel no longer compares those counts. HIP stream memops make the PLE wait-sync work there (`FREETOKEN_PLE_SYNC`, +3.5-4 % decode). TunableOp and its
+  files are gone (< 0.2 % on prompt reading once tuned for this image).
 - The GGUF kernels build on ROCm.
 - Optional switches: `FREETOKEN_MOE_COPY_OVERLAP` (expert copies on a side stream; measured 33 % slower end to end, leave
   it off), `FREETOKEN_HOST_ALLREDUCE_WAITLOG`

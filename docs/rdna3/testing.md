@@ -14,7 +14,7 @@ python3 rdna3/bench/quick_bench.py --label "2x RX 7900 XT, xt-xt"
 About a minute; it measures decode speed, a cold ~8.3k-token read, an agent turn on the cached conversation and a
 tool call, on text the server has never seen, and prints a Markdown table for an issue. For comparison, `xtx-xt` on
 the ROCm 10 image gives ~60-67 tok/s with the MTP head (a sampled answer, so it varies; ~55-56 with `--no-mtp`),
-~4.15 s and ~1.3 s, tool call parsed. On a fresh image the first run can be
+~4.0 s and ~1.3 s, tool call parsed. On a fresh image the first run can be
 slower (one-time kernel preparation): run it twice.
 
 ## CPU test suite
@@ -23,8 +23,8 @@ slower (one-time kernel preparation): run it twice.
 docker run --rm -w /opt/FreeToken --entrypoint python3 freetoken-rdna3:latest -m pytest -q -p no:cacheprovider tests
 ```
 
-About 2 minutes (131 s on the reference machine), no GPU needed, on the tree the image was built from: 1534 passed,
-541 skipped and 3 failures that come from the environment (they need flashinfer, an NVIDIA-only package) and fail the
+About 2.5 minutes (152 s on the reference machine), no GPU needed, on the tree the image was built from: 1541 passed,
+579 skipped and 3 failures that come from the environment (they need flashinfer, an NVIDIA-only package) and fail the
 same way on upstream
 (`test_cache_budget.py::test_adjust_config_defaults_moe_cache_auto_for_auto_resolved_offload_backend`,
 `test_cache_budget.py::test_adjust_config_resolves_num_tokens_generic`,

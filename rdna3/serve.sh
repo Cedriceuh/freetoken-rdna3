@@ -75,9 +75,9 @@ pfile="$HERE/profiles/$profile.env"
 [ -d "$model" ] || { echo "--model must be the checkpoint directory" >&2; exit 2; }
 model="$(cd "$model" && pwd)"
 
-# the profile: GPUS / VRAM_GIB / CTX / MEMORY / TUNABLEOP / TESTED / FT_ARGS drive this script, every other KEY=value is
+# the profile: GPUS / VRAM_GIB / CTX / MEMORY / TESTED / FT_ARGS drive this script, every other KEY=value is
 # container env
-envs=() ft_args=() p_gpus=1 p_vram="" p_ctx=131072 p_memory=110g p_tunableop=0 p_tested=1
+envs=() ft_args=() p_gpus=1 p_vram="" p_ctx=131072 p_memory=110g p_tested=1
 while IFS= read -r line || [ -n "$line" ]; do
   case "$line" in ''|\#*) continue ;; esac
   key="${line%%=*}" val="${line#*=}"
@@ -91,7 +91,6 @@ while IFS= read -r line || [ -n "$line" ]; do
     TESTED) p_tested="$val" ;;
     CTX) p_ctx="$val" ;;
     MEMORY) p_memory="$val" ;;
-    TUNABLEOP) p_tunableop="$val" ;;
     FT_ARGS) read -r -a ft_args <<< "$val" ;;
     FREETOKEN_MTP|FREETOKEN_SPEC_*) [ -n "$no_mtp" ] || envs+=(-e "$key=$val") ;;  # --no-mtp drops the head's settings
     *) envs+=(-e "$key=$val") ;;
@@ -131,10 +130,6 @@ if [ -z "$gpus" ]; then
   echo "GPUs: $(printf '%s\n' "${pick[@]}" | LC_ALL=C awk '{printf "%sHIP %s (PCI %s, %.0f GiB)", (NR > 1 ? ", " : ""), $1, $3, $2 / 1073741824}')" >&2
 fi
 mounts=(-v "$model:/models/m:ro")
-if [ "$p_tunableop" = 1 ]; then  # GEMM choices tuned on 7900 XTX / XT for the ROCm 7.14 image (read-only, never tuned online)
-  mounts+=(-v "$HERE/tunableop:/tunableop:ro")
-  envs+=(-e PYTORCH_TUNABLEOP_ENABLED=1 -e PYTORCH_TUNABLEOP_TUNING=0 -e PYTORCH_TUNABLEOP_FILENAME=/tunableop/tunableop_results%d.csv)
-fi
 if [ -z "$dry" ] && ! "$DOCKER" info >/dev/null 2>&1; then
   echo "cannot reach the Docker daemon: is it running, and is your user in the 'docker' group (log in again after adding it)?" >&2
   exit 2

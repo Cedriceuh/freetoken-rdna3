@@ -90,7 +90,7 @@ def test_geometry_and_bounds_are_checked_up_front(tmp_path):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 def test_wait_sync_probe_only_accepts_a_captured_wait_that_holds():
     """probe_wait_sync says True only where a WAIT captured in a graph blocks every replay until the host signals
-    (ROCm 10 on gfx1100; ROCm 7.14 captures one that the second replay runs through, so the probe says False)."""
+    (ROCm 10 on gfx1100; where the second replay runs through a captured wait, the probe says False)."""
     import threading
     import time
 

@@ -73,6 +73,23 @@ Two host settings, both measured on the reference machine on 2026-10-03:
 The first request after the server starts still takes ~11 s (host-side warm-up, once). Undervolting, GFXOFF and the
 display's memory power saving were ruled out on 2026-10-02.
 
+## A GPU fault or a hung collective with a full card
+
+Seen on `xtx-xt` on 2026-10-05/06, each time while a card was within a few hundred MiB of full and the driver had
+just evicted the process's queues (`/sys/class/kfd/kfd/proc/<pid>/stats_<gpu>/evicted_ms` growing outside start-up):
+
+- `CUDA error: an illegal memory access` on rank 0, with `[gfxhub] page fault` for the 7900 XTX in `dmesg`: once in an
+  agent session with the EXL3 4.05 bpw checkpoint (the XTX peaks ~0.5 GiB from full), and once on purpose, when another
+  process took and released 0.5-1.5 GiB on the XTX (the card driving the display) during the first 16k-token chunk of a
+  long prompt.
+- A hung all-gather (`Watchdog caught collective operation timeout ... _ALLGATHER_BASE`, the server stops) once in a
+  depth sweep, the XT at 37 MiB from full during a 16k-token chunk at ~41k tokens of context.
+
+Neither came back in the same runs repeated (hours of agent sessions, the sweep again, the same VRAM pressure in other
+10-minute runs): the eviction has to land at a bad moment. Keep other GPU-heavy programs off the card that drives the
+display while serving, and lower `--memory-ratio` (more headroom, fewer cached experts) if it happens again. Before
+restarting, save the log (`docker logs <container>`): the container is removed when it stops.
+
 ## Answers stop mid-sentence
 
 Deep in a long conversation (70-110k tokens of context) the model sometimes ends an answer in the middle of a sentence,
@@ -95,13 +112,6 @@ Upstream's cooperative top-k / top-p kernels hang on gfx1100; this build never u
 different build, test it on a card that drives no display: `HIP_VISIBLE_DEVICES=<index>
 rdna3/tests/run_sampling_tests.sh freetoken.kernel.triton.sampling`, with the index `rdna3/serve.sh --list-gpus` shows
 for that card (GPU 0 otherwise; each mode is killed after 90 s). Always smoke-test with a temperature above 0: greedy decoding never reaches the sampler.
-
-## Warnings about TunableOp
-
-Only with `TUNABLEOP=1` in a profile (off in the shipped ones): the files in `rdna3/tunableop/` were tuned on the ROCm
-7.14 image, and the ROCm 10 image rejects them at start (`Failed validator: ROCBLAS_VERSION`); the remaining bf16 GEMMs
-then use hipBLASLt's own choices. Harmless: tuning for ROCm 10 gained < 0.2 % on prompt reading. Set `TUNABLEOP=0`, or
-tune for your image once ([options.md](options.md#pytorch-tunableop)).
 
 ## `FREETOKEN_NVFP4_DECODE_TUNED: no tuned tiles for (N, K) = ...` in the log
 

@@ -59,11 +59,8 @@ After a merge, update the base commit named in `NOTICE`, this file and
 3. Tag the release `rdna3-vX.Y.Z` (upstream's own tags are `vX.Y.Z`, so a fetch from upstream never clashes), with
    an annotated tag; the image records the commit it was built from (`/opt/FreeToken-BUILD-PROVENANCE.txt`).
 
-## TunableOp files and tuned tiles
+## Tuned tiles
 
-TunableOp files are valid for one base image (their header records PyTorch / HIP / hipBLASLt): a new base means one
-tuning pass (`PYTORCH_TUNABLEOP_TUNING=1` on a representative workload), then freeze. For the ROCm 10 base it was
-measured instead (< 0.2 % on prompt reading) and TunableOp left off; `rdna3/tunableop/` holds the 7.14 files.
 The NVFP4 tile tables (`FREETOKEN_NVFP4_*_TUNED`) were produced with `rdna3/bench/nvfp4_*_sweep.py`; rerun them for a
 new model, split or card, keeping only tiles that preserve the summation order (M / N tiles, warps, stages).
 The EXL3 decode GEMV table (`_GEMV_TUNED` in `kernel/triton/exl3.py`) came from `rdna3/bench/exl3_gemv_bench.py`

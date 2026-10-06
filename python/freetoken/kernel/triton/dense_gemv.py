@@ -53,13 +53,15 @@ def _gemv_splitk_bf16(a_ptr, w_ptr, part_ptr, N, K, stride_wn, stride_pk, k_per,
 
 
 @triton.jit
-def _reduce_to_bf16(part_ptr, out_ptr, N, stride_pk, SPLIT: tl.constexpr, BLOCK: tl.constexpr):
+def _reduce_to_bf16(part_ptr, out_ptr, N, stride_pk, stride_pm, stride_om, SPLIT: tl.constexpr, BLOCK: tl.constexpr):
+    # program (block, row): every row in one launch, each element summed over the splits in order as before
+    row = tl.program_id(1)
     offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offs < N
     acc = tl.zeros((BLOCK,), dtype=tl.float32)
     for k in tl.static_range(SPLIT):
-        acc += tl.load(part_ptr + k * stride_pk + offs, mask=mask, other=0.0)
-    tl.store(out_ptr + offs, acc.to(tl.bfloat16), mask=mask)
+        acc += tl.load(part_ptr + row * stride_pm + k * stride_pk + offs, mask=mask, other=0.0)
+    tl.store(out_ptr + row * stride_om + offs, acc.to(tl.bfloat16), mask=mask)
 
 
 def gemv_config(weight: torch.Tensor) -> tuple[int, int, int, int] | None:
@@ -83,9 +85,8 @@ def gemv_bf16(x: torch.Tensor, weight: torch.Tensor, cfg: tuple[int, int, int, i
         x2, weight, part, N, K, weight.stride(0), part.stride(1), k_per,
         BLOCK_N=block_n, BLOCK_K=block_k, ROWS=M, stride_am=x2.stride(0), stride_pm=part.stride(0), num_warps=warps,
     )
-    for r in range(M):
-        _reduce_to_bf16[(triton.cdiv(N, 512),)](part[r], out[r], N, part.stride(1), SPLIT=split, BLOCK=512,
-                                                num_warps=4)
+    _reduce_to_bf16[(triton.cdiv(N, 512), M)](part, out, N, part.stride(1), part.stride(0), out.stride(0), SPLIT=split,
+                                              BLOCK=512, num_warps=4)
     return out
 
 

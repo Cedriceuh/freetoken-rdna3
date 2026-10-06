@@ -29,6 +29,9 @@ from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
 
+# set by a caller that sums the decode experts' outputs itself (one element: mutable, read at call time)
+PER_EXPERT_OUTPUT = [False]
+
 # Decode is captured into a CUDA graph, so the config must be fixed (no triton.autotune,
 # which benchmarks at run time). Tuned offline against the NVFP4 decode kernels.
 # These drive the original LUT-gather decode (_decode_gemm), kept only for A/B.
@@ -198,6 +201,8 @@ def _fused_experts_decode_nvfp4(
         ic2, down_packed, down_scale, down_global,
         ic3, topk_weights, topk_ids, not apply_router_weight_on_input, True,
     )
+    if PER_EXPERT_OUTPUT[0]:  # the caller sums them in its own epilogue (FREETOKEN_FUSED_MOE_EPILOGUE)
+        return ic3
     out = torch.empty_like(hidden_states)
     moe_sum_reduce_triton(ic3, out)
     return out

@@ -50,7 +50,7 @@ def _c_compiler_for(cxx: str) -> str:
 
 def _rocm_sdk_paths() -> tuple[list[str], list[str]]:
     """Include and link flags the ROCm pip SDK needs for this extension: torch's ROCM_HOME may not hold the HIP headers
-    (7.14 wheels point it at the venv), and the SDK ships only libamdhip64.so.N, which the shared JIT link flags
+    (a pip-installed ROCm SDK can point it at the venv), and the SDK ships only libamdhip64.so.N, which the shared JIT link flags
     (``kernel.utils._rocm_link_flags``) expose under the -lamdhip64 name torch links with."""
     import importlib.util
     from torch.utils.cpp_extension import ROCM_HOME

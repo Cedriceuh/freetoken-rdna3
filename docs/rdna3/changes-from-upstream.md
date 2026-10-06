@@ -116,7 +116,8 @@ Line counts in this section and the next are relative to `d72e5cb` (0.1.0 plus i
 
 | File | Lines | Change |
 |---|---:|---|
-| `Dockerfile.rdna3` | 23/5 | ROCm 10.0 / PyTorch 2.13 base; installs against its Triton 3.8, then copies the 7.14 image's Triton 3.7.1 over it (3.8 miscompiles these kernels; before the install, pip would replace torch 2.13, which requires its 3.8, with a CUDA one); pyproject's CUDA ceilings lifted at install |
+| `Dockerfile.rdna3` | 13/5 | ROCm 10.0 / PyTorch 2.13 base with its own Triton 3.8; pyproject's CUDA ceilings lifted at install |
+| `python/freetoken/kernel/triton/moe_align.py`, `tests/kernels/test_moe_align.py` | 13/9, new | no comparison on `tl.histogram` counts: Triton 3.8's AMD range analysis gives them an empty range and folds such comparisons to false, which left the expert ids unwritten (up to 1024 routes) or every count at zero (more), and the expert GEMMs then read wild addresses |
 | `python/freetoken/kernel/gguf.py`, `kernel/csrc/gguf/gguf_kernel.cu`, `dispatch.h`, `gguf_bind.cpp` | 41/8, 249/328, 37/9, new | the GGUF kernels build on ROCm: the torch wrappers in a host-only file (under HIP torch's headers include rocThrust, which the pip SDK lacks), nvcc-only flags for CUDA only, HIP's shuffles for the full-mask ones, the SDK's HIP headers, the shared ROCm link flags |
 | `python/freetoken/kernel/csrc/row_store/row_store_ext.cpp`, `kernel/row_store.py` | 32/4, 40/1 | HIP stream memops for the PLE wait-sync (the probe used to look for the CUDA driver's only); a captured wait must hold three replays with the PLE copy behind it (`FREETOKEN_PLE_SYNC`) |
 | `python/freetoken/kernel/host_allreduce.py`, `kernel/csrc/jit/host_allreduce.cuh` | 20/5, 11/5 | the optional wait log (`FREETOKEN_HOST_ALLREDUCE_WAITLOG`), removed at a clean shutdown |
@@ -141,6 +142,17 @@ Line counts here are on top of the lines listed in the sections above.
 | `python/freetoken/layers/quantization/moe/base.py`, `engine/engine.py`, `tests/engine/test_cache_budget.py` | 8/0, 17/2, 13/0 | an expert kernel can declare the temporaries of a prefill chunk (EXL3: 0.6 GiB per card at 16k tokens); the cache planner keeps them out of the expert cache and the KV pages on every rank |
 | `tests/layers/test_exl3_codec.py`, `rdna3/tests/exl3_check.py`, `rdna3/tests/exl3_moe_check.py`, `rdna3/bench/exl3_gemv_bench.py`, `rdna3/bench/exl3_moe_bench.py` | new | CPU tests, GPU checks, micro-benchmarks |
 
+## Fewer decode kernels (bit-exact fusions)
+
+Line counts here are on top of the lines listed in the sections above.
+
+| File | Lines | Change |
+|---|---:|---|
+| `python/freetoken/kernel/triton/moe_shared_gate.py`, `moe/fused_nvfp4.py`, `models/qwen4_exp/moe.py` | 64/1, 5/0, 32/6 | the MoE epilogue in one kernel (`FREETOKEN_FUSED_MOE_EPILOGUE`): the NVFP4 decode can hand over its per-expert outputs |
+| `python/freetoken/kernel/triton/hc.py`, `models/qwen4_exp/hc.py`, `models/qwen4_exp/model.py` | 67/0, 9/1, 59/4 | each hyper-connection combine fused with the next grouped RMSNorm (`FREETOKEN_FUSED_HC_NORM`) |
+| `python/freetoken/kernel/triton/dense_gemv.py` | 7/6 | one split-K reduce launch for all the rows |
+| `tests/kernels/test_moe_shared_gate.py`, `test_hc_combine_rmsnorm.py`, `test_gemv_bf16_rows.py`, `tests/models/qwen4_exp/test_moe_epilogue.py` | new | bit-exactness on the GPU; which expert paths take the fused epilogue |
+
 ## Tooling and documentation
 
 | File | Change |
@@ -148,6 +160,6 @@ Line counts here are on top of the lines listed in the sections above.
 | `python/freetoken/engine/ftprof.py` (93/0) | env-gated decode profiling (`FT_STATS_EVERY`, `FT_PROF_*`) |
 | `python/freetoken/server/args.py` (3/1) | `--cuda-graph-max-bs` help |
 | `Dockerfile.rdna3`, `.dockerignore` | the ROCm image |
-| `rdna3/` | profiles (the MTP head on, TunableOp off), `serve.sh` (`--no-mtp`; a lower `--memory-ratio` for EXL3 on two cards), GPU checks, micro-benchmarks and `bench/depth_sweep.py`, the ROCm 7.14 TunableOp files, maintenance tools |
+| `rdna3/` | profiles (the MTP head on), `serve.sh` (`--no-mtp`; a lower `--memory-ratio` for EXL3 on two cards), GPU checks, micro-benchmarks and `bench/depth_sweep.py`, maintenance tools |
 | `README.md`, `NOTICE`, `CHANGELOG.md`, `llms.txt`, `llms-full.txt`, `AGENTS.md`, `CONTRIBUTING.md`, `SECURITY.md`, `docs/rdna3/` | this repository's documentation (the banner rendered from `docs/rdna3/assets/social-preview.html`); upstream's README moved to `docs/FREETOKEN_UPSTREAM_README.md` |
 | `.github/` | upstream's release workflows and issue templates replaced by this repository's |

@@ -25,9 +25,8 @@ docker build -f Dockerfile.rdna3 -t freetoken-rdna3:latest .
 ```
 
 Build from a git clone, not from a downloaded archive: the build records the commit it was made from
-(`/opt/FreeToken-BUILD-PROVENANCE.txt` in the image) and fails without `.git`. The first build pulls two ROCm PyTorch
-images, pinned by digest: the ROCm 10.0 base (31 GB) and the ROCm 7.14 one (29 GB), only for its Triton 3.7.1, which
-`docker image rm` can drop after the build; after that a rebuild takes a couple of minutes. `--build-arg GPU_ARCH=gfx1100`
+(`/opt/FreeToken-BUILD-PROVENANCE.txt` in the image) and fails without `.git`. The first build pulls the ROCm 10.0 PyTorch
+image (31 GB, pinned by digest); after that a rebuild takes a couple of minutes. `--build-arg GPU_ARCH=gfx1100`
 is the default and the only architecture tested. Do not use `install.sh` or `scripts/`: they install and build
 upstream's NVIDIA / CUDA wheels.
 

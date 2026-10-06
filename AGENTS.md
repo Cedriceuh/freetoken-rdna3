@@ -33,14 +33,14 @@ python/freetoken/      the engine (upstream layout: server/, scheduler/, kvcache
   kvcache/host_kv_pool.py     conversations kept in RAM (with kvcache/hybrid_radix_cache.py)
   models/qwen4_exp/           Qwen3.8-Flash-Next, tensor-parallel port
 tests/                 CPU tests, mirroring python/freetoken/
-rdna3/                 profiles, serve.sh, GPU checks (tests/), micro-benchmarks (bench/), TunableOp files, tools/
+rdna3/                 profiles, serve.sh, GPU checks (tests/), micro-benchmarks (bench/), tools/
 docs/rdna3/            this repository's documentation; docs/*.md is upstream's
 Dockerfile.rdna3       the ROCm image
 ```
 
 ## Development
 
-Everything runs in the image (ROCm 10.0, PyTorch 2.13, Triton 3.7.1). The command below tests the tree the image was built
+Everything runs in the image (ROCm 10.0, PyTorch 2.13, Triton 3.8). The command below tests the tree the image was built
 from; to test your working tree without rebuilding, mount it as [testing.md](docs/rdna3/testing.md#cpu-test-suite)
 shows:
 

@@ -386,10 +386,77 @@ def hc_combine_norm(
     return out, y
 
 
+@triton.jit
+def _hc_combine_rmsnorm_kernel(
+    block_ptr,
+    res_ptr,
+    inj_ptr,
+    w_ptr,
+    out_ptr,
+    y_ptr,
+    stride_block,
+    stride_res,
+    stride_inj,
+    stride_out,
+    stride_y,
+    HC_DIM: tl.constexpr,
+    HC: tl.constexpr,
+    W_SHARED: tl.constexpr,
+    EPS: tl.constexpr,
+) -> None:
+    # hc_combine then grouped_gemma_rmsnorm in one launch, each as its own kernel computes it: one program per (row,
+    # stream) on the norm's 1D tile and warps (the same sum of squares), the combine rounded to the residual dtype
+    # before the norm reads it back.
+    BLOCK_SIZE: tl.constexpr = triton.next_power_of_2(HC_DIM)
+    pid = tl.program_id(0)
+    stream = pid % HC
+    row = (pid // HC).to(tl.int64)
+    offs_g = tl.arange(0, BLOCK_SIZE)
+    mask = offs_g < HC_DIM
+    offsets = stream * HC_DIM + offs_g
+    w_offs = offs_g if W_SHARED else offsets
+    inj = 2.0 * tl.sigmoid(tl.load(inj_ptr + row * stride_inj + stream).to(tl.float32) / HC)
+    block = tl.load(block_ptr + row * stride_block + offs_g, mask, other=0.0)
+    res = tl.load(res_ptr + row * stride_res + offsets, mask, other=0.0)
+    out = (res.to(tl.float32) + block.to(tl.float32) * inj).to(out_ptr.dtype.element_ty)
+    tl.store(out_ptr + row * stride_out + offsets, out, mask)
+    x = out.to(tl.float32)
+    w = tl.load(w_ptr + w_offs, mask, other=0.0)
+    rrms = tl.rsqrt(tl.sum(x * x) / HC_DIM + EPS)
+    y = x * rrms
+    y += y * w.to(tl.float32)
+    tl.store(y_ptr + row * stride_y + offsets, y, mask)
+
+
+def hc_combine_rmsnorm(
+    residual: torch.Tensor,
+    block_output: torch.Tensor,
+    injection_logits: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+    hc_count: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``hc_combine`` and the next ``grouped_gemma_rmsnorm`` in one launch, bit for bit; returns (combined, normed)."""
+    N, DIM = residual.shape
+    hc_dim = DIM // hc_count
+    assert DIM % hc_count == 0 and block_output.shape == (N, hc_dim) and injection_logits.shape == (N, hc_count)
+    assert residual.stride(1) == 1 and block_output.stride(1) == 1 and injection_logits.stride(1) == 1
+    assert norm_weight.is_contiguous() and norm_weight.numel() in (hc_dim, DIM)
+    out = residual.new_empty(residual.shape)
+    y = residual.new_empty(residual.shape)
+    _hc_combine_rmsnorm_kernel[(N * hc_count,)](
+        block_output, residual, injection_logits, norm_weight, out, y,
+        block_output.stride(0), residual.stride(0), injection_logits.stride(0), out.stride(0), y.stride(0),
+        HC_DIM=hc_dim, HC=hc_count, W_SHARED=norm_weight.numel() == hc_dim, EPS=eps,
+    )
+    return out, y
+
+
 __all__ = [
     "grouped_gemma_rmsnorm",
     "hc_combine",
     "hc_combine_norm",
     "hc_gate_mix",
     "hc_silu",
+    "hc_combine_rmsnorm",
 ]

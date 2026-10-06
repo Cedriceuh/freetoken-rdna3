@@ -15,6 +15,8 @@ immediate combine::
 
 from __future__ import annotations
 
+import os
+
 from typing import TYPE_CHECKING, List
 
 import torch
@@ -57,6 +59,12 @@ def build_linear_mixer(config: ModelConfig, layer_id: int, prefix: str) -> BaseO
     )
 
 
+# FREETOKEN_FUSED_HC_NORM (default 1): every hc combine and the grouped RMSNorm that reads the streams next (the MLP
+# block's, the next layer's attention block's, the final mixer's) in one kernel, the same arithmetic in the same order
+# (same bits), two launches fewer per layer; 0 keeps them apart
+_FUSED_HC_NORM = os.environ.get("FREETOKEN_FUSED_HC_NORM", "1") == "1"
+
+
 class Qwen4ExpDecoderLayer(BaseOP):
     """One decoder layer over the hyper-connection streams (see the module docstring for the flow)."""
 
@@ -83,9 +91,44 @@ class Qwen4ExpDecoderLayer(BaseOP):
             block_output = self.linear_attn.forward(block_input)
         else:
             block_output = self.self_attn.forward(block_input, batch)
-        hidden = self.attn_hyper_connection.combine(hidden, block_output, inject)
-        block_input, inject = self.mlp_hyper_connection.mix(hidden)
+        if _FUSED_HC_NORM and hidden.is_cuda:
+            hidden, normed = self.attn_hyper_connection.combine_norm(hidden, block_output, inject, self.mlp_hyper_connection)
+            block_input, inject = self.mlp_hyper_connection.mix_normed(normed)
+            del normed
+        else:
+            hidden = self.attn_hyper_connection.combine(hidden, block_output, inject)
+            block_input, inject = self.mlp_hyper_connection.mix(hidden)
         return self.mlp_hyper_connection.combine(hidden, self.mlp.forward(block_input), inject)
+
+    def forward_hc_fused(self, hidden: torch.Tensor, batch: Batch, carry: list, nxt) -> torch.Tensor:
+        """``forward`` with every hc combine fused into the grouped RMSNorm after it (FREETOKEN_FUSED_HC_NORM):
+        ``carry`` holds this layer's attention norm of ``hidden`` from the layer before (empty: compute it here); the
+        layer takes it out and leaves the normed streams for ``nxt`` (None: plain combine) in it. Normed streams live
+        only until read: a 16k-token prefill chunk's are 320 MiB, held through a block they would raise the prefill peak
+        by that much."""
+        normed = carry.pop() if carry else None
+        if self.ple is not None:
+            assert normed is None, "the PLE adds to the streams after the combine before"
+            hidden = hidden + self.ple.forward(hidden, batch)
+        if normed is None:
+            block_input, inject = self.attn_hyper_connection.mix(hidden)
+        else:
+            block_input, inject = self.attn_hyper_connection.mix_normed(normed)
+        del normed
+        if self._is_linear:
+            block_output = self.linear_attn.forward(block_input)
+        else:
+            block_output = self.self_attn.forward(block_input, batch)
+        hidden, normed = self.attn_hyper_connection.combine_norm(hidden, block_output, inject, self.mlp_hyper_connection)
+        del block_output
+        block_input, inject = self.mlp_hyper_connection.mix_normed(normed)
+        del normed
+        mlp_output = self.mlp.forward(block_input)
+        if nxt is None:
+            return self.mlp_hyper_connection.combine(hidden, mlp_output, inject)
+        hidden, normed = self.mlp_hyper_connection.combine_norm(hidden, mlp_output, inject, nxt)
+        carry.append(normed)
+        return hidden
 
 
 class Qwen4ExpModel(BaseOP):
@@ -120,14 +163,26 @@ class Qwen4ExpModel(BaseOP):
             meta = build_ple_metadata(batch, self._ple[0].args, input_ids.device)
             for ple in self._ple:  # gather the pinned-host PLE rows while the early layers run
                 ple.start_prefetch(batch, meta)
-        for layer in self.layers.op_list:
-            hidden = layer.forward(hidden, batch)
+        layers = self.layers.op_list
+        carry = []
+        if _FUSED_HC_NORM and hidden.is_cuda:
+            for i, layer in enumerate(layers):
+                if i + 1 == len(layers):
+                    nxt = self.hyper_connection_mixer
+                else:
+                    nxt = layers[i + 1].attn_hyper_connection if layers[i + 1].ple is None else None
+                hidden = layer.forward_hc_fused(hidden, batch, carry, nxt)
+        else:
+            for layer in layers:
+                hidden = layer.forward(hidden, batch)
         if meta is not None:
             # single writer: the layers only read the context, so a second PLE layer's
             # prefetch sees the un-rolled window
             commit_ngram_context(meta, getattr(batch, "fla_metadata", None))
         if MTP_ENABLED:
             self._keep_streams(hidden, batch)
+        if carry:
+            return self.hyper_connection_mixer.mix_normed(carry.pop())[0]
         return self.hyper_connection_mixer.mix(hidden)[0]
 
     def _keep_streams(self, hidden: torch.Tensor, batch: Batch) -> None:

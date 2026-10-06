@@ -1,6 +1,6 @@
 # The journey
 
-How this build came about: measured experiments from 2026-09-25 to 2026-10-03 on one machine, an RX 7900
+How this build came about: measured experiments from 2026-09-25 to 2026-10-05 on one machine, an RX 7900
 XTX 24 GB + RX 7900 XT 20 GB (gfx1100, no GPU peer-to-peer), a Threadripper 3970X and 128 GB of DDR4, serving
 Qwen3.8-Flash-Next NVFP4 to the author's coding agent (OpenCode) with a ~250k-token context (262k until 2026-10-03). Every number was measured
 on that machine (changes in interleaved A/B runs), except the few marked as estimates. The choices and their
@@ -261,7 +261,7 @@ decode -0.5 % (noise), prefill ~1 % faster. The published image itself was measu
 | Predicting the next layer's experts to prefetch them | co-occurrence: 31 wasted copies per useful one; a next-layer router: 65 % recall, still 5 wasted per useful one and an extra router per layer |
 | More router warps | upstream's single warp is fastest on RDNA3 |
 | Sampled-LRU expert cache | estimated +0.3 %, not worth an A/B |
-| Fusing the hyper-connection activation into the next GEMV | exact but twice as slow |
+| A gated activation computed inside the GEMV that reads it (hyper-connection up, expert down projections) | exact, but every output tile recomputes it: HC up 7.9 -> 14.2 µs a call on the XTX (8.8 -> 16.4 on the XT), routed NVFP4 down 10.8 -> 12.7 (13.1 -> 19.7), shared-expert int8 down 5.5 -> 4.6 at one row but 5.9 -> 6.3 at two (2026-10-06, graph replay); added to the kept fusions of section 19 on the server: 16.07 against 15.45 ms a step |
 | Interleaving decode steps between prefill chunks | hurts the short prefills of agent turns |
 | Even split of the GDN heads under the uneven split | -2.5 % decode |
 | Grouped int8, int8 KV | precision (sections 6 and 8) |
@@ -273,7 +273,6 @@ decode -0.5 % (noise), prefill ~1 % faster. The published image itself was measu
 | Missing experts copied by the expert GEMV itself (the route reads its host bank and fills its slot) | exact, but slower: the GEMV's tiles read PCIe at ~15-19 GB/s against 28 for the copy kernel (64-byte rows for `down`), and no other tile is bit-exact; per layer 1 miss 126 against 99 µs, 3 misses 339 against 207 |
 | HIP graph segment scheduling (`DEBUG_HIP_GRAPH_SEGMENT_SCHEDULING=1`) | a captured graph's independent branches run one after the other by default; with it they overlap a little in a microbenchmark, not measurably on the server |
 | Thread trace (ATT) of the expert GEMV under ROCm 10 | the image's profiler could not load its aqlprofile library, and with it on the loader path the traced process spun for 20 min without a trace |
-| Fusing kernels to save launches | the kernels of a captured step overlap (median gap -2.6 µs); the real bubbles are ~0.26 ms a step |
 | EXL3: the codebook's per-weight fp16 rounding replaced by an affine form | gained nothing once the byte sum was one `v_dot4_u32_u8` |
 | EXL3: the Hadamard rotations as 16-row `tl.dot` tiles in decode | 16.9 ms of decode MoE per step against 3.06 ms for one program per 128-vector |
 | EXL3: gate\|up and the step between the products fused in one epilogue | 7.8 against 5.7 + 1.5 ms per 4096-token layer (two accumulators per program, half the programs) |
@@ -288,19 +287,76 @@ kernel's memory compaction moving host pages the GPU driver maps without pinning
 process for 5-22 s. Turning off proactive compaction was not enough (background reclaim still woke the compaction
 daemon: three stops in nine minutes, once 140 s and a dead server); the engine now locks its memory and
 `vm.compact_unevictable_allowed=0` keeps compaction off it (a forced compaction during decoding: no stop). The prefill
-out-of-memory retries at 14-16k-token chunks past ~26k of context (seen on the ROCm 10 image; 7.14 was not checked) went away with
+out-of-memory retries at 14-16k-token chunks past ~26k of context (seen on the ROCm 10 image) went away with
 expandable segments. After a pause, the VRAM clock stayed at 96 MHz for ~10 s under the default power profile. The
 host settings: [troubleshooting.md](troubleshooting.md#long-pauses-in-the-middle-of-a-run).
 
-## 18. Still open
+## 18. ROCm 10's own Triton (2026-10-05)
+
+- **The detour.** On the ROCm 10 image its Triton 3.8 crashed the first prefill (an illegal memory access in an expert
+  GEMM, then a hang), so the image carried an older base's Triton 3.7.1, a second 29 GB image pulled for one package.
+  PyPI's Triton 3.7.1 was no way out: its library exports its LLVM symbols, which clash with the LLVM torch has already
+  loaded (a segfault at `import triton` after `import torch`).
+- **Not a miscompile.** The GEMM ran fine on random inputs, and its inputs captured from the crashing run crashed
+  both Tritons: they came from `moe_align_block_size`, which sorts the routes by expert and had left its expert ids
+  unwritten. Triton 3.8's AMD integer range analysis gives `tl.histogram`'s counts the range [0, -1] (the unsigned
+  maximum read as signed; Triton's main branch has the fix), and the pass that folds always-true comparisons turned
+  `j < nblk` and `h > 0` into `false`. Four lines show it: `tl.where(h > 0, h, -1)` over a histogram gives -1
+  everywhere on 3.8 and the counts on 3.7.1.
+- **The fix.** `moe_align` no longer compares histogram counts: the small path reads its block counts back from the
+  scratch it already writes, the large one adds the zero bins too. The same integers on both Tritons;
+  `tests/kernels/test_moe_align.py` fails on 3.8 without it. The sampler and the QSA top-k also call `tl.histogram`
+  but compare only sums and prefix sums of it, which the analysis does not bound: the GPU checks, the sampler tests
+  and the pytest suite run on the GPUs fail nothing on 3.8 that passes on 3.7.1.
+- **Measured** (`xtx-xt`, the same code on both Tritons, one server per run, 3.8 / 3.7.1 / 3.8): decode within 1 %
+  (greedy, 512 tokens: NVFP4 83.8-83.9 against 83.3-83.4 tok/s with the MTP head, 58.0-58.6 against 57.9-58.4
+  without; EXL3 3.05 bpw 86.8-87.2 against 87.4-87.7 and 58.3-58.8 against 58.8-59.4), prompt reading ~5 % faster
+  (a cold 8.3k-token read in 4.00-4.02 s against 4.20-4.22 s for NVFP4, 3.80-3.83 against 3.99-4.02 s for EXL3),
+  agent turns the same. Greedy answers are identical from one 3.8 server to the next (11 of 11) but not to 3.7.1 (3
+  to 5 of 11; the texts part at a word and stay coherent): another compiler rounds differently. Not yet run on the
+  agentic benchmark. The two-card tables of [benchmarks.md](benchmarks.md) were measured again on it (2026-10-06):
+  decode the same to +3 %, prompts read 3-6 % faster, from 9k to 248k tokens.
+
+## 19. Fewer decode kernels (2026-10-06)
+
+- **What a short kernel costs.** An eager profile of an NVFP4 decode step on `xtx-xt` (no MTP head) runs ~1770
+  kernels, ~950 of them under 6 µs: ~3.2 ms of a 16 ms step. An earlier look counted only the gaps between the kernels
+  of a captured step (~0.26 ms) and concluded fusing would not pay; but each short kernel's own time counts too. A test
+  build that skipped 144 of them (wrong answers, timing only) saved 0.73 ms a step, ~5 µs per kernel once its extra
+  expert misses were discounted.
+- **Kept, bit-exact:** each fused kernel does the arithmetic of the kernels it replaces in the same order, on the same
+  tile and warps (so the same sums); GPU tests compare the bits on both cards
+  (`tests/kernels/test_moe_shared_gate.py`, `test_hc_combine_rmsnorm.py`, `test_gemv_bf16_rows.py`).
+  - The MoE epilogue (`FREETOKEN_FUSED_MOE_EPILOGUE`): the routed sum, the shared expert's gate and the mul-add in one
+    kernel, two launches fewer per layer.
+  - The hyper-connection combine with the grouped RMSNorm that reads the streams next (`FREETOKEN_FUSED_HC_NORM`),
+    within a layer, across layers and into the final mixer, two launches fewer per layer. A first version kept the
+    normed streams alive through each block: 320 MiB more at a 16k-token prefill chunk, enough to bring the XT to its
+    last 28 MiB with the MTP head, and the server hung at the first long prompt, three times out of three. They are now
+    freed once read: XT peak 20213 MiB against 20193 without the fusion.
+  - The bf16 split-K GEMV reduces every row of a verify step in one launch instead of one per row.
+- **Measured** on `xtx-xt` (greedy, 512 tokens, median of four prompts, one server per build; 11 greedy prompts, up to
+  34k tokens, identical between the builds):
+
+  | Checkpoint | Without | With | With the MTP head: without | with |
+  |---|---:|---:|---:|---:|
+  | NVFP4 | 57.8 | 59.8-60.0 | 82.9 | 85.6 |
+  | EXL3 3.05 bpw | 58.4 | 59.7 | 86.4 | 89.2 |
+  | EXL3 4.05 bpw | 55.3 | 56.5 | 81.6 | 83.3 |
+
+  GPU time of an NVFP4 step: 16.05 -> 15.45 ms, 29.68 -> 28.56 ms with the head; prompt reading the same (~1960 tok/s
+  NVFP4, ~2150 EXL3). A depth sweep to 248k with the head: decode +2-3 % at every depth (71.9-90.4 against
+  70.4-88.4 tok/s), prompt reading and agent turns the same, no new eviction. The image built with the fusions
+  against the one before, sessions interleaved (A B A B, greedy, with the head): NVFP4 83.0 / 83.2 -> 85.6 / 85.7 tok/s,
+  EXL3 4.05 bpw 81.5 -> 83.4, the same answers.
+
+## 20. Still open
 
 - In NVFP4 the model needs ~63 GiB of RAM for its experts alone (the engine keeps every expert in RAM). The EXL3 3.05
   bpw checkpoint needs 42.6 GiB and served under a 56 GiB container limit, but a real 64 GB machine is untested
   ([limits.md](limits.md)).
-- ROCm 10 / PyTorch 2.13, the image's base since 2026-10-02: its Triton 3.8 miscompiles these kernels, so the image
-  carries the 7.14 image's Triton 3.7.1. On two cards decode and prompt reading match or beat 7.14, and the PLE
-  wait-sync (`FREETOKEN_PLE_SYNC`) adds 3.5-4 % decode; on one card the same depth sweep gives the same decode on both
-  images (29.5 against 29.1 tok/s at 124k on `xtx`). Greedy answers differ from 7.14 on 2 of 5 prompts; with the MTP head it scored 12 and 18 of 29 on the agentic benchmark. Its `F.linear`
+- Triton 3.8 is not bit-exact with the 3.7.1 the agentic benchmark last ran on (section 18): not run on it yet.
+- ROCm 10 / PyTorch 2.13, the image's base since 2026-10-02: its `F.linear`
   changes its sums with the row count for some shapes ((3072, 256), (6656, 2560)): serving does not use it for them
   (int8 or table GEMVs), but `test_qsa_spec_rows`' toy projections did, which made it fail on 3-4 rows; computed a row
   at a time they pass (the test now does so).

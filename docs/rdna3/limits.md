@@ -104,9 +104,8 @@ On in the profiles (`FREETOKEN_MTP=1 FREETOKEN_SPEC_VERIFY_M=4`); `rdna3/serve.s
 - **One card gains less**: +7-8 % at the model's sampling and +6-12 % greedy on `xtx` or `xt`, -8 % time on code and
   math; one of six sampled test prompts (a long story) is 3-4 % slower. Its step costs keep the verify steps mostly at 2
   rows: the extra rows' missing experts cross PCIe there.
-- **Greedy answers are unchanged**: identical to plain decode on every profile under ROCm 10 (chat prompts, 60 code and
-  math items, 108k-token turns, the functional checks) and on the 120-item precision set under ROCm 7.14; with the
-  default fp32 GDN state (`FREETOKEN_MAMBA_SSM_DTYPE`). Sampled requests use exact speculative sampling: the same
+- **Greedy answers are unchanged**: identical to plain decode on every profile (chat prompts, 60 code and math items,
+  108k-token turns, the functional checks), with the default fp32 GDN state (`FREETOKEN_MAMBA_SSM_DTYPE`). Sampled requests use exact speculative sampling: the same
   distribution, not the same draws.
 - **Reading a prompt is 0-4 % slower** (the head reads it too; 4-5 % on a 108k-token prompt), and the head takes room
   in the expert cache (7,127 experts per card on `xtx-xt` instead of 7,395).
