@@ -54,6 +54,7 @@ run each; NVFP4: 12 and 18 in two runs).
 ## 4. Start the server
 
 ```bash
+rdna3/serve.sh --list                                                  # the profiles: GPUs, context, K/V pool, measured or not
 rdna3/serve.sh --list-gpus                                             # what HIP sees
 rdna3/serve.sh xtx-xt --model ~/models/Qwen3.8-Flash-Next-NVFP4       # two cards
 rdna3/serve.sh xtx    --model ~/models/Qwen3.8-Flash-Next-NVFP4       # one XTX

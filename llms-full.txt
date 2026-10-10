@@ -110,7 +110,8 @@ One ready-made profile per hardware setup, measured for the tested ones and deri
 Untested profiles are derived from the measured ones and the engine's memory plans; the script says so when you start
 one. Measured something? Please open an issue with your numbers.
 
-`rdna3/serve.sh` picks the right cards by itself; `--dry-run` shows the exact `docker run` it would start.
+`rdna3/serve.sh --list` prints this table from the profile files; `rdna3/serve.sh` picks the right cards by itself;
+`--dry-run` shows the exact `docker run` it would start.
 
 ## Documentation
 
@@ -201,6 +202,7 @@ run each; NVFP4: 12 and 18 in two runs).
 ## 4. Start the server
 
 ```bash
+rdna3/serve.sh --list                                                  # the profiles: GPUs, context, K/V pool, measured or not
 rdna3/serve.sh --list-gpus                                             # what HIP sees
 rdna3/serve.sh xtx-xt --model ~/models/Qwen3.8-Flash-Next-NVFP4       # two cards
 rdna3/serve.sh xtx    --model ~/models/Qwen3.8-Flash-Next-NVFP4       # one XTX

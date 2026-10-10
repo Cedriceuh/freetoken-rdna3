@@ -100,7 +100,8 @@ One ready-made profile per hardware setup, measured for the tested ones and deri
 Untested profiles are derived from the measured ones and the engine's memory plans; the script says so when you start
 one. Measured something? Please open an issue with your numbers.
 
-`rdna3/serve.sh` picks the right cards by itself; `--dry-run` shows the exact `docker run` it would start.
+`rdna3/serve.sh --list` prints this table from the profile files; `rdna3/serve.sh` picks the right cards by itself;
+`--dry-run` shows the exact `docker run` it would start.
 
 ## Documentation
 
