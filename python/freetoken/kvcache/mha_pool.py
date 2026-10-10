@@ -50,10 +50,8 @@ class MHAKVCache(BaseKVCachePool):
                     raise ValueError(f"KV layer id {global_id} outside [0, {num_layers})")
                 layer_map[global_id] = dense
             self._layer_map = layer_map
-        self._kv_buffer = torch.empty(
-            (2, num_storage_layers, num_pages, page_size, local_kv_heads, head_dim),
-            device=device,
-            dtype=dtype,
+        self._kv_buffer = self._new_kv_buffer(
+            (2, num_storage_layers, num_pages, page_size, local_kv_heads, head_dim), dtype, device
         )
         self._k_buffer = self._kv_buffer[0]
         self._v_buffer = self._kv_buffer[1]
@@ -76,14 +74,15 @@ class MHAKVCache(BaseKVCachePool):
         if device.type == "cuda":
             torch.cuda.synchronize(device)
             torch.cuda.empty_cache()
-        self._kv_buffer = torch.empty(
-            (2, num_storage_layers, num_pages, page_size, local_kv_heads, head_dim),
-            device=device,
-            dtype=dtype,
+        self._kv_buffer = self._new_kv_buffer(
+            (2, num_storage_layers, num_pages, page_size, local_kv_heads, head_dim), dtype, device
         )
         self._k_buffer = self._kv_buffer[0]
         self._v_buffer = self._kv_buffer[1]
         self._storage_shape = (num_pages * page_size, local_kv_heads, head_dim)
+
+    def _new_kv_buffer(self, shape: tuple[int, ...], dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        return torch.empty(shape, device=device, dtype=dtype)
 
     @classmethod
     def kv_cost(cls, config) -> tuple[int, int, int, int]:

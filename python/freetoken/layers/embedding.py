@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Dict
 
 import torch
@@ -56,6 +57,10 @@ class VocabParallelEmbedding(BaseOP):
                 )
             y = y * self._embed_scale_t
         return y
+
+
+_DUMP_DIR = os.environ.get("FREETOKEN_DUMP_PROMPT_TOPK", "")
+_DUMP_COUNT = 0
 
 
 class ParallelLMHead(VocabParallelEmbedding):
@@ -121,11 +126,38 @@ class ParallelLMHead(VocabParallelEmbedding):
             return super().state_dict(prefix=prefix, result=result)
         return {} if result is None else result
 
+    def _dump_prompt_topk(self, x: torch.Tensor, k: int = 40, rows: int = 64) -> None:
+        """FREETOKEN_DUMP_PROMPT_TOPK=<dir> (tests only): the top-k log-probabilities at every prompt position of a
+        prefill chunk, saved by rank 0 as ``<dir>/prompt-<n>.pt`` -- teacher-forced comparison with a reference."""
+        global _DUMP_COUNT
+        ids, lps = [], []
+        for a in range(0, x.shape[0], rows):
+            part = x[a: a + rows].contiguous()
+            local = F.linear(part, self.tied_embedding.weight, self.bias) if self.tied_embedding is not None \
+                else self.quant_method.apply(self, part)
+            if self.tp_size > 1:
+                shape = local.shape
+                full = self._comm.all_gather(local).view((self.tp_size,) + shape).permute(1, 0, 2)
+                local = full.reshape(shape[0], self.tp_size * shape[1])
+            lp = torch.log_softmax(local[:, : self.num_embeddings].float(), dim=-1)
+            top = lp.topk(k, dim=-1)
+            ids.append(top.indices.cpu())
+            lps.append(top.values.cpu())
+        if get_tp_info().is_primary():
+            import os
+
+            os.makedirs(_DUMP_DIR, exist_ok=True)
+            torch.save({"ids": torch.cat(ids), "lp": torch.cat(lps), "input_ids": get_global_ctx().batch.input_ids.cpu()},
+                       os.path.join(_DUMP_DIR, f"prompt-{_DUMP_COUNT}.pt"))
+        _DUMP_COUNT += 1
+
     @nvtx_annotate("LMHead")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         ctx = get_global_ctx()
         batch = ctx.batch
         bs = batch.size
+        if _DUMP_DIR and batch.is_prefill:
+            self._dump_prompt_topk(x)
         if batch.is_prefill and x.shape[0] > bs:  # bs rows: one per request already (the MTP head picks its own)
             indices = batch.attn_metadata.get_last_indices(bs)
             x = x[indices].contiguous()

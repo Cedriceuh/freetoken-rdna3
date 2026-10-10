@@ -361,8 +361,18 @@ def _split_topk_case(n_blocks: int, width: int, bs: int, mode: str, seed: int):
     return logits, torch.full((bs,), n_blocks, dtype=torch.int32, device="cuda")
 
 
+def test_block_topk_split_plan_bounds():
+    """Past 16 chunks a row takes more chunks (a 1M-token page table), up to 16384 merge candidates."""
+    from freetoken.kernel.triton.qsa.topk import _split_plan
+
+    assert _split_plan(65536, 512) == (4096, 16)
+    assert _split_plan(250000, 512) == (8192, 31)  # 1,000,000 tokens of context
+    assert _split_plan(262144, 512) == (8192, 32)
+    assert _split_plan(262145, 512) is None  # 33 chunks: the tie count would outgrow its 16 bits
+
+
 @requires_cuda
-@pytest.mark.parametrize("n_blocks", [65536])
+@pytest.mark.parametrize("n_blocks", [65536, 250000])
 @pytest.mark.parametrize("bs", [4])
 @pytest.mark.parametrize("mode", ["random", "boundary", "ragged", "dead"])
 def test_block_topk_split_path_matches_torch_topk(n_blocks: int, bs: int, mode: str):

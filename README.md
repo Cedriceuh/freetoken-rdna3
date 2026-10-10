@@ -64,7 +64,7 @@ upstream's NVIDIA / CUDA installer and is not used here.
 
 ```bash
 git clone https://github.com/Cedriceuh/freetoken-rdna3 && cd freetoken-rdna3
-docker build -f Dockerfile.rdna3 -t freetoken-rdna3:latest .          # pulls two ROCm + PyTorch bases, ~60 GB
+docker build -f Dockerfile.rdna3 -t freetoken-rdna3:latest .          # pulls the ROCm 10.1 PyTorch base, 25 GB
 mkdir -p ~/models      # model download (~135 GB), with the image's own `hf`
 docker run --rm --user "$(id -u):$(id -g)" -e HF_HOME=/models/.cache/huggingface -v ~/models:/models \
   --entrypoint hf freetoken-rdna3:latest download RadixArk/Qwen3.8-Flash-Next-NVFP4 \
@@ -94,6 +94,8 @@ One ready-made profile per hardware setup, measured for the tested ones and deri
 | `xtx-xtx` | two RX 7900 XTX 24 GB | 250k | 4 | untested: decode expected >= `xtx-xt`; EXL3 needs `FREETOKEN_TP_SPLIT=0.6` |
 | `xt-xt` | two RX 7900 XT 20 GB | 250k | 4 | untested: decode expected a little below `xtx-xt`; same EXL3 note |
 | `gre` | one RX 7900 GRE 16 GB | 65k | 1 | untested: ~20 tok/s at best expected (NVFP4, head off) |
+| `xtx-xt-4x262k` | RX 7900 XTX 24 GB + RX 7900 XT 20 GB | 262k each | 4 | experimental, EXL3 3.05 bpw measured: the K/V in RAM, 4 full contexts at once ([long-context](docs/rdna3/long-context.md)) |
+| `xtx-xt-1m` | RX 7900 XTX 24 GB + RX 7900 XT 20 GB | 1M | 4 (sharing 1M) | experimental, EXL3 3.05 bpw measured: the K/V in RAM, one conversation up to 1M ([long-context](docs/rdna3/long-context.md)) |
 
 Untested profiles are derived from the measured ones and the engine's memory plans; the script says so when you start
 one. Measured something? Please open an issue with your numbers.

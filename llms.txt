@@ -38,6 +38,7 @@ model cannot run above TP=2 in this build).
 - [Testing](docs/rdna3/testing.md): CPU suite, GPU checks, micro-benchmarks, the release validation procedure
 - [Maintaining](docs/rdna3/maintaining.md): relation to upstream, sync and release procedure
 - [Changes from upstream](docs/rdna3/changes-from-upstream.md): every modified file with the reason
+- [Long context](docs/rdna3/long-context.md): the K/V in host RAM (experimental): four 262k conversations at once or one of 1M, YaRN or the plain rope, measured to 988k
 - [Credits](docs/rdna3/credits.md): who wrote what
 - [All docs in one file](llms-full.txt): the documents above concatenated (README included)
 

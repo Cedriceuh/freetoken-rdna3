@@ -323,6 +323,10 @@ def make_host_kv_pool(kv_pool, linear_state_pool, page_size: int, device: torch.
         logger.warning(f"FREETOKEN_HOST_KV=1 ignored: needs a GDN state pool and a KV pool that declares "
                        f"host_tier_supported (got {type(kv_pool).__name__})")
         return None
+    if getattr(kv_pool, "kv_on_host", False):
+        # FREETOKEN_QSA_KV_HOST: the pool is host memory already; a second copy of its pages would only pin more RAM
+        logger.warning("FREETOKEN_HOST_KV=1 ignored: FREETOKEN_QSA_KV_HOST=1 keeps the K/V pool in host RAM already")
+        return None
     # Defaults sized for Qwen3.8-Flash-Next at TP=2: ~12.8 KB of KV per token and ~60 MB per GDN
     # snapshot per rank -> 262144 tokens + 24 snapshots ~= 4.3-4.6 GiB of locked RAM per rank on xtx-xt.
     tokens = int(os.environ.get(HOST_KV_TOKENS_ENV, str(256 * 1024)))

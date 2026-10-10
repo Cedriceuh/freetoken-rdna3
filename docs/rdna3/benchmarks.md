@@ -51,7 +51,7 @@ guesses: read the decode columns across checkpoints as an order of magnitude.
 With the head, one request decodes 33 % faster on two cards at the model's sampling (+29 to +64 % greedy along the
 sweep) and 7-8 % faster on one card (+6 to +12 % greedy); reading a prompt costs 0-4 % more, since the head reads it
 too. On one card one of the six sampled prompts (a long story) is 3-4 % slower with it. With more requests
-decoding than `FREETOKEN_SPEC_BS_MAX` (2 in `xtx-xt`, 1 in the other profiles), the head only writes its KV: see
+decoding than `FREETOKEN_SPEC_BS_MAX` (2 in `xtx-xt` and its K/V-in-RAM variants, 1 in the other profiles), the head only writes its KV: see
 the table further down.
 
 Decode loses ~6 % from 9k to 248k on two cards and 20-24 % from 9k to 124k on one card. Where the

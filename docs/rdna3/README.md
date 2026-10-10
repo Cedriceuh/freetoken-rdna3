@@ -4,6 +4,7 @@
 |---|---|
 | [getting-started.md](getting-started.md) | installing, the first run, connecting a client, running it as a service |
 | [profiles.md](profiles.md) | what each hardware profile sets, and adapting one |
+| [long-context.md](long-context.md) | the K/V in host RAM: four 262k conversations at once, or one of 1M (experimental) |
 | [options.md](options.md) | every environment variable this build adds |
 | [benchmarks.md](benchmarks.md) | the measurements, and how they were taken |
 | [how-it-works.md](how-it-works.md) | what changed in the engine, and why |

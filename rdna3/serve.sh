@@ -2,14 +2,14 @@
 # Serve a model with the freetoken-rdna3 image and one of the profiles in rdna3/profiles/.
 #
 #   rdna3/serve.sh <profile> --model DIR [options] [-- extra ft serve flags]
-#   rdna3/serve.sh --list              the profiles, with their first comment line
+#   rdna3/serve.sh --list              the profiles: GPUs, context, K/V pool, measured or not, first comment line
 #   rdna3/serve.sh --list-gpus         the GPUs, as HIP numbers them (index, PCI address, VRAM)
 #
 # options:
 #   --model DIR        checkpoint directory (e.g. .../Qwen3.8-Flash-Next-NVFP4), mounted read-only
 #   --port N           HTTP port (default 1919): OpenAI-compatible API at http://HOST:N/v1
 #   --host ADDR        bind address (default 127.0.0.1; 0.0.0.0 to serve your LAN)
-#   --ctx N            context length (default: the profile's CTX)
+#   --ctx N            context length of one request (default: the profile's CTX)
 #   --gpus LIST        HIP_VISIBLE_DEVICES, rank 0 first (default: a one-card profile takes the smallest card with the
 #                      profile's VRAM_GIB, a multi-card one the largest cards, largest first)
 #   --image REF        image to run (default freetoken-rdna3:latest, built with Dockerfile.rdna3)
@@ -19,7 +19,7 @@
 #   --vision           accept image input: builds the vision tower on rank 0 (measured on xtx-xt, xtx and xt:
 #                      docs/rdna3/benchmarks.md); images are scaled down to 1024 tokens (one per 32x32 pixels),
 #                      `-- --image-max-tokens N` changes it
-#   --no-mtp           decode without the MTP draft head the profiles turn on (it speeds up one request at a time;
+#   --no-mtp           decode without the MTP draft head the profiles except gre turn on (it speeds up one request at a time;
 #                      docs/rdna3/limits.md)
 #   --dry-run          print the docker command instead of running it
 #
@@ -60,7 +60,14 @@ while [ $# -gt 0 ]; do
     --dry-run) dry=1; shift ;;
     --no-mtp) no_mtp=1; shift ;;
     --list)
-      for f in "$HERE"/profiles/*.env; do printf '%-9s %s\n' "$(basename "$f" .env)" "$(sed -n '1s/^# //p' "$f")"; done
+      printf '%-14s %-4s %9s %9s  %-8s %s\n' profile GPUs context "K/V pool" status description
+      for f in "$HERE"/profiles/*.env; do
+        awk -v n="$(basename "$f" .env)" -F= '
+          NR == 1 { sub(/^# /, ""); d = $0 }
+          /^(GPUS|CTX|KV_TOKENS|TESTED)=/ { v = $2; sub(/[ \t]*#.*/, "", v); k[$1] = v }
+          END { c = k["CTX"] ? k["CTX"] : 131072; s = (k["TESTED"] == "0") ? "untested" : "measured"
+                printf "%-14s %-4s %9s %9s  %-8s %s\n", n, k["GPUS"] ? k["GPUS"] : 1, c, k["KV_TOKENS"] ? k["KV_TOKENS"] : c, s, d }' "$f"
+      done
       exit 0 ;;
     --list-gpus) list_gpus | LC_ALL=C awk '{printf "HIP %s  PCI %s  %.1f GiB VRAM\n", $1, $3, $2 / 1073741824}'; exit 0 ;;
     -h|--help) awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"; exit 0 ;;
@@ -75,9 +82,9 @@ pfile="$HERE/profiles/$profile.env"
 [ -d "$model" ] || { echo "--model must be the checkpoint directory" >&2; exit 2; }
 model="$(cd "$model" && pwd)"
 
-# the profile: GPUS / VRAM_GIB / CTX / MEMORY / TESTED / FT_ARGS drive this script, every other KEY=value is
-# container env
-envs=() ft_args=() p_gpus=1 p_vram="" p_ctx=131072 p_memory=110g p_tested=1
+# the profile: GPUS / VRAM_GIB / CTX / KV_TOKENS / MEMORY / TESTED / FT_ARGS drive this script, every other KEY=value
+# is container env
+envs=() ft_args=() p_gpus=1 p_vram="" p_ctx=131072 p_kv="" p_memory=110g p_tested=1
 while IFS= read -r line || [ -n "$line" ]; do
   case "$line" in ''|\#*) continue ;; esac
   key="${line%%=*}" val="${line#*=}"
@@ -90,6 +97,7 @@ while IFS= read -r line || [ -n "$line" ]; do
     VRAM_GIB) p_vram="$val" ;;
     TESTED) p_tested="$val" ;;
     CTX) p_ctx="$val" ;;
+    KV_TOKENS) p_kv="$val" ;;
     MEMORY) p_memory="$val" ;;
     FT_ARGS) read -r -a ft_args <<< "$val" ;;
     FREETOKEN_MTP|FREETOKEN_SPEC_*) [ -n "$no_mtp" ] || envs+=(-e "$key=$val") ;;  # --no-mtp drops the head's settings
@@ -97,6 +105,9 @@ while IFS= read -r line || [ -n "$line" ]; do
   esac
 done < "$pfile"
 ctx="${ctx:-$p_ctx}" memory="${memory:-$p_memory}"
+# the K/V pool the requests share: the profile's KV_TOKENS, never less than one request's context
+kv="${p_kv:-$ctx}"
+[ "$kv" -ge "$ctx" ] || kv="$ctx"
 [ "$p_tested" = 1 ] || echo "note: profile $profile is UNTESTED (derived from measured profiles, see its header); please report what you measure" >&2
 
 # EXL3 checkpoints (experimental) on two cards: the expert slices round to 384 / 256, so the card holding 384 bounds the
@@ -149,14 +160,15 @@ gpu_flags=(--device=/dev/kfd --device=/dev/dri --group-add "$video_gid" --group-
            --security-opt seccomp=unconfined)
 mounts+=(-v "freetoken-rdna3-kcache-$short:/root/.cache/freetoken-rdna3")
 
-# expandable segments: without them the allocator's cache filled the VRAM left free and every 14-16k-token prefill
-# chunk past ~26k of context failed once and retried (xtx-xt, 2026-10-03; none with them, same speed)
+# expandable segments (the engine also sets them when PYTORCH_ALLOC_CONF is unset): without them the allocator's
+# cache filled the VRAM left free and every 14-16k-token prefill chunk past ~26k of context failed once and retried
+# (xtx-xt, 2026-10-03; none with them, same speed)
 cmd=("$DOCKER" run --rm --init --name "$name" --network host --ipc=host "${gpu_flags[@]}"
      --ulimit memlock=-1 --memory "$memory"
      -e PYTORCH_ALLOC_CONF=expandable_segments:True -e OMP_WAIT_POLICY=PASSIVE -e "HIP_VISIBLE_DEVICES=$gpus"
      "${envs[@]}" "${mounts[@]}"
      "$image_id" ft serve --model /models/m --host "$host" --port "$port" --served-model-name "$served" "${mm_args[@]}"
-     --max-seq-len-override "$ctx" --kv-reserve-tokens "$ctx" "${ft_args[@]}" "${extra[@]}")
+     --max-seq-len-override "$ctx" --kv-reserve-tokens "$kv" "${ft_args[@]}" "${extra[@]}")
 if [ -n "$dry" ]; then
   echo "# first: $DOCKER rm -f $name  (a container left behind would hold the GPUs and the port)"
   for a in "${cmd[@]}"; do

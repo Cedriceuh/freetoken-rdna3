@@ -193,6 +193,64 @@ class MRotaryEmbedding(RotaryEmbedding):
         return query, key
 
 
+def _yarn_frequencies(
+    rotary_dim: int, base: float, rope_scaling: Dict[str, Any]
+) -> tuple[Callable[[torch.Tensor], torch.Tensor], float]:
+    """YaRN's inverse-frequency ramp and cos/sin scale (HF ``_compute_yarn_parameters``)."""
+    factor: float = rope_scaling["factor"]
+    beta_fast: float = rope_scaling.get("beta_fast", 32.0)
+    beta_slow: float = rope_scaling.get("beta_slow", 1.0)
+    orig_max_pos: int = rope_scaling["original_max_position_embeddings"]
+
+    def get_mscale(scale: float, mscale: float = 1.0) -> float:
+        if scale <= 1:
+            return 1.0
+        return 0.1 * mscale * math.log(scale) + 1.0
+
+    attention_factor = rope_scaling.get("attention_factor")
+    if attention_factor is None:
+        mscale = rope_scaling.get("mscale")
+        mscale_all_dim = rope_scaling.get("mscale_all_dim")
+        # Truthiness, not presence: HF falls back to get_mscale(factor) when
+        # mscale_all_dim is 0 (a real DeepSeek-lineage default).
+        if mscale and mscale_all_dim:
+            attention_factor = get_mscale(factor, mscale) / get_mscale(
+                factor, mscale_all_dim
+            )
+        else:
+            attention_factor = get_mscale(factor)
+
+    def _find_correction_dim(num_rotations: float) -> float:
+        return (
+            rotary_dim
+            * math.log(orig_max_pos / (num_rotations * 2 * math.pi))
+            / (2 * math.log(base))
+        )
+
+    low = _find_correction_dim(beta_fast)
+    high = _find_correction_dim(beta_slow)
+    if rope_scaling.get("truncate", True):
+        low = math.floor(low)
+        high = math.ceil(high)
+    low = max(low, 0)
+    # rotary_dim - 1, per HF's find_correction_range and this repo's own faithful copy in
+    # models/deepseek_v4/ops.py. Clamping to rotary_dim//2 - 1 instead forces the ramp to
+    # reach 1.0 at the last entry, fully interpolating the longest-wavelength dims that
+    # the reference deliberately leaves partly extrapolated.
+    high = min(high, rotary_dim - 1)
+    if low == high:  # HF nudges instead of flooring the gap at 1 ("truncate": false)
+        high += 0.001
+
+    def post_process(inv_freq: torch.Tensor) -> torch.Tensor:
+        ramp = torch.clamp(
+            (torch.arange(rotary_dim // 2, dtype=torch.float32) - low) / (high - low),
+            0, 1,
+        )
+        return (inv_freq / factor) * ramp + inv_freq * (1 - ramp)
+
+    return post_process, float(attention_factor)
+
+
 def _get_rope(
     head_dim: int,
     rotary_dim: int,
@@ -245,64 +303,14 @@ def _get_rope(
             )
 
         case "yarn":
-            factor: float = rope_scaling["factor"]
-            beta_fast: float = rope_scaling.get("beta_fast", 32.0)
-            beta_slow: float = rope_scaling.get("beta_slow", 1.0)
-            orig_max_pos: int = rope_scaling["original_max_position_embeddings"]
-
-            def get_mscale(scale: float, mscale: float = 1.0) -> float:
-                if scale <= 1:
-                    return 1.0
-                return 0.1 * mscale * math.log(scale) + 1.0
-
-            attention_factor = rope_scaling.get("attention_factor")
-            if attention_factor is None:
-                mscale = rope_scaling.get("mscale")
-                mscale_all_dim = rope_scaling.get("mscale_all_dim")
-                # Truthiness, not presence: HF falls back to get_mscale(factor) when
-                # mscale_all_dim is 0 (a real DeepSeek-lineage default).
-                if mscale and mscale_all_dim:
-                    attention_factor = get_mscale(factor, mscale) / get_mscale(
-                        factor, mscale_all_dim
-                    )
-                else:
-                    attention_factor = get_mscale(factor)
-
-            def _find_correction_dim(num_rotations: float) -> float:
-                return (
-                    rotary_dim
-                    * math.log(orig_max_pos / (num_rotations * 2 * math.pi))
-                    / (2 * math.log(base))
-                )
-
-            low = _find_correction_dim(beta_fast)
-            high = _find_correction_dim(beta_slow)
-            if rope_scaling.get("truncate", True):
-                low = math.floor(low)
-                high = math.ceil(high)
-            low = max(low, 0)
-            # rotary_dim - 1, per HF's find_correction_range and this repo's own faithful copy in
-            # models/deepseek_v4/ops.py. Clamping to rotary_dim//2 - 1 instead forces the ramp to
-            # reach 1.0 at the last entry, fully interpolating the longest-wavelength dims that
-            # the reference deliberately leaves partly extrapolated.
-            high = min(high, rotary_dim - 1)
-            if low == high:  # HF nudges instead of flooring the gap at 1 ("truncate": false)
-                high += 0.001
-
-            def post_process(inv_freq: torch.Tensor) -> torch.Tensor:
-                ramp = torch.clamp(
-                    (torch.arange(rotary_dim // 2, dtype=torch.float32) - low) / (high - low),
-                    0, 1,
-                )
-                return (inv_freq / factor) * ramp + inv_freq * (1 - ramp)
-
+            post_process, attention_factor = _yarn_frequencies(rotary_dim, base, rope_scaling)
             return RotaryEmbedding(
                 head_dim,
                 rotary_dim,
                 max_position,
                 base,
                 post_process,
-                attention_factor=float(attention_factor),
+                attention_factor=attention_factor,
                 is_neox=is_neox,
             )
 
@@ -332,11 +340,18 @@ def get_rope(
 
     def build() -> RotaryEmbedding:
         if mrope_section is not None:
-            assert rope_map is None or rope_map.get("rope_type", "default") == "default"
+            kind = rope_map.get("rope_type", "default") if rope_map is not None else "default"
+            assert kind in ("default", "yarn"), kind
+            # YaRN under mrope (Qwen3.8-Flash-Next's long context): the sections split YaRN's frequencies, as HF's
+            # rotary embedding interleaves the frequencies its rope_init_fn returns
+            yarn = {}
+            if kind == "yarn":
+                post_process, attention_factor = _yarn_frequencies(rotary_dim, base, rope_map)
+                yarn = dict(post_process=post_process, attention_factor=attention_factor)
             return MRotaryEmbedding(
                 head_dim, rotary_dim, max_position, base,
                 is_neox=is_neox, mrope_section=tuple(mrope_section),
-                layout=mrope_layout,
+                layout=mrope_layout, **yarn,
             )
         return _get_rope(head_dim, rotary_dim, max_position, base, rope_map, is_neox)
 

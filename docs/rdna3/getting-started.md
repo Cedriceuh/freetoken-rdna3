@@ -108,8 +108,8 @@ Anthropic-compatible `/v1/messages`. The API key is not checked (use any string)
 - **Anthropic-compatible clients** (Claude Code, Anthropic SDKs) add `/v1/messages` themselves: base URL
   `http://127.0.0.1:1919` (for Claude Code: `ANTHROPIC_BASE_URL=http://127.0.0.1:1919`, any API key).
 
-For a coding agent, set the context window to the profile's context (250000 for the two-card profiles, 131072 for
-`xtx` / `xt`, 65536 for `gre`, or your `--ctx`) so the agent compacts at the right time.
+For a coding agent, set the context window to the profile's context (250000 for the two-card profiles, 262144 for
+`xtx-xt-4x262k`, 1000000 for `xtx-xt-1m`, 131072 for `xtx` / `xt`, 65536 for `gre`, or your `--ctx`) so the agent compacts at the right time.
 
 ## 7. Run it as a service (optional)
 

@@ -88,6 +88,7 @@ class QSASparseMetadata(BaseAttnMetadata):
     # Per-forward scatter plans, built once by the first QSA layer and reused by the rest.
     # positions is bound here (not in prepare_metadata) because a capture batch has none yet.
     cmp_rows:         torch.Tensor | None = None  # [T] int32, compressed slab destination
+    stage_pages:      torch.Tensor | None = None  # host K/V prefill: the batch's physical pages, staged per layer
     ring_rows:        torch.Tensor | None = None  # [T] int32, flat ring row or -1
     positions:        torch.Tensor | None = None  # [T] int32, logical query positions
     # mrope only, built once per forward: row r of the caches is token r's [cos | sin] (queries) or its group start's (keys)
@@ -304,10 +305,18 @@ class QSASparseAttnBackend(BaseAttnBackend):
         self._update_index_cache(index, md, slot)
         indices = self._select(index, md, slot)
         int8 = self.kvcache.kv_int8
+        k_cache, v_cache = self.kvcache.k_cache(layer_id), self.kvcache.v_cache(layer_id)
+        if not md.is_decode and getattr(self.kvcache, "kv_on_host", False):
+            # host K/V (FREETOKEN_QSA_KV_HOST): a prefill's rows select most of the history, so the layer's pages in
+            # use come to VRAM once (whole 32 KB pages at PCIe speed) instead of every row reading across PCIe
+            if slot == 0 or md.stage_pages is None:
+                n = ((md.kv_len_cpu + self.page_size - 1) // self.page_size).tolist()
+                md.stage_pages = torch.cat([md.block_table[i, :c] for i, c in enumerate(n)])
+            k_cache, v_cache = self.kvcache.staged_kv(layer_id, md.stage_pages)
         return qsa_sparse_paged_attention(
             q,
-            self.kvcache.k_cache(layer_id),
-            self.kvcache.v_cache(layer_id),
+            k_cache,
+            v_cache,
             indices,
             md.block_table,
             md.token_to_req,

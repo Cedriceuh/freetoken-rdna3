@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from dataclasses import dataclass
 from typing import Any, Tuple
 
@@ -160,10 +162,19 @@ def parse_config(hf_config: Any) -> ModelConfig:
             raise ValueError(f"PLE must sit on a linear_attention layer, got layer {lid}")
 
     vision_config = parse_vision_config(hf_config)
+    # FREETOKEN_ROPE_MAX_POSITION=N: the plain rope table runs to N positions (the frequencies unchanged, so positions
+    # under max_position_embeddings get the same bits); past 262144 the model extrapolates without YaRN
+    max_position = max(text.max_position_embeddings, int(os.environ.get("FREETOKEN_ROPE_MAX_POSITION") or 0))
+    if rope_scaling is not None and rope_scaling.get("rope_type") == "yarn":
+        # the table covers the extended length, as SGLang / vLLM size it: Qwen's card turns YaRN on in rope_parameters
+        # alone and leaves max_position_embeddings at the native 262144
+        max_position = max(
+            max_position, int(rope_scaling["original_max_position_embeddings"] * rope_scaling["factor"])
+        )
     full_rotary = RotaryConfig(
         head_dim=head_dim,
         rotary_dim=rotary_dim,
-        max_position=text.max_position_embeddings,
+        max_position=max_position,
         base=rope_theta,
         scaling=rope_scaling,
         mrope_section=(

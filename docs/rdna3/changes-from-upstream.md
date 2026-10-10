@@ -178,6 +178,20 @@ Line counts here are on top of the lines listed in the sections above.
 | `python/freetoken/kernel/fla/utils.py`, `chunk_delta_h.py`, `wy_fast.py` | 6/0, 2/1, 3/2 | two GDN prefill kernels at 8 warps on ROCm (`FREETOKEN_GDN_PREFILL_WARPS`) |
 | `tests/kernels/test_gdn_prefill_blocks.py`, `test_prefill_warps.py`, `test_fewer_copies.py`, `tests/models/qwen4_exp/test_ple_conv_blocks.py` | new, new, 20/0, 34/0 | bit-exactness (GPU; the PLE one on the CPU) |
 
+## Long contexts with the K/V in host RAM (experimental)
+
+| File | Lines | Change |
+|---|---:|---|
+| `python/freetoken/layers/rotary.py` | 69/54 | YaRN's frequencies in one helper, also under the multi-axis (vision) rope: Qwen3.8-Flash-Next's checkpoints carry a vision tower, and the model card's 1M-token setting is YaRN |
+| `python/freetoken/models/qwen4_exp/config.py` | 12/1 | the rope table covers YaRN's `original x factor` positions, or `FREETOKEN_ROPE_MAX_POSITION` positions of the plain rope |
+| `python/freetoken/kvcache/qsa_pool.py`, `kvcache/mha_pool.py`, `kernel/host_mapped.py`, `kernel/triton/qsa/stage.py`, `attention/qsa_sparse.py`, `kvcache/host_kv_pool.py` | 48/3, 7/8, new, new, 11/2, 4/0 | `FREETOKEN_QSA_KV_HOST`: the K/V slab in pinned, device-mapped host memory seen by torch as a GPU tensor (DLPack), allocated non-coherent on ROCm so that L2 keeps what the verify rows of one request share, a VRAM buffer that a prefill fills with the pages of one layer at a time, the VRAM budget without the slab; refused with `FREETOKEN_QSA_KV_INT8`, the RAM tier off with it |
+| `python/freetoken/kernel/triton/qsa/topk.py` | 27/8 | the split top-k takes more than 16 chunks on a page table wider than 131,072 block columns (a context over 524,288 tokens) instead of falling back to one program per row (504 us per decode layer at 988k against ~80), up to 16,384 merge candidates (the tie count's 16 bits) |
+| `python/freetoken/engine/engine.py` | 8/1 | with `FREETOKEN_QSA_KV_HOST` the planned K/V pool stays at `--kv-reserve-tokens` (a page past it pins ~0.9 MB of RAM); the rope-length error names `FREETOKEN_ROPE_MAX_POSITION` |
+| `python/freetoken/layers/embedding.py` | 32/0 | `FREETOKEN_DUMP_PROMPT_TOPK` (tests only): every prefill row's top-40 log-probabilities and the input ids, saved by rank 0 |
+| `rdna3/serve.sh` | 22/10 | `KV_TOKENS` in a profile: the K/V pool shared by the requests, apart from one request's `CTX`; `--list` prints a table (GPUs, context, pool, status) |
+| `tests/models/qwen4_exp/test_qsa_kernels.py` | 11/1 | the split top-k on a 1M-token page table against `torch.topk` and the tie policy; the plan's bounds |
+| `tests/layers/test_rotary_yarn.py`, `tests/kernels/test_qsa_kv_host.py`, `rdna3/profiles/xtx-xt-1m.env`, `rdna3/profiles/xtx-xt-4x262k.env` | new | YaRN and the longer table against HF's rotary embedding (CPU); the host-mapped tensor and the page staging (GPU); one conversation of 1M, four of 262,144 at once |
+
 ## Tooling and documentation
 
 | File | Change |

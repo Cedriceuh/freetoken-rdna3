@@ -7,6 +7,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 docs=(README.md docs/rdna3/getting-started.md docs/rdna3/profiles.md docs/rdna3/options.md docs/rdna3/benchmarks.md
       docs/rdna3/how-it-works.md docs/rdna3/decisions.md docs/rdna3/journey.md docs/rdna3/limits.md
       docs/rdna3/troubleshooting.md docs/rdna3/testing.md docs/rdna3/maintaining.md docs/rdna3/changes-from-upstream.md
+      docs/rdna3/long-context.md
       docs/rdna3/credits.md)
 {
   echo "# freetoken-rdna3: all documentation in one file"

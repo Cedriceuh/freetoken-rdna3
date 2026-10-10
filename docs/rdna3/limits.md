@@ -18,7 +18,8 @@ in EXL3 3.05 bpw) stay on disk and only use the free page cache.
 
 Not with the NVFP4 checkpoint: its experts alone need ~63 GiB of RAM, and the engine has no mode that reads experts
 from disk. An **EXL3 checkpoint at 3 bits per weight** (experimental, [how-it-works.md](how-it-works.md#exl3-checkpoints))
-needs 42.6 GiB for its experts (63.3 in NVFP4; 43.5 and 68.0 with the MTP head's experts): on `xtx-xt`, with the RAM
+needs 42.6 GiB for its experts (63.3 in NVFP4; 43.5 and ~64.6 with the MTP head's experts, which an NVFP4 checkpoint stores in bf16, 4.7 GiB,
+and the engine quantizes to NVFP4 at load): on `xtx-xt`, with the RAM
 tier off and the experts loaded one file at a time, the server ran under a 56 GiB container limit at 52.3 GiB used
 (`FREETOKEN_HOST_KV=0` in the profile file, then `rdna3/serve.sh xtx-xt --model DIR --memory 56g -- --expert-load
 serial`; the parallel loader was killed under a 52 GiB limit). A real 64 GB machine is untested. On the agentic benchmark the 3.05 bpw checkpoint fixed 13 of 29 bugs (one run; NVFP4: 12 and 18 in two runs).
@@ -91,14 +92,14 @@ With `--vision`:
 
 ## Speculative decoding (MTP)?
 
-On in the profiles (`FREETOKEN_MTP=1 FREETOKEN_SPEC_VERIFY_M=4`); `rdna3/serve.sh --no-mtp` serves without it
+On in the profiles except `gre` (`FREETOKEN_MTP=1 FREETOKEN_SPEC_VERIFY_M=4`); `rdna3/serve.sh --no-mtp` serves without it
 ([options.md](options.md#speculative-decoding-with-the-mtp-head-qwen38-flash-next-experimental)). Measured on `xtx-xt`,
 `xtx` and `xt` with Qwen3.8-Flash-Next ([benchmarks.md](benchmarks.md#speculative-decoding-mtp-head)):
 
 - **One request at a time gains (two in `xtx-xt`), more do not.** On `xtx-xt`, a request alone decodes 34 % faster at the model's
   sampling and 30-61 % faster greedy along a sweep to 248k of context (earlier runs: +11-39 % on chat, agent turns, a
   108k-token context and a 1500-token answer; x1.38 on 60 code and math items). With more decoding at once than
-  `FREETOKEN_SPEC_BS_MAX` (2 in `xtx-xt`, 1 in the other profiles), steps run one row per request: from the send to the
+  `FREETOKEN_SPEC_BS_MAX` (2 in `xtx-xt` and its K/V-in-RAM variants, 1 in the other profiles), steps run one row per request: from the send to the
   last token, 3-4 requests take 3-4 % longer; two agents at ~100k of context decode 8-15 % faster each with `2` than
   with `1`.
 - **One card gains less**: +7-8 % at the model's sampling and +6-12 % greedy on `xtx` or `xt`, -8 % time on code and

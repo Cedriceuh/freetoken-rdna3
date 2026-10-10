@@ -35,6 +35,9 @@ _MAX_BLOCK_N = 4096
 # phases stay resident; past 8192 the tile spills (255 registers) and that reverses.
 _MAX_RESIDENT = 8192
 _MIN_CHUNK = 4096
+# The merge tile's packed cumsum counts the ties in the high 16 bits of an int32: 32768 equal keys would reach the sign
+# bit, so a plan merges at most 16384 candidates (32 chunks at top_k 512: contexts up to 1,048,576 tokens).
+_MAX_MERGE = 16384
 
 
 @triton.jit
@@ -276,6 +279,7 @@ def _qsa_topk_merge_kernel(
     N_SPLITS: tl.constexpr,
     BLOCK_SMALL: tl.constexpr,
     BLOCK_MID: tl.constexpr,
+    BLOCK_LARGE: tl.constexpr,
     BLOCK_FULL: tl.constexpr,
     BINS: tl.constexpr,
     RADIX: tl.constexpr,
@@ -316,10 +320,23 @@ def _qsa_topk_merge_kernel(
                 TOP_K, BLOCK_MID, BINS, RADIX, PASSES,
             )
         else:
-            emitted = _merge_tile(
-                key_row, col_row, out_row, candidates, k_eff,
-                TOP_K, BLOCK_FULL, BINS, RADIX, PASSES,
-            )
+            if BLOCK_LARGE < BLOCK_FULL:
+                # more splits than one resident tile holds: the spilled full tile only when the row needs it
+                if candidates <= BLOCK_LARGE:
+                    emitted = _merge_tile(
+                        key_row, col_row, out_row, candidates, k_eff,
+                        TOP_K, BLOCK_LARGE, BINS, RADIX, PASSES,
+                    )
+                else:
+                    emitted = _merge_tile(
+                        key_row, col_row, out_row, candidates, k_eff,
+                        TOP_K, BLOCK_FULL, BINS, RADIX, PASSES,
+                    )
+            else:
+                emitted = _merge_tile(
+                    key_row, col_row, out_row, candidates, k_eff,
+                    TOP_K, BLOCK_FULL, BINS, RADIX, PASSES,
+                )
 
     pad = tl.arange(0, PAD_K)
     tl.store(out_row + pad, -1, mask=(pad >= emitted) & (pad < TOP_K))
@@ -332,12 +349,13 @@ def _split_plan(columns: int, top_k: int) -> tuple[int, int] | None:
     max_splits = _MAX_RESIDENT // triton.next_power_of_2(top_k)
     if max_splits < 2:
         return None
-    chunk = max(_MIN_CHUNK, triton.next_power_of_2(-(-columns // max_splits)))
-    if chunk > _MAX_RESIDENT:
-        return None
+    # Past max_splits resident chunks (a page table over 16 x 8192 columns, a context over ~512k tokens) the row takes
+    # more chunks instead of the one-program path, which scans it alone (504 us per decode layer at 988k visible tokens
+    # on a 7900 XT); only a row with more live chunks than that merges in a spilled tile.
+    chunk = min(max(_MIN_CHUNK, triton.next_power_of_2(-(-columns // max_splits))), _MAX_RESIDENT)
     n_splits = -(-columns // chunk)
     # Merging n_splits*top_k candidates has to be cheaper than scanning the row once.
-    if n_splits < 2 or n_splits * top_k >= columns:
+    if n_splits < 2 or n_splits * top_k >= columns or n_splits * top_k > _MAX_MERGE:
         return None
     return chunk, n_splits
 
@@ -445,6 +463,7 @@ def qsa_block_topk(
         N_SPLITS=n_splits,
         BLOCK_SMALL=min(1024, merge_block),
         BLOCK_MID=min(4096, merge_block),
+        BLOCK_LARGE=min(_MAX_RESIDENT, merge_block),
         BLOCK_FULL=merge_block,
         BINS=_BINS,
         RADIX=_RADIX,

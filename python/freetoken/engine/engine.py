@@ -738,6 +738,8 @@ class Engine:
         without a GPU. Reused by the Phase-2 runtime rebuild.
         """
         from freetoken.engine.cache_budget import expert_bytes_per_slot, resolve_moe_cache_auto
+        from freetoken.kvcache.qsa_pool import kv_host_enabled
+        from freetoken.utils import div_ceil
 
         cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
         fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
@@ -769,6 +771,10 @@ class Engine:
             page_size=page_tokens,
             max_slots=method.slot_limit() if method is not None else None,
         )
+        if kv_host_enabled():
+            # FREETOKEN_QSA_KV_HOST: a page past the reserve costs ~0.1 MB of VRAM but ~0.9 MB of pinned host RAM, so the
+            # pool stays at the reserve when the experts leave VRAM over
+            pages = min(pages, div_ceil(max(config.kv_reserve_tokens, min_reserve), page_tokens))
         if uneven:
             plan = torch.tensor([size, pages, int(overlap)], dtype=torch.int64)
             torch.distributed.all_reduce(plan, op=torch.distributed.ReduceOp.MIN, group=self.tp_cpu_group)
@@ -2234,7 +2240,8 @@ def _adjust_config(config: EngineConfig):
                 f"--max-seq-len-override {seq_override} exceeds the model's "
                 f"rope table ({rotary.max_position} positions). Serving past it would read "
                 "out of bounds; extend the checkpoint's rope_scaling / "
-                "max_position_embeddings in config.json instead."
+                "max_position_embeddings in config.json instead, or, for Qwen3.8-Flash-Next, "
+                "set FREETOKEN_ROPE_MAX_POSITION."
             )
 
     # The startup ServerArgs dump is the *requested* config, printed in the frontend process

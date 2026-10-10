@@ -12,6 +12,8 @@ it).
 | `xtx-xtx` *(untested)* | 2x RX 7900 XTX 24 GB | 250,000 | expected >= `xtx-xt` | – | – | – | 4 requests |
 | `xt-xt` *(untested)* | 2x RX 7900 XT 20 GB | 250,000 | expected a little below `xtx-xt` | – | – | – | 4 requests |
 | `gre` *(untested)* | RX 7900 GRE 16 GB | 65,536 | expected ~20 tok/s at best (head off) | – | – | – | 1 request |
+| `xtx-xt-4x262k` *(experimental)* | RX 7900 XTX 24 GB + RX 7900 XT 20 GB | 262,144 per request, 4 at once | EXL3 3.05: 91 tok/s alone at 261k, 29-30 each with 4 | – | – | 1.8-4.6 s at 260k | 4 requests |
+| `xtx-xt-1m` *(experimental)* | RX 7900 XTX 24 GB + RX 7900 XT 20 GB | 1,000,000 | EXL3 3.05: 84-92 tok/s from 118k to 988k | – | – | – | 4 requests, sharing 1M |
 
 "Decode" is one request's 512-token answers at the model's default sampling (median of 12); "deep decode" is greedy
 decode at every context step from 9k to the profile's maximum (248k on two cards, 124k on one); "agent turn" is the
@@ -25,7 +27,8 @@ the MTP head on; `rdna3/serve.sh <profile> --no-mtp` turns it off (numbers in br
 GPUS=2                  # how many cards the automatic choice picks (--gpus picks them yourself)
 VRAM_GIB="24 20"        # minimum VRAM per rank, used for the automatic choice
 TESTED=0                # derived, not measured: serve.sh says so at start (default 1)
-CTX=250000              # context length (--ctx overrides); passed as --max-seq-len-override and --kv-reserve-tokens
+CTX=250000              # context length of one request (--ctx overrides); passed as --max-seq-len-override
+KV_TOKENS=1050000       # the K/V pool all requests share, --kv-reserve-tokens (default: CTX, never less)
 MEMORY=110g             # container RAM limit (--memory overrides)
 FREETOKEN_...=...       # any other KEY=value line becomes an environment variable of the container
 FT_ARGS="..."           # flags passed to `ft serve` (its --tp-size must match GPUS)
@@ -72,6 +75,16 @@ moe.nvfp4=triton` and the `FREETOKEN_NVFP4_*_TUNED` tiles do nothing; the split 
 instead of 51. On two cards `serve.sh` lowers `--memory-ratio` to 0.77 (0.76 from 4 bpw): the card holding the
 384-wide slice bounds the expert cache, and at 0.80 the 7900 XTX peaked 200 MiB under full VRAM
 ([journey.md](journey.md#16-exl3-checkpoints-2026-10-04)); `-- --memory-ratio X` overrides it.
+
+## `xtx-xt-4x262k` and `xtx-xt-1m`: the K/V in host RAM (experimental)
+
+The `xtx-xt` settings with the attention K/V in pinned host memory (`FREETOKEN_QSA_KV_HOST=1`), so the K/V pool is no
+longer bounded by VRAM: `xtx-xt-4x262k` keeps each request to the model's native 262,144 positions and holds four of
+them at once (`KV_TOKENS=1050000`), `xtx-xt-1m` serves one conversation of up to 1M tokens (the plain rope past
+262,144, `FREETOKEN_ROPE_MAX_POSITION`). The RAM tier is off (`FREETOKEN_HOST_KV=0`): the pool already lives in RAM.
+Measured with EXL3 3.05 bpw only, ~77 GiB of host RAM locked; NVFP4 untested (its experts alone take 63 GiB). A
+request alone decodes a few percent slower than on `xtx-xt` (the kernels read the K/V across PCIe), its prompt reads
+faster (more expert slots). Measurements: [long-context.md](long-context.md).
 
 ## `xtx` and `xt`: one card
 

@@ -51,6 +51,15 @@ def kv_int8_enabled() -> bool:
     return os.environ.get(KV_INT8_ENV) == "1"
 
 
+# FREETOKEN_QSA_KV_HOST=1 (experiment): the K/V slab lives in pinned, device-mapped host memory; the kernels read the
+# selected tokens across PCIe and the VRAM it frees goes to the expert cache (the index tiers stay in VRAM)
+KV_HOST_ENV = "FREETOKEN_QSA_KV_HOST"
+
+
+def kv_host_enabled() -> bool:
+    return os.environ.get(KV_HOST_ENV) == "1"
+
+
 class QSAKVCache(MHAKVCache):
     """MHA paged pool + the compressed index-key slab + the per-request pending ring.
 
@@ -129,6 +138,35 @@ class QSAKVCache(MHAKVCache):
         self._alloc_kv_scales()
         self._zero_kv_slabs()
         self._alloc_index_tiers(num_pages)
+        self._alloc_staging()
+
+    def _alloc_staging(self) -> None:
+        # host K/V: one layer's K and V staged in VRAM for a prefill's attention, at the physical page ids
+        self._staging = None
+        if kv_host_enabled():
+            _, _, pages, page_size, heads, head_dim = self._kv_buffer.shape
+            self._staging = torch.empty((2, pages, page_size, heads, head_dim), dtype=self._kv_buffer.dtype,
+                                        device=self._device)
+
+    @property
+    def kv_on_host(self) -> bool:
+        return self._staging is not None
+
+    def staged_kv(self, layer_id: int, pages: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Copy ``pages`` of this layer's host K/V into the VRAM staging buffer; its K and V views (same page ids)."""
+        from freetoken.kernel.triton.qsa.stage import stage_pages
+
+        dense = self._dense(layer_id)
+        stage_pages(self._k_buffer[dense], self._staging[0], pages)
+        stage_pages(self._v_buffer[dense], self._staging[1], pages)
+        return self._staging[0], self._staging[1]
+
+    def _new_kv_buffer(self, shape: tuple[int, ...], dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        if not kv_host_enabled():
+            return super()._new_kv_buffer(shape, dtype, device)
+        from freetoken.kernel.host_mapped import host_mapped_empty
+
+        return host_mapped_empty(shape, dtype, device)
 
     def _alloc_kv_scales(self) -> None:
         if self._kv_int8:
@@ -180,11 +218,13 @@ class QSAKVCache(MHAKVCache):
         self._pending_ring = None
         self._rope_positions = None
         self._kv_scale = None
+        self._staging = None
         super().rebuild(num_pages)
         self._alloc_kv_scales()
         self._zero_kv_slabs()
         try:
             self._alloc_index_tiers(num_pages)
+            self._alloc_staging()
         except Exception:
             self._kv_buffer = None
             self._k_buffer = None
@@ -195,7 +235,10 @@ class QSAKVCache(MHAKVCache):
     def kv_cost(cls, config) -> tuple[int, int, int, int]:
         from .base import spec_kv_bytes_per_token
         from freetoken.attention import AttnType
+        from freetoken.utils import div_even
 
+        if kv_host_enabled() and kv_int8_enabled():
+            raise ValueError(f"{KV_HOST_ENV}=1 and {KV_INT8_ENV}=1 do not combine: the host K/V is kept in the compute dtype")
         num_req_slots = config.max_running_req + 1
         per_token = 0
         fixed = 0
@@ -203,10 +246,12 @@ class QSAKVCache(MHAKVCache):
             if spec.is_swa:
                 continue
             per_token += spec_kv_bytes_per_token(spec, config)
-            if spec.attn_type is AttnType.QSA and kv_int8_enabled():
+            if spec.attn_type is AttnType.QSA and kv_host_enabled():
+                # the K/V slab is host memory: only the index tiers count against the VRAM budget
+                heads = div_even(spec.num_kv_heads, config.tp_info.size, allow_replicate=True)
+                per_token -= 2 * heads * (spec.num_layers - 1) * spec.head_dim * config.dtype.itemsize  # one layer staged
+            elif spec.attn_type is AttnType.QSA and kv_int8_enabled():
                 # int8 codes + one fp32 scale per (token, kv head) instead of compute-dtype K/V
-                from freetoken.utils import div_even
-
                 heads = div_even(spec.num_kv_heads, config.tp_info.size, allow_replicate=True)
                 slabs = 2 * heads * spec.num_layers
                 per_token += slabs * (spec.head_dim * 1 + _KV_SCALE_BYTES) - slabs * spec.head_dim * config.dtype.itemsize
