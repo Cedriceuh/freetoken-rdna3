@@ -409,7 +409,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
         else:
             rope_positions, rope_cache = md.rope_rows, md.q_rope_cache
         qsa_index_norm_rope(
-            index.q.view(-1, self.index_head_dim),
+            index.q if not index.q.is_contiguous() else index.q.view(-1, self.index_head_dim),
             rope_positions,
             rope_cache,
             index.q_norm_weight,

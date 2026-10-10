@@ -14,6 +14,7 @@ norm weights travel with the call (:class:`QSAIndexerInputs`).
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
@@ -22,11 +23,18 @@ from freetoken.core import get_global_ctx
 from freetoken.distributed import get_tp_info
 from freetoken.layers import BaseOP, GemmaPlusOneRMSNorm, LinearColParallelMerged, LinearOProj, LinearReplicated
 from freetoken.layers.rotary import get_rope
+from freetoken.kernel.triton.attn_gate import sigmoid_gate_mul
 from freetoken.utils import div_even, nvtx_annotate
 
 if TYPE_CHECKING:
     from freetoken.core import Batch
     from freetoken.models.config import ModelConfig
+
+
+# FREETOKEN_FEWER_COPIES (default 1 on ROCm, 0 elsewhere): q / k normalized where the projection wrote them, the output
+# gate applied in one kernel (models/qwen4_exp/gdn.py: the gated norm reads z in place); the same bits, fewer launches.
+# Off elsewhere: flashinfer's gemma_rmsnorm takes 2D inputs only, and the bits were checked on ROCm's Triton only
+_FEWER_COPIES = os.environ.get("FREETOKEN_FEWER_COPIES", "1" if torch.version.hip is not None else "0") == "1"
 
 
 @dataclass(frozen=True)
@@ -94,6 +102,11 @@ class Qwen4ExpIndexer(BaseOP):
 
     def forward(self, x: torch.Tensor) -> QSAIndexerInputs:
         q, k = self.index_qk_proj.forward(x).split(self._split, dim=-1)
+        if _FEWER_COPIES:  # the indexer kernels read both where the projection wrote them (row / head strides)
+            return QSAIndexerInputs(
+                q=q.reshape(-1, self.num_heads, self.head_dim), k=k.reshape(-1, self.head_dim),
+                q_norm_weight=self.q_layernorm.weight, k_norm_weight=self.k_layernorm.weight, eps=self.eps,
+            )
         return QSAIndexerInputs(
             q=q.reshape(-1, self.num_heads, self.head_dim).contiguous(),
             k=k.reshape(-1, self.head_dim).contiguous(),
@@ -163,12 +176,19 @@ class Qwen4ExpAttention(BaseOP):
     def forward(self, x: torch.Tensor, batch: Batch) -> torch.Tensor:
         qg, k, v = self.qkv_proj.forward(x).split(self._qkv_split, dim=-1)
         qg = qg.view(-1, self.num_q, self.head_dim * 2)
-        q = qg[..., : self.head_dim].contiguous()
-        gate = qg[..., self.head_dim :].reshape(-1, self.qo_attn_dim)
-        k = k.contiguous().view(-1, self.num_kv, self.head_dim)
+        if _FEWER_COPIES:
+            # the norms read q and k where the projection wrote them and write them contiguous (same rows, same
+            # warps: the bits of the copy-then-normalize-in-place form, two launches fewer)
+            q = self.q_norm.forward_strided(qg[..., : self.head_dim])
+            k = self.k_norm.forward_strided(k.view(-1, self.num_kv, self.head_dim))
+            gate = qg[..., self.head_dim :]
+        else:
+            q = qg[..., : self.head_dim].contiguous()
+            gate = qg[..., self.head_dim :].reshape(-1, self.qo_attn_dim)
+            k = k.contiguous().view(-1, self.num_kv, self.head_dim)
+            self.q_norm.forward_inplace(q)
+            self.k_norm.forward_inplace(k)
         v = v.contiguous()
-        self.q_norm.forward_inplace(q)
-        self.k_norm.forward_inplace(k)
         q, k = self.rotary.forward(
             batch.get_attn_positions(), q.view(-1, self.qo_attn_dim), k.view(-1, self.kv_attn_dim)
         )
@@ -176,7 +196,10 @@ class Qwen4ExpAttention(BaseOP):
         o = get_global_ctx().attn_backend.qsa_forward(
             q.view(-1, self.num_q, self.head_dim), k, v, index, self.layer_id, batch
         )
-        gated = o.reshape(-1, self.qo_attn_dim) * torch.sigmoid(gate)
+        if _FEWER_COPIES:
+            gated = sigmoid_gate_mul(o.view(-1, self.num_q, self.head_dim), gate)
+        else:
+            gated = o.reshape(-1, self.qo_attn_dim) * torch.sigmoid(gate)
         return self.o_proj.forward(gated)
 
 

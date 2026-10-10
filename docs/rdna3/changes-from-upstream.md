@@ -116,7 +116,8 @@ Line counts in this section and the next are relative to `d72e5cb` (0.1.0 plus i
 
 | File | Lines | Change |
 |---|---:|---|
-| `Dockerfile.rdna3` | 13/5 | ROCm 10.0 / PyTorch 2.13 base with its own Triton 3.8; pyproject's CUDA ceilings lifted at install |
+| `Dockerfile.rdna3` | 13/5 | ROCm 10.1 / PyTorch 2.14 base with its own Triton 3.8; pyproject's CUDA ceilings lifted at install |
+| `setup.py` | 3/3 | the C++ extensions build as C++20 (PyTorch 2.14's headers require it) |
 | `python/freetoken/kernel/triton/moe_align.py`, `tests/kernels/test_moe_align.py` | 13/9, new | no comparison on `tl.histogram` counts: Triton 3.8's AMD range analysis gives them an empty range and folds such comparisons to false, which left the expert ids unwritten (up to 1024 routes) or every count at zero (more), and the expert GEMMs then read wild addresses |
 | `python/freetoken/kernel/gguf.py`, `kernel/csrc/gguf/gguf_kernel.cu`, `dispatch.h`, `gguf_bind.cpp` | 41/8, 249/328, 37/9, new | the GGUF kernels build on ROCm: the torch wrappers in a host-only file (under HIP torch's headers include rocThrust, which the pip SDK lacks), nvcc-only flags for CUDA only, HIP's shuffles for the full-mask ones, the SDK's HIP headers, the shared ROCm link flags |
 | `python/freetoken/kernel/csrc/row_store/row_store_ext.cpp`, `kernel/row_store.py` | 32/4, 40/1 | HIP stream memops for the PLE wait-sync (the probe used to look for the CUDA driver's only); a captured wait must hold three replays with the PLE copy behind it (`FREETOKEN_PLE_SYNC`) |
@@ -153,11 +154,35 @@ Line counts here are on top of the lines listed in the sections above.
 | `python/freetoken/kernel/triton/dense_gemv.py` | 7/6 | one split-K reduce launch for all the rows |
 | `tests/kernels/test_moe_shared_gate.py`, `test_hc_combine_rmsnorm.py`, `test_gemv_bf16_rows.py`, `tests/models/qwen4_exp/test_moe_epilogue.py` | new | bit-exactness on the GPU; which expert paths take the fused epilogue |
 
+## Fewer copies (bit-exact)
+
+Line counts here are on top of the lines listed in the sections above.
+
+| File | Lines | Change |
+|---|---:|---|
+| `python/freetoken/models/qwen4_exp/attention.py`, `models/qwen4_exp/gdn.py`, `layers/norm.py`, `kernel/triton/attn_gate.py` | 29/6, 7/1, 7/0, new | q / k normalized where the projection wrote them, the output gate in one kernel, the GDN gate read in place (`FREETOKEN_FEWER_COPIES`) |
+| `python/freetoken/kernel/fla/layernorm_gated.py`, `kernel/triton/qsa/compress.py`, `attention/qsa_sparse.py` | 24/4, 23/5, 1/1 | the gated norm and the QSA indexer's norm + rope take token / head strides |
+| `python/freetoken/kernel/triton/dense_gemv.py`, `layers/quantization/linear/unquantized.py` | 38/7, 10/1 | the split-K bf16 GEMV's last program reduces (`FREETOKEN_GEMV_LAST_REDUCES`), counters allocated at layer finalize |
+| `tests/kernels/test_fewer_copies.py` | new | bit-exactness on the GPU |
+
+## Lower prefill peaks, kernels that no longer spill (bit-exact)
+
+Line counts here are on top of the lines listed in the sections above.
+
+| File | Lines | Change |
+|---|---:|---|
+| `python/freetoken/kernel/triton/hc.py`, `models/qwen4_exp/hc.py`, `models/qwen4_exp/model.py`, `models/qwen4_exp/ple.py` | 7/3, 7/2, 9/3, 50/2 | the hc combines write over their input, the PLE output is added to the streams in place, block by block for one request (`FREETOKEN_HC_INPLACE`) |
+| `python/freetoken/models/qwen4_exp/gdn.py`, `attention/linear.py` | 66/12, 10/2 | the GDN delta rule of a prefill 4096 tokens of a request at a time (`FREETOKEN_GDN_PREFILL_BLOCK`); the host bounds of each request and track entry in the metadata |
+| `python/freetoken/models/qwen4_exp/mtp.py`, `engine/engine.py` | 16/7, 44/4 | the MTP head frees the prompt's streams and their normed copy once read and adds the embedding in place; the torch allocator capped short of the card on ROCm (`FREETOKEN_VRAM_MARGIN_MIB`) |
+| `python/freetoken/kernel/triton/qsa/attend.py` | 9/0 | at least 4 warps on ROCm (`FREETOKEN_QSA_MIN_WARPS`) |
+| `python/freetoken/kernel/fla/utils.py`, `chunk_delta_h.py`, `wy_fast.py` | 6/0, 2/1, 3/2 | two GDN prefill kernels at 8 warps on ROCm (`FREETOKEN_GDN_PREFILL_WARPS`) |
+| `tests/kernels/test_gdn_prefill_blocks.py`, `test_prefill_warps.py`, `test_fewer_copies.py`, `tests/models/qwen4_exp/test_ple_conv_blocks.py` | new, new, 20/0, 34/0 | bit-exactness (GPU; the PLE one on the CPU) |
+
 ## Tooling and documentation
 
 | File | Change |
 |---|---|
-| `python/freetoken/engine/ftprof.py` (93/0) | env-gated decode profiling (`FT_STATS_EVERY`, `FT_PROF_*`) |
+| `python/freetoken/engine/ftprof.py` (106/0) | env-gated decode profiling (`FT_STATS_EVERY`, `FT_PROF_*`) |
 | `python/freetoken/server/args.py` (3/1) | `--cuda-graph-max-bs` help |
 | `Dockerfile.rdna3`, `.dockerignore` | the ROCm image |
 | `rdna3/` | profiles (the MTP head on), `serve.sh` (`--no-mtp`; a lower `--memory-ratio` for EXL3 on two cards), GPU checks, micro-benchmarks and `bench/depth_sweep.py`, maintenance tools |

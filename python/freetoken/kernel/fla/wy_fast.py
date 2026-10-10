@@ -9,6 +9,7 @@ import triton
 import triton.language as tl
 
 from freetoken.kernel.fla.index import prepare_chunk_indices
+from freetoken.kernel.fla.utils import GDN_PREFILL_WARPS
 
 
 # @triton.autotune(
@@ -147,8 +148,8 @@ def recompute_w_u_fwd(
         BK=BK,
         BV=BV,
         IS_VARLEN=cu_seqlens is not None,
-        num_warps=4,
-        num_stages=3,
+        num_warps=GDN_PREFILL_WARPS or 4,
+        num_stages=1 if GDN_PREFILL_WARPS else 3,
     )
     return w, u
 

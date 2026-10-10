@@ -15,8 +15,8 @@ then measure. If it stays slow, check that the kernel-cache volume is mounted (`
 ## My desktop session closed, or the screen went black
 
 A GPU kernel faulted hard on the card that drives your monitor: the driver resets that card and the desktop dies with
-it. Check with `journalctl -k | grep -i "device coredump"`. With this build's profiles this should not happen; if you
-experiment with kernels or options, do it on a card without a monitor attached (`--gpus`), and report the fault.
+it. Check with `journalctl -k | grep -i "device coredump"`. With this build's profiles this should not happen: report
+the fault.
 
 ## `profile ... needs N GPU(s)` or the wrong card is picked
 
@@ -29,9 +29,12 @@ first; one-card profiles take the smallest card with enough VRAM. Force a choice
   and decode fell to 1.9 tok/s (the allocator thrashes).
 - Lower the context (`--ctx 131072` on two cards, `--ctx 65536` on one), then the memory ratio
   (`-- --memory-ratio 0.75`).
-- A prefill peak above the card's VRAM does not always fail an allocation: the driver evicts memory and stops the
-  process's GPU queues for seconds (the `evicted_ms` counter of [Long pauses](#long-pauses-in-the-middle-of-a-run)),
-  and a rank has died on an illegal memory access that way. `/sys/class/drm/card*/device/mem_info_vram_used` sampled
+- Without a cap, a prefill peak above the card's VRAM does not always fail an allocation: the driver evicts memory
+  and stops the process's GPU queues for seconds (the `evicted_ms` counter of
+  [Long pauses](#long-pauses-in-the-middle-of-a-run)), and a rank has died on an illegal memory access that way. On
+  ROCm the torch allocator is capped 512 MiB short of the card (`FREETOKEN_VRAM_MARGIN_MIB`; the log's `VRAM at start`
+  and `torch allocator capped at` lines give the numbers), so a peak over it ends in `torch.OutOfMemoryError` and its
+  traceback says where. `/sys/class/drm/card*/device/mem_info_vram_used` sampled
   during the first long prompt shows how close the peak comes; the card driving the display also holds the
   desktop's buffers. On `xtx-xt`, `--memory-ratio` 0.80 -> 0.78 lowered the 7900 XTX's peak by 350 MiB.
 - The container needs `--ulimit memlock=-1` (pinned RAM for the experts and the RAM tier) and enough RAM under its
@@ -84,6 +87,23 @@ just evicted the process's queues (`/sys/class/kfd/kfd/proc/<pid>/stats_<gpu>/ev
   long prompt.
 - A hung all-gather (`Watchdog caught collective operation timeout ... _ALLGATHER_BASE`, the server stops) once in a
   depth sweep, the XT at 37 MiB from full during a 16k-token chunk at ~41k tokens of context.
+- Profiling on ROCm 10.1 with two cards (rocprofv3 `--kernel-trace`, or torch.profiler around a prefill): RCCL's
+  all-reduce of a prefill chunk hung (60 s watchdog) twice out of two; without a profiler the same load ran (not
+  tried: one card, or profiling decode only).
+- The same page fault once at start-up (2026-10-07, EXL3 3.05 bpw), ~3 s after the CUDA graphs were captured, with
+  3.9 GiB still free on the XTX: VRAM pressure does not explain that one. The 16 starts that followed (with and
+  without that night's changes) were clean; restarting is enough.
+- On purpose, 2026-10-07: `--memory-ratio 0.83` before the prefill reductions of
+  [journey.md](journey.md#21-prefill-peaks-spills-and-the-vram-outside-torch-2026-10-07),
+  two agents at ~120k tokens, a page fault on the XT at 20420 of 20464 MiB, on the first try. With the torch allocator
+  capped (`FREETOKEN_VRAM_MARGIN_MIB`) the same load gave an out-of-memory error instead.
+
+What fills a card besides torch (logged at start as `outside torch`): ~1 GiB, growing by 200-250 MiB while serving,
+plus, on the card driving the display, the desktop's buffers (0.66 to 1.8 GiB on the 7900 XTX here, the same day),
+which the free memory HIP reports leaves out (`/sys/class/drm/card*/device/mem_info_vram_used` counts them; the cap
+reads it). Each Triton kernel module the HIP runtime loads takes 2 MiB of VRAM whatever its size, and new shapes load
+new ones; kernels that spill registers take scratch per GPU queue; RCCL ~8 MiB. The cap is set at start, so that
+growth, and the desktop's, eats into its 512 MiB.
 
 Neither came back in the same runs repeated (hours of agent sessions, the sweep again, the same VRAM pressure in other
 10-minute runs): the eviction has to land at a bad moment. Keep other GPU-heavy programs off the card that drives the

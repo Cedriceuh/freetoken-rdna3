@@ -28,7 +28,7 @@ from freetoken.spec_decode import MTP_ENABLED
 from freetoken.utils import nvtx_annotate
 
 from .attention import Qwen4ExpAttention
-from .hc import GatedResidual
+from .hc import _HC_INPLACE, GatedResidual
 from .moe import Qwen4ExpMoE
 from .ple import PLELayer
 from freetoken.models.blocks import embed_input_ids
@@ -65,6 +65,12 @@ def build_linear_mixer(config: ModelConfig, layer_id: int, prefix: str) -> BaseO
 _FUSED_HC_NORM = os.environ.get("FREETOKEN_FUSED_HC_NORM", "1") == "1"
 
 
+def _add_ple(hidden: torch.Tensor, ple: PLELayer, batch: Batch) -> torch.Tensor:
+    """The PLE output added to the streams, in place under FREETOKEN_HC_INPLACE (same dtype and shape: the same bits as
+    ``hidden + ple_out``, without a third [T, hc * hidden] buffer; a long one-request prefill adds block by block,
+    without the PLE's own)."""
+    return ple.forward(hidden, batch, add_into=True) if _HC_INPLACE else hidden + ple.forward(hidden, batch)
+
 class Qwen4ExpDecoderLayer(BaseOP):
     """One decoder layer over the hyper-connection streams (see the module docstring for the flow)."""
 
@@ -85,7 +91,7 @@ class Qwen4ExpDecoderLayer(BaseOP):
     @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
     def forward(self, hidden: torch.Tensor, batch: Batch) -> torch.Tensor:
         if self.ple is not None:
-            hidden = hidden + self.ple.forward(hidden, batch)
+            hidden = _add_ple(hidden, self.ple, batch)
         block_input, inject = self.attn_hyper_connection.mix(hidden)
         if self._is_linear:
             block_output = self.linear_attn.forward(block_input)
@@ -109,7 +115,7 @@ class Qwen4ExpDecoderLayer(BaseOP):
         normed = carry.pop() if carry else None
         if self.ple is not None:
             assert normed is None, "the PLE adds to the streams after the combine before"
-            hidden = hidden + self.ple.forward(hidden, batch)
+            hidden = _add_ple(hidden, self.ple, batch)
         if normed is None:
             block_input, inject = self.attn_hyper_connection.mix(hidden)
         else:

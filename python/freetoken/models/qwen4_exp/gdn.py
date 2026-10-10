@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn.functional as F
 from freetoken.core import get_global_ctx
@@ -12,6 +14,14 @@ from freetoken.models.qwen3_5_moe.gdn_kernels import gdn_decode_fla, gdn_prefill
 from freetoken.spec_decode import SPEC_M, RollbackTarget, register, rows_of
 
 
+# FREETOKEN_FEWER_COPIES (default 1 on ROCm, 0 elsewhere, see models/qwen4_exp/attention.py): the gated norm reads z in
+# place
+_FEWER_COPIES = os.environ.get("FREETOKEN_FEWER_COPIES", "1" if torch.version.hip is not None else "0") == "1"
+# FREETOKEN_GDN_PREFILL_BLOCK (default 4096, 0 = off): a prefill's delta rule runs this many tokens of a request at a
+# time, the recurrent state chained through its pool slot: the same bits (the kernels work per 64-token chunk, the
+# state in fp32), a quarter of the temporaries at a 16k-token chunk (~0.8 GiB less on a 7900 XT)
+_GDN_PREFILL_BLOCK = int(os.environ.get("FREETOKEN_GDN_PREFILL_BLOCK", "4096"))
+assert _GDN_PREFILL_BLOCK % 64 == 0, "FREETOKEN_GDN_PREFILL_BLOCK must be a multiple of the 64-token chunk"
 _SPEC_BUFS: list = []  # [(recurrent [layers, reqs, m-1, ...], conv [layers, m-1, reqs, ...])] once allocated
 _SPEC_ROWS: list = []
 
@@ -176,14 +186,16 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         return mixed.view(reqs * m, -1), self._spec_inter[:reqs]
 
     def _write_track_snapshot(self, pool, li: int, conv_in: torch.Tensor,
-                              h: torch.Tensor, fla) -> None:
+                              h: torch.Tensor | None, fla, h_rows: torch.Tensor | None = None) -> None:
         """Snapshot this layer's recurrent + conv state at the chunk-aligned track boundary
         into a donatable pool slot, on the forward stream (hybrid-radix extra_buffer path).
         SSM: ``recurrent_states[li, dst] = h[0, h_row]`` -- a DIRECT copy (h is [V,K], the
         state pool is [K,V]; they coincide because GDN requires head_k_dim == head_v_dim).
         Conv: the last (kernel-1) raw conv-input timesteps ending at the boundary."""
         rec = pool.recurrent_states[li]
-        rec.index_copy_(0, fla.track_dst, h[0, fla.track_h_row].to(rec.dtype))
+        if h_rows is None:  # the blocked prefill hands over the tracked rows only
+            h_rows = h[0, fla.track_h_row]
+        rec.index_copy_(0, fla.track_dst, h_rows.to(rec.dtype))
         cv = pool.conv_states[li]
         # conv_in [total, conv_dim]; gather the (kernel-1) window per tracked req.
         conv_win = conv_in[fla.track_conv_src].transpose(-1, -2).contiguous()  # [nt, conv_dim, K-1]
@@ -254,23 +266,71 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
             if fla.fresh_state_indices is not None:
                 pool.recurrent_states[li].index_fill_(0, fla.fresh_state_indices, 0.0)
             track = fla.track_dst is not None
-            result = gdn_prefill_chunk_fla(
-                q, k, v, g, beta,
-                state_source=pool.recurrent_states[li], indices=fla.cache_indices,
-                cu_seqlens=fla.cu_seqlens, scale=self.head_k_dim ** -0.5,
-                return_h=track,
-            )
-            if track:
-                core_out, h = result
-                self._write_track_snapshot(pool, li, conv_in, h, fla)
+            if _GDN_PREFILL_BLOCK > 0 and fla.seq_bounds is not None and total > _GDN_PREFILL_BLOCK:
+                core_out, h_rows = _gdn_prefill_blocked(q, k, v, g, beta, pool.recurrent_states[li], fla,
+                                                        self.head_k_dim ** -0.5, track)
+                if track:
+                    self._write_track_snapshot(pool, li, conv_in, None, fla, h_rows=h_rows)
             else:
-                core_out = result
+                result = gdn_prefill_chunk_fla(
+                    q, k, v, g, beta,
+                    state_source=pool.recurrent_states[li], indices=fla.cache_indices,
+                    cu_seqlens=fla.cu_seqlens, scale=self.head_k_dim ** -0.5,
+                    return_h=track,
+                )
+                if track:
+                    core_out, h = result
+                    self._write_track_snapshot(pool, li, conv_in, h, fla)
+                else:
+                    core_out = result
 
         core_out = core_out.reshape(-1, self.head_v_dim)
-        z = z.reshape(-1, self.head_v_dim)
+        if not _FEWER_COPIES:
+            z = z.reshape(-1, self.head_v_dim)  # a copy when z is a strided slice of several rows
         # decode: one row per norm program, so a verify step's rows (and a batch's) get their single-row bits
         out = self.norm.forward(core_out, z, rows_per_block=1 if batch.is_decode else None).reshape(total, -1)
         return self.out_proj.forward(out)
+
+
+def _gdn_blocks(fla, device: torch.device) -> list:
+    """(start, end, request, cu_seqlens) per block of each request's prefill rows; built once per forward from the host
+    bounds (one pinned non-blocking copy) and shared by every GDN layer."""
+    blocks = getattr(fla, "_gdn_blocks", None)
+    if blocks is None:
+        spans = [(a, min(a + _GDN_PREFILL_BLOCK, end), i)
+                 for i, (start, end) in enumerate(fla.seq_bounds) for a in range(start, end, _GDN_PREFILL_BLOCK)]
+        cu = torch.tensor([[0, b - a] for a, b, _ in spans], dtype=torch.int64,
+                          pin_memory=torch.cuda.is_available()).to(device, non_blocking=True)
+        blocks = fla._gdn_blocks = [(a, b, i, cu[j]) for j, (a, b, i) in enumerate(spans)]
+    return blocks
+
+
+def _gdn_prefill_blocked(q, k, v, g, beta, state: torch.Tensor, fla, scale: float, track: bool):
+    """``gdn_prefill_chunk_fla`` over the whole prefill, a block of one request at a time (the state chained through its
+    slot); returns (o, the h rows of the track entries or None)."""
+    blocks = _gdn_blocks(fla, q.device)
+    want: dict[int, list] = {}
+    if track:
+        for e, (i, c) in enumerate(fla.track_seq_chunk):
+            start = fla.seq_bounds[i][0]
+            for j, (a, b, ii, _) in enumerate(blocks):
+                if ii == i and a - start <= c * 64 < b - start:
+                    want.setdefault(j, []).append((e, c - (a - start) // 64))
+                    break
+    o = rows = None
+    for j, (a, b, i, cu) in enumerate(blocks):
+        res = gdn_prefill_chunk_fla(q[:, a:b], k[:, a:b], v[:, a:b], g[:, a:b], beta[:, a:b], state_source=state,
+                                    indices=fla.cache_indices[i:i + 1], cu_seqlens=cu, scale=scale, return_h=j in want)
+        if j in want:
+            res, h = res
+            if rows is None:
+                rows = h.new_empty((len(fla.track_seq_chunk), *h.shape[2:]))
+            for e, local in want[j]:
+                rows[e] = h[0, local]
+        if o is None:
+            o = res.new_empty((q.shape[1], *res.shape[1:]))
+        o[a:b] = res
+    return o, rows
 
 
 __all__ = ["Qwen4ExpGatedDeltaNet"]

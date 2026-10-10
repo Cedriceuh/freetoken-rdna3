@@ -81,16 +81,25 @@ class Qwen4ExpMTP(BaseOP):
         mlp.experts = experts
         self.hyper_connection_mixer = GatedResidual(config, use_combine=False, prefix=f"{prefix}.hyper_connection_mixer")
 
-    def forward(self, streams: torch.Tensor, next_embeds: torch.Tensor, batch: Batch,
+    def forward(self, streams: torch.Tensor | list, next_embeds: torch.Tensor, batch: Batch,
                 keep: torch.Tensor | None = None, kv_only: bool = False) -> tuple[torch.Tensor, torch.Tensor] | None:
-        """``streams [T, hc*hidden]``: the main model's streams at rows i (before its top mixer); ``next_embeds
-        [T, hidden]``: the embedding of token i+1. Returns the head input (guess for token i+2) and the MTP layer's
-        own streams (the input of a chained guess), for the rows ``keep`` (all T when None): the attention runs on
-        every row, whose KV later drafts read; the MoE after it only where a guess is read (rows are independent past
-        the attention). ``kv_only``: stop after the attention (its KV written), return None."""
+        """``streams [T, hc*hidden]``: the main model's streams at rows i (before its top mixer), or a one-element list
+        holding them that the head empties, so they are freed once normed (a 16k-token prefill chunk's are 320 MiB,
+        and the head's mix holds three more of that size); ``next_embeds [T, hidden]``: the embedding of token i+1.
+        Returns the head input (guess for token i+2) and the MTP layer's own streams (the input of a chained guess),
+        for the rows ``keep`` (all T when None): the attention runs on every row, whose KV later drafts read; the MoE
+        after it only where a guess is read (rows are independent past the attention). ``kv_only``: stop after the
+        attention (its KV written), return None."""
         e = self.fc_embedding.forward(self.pre_fc_norm_embedding.forward(next_embeds))
+        if isinstance(streams, list):
+            streams = streams.pop()
         h = self.pre_fc_norm_hidden.forward(streams).view(-1, self.hidden_size)  # 2-D: the int8 GEMV takes few rows
-        x = (self.fc_hidden.forward(h).view(-1, self.hc_count, self.hidden_size) + e.unsqueeze(-2)).flatten(-2)
+        del streams
+        # the embedding added in place: the same bf16 sums as ``a + b``, without a second [T, hc*hidden] tensor
+        x = self.fc_hidden.forward(h).view(-1, self.hc_count, self.hidden_size)
+        del h
+        x = x.add_(e.unsqueeze(-2)).flatten(-2)
+        del e
         layer = self.layers.op_list[0]
         block_input, inject = layer.attn_hyper_connection.mix(x)
         x = layer.attn_hyper_connection.combine(x, layer.self_attn.forward(block_input, batch), inject)

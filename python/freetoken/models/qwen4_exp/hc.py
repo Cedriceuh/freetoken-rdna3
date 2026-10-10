@@ -10,6 +10,7 @@ back at the store, so they agree to fp32 rounding.
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Tuple
 
 import torch
@@ -25,6 +26,10 @@ from freetoken.layers import BaseOP, LinearReplicated
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
+
+# FREETOKEN_HC_INPLACE (default 1): a combine writes the new streams over the old ones, which nothing reads after it
+# (the same bits; one [T, hc * hidden] buffer less: 320 MiB at a 16k-token prefill chunk)
+_HC_INPLACE = os.environ.get("FREETOKEN_HC_INPLACE", "1") == "1"
 
 
 def grouped_plus_one_rms_norm(
@@ -150,12 +155,12 @@ class GatedResidual(BaseOP):
 
     def combine_norm(self, R: torch.Tensor, y: torch.Tensor, s: torch.Tensor, nxt: "GatedResidual"):
         """``combine``, then the normed streams ``nxt.mix`` starts from, in one kernel: (R', Rn') for ``nxt.mix_normed``."""
-        return hc_combine_rmsnorm(R, y, s, nxt.hc_norm.weight, nxt.hc_norm.eps, self.hc_count)
+        return hc_combine_rmsnorm(R, y, s, nxt.hc_norm.weight, nxt.hc_norm.eps, self.hc_count, inplace=_HC_INPLACE)
 
     def combine(self, R: torch.Tensor, y: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
         """Inject the block output ``y [T, hidden]`` back into every stream of ``R``."""
         if R.is_cuda:
-            return hc_combine(R, y, s, self.hc_count)
+            return hc_combine(R, y, s, self.hc_count, inplace=_HC_INPLACE)
         return self._combine_torch(R, y, s)
 
 

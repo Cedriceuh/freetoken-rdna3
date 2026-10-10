@@ -37,6 +37,7 @@ def _layer_norm_fwd_1pass_kernel(
     stride_x_row,  # how much to increase the pointer when moving by 1 row
     stride_y_row,
     stride_z_row,
+    stride_z_head,  # Z_HEADS > 0: z row r lives at (r // Z_HEADS) * stride_z_row + (r % Z_HEADS) * stride_z_head
     M,  # number of rows in X
     N: tl.constexpr,  # number of columns in X
     eps,  # epsilon to avoid division by zero
@@ -47,6 +48,7 @@ def _layer_norm_fwd_1pass_kernel(
     NORM_BEFORE_GATE: tl.constexpr,
     IS_RMS_NORM: tl.constexpr,
     ACTIVATION: tl.constexpr,
+    Z_HEADS: tl.constexpr = 0,
 ):
     # Map the program id to the starting row of X and Y it should compute.
     row_start = tl.program_id(0) * ROWS_PER_BLOCK
@@ -73,7 +75,11 @@ def _layer_norm_fwd_1pass_kernel(
     x = tl.load(X_base, mask=mask, other=0.0).to(tl.float32)
 
     if HAS_Z and not NORM_BEFORE_GATE:
-        Z_base = Z + rows[:, None] * stride_z_row + col_offsets
+        if Z_HEADS > 0:
+            Z_base = (Z + (rows[:, None] // Z_HEADS) * stride_z_row + (rows[:, None] % Z_HEADS) * stride_z_head
+                      + col_offsets)
+        else:
+            Z_base = Z + rows[:, None] * stride_z_row + col_offsets
         z = tl.load(Z_base, mask=mask, other=0.0).to(tl.float32)
         if ACTIVATION == "swish" or ACTIVATION == "silu":
             x *= z * tl.sigmoid(z)
@@ -119,7 +125,11 @@ def _layer_norm_fwd_1pass_kernel(
     y = x_hat * w[None, :] + b[None, :] if HAS_BIAS else x_hat * w[None, :]
 
     if HAS_Z and NORM_BEFORE_GATE:
-        Z_base = Z + rows[:, None] * stride_z_row + col_offsets
+        if Z_HEADS > 0:
+            Z_base = (Z + (rows[:, None] // Z_HEADS) * stride_z_row + (rows[:, None] % Z_HEADS) * stride_z_head
+                      + col_offsets)
+        else:
+            Z_base = Z + rows[:, None] * stride_z_row + col_offsets
         z = tl.load(Z_base, mask=mask, other=0.0).to(tl.float32)
         if ACTIVATION == "swish" or ACTIVATION == "silu":
             y *= z * tl.sigmoid(z)
@@ -163,9 +173,14 @@ def _layer_norm_fwd(
     assert N % group_size == 0
     ngroups = N // group_size
     assert x.stride(-1) == 1
+    z_heads = 0
     if z is not None:
         assert z.stride(-1) == 1
-        assert z.shape == (M, N)
+        if z.dim() == 3:  # [T, heads, N] read in place (rows of x are (token, head) pairs)
+            assert z.shape[0] * z.shape[1] == M and z.shape[2] == N
+            z_heads = z.shape[1]
+        else:
+            assert z.shape == (M, N)
     assert weight.shape == (N,)
     assert weight.stride(-1) == 1
     if bias is not None:
@@ -209,6 +224,7 @@ def _layer_norm_fwd(
             x.stride(0),
             out.stride(0),
             z.stride(0) if z is not None else 0,
+            z.stride(1) if z is not None and z_heads else 0,
             M,
             group_size,
             eps,
@@ -220,6 +236,7 @@ def _layer_norm_fwd(
             IS_RMS_NORM=is_rms_norm,
             num_warps=num_warps,
             ACTIVATION=activation,
+            Z_HEADS=z_heads,
         )
     return out, mean, rstd
 
@@ -244,7 +261,10 @@ def rms_norm_gated(
     x = x.reshape(-1, x.shape[-1])
     if x.stride(-1) != 1:
         x = x.contiguous()
-    if z is not None:
+    if z is not None and z.dim() == 3 and len(x_shape_og) == 2 and z.shape[0] * z.shape[1] == x_shape_og[0] \
+            and z.stride(-1) == 1:
+        pass  # [T, heads, N] beside x [T * heads, N]: the kernel reads it in place
+    elif z is not None:
         assert z.shape == x_shape_og
         z = z.reshape(-1, z.shape[-1])
         if z.stride(-1) != 1:

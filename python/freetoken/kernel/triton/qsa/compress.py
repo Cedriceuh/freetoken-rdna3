@@ -122,6 +122,8 @@ def _index_norm_rope_kernel(
     BLOCK_R: tl.constexpr,
     BLOCK_D: tl.constexpr,
     HAS_DEST_ROWS: tl.constexpr,
+    stride_x_head=0,
+    X_BY_HEAD: tl.constexpr = False,
 ) -> None:
     rows = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
     live = rows < num_rows
@@ -134,7 +136,10 @@ def _index_norm_rope_kernel(
     partner = tl.where(dims < ROTARY_HALF, dims + ROTARY_HALF, dims - ROTARY_HALF)
     partner = tl.where(in_rotary, partner, dims)
 
-    base = x_ptr + rows[:, None].to(tl.int64) * stride_x_row
+    if X_BY_HEAD:  # x [tokens, HEADS, head_dim] read in place: row r is (token r // HEADS, head r % HEADS)
+        base = x_ptr + (rows[:, None] // HEADS).to(tl.int64) * stride_x_row + (rows[:, None] % HEADS) * stride_x_head
+    else:
+        base = x_ptr + rows[:, None].to(tl.int64) * stride_x_row
     mask = live[:, None] & in_dim[None, :]
     x = tl.load(base + dims[None, :], mask=mask, other=0.0).to(tl.float32)
     x_partner = tl.load(base + partner[None, :], mask=mask, other=0.0).to(tl.float32)
@@ -260,13 +265,24 @@ def qsa_index_norm_rope(
     heads: int = 1,
     dest_rows: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Zero-centered RMSNorm then partial NeoX rope on [rows, head_dim] indexer rows."""
+    """Zero-centered RMSNorm then partial NeoX rope on [rows, head_dim] indexer rows (or [tokens, heads, head_dim]
+    with any token / head strides, read in place)."""
 
-    rows, head_dim = x.shape
+    by_head = x.dim() == 3
+    if by_head:
+        if x.shape[1] != heads:
+            raise ValueError("QSA indexer x [tokens, heads, head_dim] must have `heads` heads")
+        stride_x_head = x.stride(1)
+        x_row_stride = x.stride(0)
+        rows, head_dim = x.shape[0] * heads, x.shape[2]
+        unit = x.stride(2) == 1
+    else:
+        rows, head_dim = x.shape
+        stride_x_head, x_row_stride, unit = 0, x.stride(0), x.stride(1) == 1
     rotary_dim = cos_sin_cache.shape[1]
     if rotary_dim % 2 or rotary_dim > head_dim:
         raise ValueError("QSA indexer rope needs an even rotary_dim <= head_dim")
-    if x.stride(1) != 1 or out.stride(1) != 1 or not cos_sin_cache.is_contiguous():
+    if not unit or out.stride(1) != 1 or not cos_sin_cache.is_contiguous():
         raise ValueError("QSA indexer norm+rope needs unit-stride rows")
     if rows % heads:
         raise ValueError("QSA indexer rows must be a whole number of head groups")
@@ -280,7 +296,7 @@ def qsa_index_norm_rope(
         norm_weight,
         out,
         dest_rows,
-        x.stride(0),
+        x_row_stride,
         out.stride(0),
         cos_sin_cache.stride(0),
         rows,
@@ -291,6 +307,8 @@ def qsa_index_norm_rope(
         BLOCK_R=block_r,
         BLOCK_D=triton.next_power_of_2(head_dim),
         HAS_DEST_ROWS=dest_rows is not None,
+        stride_x_head=stride_x_head,
+        X_BY_HEAD=by_head,
         num_warps=4,
     )
     return out

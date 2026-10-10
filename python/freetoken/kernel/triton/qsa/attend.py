@@ -5,9 +5,17 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 import triton
 import triton.language as tl
+
+# FREETOKEN_QSA_MIN_WARPS (default 4 on ROCm, 0 = the profile's own): the prefill profile's 2 warps hold the
+# [BLOCK_M, HEAD_DIM] accumulator and the K / V tiles in ~2.2 KB of scratch per lane on RDNA3 (head_dim 256); at 4
+# warps none spills: the same bits (each lane's sums keep their order), the kernel ~40 % faster at 1k-16k rows, and no
+# per-queue scratch (~60 MiB a queue on a 7900 XT) that the HIP runtime takes outside the torch allocator
+_MIN_WARPS = int(os.environ.get("FREETOKEN_QSA_MIN_WARPS", "4")) if torch.version.hip is not None else 0
 
 
 @triton.jit
@@ -314,6 +322,7 @@ def qsa_sparse_paged_attention(
         block_n, target_splits, partial_warps = 64, 4, 2
     else:
         block_n, target_splits, partial_warps = 64, 1, 2
+    partial_warps = max(partial_warps, _MIN_WARPS)
 
     # RDNA (gfx11 / gfx12) has 64 KiB of LDS per workgroup; the profile above was
     # tuned on GB300. The K tile [head_dim, BLOCK_N] and the V tile [BLOCK_N, head_dim] alone

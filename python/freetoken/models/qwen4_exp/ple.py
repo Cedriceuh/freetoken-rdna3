@@ -670,7 +670,10 @@ class PLELayer(BaseOP):
         batch: Batch,
         meta: PLEMetadata | None = None,
         conv_states: torch.Tensor | None = None,
+        add_into: bool = False,
     ) -> torch.Tensor:
+        """``D`` (see the class docstring); ``add_into``: return ``R`` with ``D`` added to it in place instead (the same
+        bits as ``R + D``), a long one-request prefill block by block without ``D`` itself."""
         pending, self._pending = self._pending, None
         row_ids = None
         if meta is None:
@@ -686,7 +689,10 @@ class PLELayer(BaseOP):
         embeddings = self.ple_embedding.lookup(row_ids).to(R.dtype)
         if (not meta.is_decode and R.shape[0] > PLE_CONV_BLOCK > 0
                 and self.state_len == (self.conv1d.weight.shape[-1] - 1) * self.dilation):
-            return self._forward_blocks(R, batch, meta, embeddings, conv_states)
+            if add_into and len(meta.seq_lens) == 1:
+                return self._forward_blocks_into(R, batch, meta, embeddings, conv_states)
+            out = self._forward_blocks(R, batch, meta, embeddings, conv_states)
+            return R.add_(out) if add_into else out
         key = self.norm_key.forward(self.key_proj.forward(embeddings))
         value = self.value_proj.forward(embeddings)
         query = self.norm_query.forward(R)
@@ -699,7 +705,8 @@ class PLELayer(BaseOP):
         fla = getattr(batch, "fla_metadata", None)
         if fla is not None and fla.track_boundary_row is not None:
             self._write_track_snapshot(states, x, fla)
-        return gated + self._short_conv(x, meta, states)
+        out = gated + self._short_conv(x, meta, states)
+        return R.add_(out) if add_into else out
 
     def _forward_blocks(self, R: torch.Tensor, batch: Batch, meta: PLEMetadata, embeddings: torch.Tensor,
                         conv_states: torch.Tensor | None) -> torch.Tensor:
@@ -749,6 +756,47 @@ class PLELayer(BaseOP):
         assert off == total, (off, total)
         states.index_copy_(0, meta.state_slots, torch.stack(new_states).to(states.dtype).contiguous())
         return gated
+
+    def _forward_blocks_into(self, R: torch.Tensor, batch: Batch, meta: PLEMetadata, embeddings: torch.Tensor,
+                             conv_states: torch.Tensor | None) -> torch.Tensor:
+        """_forward_blocks() for one request, each block's output added into ``R`` as soon as it is done: the same ops on
+        the same rows in the same blocks (the same bits as ``R + _forward_blocks(...)``), without the [T, hc_count *
+        hidden] ``gated`` (320 MiB at a 16k-token chunk, the prefill's peak once the hc combines run in place). The rows
+        the GDN track snapshot reads are copied aside before their block goes into ``R``."""
+        total = R.shape[0]
+        width = R.shape[1]
+        shape = (-1, self.hc_count, self.hidden_size)
+        value = self.value_proj.forward(embeddings)
+        states = conv_states if conv_states is not None else self._conv_state_slab(R)
+        fla = getattr(batch, "fla_metadata", None)
+        src = snap = None
+        if fla is not None and fla.track_boundary_row is not None:
+            src = (fla.track_boundary_row.unsqueeze(1) + torch.arange(-self.state_len, 0, device=R.device)).reshape(-1)
+            snap = R.new_zeros(src.numel(), width)
+        hist = self._read_state(meta, states, R.dtype)[0]  # [width, state_len]
+        for start in range(0, total, PLE_CONV_BLOCK):
+            end = min(start + PLE_CONV_BLOCK, total)
+            key = self.norm_key.forward(self.key_proj.forward(embeddings[start:end]))
+            query = self.norm_query.forward(R[start:end])
+            gate = (key.view(shape) * query.view(shape)).sum(-1, keepdim=True) / math.sqrt(self.hidden_size)
+            gate = torch.sigmoid(gate.sign() * gate.abs().clamp_min(1e-6).sqrt())
+            gated = (gate * value[start:end].unsqueeze(-2)).flatten(-2)
+            del key, query, gate
+            if snap is not None:
+                inside = ((src >= start) & (src < end)).unsqueeze(1)
+                snap = torch.where(inside, gated[(src - start).clamp(0, end - start - 1)], snap)
+            x = self.norm_conv.forward(gated)
+            h = torch.cat([hist, x.transpose(0, 1)], dim=1)
+            conv = F.conv1d(h.unsqueeze(0), self.conv1d.weight, groups=width, dilation=self.dilation).squeeze(0)
+            gated += F.silu(conv.transpose(0, 1))
+            hist = h[:, -self.state_len:]
+            R[start:end] += gated
+            del x, h, conv, gated
+        if snap is not None:
+            rows = self.norm_conv.forward(snap).view(*fla.track_boundary_row.shape, self.state_len, width)
+            states.index_copy_(0, fla.track_dst, rows.transpose(-1, -2).contiguous().to(states.dtype))
+        states.index_copy_(0, meta.state_slots, hist.unsqueeze(0).to(states.dtype).contiguous())
+        return R
 
     def _write_track_snapshot(self, states: torch.Tensor, x: torch.Tensor, fla) -> None:
         """Copy the conv history at the GDN track boundary into the same donatable slot, so a radix

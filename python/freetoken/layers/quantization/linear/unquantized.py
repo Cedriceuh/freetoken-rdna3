@@ -21,6 +21,15 @@ _GEMV_ROWS_MAX = max(1, int(os.environ.get("FREETOKEN_INT8_ROWS_MAX", "8")))
 class TorchLinearKernel(LinearKernel):
     name = "torch"
 
+    def finalize(self, layer: Any) -> None:
+        # arrival counters of the split-K GEMV's in-kernel reduce, allocated here: the first decode call is captured
+        w = getattr(layer, "weight", None)
+        if w is not None and w.is_cuda and w.dtype is torch.bfloat16 and getattr(layer, "bias", None) is None:
+            from freetoken.kernel.triton.dense_gemv import gemv_counters
+
+            cfg = _decode_gemv_config(w)
+            layer._gemv_counters = gemv_counters(w, cfg) if cfg is not None else None
+
     def apply(self, layer: Any, x: torch.Tensor) -> torch.Tensor:
         # an fp32 activation stream (DeepSeek-V4's compressors) upcasts the bf16 weight on the fly, as the reference does
         w, b = layer.weight, layer.bias
@@ -35,7 +44,7 @@ class TorchLinearKernel(LinearKernel):
             if cfg is not None:
                 from freetoken.kernel.triton.dense_gemv import gemv_bf16
 
-                return gemv_bf16(x, w, cfg)
+                return gemv_bf16(x, w, cfg, counters=getattr(layer, "_gemv_counters", None))
         return F.linear(x, w, b)
 
 

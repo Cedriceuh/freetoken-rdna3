@@ -24,6 +24,12 @@ COMPILER_MODE = os.getenv("FLA_COMPILER_MODE") == "1"
 FLA_CI_ENV = os.getenv("FLA_CI_ENV") == "1"
 FLA_CACHE_RESULTS = os.getenv("FLA_CACHE_RESULTS", "1") == "1"
 
+# FREETOKEN_GDN_PREFILL_WARPS (default 8 on ROCm, 0 = upstream's launch): the warps of two GDN prefill kernels,
+# chunk_delta_h's state recurrence (upstream 4) and wy_fast's recompute_w_u (upstream 4, 3 stages; 1 stage here). At
+# upstream's they spill 484 and 796 B of scratch per lane on RDNA3; at 8 the same bits, a 16k-token GDN prefill 37 %
+# faster on a 7900 XT, and half the scratch the HIP runtime takes outside the torch allocator (101 -> 48 MiB a queue)
+GDN_PREFILL_WARPS = int(os.getenv("FREETOKEN_GDN_PREFILL_WARPS", "8")) if torch.version.hip is not None else 0
+
 
 SUPPORTS_AUTOTUNE_CACHE = (
     "cache_results" in inspect.signature(triton.autotune).parameters

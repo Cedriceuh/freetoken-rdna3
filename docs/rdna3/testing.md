@@ -23,8 +23,8 @@ slower (one-time kernel preparation): run it twice.
 docker run --rm -w /opt/FreeToken --entrypoint python3 freetoken-rdna3:latest -m pytest -q -p no:cacheprovider tests
 ```
 
-About 2.5 minutes (152 s on the reference machine), no GPU needed, on the tree the image was built from: 1541 passed,
-579 skipped and 3 failures that come from the environment (they need flashinfer, an NVIDIA-only package) and fail the
+About 2.5 minutes (139 s on the reference machine), no GPU needed, on the tree the image was built from: 1553 passed,
+624 skipped and 3 failures that come from the environment (they need flashinfer, an NVIDIA-only package) and fail the
 same way on upstream
 (`test_cache_budget.py::test_adjust_config_defaults_moe_cache_auto_for_auto_resolved_offload_backend`,
 `test_cache_budget.py::test_adjust_config_resolves_num_tokens_generic`,
@@ -36,8 +36,7 @@ compiled CPU extension lives in the image's tree, not in yours.
 
 ## GPU checks (`rdna3/tests/`)
 
-Each is a standalone script run inside the image with one or two GPUs (on a two-card machine, prefer the card that
-does not drive your display: a faulting kernel resets its card), e.g.
+Each is a standalone script run inside the image with one or two GPUs, e.g.
 
 ```bash
 docker run --rm --device=/dev/kfd --device=/dev/dri --security-opt seccomp=unconfined --ipc=host \

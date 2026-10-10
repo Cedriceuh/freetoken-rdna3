@@ -4,6 +4,8 @@ FT_STATS_EVERY=N   every N graph-replayed decode steps, log the host step period
                    (CUDA events) and, with FT_MOE_STATS=1, the MoE offload cache decode miss counters.
 FT_PROF_STEPS=N    torch.profiler window over N decode steps starting at decode step FT_PROF_START; per-rank kernel
 FT_PROF_START=S    and op tables plus a chrome trace are written to FT_PROF_DIR (default ./ftprof, created if missing).
+FT_PROF_STACK=1    with FT_PROF_STEPS: also record Python stacks and input shapes (ops_by_stack / ops_by_shape tables;
+                   the chrome trace then ties each kernel to the line that launched it)
 FT_PROF_EAGER=1    also count eager decode steps (run with --cuda-graph-max-bs 0): ROCm's torch.profiler does not see
                    the kernels inside a replayed graph, so a per-kernel breakdown needs eager decode (kernel device
                    times are the same; only the launch gaps between them differ).
@@ -50,7 +52,9 @@ class DecodeProfiler:
         self.cur = (e0, e1)
         if self.prof_steps and self.n == self.prof_start and self.prof is None:
             self.prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
-                                                           torch.profiler.ProfilerActivity.CUDA])
+                                                           torch.profiler.ProfilerActivity.CUDA],
+                                               with_stack=os.environ.get("FT_PROF_STACK") == "1",
+                                               record_shapes=os.environ.get("FT_PROF_STACK") == "1")
             self.prof.__enter__()
             logger.warning(f"[ftprof] rank {get_tp_info().rank}: torch.profiler started at decode step {self.n}")
 
@@ -73,6 +77,15 @@ class DecodeProfiler:
                 f.write(ka.table(sort_by="self_device_time_total", row_limit=80, max_name_column_width=110))
             with open(f"{self.out}/rank{rank}_ops_by_cpu_time.txt", "w") as f:
                 f.write(ka.table(sort_by="self_cpu_time_total", row_limit=50, max_name_column_width=110))
+            if os.environ.get("FT_PROF_STACK") == "1":
+                with open(f"{self.out}/rank{rank}_ops_by_stack.txt", "w") as f:
+                    f.write(self.prof.key_averages(group_by_stack_n=8).table(
+                        sort_by="self_device_time_total", row_limit=120, max_name_column_width=60,
+                        max_src_column_width=200))
+                with open(f"{self.out}/rank{rank}_ops_by_shape.txt", "w") as f:
+                    f.write(self.prof.key_averages(group_by_input_shape=True).table(
+                        sort_by="device_time_total", row_limit=150, max_name_column_width=60,
+                        max_shapes_column_width=80))
             self.prof.export_chrome_trace(f"{self.out}/rank{rank}_trace.json")
             logger.warning(f"[ftprof] rank {rank}: profile of {self.prof_steps} decode steps written to {self.out}")
             self.prof = "done"

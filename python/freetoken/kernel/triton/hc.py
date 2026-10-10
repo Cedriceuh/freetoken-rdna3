@@ -245,6 +245,7 @@ def hc_combine(
     block_output: torch.Tensor,
     injection_logits: torch.Tensor,
     hc_count: int,
+    inplace: bool = False,
 ) -> torch.Tensor:
     N, DIM = residual.shape
     assert DIM % hc_count == 0
@@ -255,7 +256,8 @@ def hc_combine(
     assert block_output.stride(1) == 1
     assert injection_logits.stride(1) == 1
 
-    out = residual.new_empty(residual.shape)
+    # inplace: each program reads its residual elements before writing the same ones, so the output may alias it
+    out = residual if inplace else residual.new_empty(residual.shape)
     BLOCK_SIZE = 512
     _hc_combine_kernel[(N, triton.cdiv(hc_dim, BLOCK_SIZE))](
         block_output,
@@ -435,14 +437,16 @@ def hc_combine_rmsnorm(
     norm_weight: torch.Tensor,
     eps: float,
     hc_count: int,
+    inplace: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """``hc_combine`` and the next ``grouped_gemma_rmsnorm`` in one launch, bit for bit; returns (combined, normed)."""
+    """``hc_combine`` and the next ``grouped_gemma_rmsnorm`` in one launch, bit for bit; returns (combined, normed).
+    ``inplace``: the combined streams overwrite ``residual`` (each program reads its slice before writing it)."""
     N, DIM = residual.shape
     hc_dim = DIM // hc_count
     assert DIM % hc_count == 0 and block_output.shape == (N, hc_dim) and injection_logits.shape == (N, hc_count)
     assert residual.stride(1) == 1 and block_output.stride(1) == 1 and injection_logits.stride(1) == 1
     assert norm_weight.is_contiguous() and norm_weight.numel() in (hc_dim, DIM)
-    out = residual.new_empty(residual.shape)
+    out = residual if inplace else residual.new_empty(residual.shape)
     y = residual.new_empty(residual.shape)
     _hc_combine_rmsnorm_kernel[(N * hc_count,)](
         block_output, residual, injection_logits, norm_weight, out, y,

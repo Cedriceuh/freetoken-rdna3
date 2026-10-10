@@ -8,11 +8,11 @@ From a fresh Linux machine to an OpenAI-compatible endpoint serving Qwen3.8-Flas
 |---|---|---|
 | GPUs | RX 7900 XTX 24 GB + RX 7900 XT 20 GB | one RX 7900 XTX 24 GB or RX 7900 XT 20 GB |
 | System RAM (NVFP4; EXL3 3.05 / 4.05 bpw) | 82 GiB used while serving: **128 GB** machine (59 / 74 GiB) | 72 GiB used: **96 GB** is tight, 128 GB comfortable (51 / 65 GiB) |
-| Disk | 135 GB for the NVFP4 model (85 / 108 GB in EXL3 3.05 / 4.05 bpw), ~33 GB for the image (its ROCm 10 base included), ~29 GB more while building | same |
+| Disk | 135 GB for the NVFP4 model (85 / 108 GB in EXL3 3.05 / 4.05 bpw), ~27 GB for the image (its ROCm 10.1 base included), ~29 GB more while building | same |
 | Software | Linux x86_64 with the in-kernel `amdgpu` driver (`/dev/kfd` present), Docker | same |
 | Tested on | Ubuntu 26.04 LTS, kernel 7.0 (older kernels untested) | same |
 
-The ROCm user space (10.0), PyTorch and Triton are inside the image: nothing ROCm-related has to be installed on the
+The ROCm user space (10.1), PyTorch and Triton are inside the image: nothing ROCm-related has to be installed on the
 host. Your user must be allowed to run Docker and be in the `video` and `render` groups. Why so much RAM, and what to
 do with less: [limits.md](limits.md). Two host settings avoid pauses of several seconds (memory compaction kept off
 the engine's locked memory, the `COMPUTE` power profile): [troubleshooting.md](troubleshooting.md#long-pauses-in-the-middle-of-a-run).
@@ -25,8 +25,8 @@ docker build -f Dockerfile.rdna3 -t freetoken-rdna3:latest .
 ```
 
 Build from a git clone, not from a downloaded archive: the build records the commit it was made from
-(`/opt/FreeToken-BUILD-PROVENANCE.txt` in the image) and fails without `.git`. The first build pulls the ROCm 10.0 PyTorch
-image (31 GB, pinned by digest); after that a rebuild takes a couple of minutes. `--build-arg GPU_ARCH=gfx1100`
+(`/opt/FreeToken-BUILD-PROVENANCE.txt` in the image) and fails without `.git`. The first build pulls the ROCm 10.1 PyTorch
+image (25 GB, pinned by digest); after that a rebuild takes a couple of minutes. `--build-arg GPU_ARCH=gfx1100`
 is the default and the only architecture tested. Do not use `install.sh` or `scripts/`: they install and build
 upstream's NVIDIA / CUDA wheels.
 

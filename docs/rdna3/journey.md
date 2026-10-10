@@ -1,6 +1,6 @@
 # The journey
 
-How this build came about: measured experiments from 2026-09-25 to 2026-10-05 on one machine, an RX 7900
+How this build came about: measured experiments from 2026-09-25 to 2026-10-07 on one machine, an RX 7900
 XTX 24 GB + RX 7900 XT 20 GB (gfx1100, no GPU peer-to-peer), a Threadripper 3970X and 128 GB of DDR4, serving
 Qwen3.8-Flash-Next NVFP4 to the author's coding agent (OpenCode) with a ~250k-token context (262k until 2026-10-03). Every number was measured
 on that machine (changes in interleaved A/B runs), except the few marked as estimates. The choices and their
@@ -18,8 +18,6 @@ trade-offs are summed up in [decisions.md](decisions.md).
 - **Microbenchmarks mislead twice**: weights stay hot in the 80-96 MB Infinity Cache, and the kernel mix differs from a
   real step. Only the full model decides.
 - **Short fidelity tests are not enough** (section 8): an agentic, multi-turn benchmark is the referee.
-- **Never run a kernel that may fault on the GPU driving your monitor**: a hard fault resets the card and takes the
-  desktop session with it.
 
 ## 1. Starting point: FreeToken on two unequal cards
 
@@ -350,16 +348,140 @@ host settings: [troubleshooting.md](troubleshooting.md#long-pauses-in-the-middle
   against the one before, sessions interleaved (A B A B, greedy, with the head): NVFP4 83.0 / 83.2 -> 85.6 / 85.7 tok/s,
   EXL3 4.05 bpw 81.5 -> 83.4, the same answers.
 
-## 20. Still open
+## 20. ROCm 10.1, and fewer copies (2026-10-07)
+
+- **ROCm 10.1** (released 2026-10-05: HIP 7.16, RCCL 2.30.7, PyTorch 2.12-2.14 images; its notes list nothing for
+  gfx1100). The image builds on `rocm10.1.0_ubuntu24.04_py3.12_pytorch_release_2.13.0` with two changes: that base has
+  no virtual environment (the system Python, `python3` only) and no git. Against the ROCm 10.0 image, the same code,
+  sessions interleaved (`xtx-xt`, MTP head, greedy, 12 prompts of 512 tokens):
+  - NVFP4: the same answers (12 of 12); decode 0.5 % slower on every prompt (83.0 against 83.5 tok/s); prompts read
+    1.5-2 % slower (a 6.2k-token prompt 1895 against 1937 tok/s, 25k 1940 against 1969).
+  - EXL3: other answers (0 of 12 the same; each build agrees with itself). At load the dense EXL3 weights are rebuilt
+    with two fp32 Hadamard products in torch (`models/exl3_weights.py`), and 10.1's BLAS picks another kernel for the
+    batched left one: 45 % of its fp32 outputs differ, 0.02-0.03 % of the bf16 weights by one unit in the last place.
+    The Triton dequantization and the bf16 products give the same bits. Prompts 1.5-2 % slower, as with NVFP4.
+  - Its Triton (3.8.0+git669b31ac) still has the `tl.histogram` range bug of section 18.
+  - Adopted the next morning anyway (the newer stack is the one to be on): each component measured alone in both
+    images on the XT gave the same time on 10.1 (the bf16 prefill GEMMs at 4.7k-16k rows with either BLAS, the NVFP4
+    prefill MoE GEMMs, the QSA prefill attention, RCCL's all-reduce of a 16k chunk, kernel launches, pinned host-to-GPU
+    copies), so the 1.5-2 % on prompts could not be pinned on one; tonight's +2.3-2.9 % of decode more than covers it.
+    The EXL3 rebuild runs its two products in fp64 (`FREETOKEN_EXL3_RECON_FP64`, on): the bf16 weights are then the
+    same on 10.0 and 10.1 (0 of 39M differ in a check), so are the greedy answers (12 of 12), at the cost of a one-time
+    change from the fp32 rebuild. No BLAS setting reproduces 10.0's fp32 product on 10.1 (hipBLASLt changed its
+    batched kernel; rocBLAS sums in a third order).
+  - Profiling on 10.1 (rocprofv3 `--kernel-trace`, torch.profiler) hung RCCL's all-reduce of a prefill chunk on two
+    cards, twice out of two (60 s watchdog); the same load without a profiler ran normally, and 10.0 profiled fine.
+  - With PyTorch 2.14 (offered with 10.1; it needs C++20, the C++ extensions now build with `-std=c++20`): greedy
+    answers identical to PyTorch 2.13 on 10.1 (NVFP4 and EXL3, 12 of 12), the same decode and prompt reading
+    (NVFP4 84.9 tok/s, a 6.2k-token prompt at 1903 against 1896 tok/s). The image uses it.
+- **Fewer copies.** A profile tied to the lines that launch each kernel (`FT_PROF_STACK=1`) showed ~110 small copies
+  and elementwise kernels per verify step of the MTP head (q, the output gate, k, v, the GDN gate z, the indexer's q and
+  k made contiguous; the gate's sigmoid and product) and the router's 48 split-K reduces. The norms and the indexer
+  kernels now read the projections' outputs through their strides, the gate is applied in one kernel, and the router
+  GEMV's last program sums the partials (`FREETOKEN_FEWER_COPIES`, `FREETOKEN_GEMV_LAST_REDUCES`): the same
+  arithmetic, the same bits. In a graph, an attention block's part went from 22.3 to 11.8 µs at one row and from 26.0
+  to 11.9 at four. On the server (interleaved, the same 12 answers): NVFP4 83.2 -> 85.1-85.2 tok/s, EXL3 3.05 bpw
+  99.1 -> 101.9-102.0, the GPU time of the same decode steps 2.6-3.3 % lower; prompt reading unchanged, VRAM peaks
+  ~100 MiB lower.
+- **Where a verify step goes** (NVFP4, `xtx-xt`, MTP head, four rows; a kernel trace of captured steps with
+  `rocprofv3 --kernel-trace`, which sees graph replays: started with `-P` after the load, the rank processes stopped
+  with SIGTERM so they write their trace; the packaged `rocprofv3 --attach` lacks its helper on 10.0 and 10.1): ~2000
+  kernels per step; the copies of the missing experts 30-35 % of the kernel time (rank 0 11.9 ms, rank 1 9.7 ms, under
+  the profiler), the int8 GEMVs ~7.5 ms, the NVFP4 expert GEMVs 3.9 ms, the host all-reduce 2.2-2.9 ms, the kernels
+  under 6 µs ~1000 per step for 2.9 ms. Without the profiler (`FT_MOE_STATS`, a long greedy answer): 20-25 experts per
+  layer per step, 1.5-4 of them missing (7-17 %), and each extra miss per layer adds ~3.5 ms to a step (23 ms at 1.5,
+  31.6 ms at 4). Four rows route to ~2.4x the experts of one, so misses weigh far more with the MTP head than the
+  ~1 ms per token measured without it.
+- **Expert-cache policies, replayed offline** on a recorded routing sequence (67,828 MoE calls of three answers,
+  6979 slots as served): the engine's LRU 3.67 misses per call (15.3 %); a decaying-frequency policy -8 to -9 % with a
+  12-16 step half-life but -1 % at 24 steps and +13 % at 32; segmented LRU (2Q) -1 %; the offline optimum (Belady)
+  -56 %. Not implemented: ~2 % of decode at best, and tuned to one trace. What would move misses is more cache, smaller
+  experts (EXL3 3.05 bpw moves ~2/3 of NVFP4's bytes per miss: 3.05 against 4.5 bits per weight) or copies that
+  overlap compute.
+- **KFD evictions at start.** The ~1 s per GPU queue that `evicted_ms` shows after a start (4.5 s summed over the
+  four queues, EXL3 3.05 bpw) all happen 10-23 s into the weight load, while the expert banks are registered with the
+  GPU, and not once while serving (unchanged through a whole agent run and depth sweep). Locking the process memory
+  before the load instead of after it did not remove them (6.5 s).
+- **Dropped:** the router reading the GEMV's fp32 partial sums itself. The experts chosen were the same, their
+  weights not always: the partial sums load 4 values per lane where the bf16 logits load 8, Triton lays the tile out
+  differently, and the softmax adds its terms in another order.
+- **Method.** `--moe-cache-auto` sizes the expert cache from the VRAM free at start: a GPU test run on a card while
+  another server loaded shrank that server's cache (6732 against 6979 slots) and its speed. And a source tree mounted
+  into a server must not change during a series (two sessions picked up an unfinished change).
+
+## 21. Prefill peaks, spills and the VRAM outside torch (2026-10-07)
+
+- **Why.** Expert misses are a third of a verify step (section 20) and the cache is what VRAM leaves: `--memory-ratio`
+  0.80 -> 0.83 on `xtx-xt` gives 7487 slots instead of 6977 and +3.8 % decode (85.1 -> 88.3 tok/s, the same answers).
+  The first worst-case run at 0.83 (two agents growing to ~150k tokens, one's prefill chunks between the other's decode
+  steps) ended in a `[gfxhub] page fault` on the 7900 XT, the card at 20420 of 20464 MiB, like the earlier faults and
+  the hung all-gather of [troubleshooting.md](troubleshooting.md#a-gpu-fault-or-a-hung-collective-with-a-full-card).
+- **The cap.** `FREETOKEN_VRAM_MARGIN_MIB` (512 on ROCm) caps the torch allocator once the engine is built, at the
+  card's VRAM minus what lives outside torch then minus 512 MiB. The same run at 0.83 then stopped on a plain
+  out-of-memory error instead of a fault, and the error named the peak: the MTP head's pass over a 16k-token prefill
+  chunk.
+- **Prefill peaks, the same bits.** At a 16k-token chunk each `[T, 5 x hidden]` tensor of the hyper-connection streams
+  is 320 MiB:
+  - the hc combines write over their input (`FREETOKEN_HC_INPLACE`): -312 MiB on the XT;
+  - the GDN delta rule runs 4096 tokens of a request at a time (`FREETOKEN_GDN_PREFILL_BLOCK`): -289 to -327 MiB on
+    the XT, -893 on the XTX;
+  - the PLE output is added to the streams block by block for one request;
+  - the MTP head frees the prompt's streams and their normed copy once read, and adds the embedding in place (two of
+    five such tensors at its pass).
+
+  At 0.83 the XT's allocated peak over the worst-case run is 18545 MiB, against a cap of 18989.
+- **Outside torch**: ~1 GiB per card at start (962 MiB on the XT), +200-250 MiB while serving:
+  - each Triton kernel module the HIP runtime loads takes 2 MiB of VRAM (20 trivial kernels: +40 MiB), whatever its
+    size; no runtime setting changes it;
+  - the scratch of kernels that spill registers, per GPU queue (the QSA prefill attention: 62 MiB, a 16k-token GDN
+    prefill: 101 MiB);
+  - RCCL: ~8 MiB (no P2P between these two cards, it goes through the host).
+- **Spills.** The QSA sparse attention's prefill profile (tuned on GB300) runs 2 warps: on RDNA3 at head_dim 256 that
+  is ~2.2 KB of scratch per lane. At 4 warps (`FREETOKEN_QSA_MIN_WARPS`) it spills nothing and gives the same bits (8
+  shapes of 128-16k rows), 39-45 % faster. Two GDN prefill kernels spilled 484 and 796 B per lane at 4 warps; at 8
+  (`FREETOKEN_GDN_PREFILL_WARPS`) the same bits, a 16k-token GDN prefill 8.56 -> 5.43 ms. Server, sessions at 0.83:
+  prompt reading +2.6 to +3.5 % at each of 10 depths from 8.8k to 248k tokens, decode unchanged.
+- **The copies of the missing experts already run at the bus's speed** (both cards on PCIe 4.0 x16 to the CPU): the
+  shader copy from pinned RAM moves 26-28 GB/s from two experts on (20 GB/s for one), whatever its grid (8 to 64
+  blocks of 256-1024 threads per bank); DMA copies, one `hipMemcpyAsync` per expert and bank, 15.6 GB/s. Only fewer
+  misses (a bigger cache) or smaller experts make them cheaper.
+- **The desktop decides, so the ratio stays 0.80.** The 7900 XTX drives the display, and the desktop's buffers on it do
+  not show in the free memory HIP reports (sysfs `mem_info_vram_used` counts them; the cap reads it): 0.66 GiB at
+  noon, 1.4-1.8 GiB later the same day with the desktop in use. The runs above had the light desktop. Through the
+  launcher with the desktop in use:
+  - 0.83 (7487 slots): the worst-case workload clean, but the XTX at most 107 MiB from full and the XT 62 MiB (a first
+    start after a new image loads every autotune candidate's kernel module);
+  - 0.81 (7147 slots, decode +1-2 %): the XTX 273 MiB from full;
+  - 0.80 (6977 slots, as before): both cards ~970 MiB from full at worst (the desktop at 1.43 GiB), the same 12
+    greedy answers, the workload clean.
+
+  Each 0.01 of ratio is ~170 expert slots, ~260 MiB on the XTX and ~210 on the XT. Without today's reductions (~0.9
+  GiB on the XTX), 0.80 would have left the XTX within ~0.1 GiB of full with a desktop that size, which fits the faults
+  seen on it. The profiles keep 0.80, and the reductions are headroom. EXL3 3.05 bpw splits its experts 384 / 256, so
+  the XTX bounds it: at 0.83 it came within 56 MiB of full with the light desktop; it keeps 0.77, where the XTX stayed
+  531 MiB from full with the desktop at 1.5 GiB (the workload clean, the same answers).
+
+## 22. Still open
 
 - In NVFP4 the model needs ~63 GiB of RAM for its experts alone (the engine keeps every expert in RAM). The EXL3 3.05
   bpw checkpoint needs 42.6 GiB and served under a 56 GiB container limit, but a real 64 GB machine is untested
   ([limits.md](limits.md)).
 - Triton 3.8 is not bit-exact with the 3.7.1 the agentic benchmark last ran on (section 18): not run on it yet.
-- ROCm 10 / PyTorch 2.13, the image's base since 2026-10-02: its `F.linear`
-  changes its sums with the row count for some shapes ((3072, 256), (6656, 2560)): serving does not use it for them
-  (int8 or table GEMVs), but `test_qsa_spec_rows`' toy projections did, which made it fail on 3-4 rows; computed a row
-  at a time they pass (the test now does so).
+- ROCm 10 / PyTorch 2.13 and ROCm 10.1 / PyTorch 2.14 (rechecked 2026-10-10), the image's bases since 2026-10-02:
+  `F.linear` changes its sums with the row count for some shapes ((3072, 256), (6656, 2560)): serving does not use it
+  for them (int8 or table GEMVs), but `test_qsa_spec_rows`' toy projections did, which made it fail on 3-4 rows;
+  computed a row at a time they pass (the test now does so).
+- A rare GPU page fault (`[gfxhub] page fault`, permission fault, `sq_intr` errors): those while serving came with a
+  card within tens of MiB of full (section 21; the torch allocator is now capped 512 MiB short of that). One at start
+  on 2026-10-07, ~3 s after the CUDA graphs were captured, with 3.9 GiB free on the XTX (EXL3 3.05 bpw; 1 start in
+  ~32 that night, the 16 starts of a series after it were clean): cause not found.
+- Expert misses are 30-35 % of a decode step with the MTP head (section 20): the next lever for decode, not a
+  cache policy (an online one gains ~8 % of the misses at best on a recorded trace). More VRAM for the cache: ~170
+  loaded Triton kernel modules at 2 MiB each per card (section 21), and a desktop-aware plan for the card that drives
+  the display.
+- EXL3's dense weights are rebuilt at load in fp64 since 2026-10-07 (section 20): the same bits on ROCm 10.0 and 10.1,
+  a one-time change from the fp32 rebuild that the agentic benchmark has not run yet. The EXL3 profiles keep
+  `--memory-ratio` 0.77 / 0.76 on two cards (3.05 bpw at 0.77 measured in section 21; 4.05 bpw not again).
 - More than two GPUs, other RDNA3 cards, RDNA4 and NVIDIA are untested.
 - Image input (`serve.sh --vision`) is measured on `xtx-xt`, `xtx` and `xt` only. The derived profiles (`xtx-xtx`,
   `xt-xt`, `gre`) are untested with it, as they are without it.

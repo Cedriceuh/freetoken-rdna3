@@ -17,8 +17,6 @@ optimization.
   Document it in [docs/rdna3/options.md](docs/rdna3/options.md) with its measured effect.
 - **Report only what was run.** Never state a test or benchmark result that was not produced on real hardware in this
   session; say "untested" otherwise, as the `TESTED=0` profiles do.
-- **Do not run a kernel that may fault on the GPU that drives the user's monitor**: a hard fault resets the card and
-  closes the desktop session. Ask first, and use a card without a display (`HIP_VISIBLE_DEVICES`).
 - **Do not push, open pull requests or issues, or publish anything on the user's behalf.** The human owns every line
   and must be able to explain it.
 - **No AI attribution lines** in commits (`Co-authored-by`, `Assisted-by`): the user is the author.
@@ -40,7 +38,7 @@ Dockerfile.rdna3       the ROCm image
 
 ## Development
 
-Everything runs in the image (ROCm 10.0, PyTorch 2.13, Triton 3.8). The command below tests the tree the image was built
+Everything runs in the image (ROCm 10.1, PyTorch 2.14, Triton 3.8). The command below tests the tree the image was built
 from; to test your working tree without rebuilding, mount it as [testing.md](docs/rdna3/testing.md#cpu-test-suite)
 shows:
 

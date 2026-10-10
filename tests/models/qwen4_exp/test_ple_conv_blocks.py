@@ -87,3 +87,37 @@ def test_blocked_forward_several_requests_matches_the_packed_forward(monkeypatch
     got = _forward(layer, R, _meta(sequences, contexts, slots=slots, fresh=[False, True, False, False]), got_states)
     assert torch.allclose(got, ref, rtol=1e-5, atol=1e-6)
     assert torch.allclose(got_states, ref_states, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("block", [4, 8, 13])
+@pytest.mark.parametrize("track", [False, True])
+def test_blocked_forward_added_in_place_is_bit_identical(monkeypatch, dtype, block, track):
+    """forward(add_into=True) for one long prefill request (each block added into R as it is done, no [T, width]
+    output) == R + forward(): same bits, same next conv state and same track snapshot."""
+    from .test_ple import _config, _make_layer, _meta
+
+    torch.manual_seed(24)
+    config = _config()
+    args = config.qwen4_args
+    layer = _make_layer(config, dtype=dtype)
+    tokens = list(range(3, 3 + 30))
+    R = torch.randn(len(tokens), args.ple_state_width, dtype=dtype)
+    fla = SimpleNamespace(track_boundary_row=torch.tensor([17]) if track else None, track_dst=torch.tensor([3]))
+    batch = SimpleNamespace(fla_metadata=fla)
+    initial = torch.zeros(4, args.ple_state_width, args.ple_conv_state_len, dtype=dtype)
+    initial[1] = torch.randn(args.ple_state_width, args.ple_conv_state_len, dtype=dtype) * 0.1
+    monkeypatch.setattr(ple, "PLE_CONV_BLOCK", block)
+    results = []
+    for add_into in (False, True):
+        states = initial.clone()
+        hidden = R.clone()
+        meta = _meta([tokens], [[21, 22]], slots=[1])
+        out = layer.forward(hidden, batch, meta=meta, conv_states=states, add_into=add_into)
+        results.append((R + out if not add_into else out, states))
+        if add_into:
+            assert out is hidden
+    (ref, ref_states), (got, got_states) = results
+    assert torch.equal(got, ref)
+    assert torch.equal(got_states, ref_states)
+    assert not track or ref_states[3].abs().sum() > 0

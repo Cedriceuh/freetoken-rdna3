@@ -8,6 +8,8 @@ here, then follows the family's usual sharding and fusion.
 
 from __future__ import annotations
 
+import os
+
 from typing import Callable, Iterator
 
 import torch
@@ -68,13 +70,16 @@ def reconstruct_weight(
         return out
     from freetoken.kernel.triton.exl3 import exl3_dequant
 
-    had = ex.hadamard_128(trellis.device)
-    su = suh.to(device=trellis.device, dtype=torch.float32).view(k, 1)
-    sv = svh.to(device=trellis.device, dtype=torch.float32)
+    # FREETOKEN_EXL3_RECON_FP64 (default 1): the two Hadamard products in fp64, so the bf16 weights do not depend on
+    # the fp32 GEMM kernel the BLAS picks (ROCm 10.1's hipBLASLt sums the batched left product in another order than 10.0)
+    acc = torch.float64 if os.environ.get("FREETOKEN_EXL3_RECON_FP64", "1") == "1" else torch.float32
+    had = ex.hadamard_128(trellis.device, dtype=acc)
+    su = suh.to(device=trellis.device, dtype=acc).view(k, 1)
+    sv = svh.to(device=trellis.device, dtype=acc)
     for b0 in range(0, B, step):
         b1 = min(b0 + step, B)
         cols = (b1 - b0) * 16
-        w = exl3_dequant(trellis[:, b0:b1].contiguous(), codebook).float()
+        w = exl3_dequant(trellis[:, b0:b1].contiguous(), codebook).to(acc)
         w = (had @ w.view(k // ex.HAD_DIM, ex.HAD_DIM, cols)).view(k, cols) * su
         w = (w.view(k, cols // ex.HAD_DIM, ex.HAD_DIM) @ had).view(k, cols) * sv[b0 * 16:b1 * 16]
         out[b0 * 16:b1 * 16] = w.T.to(dtype)

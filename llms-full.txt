@@ -127,7 +127,7 @@ For LLM agents: [`llms.txt`](llms.txt) indexes everything, [`AGENTS.md`](AGENTS.
 
 ## Status
 
-Tested on one machine: RX 7900 XTX + RX 7900 XT (gfx1100), Threadripper 3970X, 128 GB DDR4, ROCm 10.0 in the
+Tested on one machine: RX 7900 XTX + RX 7900 XT (gfx1100), Threadripper 3970X, 128 GB DDR4, ROCm 10.1 in the
 container. Other RDNA3 cards, RDNA4, more than two GPUs and NVIDIA are untested ([limits](docs/rdna3/limits.md)).
 Reports from other setups are very welcome.
 
@@ -153,11 +153,11 @@ From a fresh Linux machine to an OpenAI-compatible endpoint serving Qwen3.8-Flas
 |---|---|---|
 | GPUs | RX 7900 XTX 24 GB + RX 7900 XT 20 GB | one RX 7900 XTX 24 GB or RX 7900 XT 20 GB |
 | System RAM (NVFP4; EXL3 3.05 / 4.05 bpw) | 82 GiB used while serving: **128 GB** machine (59 / 74 GiB) | 72 GiB used: **96 GB** is tight, 128 GB comfortable (51 / 65 GiB) |
-| Disk | 135 GB for the NVFP4 model (85 / 108 GB in EXL3 3.05 / 4.05 bpw), ~33 GB for the image (its ROCm 10 base included), ~29 GB more while building | same |
+| Disk | 135 GB for the NVFP4 model (85 / 108 GB in EXL3 3.05 / 4.05 bpw), ~27 GB for the image (its ROCm 10.1 base included), ~29 GB more while building | same |
 | Software | Linux x86_64 with the in-kernel `amdgpu` driver (`/dev/kfd` present), Docker | same |
 | Tested on | Ubuntu 26.04 LTS, kernel 7.0 (older kernels untested) | same |
 
-The ROCm user space (10.0), PyTorch and Triton are inside the image: nothing ROCm-related has to be installed on the
+The ROCm user space (10.1), PyTorch and Triton are inside the image: nothing ROCm-related has to be installed on the
 host. Your user must be allowed to run Docker and be in the `video` and `render` groups. Why so much RAM, and what to
 do with less: [limits.md](limits.md). Two host settings avoid pauses of several seconds (memory compaction kept off
 the engine's locked memory, the `COMPUTE` power profile): [troubleshooting.md](troubleshooting.md#long-pauses-in-the-middle-of-a-run).
@@ -170,8 +170,8 @@ docker build -f Dockerfile.rdna3 -t freetoken-rdna3:latest .
 ```
 
 Build from a git clone, not from a downloaded archive: the build records the commit it was made from
-(`/opt/FreeToken-BUILD-PROVENANCE.txt` in the image) and fails without `.git`. The first build pulls the ROCm 10.0 PyTorch
-image (31 GB, pinned by digest); after that a rebuild takes a couple of minutes. `--build-arg GPU_ARCH=gfx1100`
+(`/opt/FreeToken-BUILD-PROVENANCE.txt` in the image) and fails without `.git`. The first build pulls the ROCm 10.1 PyTorch
+image (25 GB, pinned by digest); after that a rebuild takes a couple of minutes. `--build-arg GPU_ARCH=gfx1100`
 is the default and the only architecture tested. Do not use `install.sh` or `scripts/`: they install and build
 upstream's NVIDIA / CUDA wheels.
 
@@ -504,6 +504,7 @@ disagreements over ~8k sampled tokens in `check` mode). It is on the torch.distr
 | `FREETOKEN_INT8_ROW_GROUPS` | `1` | With several rows (a speculative verify step, or requests decoding together), the int8 GEMVs whose input is longer than one tile (hyper-connection down projections, shared expert gate/up, index projection, LM head) read each weight tile once for up to 4 rows instead of once per row; same arithmetic per row, bit-exact. At 4 rows on the XT: HC down 17.7 -> 12.1 µs, LM head 704 -> 499 µs. `0`: each program runs the rows one after the other, reloading the tile for each. |
 | `FREETOKEN_MOE_COPY_OVERLAP` | unset | `1`: in decode, the copy of the missing experts goes to a side stream ahead of the shared expert and its gate; the expert GEMVs wait for it (offload backend, GPU decode, Qwen3.8-Flash-Next). Bit-exact, but slower: measured end to end on 2026-10-03 (one request, agent turns at 77-99k of context, MTP head on), 47.5 tok/s decode against 71.1 without it (-33 %; 48.9 with `expandable_segments:False`) and cold reads 13 % longer. At short context it does save ~0.5 ms a step (GPU time, as measured before), but in the MTP verify steps at 77-88k of context the forward's GPU time grows from 30-35 to 40-48 ms with the same expert misses (cause not found). Leave it off. |
 | `FREETOKEN_TRITON_GEMV` | `1` on gfx11 | Split-K Triton GEMVs for the bf16 decode shapes of RDNA3 (other GPUs: off). +3.5 % decode on the bf16 build; with `FREETOKEN_INT8_DENSE=1` only the routers are still bf16 and use it. Reorders sums (split-K), *agent-validated*. |
+| `FREETOKEN_GEMV_LAST_REDUCES` | `1` | For a bf16 Triton GEMV split over K (the MoE router: 4 splits), the last of a tile's programs to finish sums the partial results (element by element, in split order, as the separate reduce kernel did) instead of a second launch; an atomic counter per tile, reset by that program. **Bit-exact**, 48 launches fewer per decode step; measured together with `FREETOKEN_FEWER_COPIES` below. `0`: the reduce kernel. |
 
 ## Experts (MoE)
 
@@ -524,6 +525,12 @@ disagreements over ~8k sampled tokens in `check` mode). It is on the torch.distr
 | `FREETOKEN_PLE_CONV_BLOCK` | `4096` | The per-layer-embedding (PLE) convolution runs 4096 tokens at a time, for one or several requests. Keeps big prefill chunks and batched prefills within memory (3 requests prefilled together, 16k tokens, needed 2.6 GiB of temporaries, now 0.7 GiB). Reorders sums; *agent-validated* for one request, identical to the unblocked path in a GPU check with several. |
 | `FREETOKEN_FUSED_MOE_EPILOGUE` | `1` | The routed experts' sum, the shared expert's gate (a dot product and a sigmoid) and the mul-add of each MoE block in one kernel instead of three; the NVFP4 decode hands over its per-expert outputs. Same arithmetic in the same order on the same tiles: **bit-exact**. Only Triton NVFP4 / EXL3 experts on the GPU decode path, at TP=1 or with `FREETOKEN_FUSE_MOE_ALLREDUCE=1` (the bf16 kernel overwrites its input; hybrid and CPU layers add partial sums; without the block's single all-reduce the experts would reduce each expert's output): others keep the three kernels. NVFP4 `xtx-xt`, greedy decode without the MTP head: 57.8 -> 59.2 tok/s alone, with the MTP head 82.9 -> 83.8. `0`: three kernels. |
 | `FREETOKEN_FUSED_HC_NORM` | `1` | Each hyper-connection combine and the grouped RMSNorm that reads the streams next (the MLP block's, the next layer's, the final mixer's; not into a PLE layer) in one kernel, the normed streams freed as soon as read. **Bit-exact**, two launches fewer per layer. With the epilogue above, `xtx-xt` greedy decode: NVFP4 57.8 -> 59.8-60.0 tok/s (82.9 -> 85.6 with the MTP head), EXL3 3.05 bpw 58.4 -> 59.7 (86.4 -> 89.2), 4.05 bpw 55.3 -> 56.5 (81.6 -> 83.3); prompt reading and VRAM peaks unchanged ([journey.md](journey.md#19-fewer-decode-kernels-2026-10-06)). `0`: separate kernels. |
+| `FREETOKEN_FEWER_COPIES` | `1` on ROCm, `0` elsewhere | Decode and prefill read the attention's q / k, its output gate, the GDN gate z and the QSA indexer's q / k where the projections wrote them, instead of copying each to a contiguous tensor first: the norms and the indexer kernels take the row / head strides, and the gate is applied in one kernel (`o * sigmoid(gate)`, the sigmoid rounded to bf16 as torch does: identical on all 65280 finite bf16 inputs). **Bit-exact** (GPU tests on both cards, `tests/kernels/test_fewer_copies.py`); up to ~110 launches fewer per verify step of the MTP head, fewer prefill temporaries. With `FREETOKEN_GEMV_LAST_REDUCES`, `xtx-xt` greedy with the MTP head (2026-10-07, sessions interleaved, 12 prompts identical): NVFP4 83.2 -> 85.1-85.2 tok/s (GPU time per step -2.6 to -2.8 %), EXL3 3.05 bpw 99.1 -> 101.9-102.0 (-2.9 to -3.3 %); prompt reading unchanged; VRAM peak ~100 MiB lower on each card (NVFP4). Off by default on NVIDIA: flashinfer's `gemma_rmsnorm` takes 2D inputs only, and the bits were checked on ROCm's Triton only. `0`: the copies. |
+| `FREETOKEN_EXL3_RECON_FP64` | `1` | EXL3 checkpoints: the two Hadamard products that rebuild the dense weights at load run in fp64 instead of fp32, so the bf16 weights do not depend on the GEMM kernel the BLAS picks (ROCm 10.1's hipBLASLt changed the batched one: other EXL3 answers than 10.0 with fp32). Same weights on 10.0 and 10.1; differs from the fp32 rebuild in 0.02-0.03 % of the weights (one unit in the last place). Load time unchanged. `0`: fp32. |
+| `FREETOKEN_HC_INPLACE` | `1` | Each hyper-connection combine writes the new streams over the old ones, and the PLE output is added to the streams in place (a long one-request prefill adds it block by block, without the PLE's own output tensor). The same sums, the same bits; each [T, 5 x hidden] tensor avoided is 320 MiB at a 16k-token chunk. `0`: new tensors, as upstream. |
+| `FREETOKEN_GDN_PREFILL_BLOCK` | `4096` | The GatedDeltaNet delta rule of a prefill runs 4096 tokens of each request at a time, the recurrent state carried through the request's pool slot (a multiple of 64; `0`: the whole chunk in one call). The same bits (the kernels work per 64-token chunk with an fp32 state); a quarter of the temporaries at a 16k-token chunk. |
+| `FREETOKEN_GDN_PREFILL_WARPS` | `8` on ROCm | Warps of two GatedDeltaNet prefill kernels (the state recurrence of `chunk_delta_h`, upstream 4; `recompute_w_u`, upstream 4 warps and 3 stages, here 1 stage). At upstream's they spill 484 and 796 B per lane to scratch on RDNA3. The same bits; a 16k-token GDN prefill 37 % faster on a 7900 XT (8.56 -> 5.43 ms), and less of the scratch the HIP runtime takes outside the torch allocator (101 -> 48 MiB). `0`: upstream's launches. `SGLANG_GDN_CHUNK_H_NUM_WARPS` still overrides the first. |
+| `FREETOKEN_QSA_MIN_WARPS` | `4` on ROCm | The fewest warps of the QSA sparse attention kernel. Its prefill profile (tuned on GB300) runs 2 warps, which on RDNA3 at head_dim 256 spill ~2.2 KB per lane to scratch; at 4 none. The same bits (bf16 cache; 8 prefill shapes of 128-16k rows checked); the kernel 39-45 % faster at 1k-16k rows, and no ~60 MiB of scratch per GPU queue outside the torch allocator. Decode already runs 4. `0`: the profile's own. |
 | `FREETOKEN_QSA_KV_INT8` | unset | **Experimental, not recommended.** `1`: int8 KV cache for the attention (QSA) layers, 3.19 -> 1.71 GiB per card. Short benchmarks and 227k-token needle tests looked fine, but the agentic benchmark fell from 12-14 to 8-9 bugs fixed and the agent stopped exploring early. |
 
 ## Speculative decoding with the MTP head (Qwen3.8-Flash-Next, experimental)
@@ -582,6 +589,7 @@ Beyond the GPU pool + the RAM tier, the least recently used conversations are dr
 | Variable | Default | Effect |
 |---|---|---|
 | `FREETOKEN_DECODE_INTERLEAVE` | `0` | `N`: after each prefill chunk, the requests already decoding get up to N decode steps before the next chunk. Keeps other agents moving during a long read, but measured to hurt the short prefills of agent turns: keep `0`. |
+| `FREETOKEN_VRAM_MARGIN_MIB` | `512` on ROCm, `0` elsewhere | Once the engine is built, cap the torch allocator at the card's VRAM minus what lives outside torch then (HIP runtime, RCCL, loaded kernel modules, scratch, a desktop's buffers: the card's used VRAM is read from sysfs, since the free memory HIP reports leaves the graphics stack out) minus this margin. A prefill that reaches the cap makes the allocator release its cached blocks, or fail with a plain out-of-memory error, before the card is full: within tens of MiB of full the driver's evictions ended in GPU page faults and a hung collective ([troubleshooting.md](troubleshooting.md#a-gpu-fault-or-a-hung-collective-with-a-full-card)). The cap and the VRAM outside torch are logged at start. `0`: no cap. |
 | `FREETOKEN_MLOCK` | `1` | Lock the process's memory once the model is loaded (`mlockall`, current and future pages, on fault), so that with `vm.compact_unevictable_allowed=0` the kernel's memory compaction leaves the pages the GPU driver maps alone; each move stopped the GPU queues for seconds ([troubleshooting.md](troubleshooting.md#long-pauses-in-the-middle-of-a-run)). Skipped, with a log line, under a finite `RLIMIT_MEMLOCK`. `0`: off. |
 
 ## Diagnostics (off by default)
@@ -592,6 +600,7 @@ Beyond the GPU pool + the RAM tier, the least recently used conversations are dr
 | `FT_MOE_STATS=1` | With `FT_STATS_EVERY`: also the expert-cache miss counters. |
 | `FT_PROF_STEPS=N`, `FT_PROF_START=S` | torch.profiler over N decode steps from step S; tables and a chrome trace in `FT_PROF_DIR`. |
 | `FT_PROF_EAGER=1` | Also profile eager decode (run with `--cuda-graph-max-bs 0`): ROCm's profiler does not see kernels replayed from a CUDA graph. |
+| `FT_PROF_STACK=1` | With `FT_PROF_STEPS`: also record Python stacks and input shapes; the chrome trace then ties each kernel to the line that launched it (ops by input shape in `rank<r>_ops_by_shape.txt`). |
 | `FREETOKEN_SPEC_TIMING=N` | Every N decode steps, the GPU and host time of each phase (forward, verify, MTP head, draft chain) per (requests, rows); one stream sync per report. |
 | `FREETOKEN_SPEC_STALL_MS` | `500`; with `FREETOKEN_SPEC_TIMING`, every decode step whose GPU or host time, or distance to the previous step, exceeds it is logged on its own with its phases and the time of day (every rank): to catch the occasional stall. |
 | `FREETOKEN_PLE_FILL_TIMING=N` | Every N decode steps, the host's wait for the step's tokens and the PLE disk fill time after it (the GPU idles through the fill when stream memops are unavailable). |
@@ -1338,7 +1347,7 @@ benchmark with the MTP head: 12 and 18 of 29 in two runs.
 
 # The journey
 
-How this build came about: measured experiments from 2026-09-25 to 2026-10-05 on one machine, an RX 7900
+How this build came about: measured experiments from 2026-09-25 to 2026-10-07 on one machine, an RX 7900
 XTX 24 GB + RX 7900 XT 20 GB (gfx1100, no GPU peer-to-peer), a Threadripper 3970X and 128 GB of DDR4, serving
 Qwen3.8-Flash-Next NVFP4 to the author's coding agent (OpenCode) with a ~250k-token context (262k until 2026-10-03). Every number was measured
 on that machine (changes in interleaved A/B runs), except the few marked as estimates. The choices and their
@@ -1356,8 +1365,6 @@ trade-offs are summed up in [decisions.md](decisions.md).
 - **Microbenchmarks mislead twice**: weights stay hot in the 80-96 MB Infinity Cache, and the kernel mix differs from a
   real step. Only the full model decides.
 - **Short fidelity tests are not enough** (section 8): an agentic, multi-turn benchmark is the referee.
-- **Never run a kernel that may fault on the GPU driving your monitor**: a hard fault resets the card and takes the
-  desktop session with it.
 
 ## 1. Starting point: FreeToken on two unequal cards
 
@@ -1688,16 +1695,140 @@ host settings: [troubleshooting.md](troubleshooting.md#long-pauses-in-the-middle
   against the one before, sessions interleaved (A B A B, greedy, with the head): NVFP4 83.0 / 83.2 -> 85.6 / 85.7 tok/s,
   EXL3 4.05 bpw 81.5 -> 83.4, the same answers.
 
-## 20. Still open
+## 20. ROCm 10.1, and fewer copies (2026-10-07)
+
+- **ROCm 10.1** (released 2026-10-05: HIP 7.16, RCCL 2.30.7, PyTorch 2.12-2.14 images; its notes list nothing for
+  gfx1100). The image builds on `rocm10.1.0_ubuntu24.04_py3.12_pytorch_release_2.13.0` with two changes: that base has
+  no virtual environment (the system Python, `python3` only) and no git. Against the ROCm 10.0 image, the same code,
+  sessions interleaved (`xtx-xt`, MTP head, greedy, 12 prompts of 512 tokens):
+  - NVFP4: the same answers (12 of 12); decode 0.5 % slower on every prompt (83.0 against 83.5 tok/s); prompts read
+    1.5-2 % slower (a 6.2k-token prompt 1895 against 1937 tok/s, 25k 1940 against 1969).
+  - EXL3: other answers (0 of 12 the same; each build agrees with itself). At load the dense EXL3 weights are rebuilt
+    with two fp32 Hadamard products in torch (`models/exl3_weights.py`), and 10.1's BLAS picks another kernel for the
+    batched left one: 45 % of its fp32 outputs differ, 0.02-0.03 % of the bf16 weights by one unit in the last place.
+    The Triton dequantization and the bf16 products give the same bits. Prompts 1.5-2 % slower, as with NVFP4.
+  - Its Triton (3.8.0+git669b31ac) still has the `tl.histogram` range bug of section 18.
+  - Adopted the next morning anyway (the newer stack is the one to be on): each component measured alone in both
+    images on the XT gave the same time on 10.1 (the bf16 prefill GEMMs at 4.7k-16k rows with either BLAS, the NVFP4
+    prefill MoE GEMMs, the QSA prefill attention, RCCL's all-reduce of a 16k chunk, kernel launches, pinned host-to-GPU
+    copies), so the 1.5-2 % on prompts could not be pinned on one; tonight's +2.3-2.9 % of decode more than covers it.
+    The EXL3 rebuild runs its two products in fp64 (`FREETOKEN_EXL3_RECON_FP64`, on): the bf16 weights are then the
+    same on 10.0 and 10.1 (0 of 39M differ in a check), so are the greedy answers (12 of 12), at the cost of a one-time
+    change from the fp32 rebuild. No BLAS setting reproduces 10.0's fp32 product on 10.1 (hipBLASLt changed its
+    batched kernel; rocBLAS sums in a third order).
+  - Profiling on 10.1 (rocprofv3 `--kernel-trace`, torch.profiler) hung RCCL's all-reduce of a prefill chunk on two
+    cards, twice out of two (60 s watchdog); the same load without a profiler ran normally, and 10.0 profiled fine.
+  - With PyTorch 2.14 (offered with 10.1; it needs C++20, the C++ extensions now build with `-std=c++20`): greedy
+    answers identical to PyTorch 2.13 on 10.1 (NVFP4 and EXL3, 12 of 12), the same decode and prompt reading
+    (NVFP4 84.9 tok/s, a 6.2k-token prompt at 1903 against 1896 tok/s). The image uses it.
+- **Fewer copies.** A profile tied to the lines that launch each kernel (`FT_PROF_STACK=1`) showed ~110 small copies
+  and elementwise kernels per verify step of the MTP head (q, the output gate, k, v, the GDN gate z, the indexer's q and
+  k made contiguous; the gate's sigmoid and product) and the router's 48 split-K reduces. The norms and the indexer
+  kernels now read the projections' outputs through their strides, the gate is applied in one kernel, and the router
+  GEMV's last program sums the partials (`FREETOKEN_FEWER_COPIES`, `FREETOKEN_GEMV_LAST_REDUCES`): the same
+  arithmetic, the same bits. In a graph, an attention block's part went from 22.3 to 11.8 µs at one row and from 26.0
+  to 11.9 at four. On the server (interleaved, the same 12 answers): NVFP4 83.2 -> 85.1-85.2 tok/s, EXL3 3.05 bpw
+  99.1 -> 101.9-102.0, the GPU time of the same decode steps 2.6-3.3 % lower; prompt reading unchanged, VRAM peaks
+  ~100 MiB lower.
+- **Where a verify step goes** (NVFP4, `xtx-xt`, MTP head, four rows; a kernel trace of captured steps with
+  `rocprofv3 --kernel-trace`, which sees graph replays: started with `-P` after the load, the rank processes stopped
+  with SIGTERM so they write their trace; the packaged `rocprofv3 --attach` lacks its helper on 10.0 and 10.1): ~2000
+  kernels per step; the copies of the missing experts 30-35 % of the kernel time (rank 0 11.9 ms, rank 1 9.7 ms, under
+  the profiler), the int8 GEMVs ~7.5 ms, the NVFP4 expert GEMVs 3.9 ms, the host all-reduce 2.2-2.9 ms, the kernels
+  under 6 µs ~1000 per step for 2.9 ms. Without the profiler (`FT_MOE_STATS`, a long greedy answer): 20-25 experts per
+  layer per step, 1.5-4 of them missing (7-17 %), and each extra miss per layer adds ~3.5 ms to a step (23 ms at 1.5,
+  31.6 ms at 4). Four rows route to ~2.4x the experts of one, so misses weigh far more with the MTP head than the
+  ~1 ms per token measured without it.
+- **Expert-cache policies, replayed offline** on a recorded routing sequence (67,828 MoE calls of three answers,
+  6979 slots as served): the engine's LRU 3.67 misses per call (15.3 %); a decaying-frequency policy -8 to -9 % with a
+  12-16 step half-life but -1 % at 24 steps and +13 % at 32; segmented LRU (2Q) -1 %; the offline optimum (Belady)
+  -56 %. Not implemented: ~2 % of decode at best, and tuned to one trace. What would move misses is more cache, smaller
+  experts (EXL3 3.05 bpw moves ~2/3 of NVFP4's bytes per miss: 3.05 against 4.5 bits per weight) or copies that
+  overlap compute.
+- **KFD evictions at start.** The ~1 s per GPU queue that `evicted_ms` shows after a start (4.5 s summed over the
+  four queues, EXL3 3.05 bpw) all happen 10-23 s into the weight load, while the expert banks are registered with the
+  GPU, and not once while serving (unchanged through a whole agent run and depth sweep). Locking the process memory
+  before the load instead of after it did not remove them (6.5 s).
+- **Dropped:** the router reading the GEMV's fp32 partial sums itself. The experts chosen were the same, their
+  weights not always: the partial sums load 4 values per lane where the bf16 logits load 8, Triton lays the tile out
+  differently, and the softmax adds its terms in another order.
+- **Method.** `--moe-cache-auto` sizes the expert cache from the VRAM free at start: a GPU test run on a card while
+  another server loaded shrank that server's cache (6732 against 6979 slots) and its speed. And a source tree mounted
+  into a server must not change during a series (two sessions picked up an unfinished change).
+
+## 21. Prefill peaks, spills and the VRAM outside torch (2026-10-07)
+
+- **Why.** Expert misses are a third of a verify step (section 20) and the cache is what VRAM leaves: `--memory-ratio`
+  0.80 -> 0.83 on `xtx-xt` gives 7487 slots instead of 6977 and +3.8 % decode (85.1 -> 88.3 tok/s, the same answers).
+  The first worst-case run at 0.83 (two agents growing to ~150k tokens, one's prefill chunks between the other's decode
+  steps) ended in a `[gfxhub] page fault` on the 7900 XT, the card at 20420 of 20464 MiB, like the earlier faults and
+  the hung all-gather of [troubleshooting.md](troubleshooting.md#a-gpu-fault-or-a-hung-collective-with-a-full-card).
+- **The cap.** `FREETOKEN_VRAM_MARGIN_MIB` (512 on ROCm) caps the torch allocator once the engine is built, at the
+  card's VRAM minus what lives outside torch then minus 512 MiB. The same run at 0.83 then stopped on a plain
+  out-of-memory error instead of a fault, and the error named the peak: the MTP head's pass over a 16k-token prefill
+  chunk.
+- **Prefill peaks, the same bits.** At a 16k-token chunk each `[T, 5 x hidden]` tensor of the hyper-connection streams
+  is 320 MiB:
+  - the hc combines write over their input (`FREETOKEN_HC_INPLACE`): -312 MiB on the XT;
+  - the GDN delta rule runs 4096 tokens of a request at a time (`FREETOKEN_GDN_PREFILL_BLOCK`): -289 to -327 MiB on
+    the XT, -893 on the XTX;
+  - the PLE output is added to the streams block by block for one request;
+  - the MTP head frees the prompt's streams and their normed copy once read, and adds the embedding in place (two of
+    five such tensors at its pass).
+
+  At 0.83 the XT's allocated peak over the worst-case run is 18545 MiB, against a cap of 18989.
+- **Outside torch**: ~1 GiB per card at start (962 MiB on the XT), +200-250 MiB while serving:
+  - each Triton kernel module the HIP runtime loads takes 2 MiB of VRAM (20 trivial kernels: +40 MiB), whatever its
+    size; no runtime setting changes it;
+  - the scratch of kernels that spill registers, per GPU queue (the QSA prefill attention: 62 MiB, a 16k-token GDN
+    prefill: 101 MiB);
+  - RCCL: ~8 MiB (no P2P between these two cards, it goes through the host).
+- **Spills.** The QSA sparse attention's prefill profile (tuned on GB300) runs 2 warps: on RDNA3 at head_dim 256 that
+  is ~2.2 KB of scratch per lane. At 4 warps (`FREETOKEN_QSA_MIN_WARPS`) it spills nothing and gives the same bits (8
+  shapes of 128-16k rows), 39-45 % faster. Two GDN prefill kernels spilled 484 and 796 B per lane at 4 warps; at 8
+  (`FREETOKEN_GDN_PREFILL_WARPS`) the same bits, a 16k-token GDN prefill 8.56 -> 5.43 ms. Server, sessions at 0.83:
+  prompt reading +2.6 to +3.5 % at each of 10 depths from 8.8k to 248k tokens, decode unchanged.
+- **The copies of the missing experts already run at the bus's speed** (both cards on PCIe 4.0 x16 to the CPU): the
+  shader copy from pinned RAM moves 26-28 GB/s from two experts on (20 GB/s for one), whatever its grid (8 to 64
+  blocks of 256-1024 threads per bank); DMA copies, one `hipMemcpyAsync` per expert and bank, 15.6 GB/s. Only fewer
+  misses (a bigger cache) or smaller experts make them cheaper.
+- **The desktop decides, so the ratio stays 0.80.** The 7900 XTX drives the display, and the desktop's buffers on it do
+  not show in the free memory HIP reports (sysfs `mem_info_vram_used` counts them; the cap reads it): 0.66 GiB at
+  noon, 1.4-1.8 GiB later the same day with the desktop in use. The runs above had the light desktop. Through the
+  launcher with the desktop in use:
+  - 0.83 (7487 slots): the worst-case workload clean, but the XTX at most 107 MiB from full and the XT 62 MiB (a first
+    start after a new image loads every autotune candidate's kernel module);
+  - 0.81 (7147 slots, decode +1-2 %): the XTX 273 MiB from full;
+  - 0.80 (6977 slots, as before): both cards ~970 MiB from full at worst (the desktop at 1.43 GiB), the same 12
+    greedy answers, the workload clean.
+
+  Each 0.01 of ratio is ~170 expert slots, ~260 MiB on the XTX and ~210 on the XT. Without today's reductions (~0.9
+  GiB on the XTX), 0.80 would have left the XTX within ~0.1 GiB of full with a desktop that size, which fits the faults
+  seen on it. The profiles keep 0.80, and the reductions are headroom. EXL3 3.05 bpw splits its experts 384 / 256, so
+  the XTX bounds it: at 0.83 it came within 56 MiB of full with the light desktop; it keeps 0.77, where the XTX stayed
+  531 MiB from full with the desktop at 1.5 GiB (the workload clean, the same answers).
+
+## 22. Still open
 
 - In NVFP4 the model needs ~63 GiB of RAM for its experts alone (the engine keeps every expert in RAM). The EXL3 3.05
   bpw checkpoint needs 42.6 GiB and served under a 56 GiB container limit, but a real 64 GB machine is untested
   ([limits.md](limits.md)).
 - Triton 3.8 is not bit-exact with the 3.7.1 the agentic benchmark last ran on (section 18): not run on it yet.
-- ROCm 10 / PyTorch 2.13, the image's base since 2026-10-02: its `F.linear`
-  changes its sums with the row count for some shapes ((3072, 256), (6656, 2560)): serving does not use it for them
-  (int8 or table GEMVs), but `test_qsa_spec_rows`' toy projections did, which made it fail on 3-4 rows; computed a row
-  at a time they pass (the test now does so).
+- ROCm 10 / PyTorch 2.13 and ROCm 10.1 / PyTorch 2.14 (rechecked 2026-10-10), the image's bases since 2026-10-02:
+  `F.linear` changes its sums with the row count for some shapes ((3072, 256), (6656, 2560)): serving does not use it
+  for them (int8 or table GEMVs), but `test_qsa_spec_rows`' toy projections did, which made it fail on 3-4 rows;
+  computed a row at a time they pass (the test now does so).
+- A rare GPU page fault (`[gfxhub] page fault`, permission fault, `sq_intr` errors): those while serving came with a
+  card within tens of MiB of full (section 21; the torch allocator is now capped 512 MiB short of that). One at start
+  on 2026-10-07, ~3 s after the CUDA graphs were captured, with 3.9 GiB free on the XTX (EXL3 3.05 bpw; 1 start in
+  ~32 that night, the 16 starts of a series after it were clean): cause not found.
+- Expert misses are 30-35 % of a decode step with the MTP head (section 20): the next lever for decode, not a
+  cache policy (an online one gains ~8 % of the misses at best on a recorded trace). More VRAM for the cache: ~170
+  loaded Triton kernel modules at 2 MiB each per card (section 21), and a desktop-aware plan for the card that drives
+  the display.
+- EXL3's dense weights are rebuilt at load in fp64 since 2026-10-07 (section 20): the same bits on ROCm 10.0 and 10.1,
+  a one-time change from the fp32 rebuild that the agentic benchmark has not run yet. The EXL3 profiles keep
+  `--memory-ratio` 0.77 / 0.76 on two cards (3.05 bpw at 0.77 measured in section 21; 4.05 bpw not again).
 - More than two GPUs, other RDNA3 cards, RDNA4 and NVIDIA are untested.
 - Image input (`serve.sh --vision`) is measured on `xtx-xt`, `xtx` and `xt` only. The derived profiles (`xtx-xtx`,
   `xt-xt`, `gre`) are untested with it, as they are without it.
@@ -1858,8 +1989,8 @@ then measure. If it stays slow, check that the kernel-cache volume is mounted (`
 ## My desktop session closed, or the screen went black
 
 A GPU kernel faulted hard on the card that drives your monitor: the driver resets that card and the desktop dies with
-it. Check with `journalctl -k | grep -i "device coredump"`. With this build's profiles this should not happen; if you
-experiment with kernels or options, do it on a card without a monitor attached (`--gpus`), and report the fault.
+it. Check with `journalctl -k | grep -i "device coredump"`. With this build's profiles this should not happen: report
+the fault.
 
 ## `profile ... needs N GPU(s)` or the wrong card is picked
 
@@ -1872,9 +2003,12 @@ first; one-card profiles take the smallest card with enough VRAM. Force a choice
   and decode fell to 1.9 tok/s (the allocator thrashes).
 - Lower the context (`--ctx 131072` on two cards, `--ctx 65536` on one), then the memory ratio
   (`-- --memory-ratio 0.75`).
-- A prefill peak above the card's VRAM does not always fail an allocation: the driver evicts memory and stops the
-  process's GPU queues for seconds (the `evicted_ms` counter of [Long pauses](#long-pauses-in-the-middle-of-a-run)),
-  and a rank has died on an illegal memory access that way. `/sys/class/drm/card*/device/mem_info_vram_used` sampled
+- Without a cap, a prefill peak above the card's VRAM does not always fail an allocation: the driver evicts memory
+  and stops the process's GPU queues for seconds (the `evicted_ms` counter of
+  [Long pauses](#long-pauses-in-the-middle-of-a-run)), and a rank has died on an illegal memory access that way. On
+  ROCm the torch allocator is capped 512 MiB short of the card (`FREETOKEN_VRAM_MARGIN_MIB`; the log's `VRAM at start`
+  and `torch allocator capped at` lines give the numbers), so a peak over it ends in `torch.OutOfMemoryError` and its
+  traceback says where. `/sys/class/drm/card*/device/mem_info_vram_used` sampled
   during the first long prompt shows how close the peak comes; the card driving the display also holds the
   desktop's buffers. On `xtx-xt`, `--memory-ratio` 0.80 -> 0.78 lowered the 7900 XTX's peak by 350 MiB.
 - The container needs `--ulimit memlock=-1` (pinned RAM for the experts and the RAM tier) and enough RAM under its
@@ -1927,6 +2061,23 @@ just evicted the process's queues (`/sys/class/kfd/kfd/proc/<pid>/stats_<gpu>/ev
   long prompt.
 - A hung all-gather (`Watchdog caught collective operation timeout ... _ALLGATHER_BASE`, the server stops) once in a
   depth sweep, the XT at 37 MiB from full during a 16k-token chunk at ~41k tokens of context.
+- Profiling on ROCm 10.1 with two cards (rocprofv3 `--kernel-trace`, or torch.profiler around a prefill): RCCL's
+  all-reduce of a prefill chunk hung (60 s watchdog) twice out of two; without a profiler the same load ran (not
+  tried: one card, or profiling decode only).
+- The same page fault once at start-up (2026-10-07, EXL3 3.05 bpw), ~3 s after the CUDA graphs were captured, with
+  3.9 GiB still free on the XTX: VRAM pressure does not explain that one. The 16 starts that followed (with and
+  without that night's changes) were clean; restarting is enough.
+- On purpose, 2026-10-07: `--memory-ratio 0.83` before the prefill reductions of
+  [journey.md](journey.md#21-prefill-peaks-spills-and-the-vram-outside-torch-2026-10-07),
+  two agents at ~120k tokens, a page fault on the XT at 20420 of 20464 MiB, on the first try. With the torch allocator
+  capped (`FREETOKEN_VRAM_MARGIN_MIB`) the same load gave an out-of-memory error instead.
+
+What fills a card besides torch (logged at start as `outside torch`): ~1 GiB, growing by 200-250 MiB while serving,
+plus, on the card driving the display, the desktop's buffers (0.66 to 1.8 GiB on the 7900 XTX here, the same day),
+which the free memory HIP reports leaves out (`/sys/class/drm/card*/device/mem_info_vram_used` counts them; the cap
+reads it). Each Triton kernel module the HIP runtime loads takes 2 MiB of VRAM whatever its size, and new shapes load
+new ones; kernels that spill registers take scratch per GPU queue; RCCL ~8 MiB. The cap is set at start, so that
+growth, and the desktop's, eats into its 512 MiB.
 
 Neither came back in the same runs repeated (hours of agent sessions, the sweep again, the same VRAM pressure in other
 10-minute runs): the eviction has to land at a bad moment. Keep other GPU-heavy programs off the card that drives the
@@ -2007,8 +2158,8 @@ slower (one-time kernel preparation): run it twice.
 docker run --rm -w /opt/FreeToken --entrypoint python3 freetoken-rdna3:latest -m pytest -q -p no:cacheprovider tests
 ```
 
-About 2.5 minutes (152 s on the reference machine), no GPU needed, on the tree the image was built from: 1541 passed,
-579 skipped and 3 failures that come from the environment (they need flashinfer, an NVIDIA-only package) and fail the
+About 2.5 minutes (139 s on the reference machine), no GPU needed, on the tree the image was built from: 1553 passed,
+624 skipped and 3 failures that come from the environment (they need flashinfer, an NVIDIA-only package) and fail the
 same way on upstream
 (`test_cache_budget.py::test_adjust_config_defaults_moe_cache_auto_for_auto_resolved_offload_backend`,
 `test_cache_budget.py::test_adjust_config_resolves_num_tokens_generic`,
@@ -2020,8 +2171,7 @@ compiled CPU extension lives in the image's tree, not in yours.
 
 ## GPU checks (`rdna3/tests/`)
 
-Each is a standalone script run inside the image with one or two GPUs (on a two-card machine, prefer the card that
-does not drive your display: a faulting kernel resets its card), e.g.
+Each is a standalone script run inside the image with one or two GPUs, e.g.
 
 ```bash
 docker run --rm --device=/dev/kfd --device=/dev/dri --security-opt seccomp=unconfined --ipc=host \
@@ -2272,7 +2422,8 @@ Line counts in this section and the next are relative to `d72e5cb` (0.1.0 plus i
 
 | File | Lines | Change |
 |---|---:|---|
-| `Dockerfile.rdna3` | 13/5 | ROCm 10.0 / PyTorch 2.13 base with its own Triton 3.8; pyproject's CUDA ceilings lifted at install |
+| `Dockerfile.rdna3` | 13/5 | ROCm 10.1 / PyTorch 2.14 base with its own Triton 3.8; pyproject's CUDA ceilings lifted at install |
+| `setup.py` | 3/3 | the C++ extensions build as C++20 (PyTorch 2.14's headers require it) |
 | `python/freetoken/kernel/triton/moe_align.py`, `tests/kernels/test_moe_align.py` | 13/9, new | no comparison on `tl.histogram` counts: Triton 3.8's AMD range analysis gives them an empty range and folds such comparisons to false, which left the expert ids unwritten (up to 1024 routes) or every count at zero (more), and the expert GEMMs then read wild addresses |
 | `python/freetoken/kernel/gguf.py`, `kernel/csrc/gguf/gguf_kernel.cu`, `dispatch.h`, `gguf_bind.cpp` | 41/8, 249/328, 37/9, new | the GGUF kernels build on ROCm: the torch wrappers in a host-only file (under HIP torch's headers include rocThrust, which the pip SDK lacks), nvcc-only flags for CUDA only, HIP's shuffles for the full-mask ones, the SDK's HIP headers, the shared ROCm link flags |
 | `python/freetoken/kernel/csrc/row_store/row_store_ext.cpp`, `kernel/row_store.py` | 32/4, 40/1 | HIP stream memops for the PLE wait-sync (the probe used to look for the CUDA driver's only); a captured wait must hold three replays with the PLE copy behind it (`FREETOKEN_PLE_SYNC`) |
@@ -2309,11 +2460,35 @@ Line counts here are on top of the lines listed in the sections above.
 | `python/freetoken/kernel/triton/dense_gemv.py` | 7/6 | one split-K reduce launch for all the rows |
 | `tests/kernels/test_moe_shared_gate.py`, `test_hc_combine_rmsnorm.py`, `test_gemv_bf16_rows.py`, `tests/models/qwen4_exp/test_moe_epilogue.py` | new | bit-exactness on the GPU; which expert paths take the fused epilogue |
 
+## Fewer copies (bit-exact)
+
+Line counts here are on top of the lines listed in the sections above.
+
+| File | Lines | Change |
+|---|---:|---|
+| `python/freetoken/models/qwen4_exp/attention.py`, `models/qwen4_exp/gdn.py`, `layers/norm.py`, `kernel/triton/attn_gate.py` | 29/6, 7/1, 7/0, new | q / k normalized where the projection wrote them, the output gate in one kernel, the GDN gate read in place (`FREETOKEN_FEWER_COPIES`) |
+| `python/freetoken/kernel/fla/layernorm_gated.py`, `kernel/triton/qsa/compress.py`, `attention/qsa_sparse.py` | 24/4, 23/5, 1/1 | the gated norm and the QSA indexer's norm + rope take token / head strides |
+| `python/freetoken/kernel/triton/dense_gemv.py`, `layers/quantization/linear/unquantized.py` | 38/7, 10/1 | the split-K bf16 GEMV's last program reduces (`FREETOKEN_GEMV_LAST_REDUCES`), counters allocated at layer finalize |
+| `tests/kernels/test_fewer_copies.py` | new | bit-exactness on the GPU |
+
+## Lower prefill peaks, kernels that no longer spill (bit-exact)
+
+Line counts here are on top of the lines listed in the sections above.
+
+| File | Lines | Change |
+|---|---:|---|
+| `python/freetoken/kernel/triton/hc.py`, `models/qwen4_exp/hc.py`, `models/qwen4_exp/model.py`, `models/qwen4_exp/ple.py` | 7/3, 7/2, 9/3, 50/2 | the hc combines write over their input, the PLE output is added to the streams in place, block by block for one request (`FREETOKEN_HC_INPLACE`) |
+| `python/freetoken/models/qwen4_exp/gdn.py`, `attention/linear.py` | 66/12, 10/2 | the GDN delta rule of a prefill 4096 tokens of a request at a time (`FREETOKEN_GDN_PREFILL_BLOCK`); the host bounds of each request and track entry in the metadata |
+| `python/freetoken/models/qwen4_exp/mtp.py`, `engine/engine.py` | 16/7, 44/4 | the MTP head frees the prompt's streams and their normed copy once read and adds the embedding in place; the torch allocator capped short of the card on ROCm (`FREETOKEN_VRAM_MARGIN_MIB`) |
+| `python/freetoken/kernel/triton/qsa/attend.py` | 9/0 | at least 4 warps on ROCm (`FREETOKEN_QSA_MIN_WARPS`) |
+| `python/freetoken/kernel/fla/utils.py`, `chunk_delta_h.py`, `wy_fast.py` | 6/0, 2/1, 3/2 | two GDN prefill kernels at 8 warps on ROCm (`FREETOKEN_GDN_PREFILL_WARPS`) |
+| `tests/kernels/test_gdn_prefill_blocks.py`, `test_prefill_warps.py`, `test_fewer_copies.py`, `tests/models/qwen4_exp/test_ple_conv_blocks.py` | new, new, 20/0, 34/0 | bit-exactness (GPU; the PLE one on the CPU) |
+
 ## Tooling and documentation
 
 | File | Change |
 |---|---|
-| `python/freetoken/engine/ftprof.py` (93/0) | env-gated decode profiling (`FT_STATS_EVERY`, `FT_PROF_*`) |
+| `python/freetoken/engine/ftprof.py` (106/0) | env-gated decode profiling (`FT_STATS_EVERY`, `FT_PROF_*`) |
 | `python/freetoken/server/args.py` (3/1) | `--cuda-graph-max-bs` help |
 | `Dockerfile.rdna3`, `.dockerignore` | the ROCm image |
 | `rdna3/` | profiles (the MTP head on), `serve.sh` (`--no-mtp`; a lower `--memory-ratio` for EXL3 on two cards), GPU checks, micro-benchmarks and `bench/depth_sweep.py`, maintenance tools |

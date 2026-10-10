@@ -11,13 +11,16 @@
 #   --ulimit memlock=-1, --ipc=host, FREETOKEN_TP_ALLOW_IMBALANCE=1 for unequal cards, --ple-backend disk.
 
 # The base is pinned by DIGEST: the tag is mutable on someone else's registry.
-# ROCm 10.0 / PyTorch 2.13 (rocm10.0_ubuntu24.04_py3.12_pytorch_release_2.13.0)
-FROM rocm/pytorch@sha256:bbdaba66029f905321be3bbc95206a2d9a56a2bc5300877d146ad24d40db9a12
+# ROCm 10.1 / PyTorch 2.14 (rocm10.1.0_ubuntu24.04_py3.12_pytorch_release_2.14.0)
+FROM rocm/pytorch@sha256:099f59a3bee9c436f5cc57db6bc6076fdeda579c57e9e22ae40f856d5905b3e4
 
 ARG GPU_ARCH=gfx1100
 ENV PYTORCH_ROCM_ARCH=${GPU_ARCH} \
     FREETOKEN_ROCM_ARCH=${GPU_ARCH} \
     PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# the ROCm 10.1 base no longer ships git (the provenance below needs it)
+RUN command -v git || { apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*; }
 
 COPY . /opt/FreeToken
 
@@ -36,16 +39,16 @@ RUN set -eux; \
 
 # --no-build-isolation keeps the base image's ROCm torch for the C++/HIP extensions; [accel] is
 # CUDA-only (flashinfer, sgl_kernel) and gated off on ROCm anyway. pyproject's ceilings are the CUDA ones
-# (sglang-kernel links torch 2.11 only); ROCm 10 ships torch 2.13 / torchvision 0.28 / Triton 3.8, so the image lifts
+# (sglang-kernel links torch 2.11 only); ROCm 10.1 ships torch 2.14 / torchvision 0.29 / Triton 3.8, so the image lifts
 # them where it installs (after the provenance above: the recorded tree is the repository's).
 RUN set -eux; \
     cd /opt/FreeToken; \
-    sed -i -e 's/"torch>=2.11,<2.12"/"torch>=2.11,<2.14"/g' -e 's/"torchvision>=0.26,<0.27"/"torchvision>=0.26,<0.29"/' \
+    sed -i -e 's/"torch>=2.11,<2.12"/"torch>=2.11,<2.15"/g' -e 's/"torchvision>=0.26,<0.27"/"torchvision>=0.26,<0.30"/' \
         -e 's/"triton>=3.6,<3.8;/"triton>=3.6,<3.9;/' pyproject.toml; \
-    test "$(grep -c '"torch>=2.11,<2.14"' pyproject.toml)" = 2; grep -q '"torchvision>=0.26,<0.29"' pyproject.toml; \
+    test "$(grep -c '"torch>=2.11,<2.15"' pyproject.toml)" = 2; grep -q '"torchvision>=0.26,<0.30"' pyproject.toml; \
     grep -q '"triton>=3.6,<3.9;' pyproject.toml; \
-    python -m pip install --no-cache-dir "setuptools>=77" wheel; \
-    python -m pip install --no-cache-dir --no-build-isolation -e .
+    python3 -m pip install --no-cache-dir "setuptools>=77" wheel; \
+    python3 -m pip install --no-cache-dir --no-build-isolation -e .
 
 # One cache directory per image: AITER / Triton key their caches on the directory, not the image.
 ENV XDG_CACHE_HOME=/root/.cache/freetoken-rdna3 \
@@ -54,7 +57,7 @@ ENV XDG_CACHE_HOME=/root/.cache/freetoken-rdna3 \
 RUN mkdir -p /root/.cache/freetoken-rdna3/triton /root/.cache/freetoken-rdna3/freetoken/kernels
 
 # the ROCm torch and its own Triton (3.8) are the ones in place
-RUN python -c 'import importlib.metadata as md, torch, triton; v = md.version("triton"); print("torch", torch.__version__, "| hip", torch.version.hip, "| triton", v); assert torch.version.hip and torch.version.cuda is None; assert "rocm" in v, v'
+RUN python3 -c 'import importlib.metadata as md, torch, triton; v = md.version("triton"); print("torch", torch.__version__, "| hip", torch.version.hip, "| triton", v); assert torch.version.hip and torch.version.cuda is None; assert "rocm" in v, v; tv = md.version("torchvision"); assert "rocm" in tv, tv'
 
 # The port, checked by content (absence gates use `if grep; then exit 1`, never `! grep`).
 RUN set -eux; \

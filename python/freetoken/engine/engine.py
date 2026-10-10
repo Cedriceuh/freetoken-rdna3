@@ -12,7 +12,7 @@ import torch
 from freetoken.spec_decode import MTP_ENABLED, SPEC_M, apply_rollback
 from freetoken.attention import AttnType, attention_backend_info, create_attention_backend
 from freetoken.core import Batch, Context, Req, set_global_ctx
-from freetoken.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
+from freetoken.distributed import destroy_distributed, enable_pynccl_distributed, get_tp_info, set_tp_info
 from freetoken.distributed.split import tp_shares
 from freetoken.gpu_select import gpu_identity
 from freetoken.layers import set_rope_device
@@ -368,6 +368,43 @@ class ForwardOutput(NamedTuple):
     n_acc_cpu: torch.Tensor | None = None
 
 
+def _vram_used_by_driver(device: torch.device) -> int | None:
+    """VRAM in use on the card as the driver counts it (every process, the desktop's buffers included), from sysfs;
+    None where it cannot be read. On ROCm the free memory HIP reports leaves out the graphics stack's buffers: 0.66 to
+    1.8 GiB of a desktop on the 7900 XTX that drives the display, the same day."""
+    try:
+        props = torch.cuda.get_device_properties(device)
+        bdf = f"{props.pci_domain_id:04x}:{props.pci_bus_id:02x}:{props.pci_device_id:02x}.0"
+        with open(f"/sys/bus/pci/devices/{bdf}/mem_info_vram_used") as f:
+            return int(f.read())
+    except (OSError, AttributeError, ValueError):
+        return None
+
+
+def _cap_torch_vram(device: torch.device) -> None:
+    """FREETOKEN_VRAM_MARGIN_MIB (default 512 on ROCm, 0 = off): cap the torch allocator so the card keeps that much
+    free. Set once the engine is built: what lives outside torch then (the HIP runtime, RCCL, the loaded kernel
+    modules -- 2 MiB each on ROCm --, the kernels' scratch, a desktop's buffers) is measured as the card's used VRAM
+    minus torch's reserved and left out, and the allocator gets the rest minus the margin. A prefill whose temporaries
+    reach the cap makes the allocator release its cached blocks and retry (or raise a plain out-of-memory error) before
+    the card is full: within ~50 MiB of full, the driver's evictions have ended in GPU page faults and hung collectives
+    (docs/rdna3/troubleshooting.md)."""
+    margin = int(os.environ.get("FREETOKEN_VRAM_MARGIN_MIB", "512" if torch.version.hip is not None else "0")) << 20
+    free, total = torch.cuda.mem_get_info(device)
+    reserved = torch.cuda.memory_reserved(device)
+    used = max(total - free, _vram_used_by_driver(device) or 0)
+    outside = used - reserved
+    logger.info(
+        f"VRAM at start (rank {get_tp_info().rank}): total {total >> 20} MiB, used {used >> 20} (HIP's free "
+        f"{free >> 20}), torch reserved {reserved >> 20} (allocated {torch.cuda.memory_allocated(device) >> 20}), "
+        f"outside torch {outside >> 20}"
+    )
+    if margin > 0:
+        cap = total - outside - margin
+        torch.cuda.set_per_process_memory_fraction(cap / total, device)
+        logger.info(f"torch allocator capped at {cap >> 20} MiB (FREETOKEN_VRAM_MARGIN_MIB={margin >> 20})")
+
+
 class Engine:
     def __init__(self, config: EngineConfig):
         assert not torch.cuda.is_initialized()
@@ -547,6 +584,7 @@ class Engine:
             # Prefill runs on the first comma part; warm its autotune cache.
             self._warmup_prefill()
         _lock_memory()
+        _cap_torch_vram(self.device)
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         use_pynccl = config.use_pynccl
@@ -1419,9 +1457,11 @@ class Engine:
                 next_embeds = embed.forward(next_ids.clamp(max=embed.num_embeddings - 1)).masked_fill_(pad, 0)
             else:
                 next_embeds = embed.forward(next_ids)
-            # every prompt row writes its KV; the MoE and the head run on each prompt's last row only
-            head_in, _ = mtp.forward(streams, next_embeds, batch, keep=pick)
-            model.last_streams = None  # the prompt's streams (~335 MB for a 16k chunk): not kept to the next forward
+            # every prompt row writes its KV; the MoE and the head run on each prompt's last row only. The head takes
+            # the prompt's streams (320 MiB for a 16k chunk) out of the list and frees them once read: not kept to the
+            # next forward, nor through the head's own [T, hc*hidden] temporaries
+            box, streams, model.last_streams = [model.last_streams], None, None
+            head_in, _ = mtp.forward(box, next_embeds, batch, keep=pick)
             draft_logits = self.model.lm_head.forward(head_in)
         tok, q = self._pick_draft(draft_logits, batch.size, args)
         for i, req in enumerate(batch.reqs):

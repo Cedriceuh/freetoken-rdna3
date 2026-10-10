@@ -117,6 +117,13 @@ class GemmaPlusOneRMSNorm(BaseOP):
         flat = self._flat(x)
         self.gemma_rmsnorm(flat, self.weight, self.eps, out=flat)
 
+    def forward_strided(self, x: torch.Tensor) -> torch.Tensor:
+        """``x`` [T, heads, size] with any leading strides (unit last) -> a new contiguous normalized tensor: the
+        bits of ``forward_inplace`` on a contiguous copy (one program per row, the same warps for the same rows)."""
+        out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+        self.gemma_rmsnorm(x, self.weight, self.eps, out=out)
+        return out
+
 
 class GemmaPlusOneRMSNormFused(BaseOP):
     """(1 + w)-scaled RMSNorm with the fused-add-residual API of ``RMSNormFused``

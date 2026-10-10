@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- Lower prefill VRAM peaks, all bit-exact and on by default: the hyper-connection combines write in place
+  (`FREETOKEN_HC_INPLACE`, which also adds the PLE output in place), the GDN delta rule of a prefill runs 4096 tokens
+  of a request at a time (`FREETOKEN_GDN_PREFILL_BLOCK`), the MTP head frees the prompt's streams once read: -0.6 GiB
+  at the 7900 XT's peak, -0.9 GiB at the XTX's. On ROCm the torch allocator is capped 512 MiB short of the card
+  (`FREETOKEN_VRAM_MARGIN_MIB`), the card's use read from sysfs so that a desktop's buffers count: GPU page faults
+  and a hung collective came with a card within tens of MiB of full. The profiles keep `--memory-ratio` 0.80 (0.77 for
+  EXL3 on two cards): a fuller expert cache (0.83: +3.8 % decode) left the 7900 XTX, which drives the display, within
+  ~0.1 GiB of full once the desktop held 1.4 GiB; the reductions are headroom instead.
+- Prefill kernels that spilled registers on RDNA3 run more warps, bit-exact: the QSA sparse attention 4 instead of 2
+  (`FREETOKEN_QSA_MIN_WARPS`, 39-45 % faster), two GDN prefill kernels 8 instead of 4 (`FREETOKEN_GDN_PREFILL_WARPS`,
+  a GDN prefill 37 % faster). Prompt reading +2.6 to +3.5 % at every depth to 248k tokens.
+- The image moves to ROCm 10.1 and PyTorch 2.14 (HIP 7.16, RCCL 2.30.7, its Triton 3.8). Its base has no virtual
+  environment and no git: the build uses `python3` and installs git; PyTorch 2.14 needs C++20, so the C++ extensions
+  build with `-std=c++20`. Greedy answers identical between PyTorch 2.13 and 2.14 on 10.1. NVFP4 answers are identical to 10.0; EXL3 ones
+  changed, because the dense EXL3 weights were rebuilt at load with fp32 BLAS products whose kernel 10.1 changed: the
+  rebuild now runs them in fp64 (`FREETOKEN_EXL3_RECON_FP64`, on), which gives the same weights on 10.0 and 10.1 (and a
+  one-time change from the fp32 ones, 0.02-0.03 % of the weights by one unit in the last place). Profiling with
+  rocprofiler (rocprofv3, torch.profiler) on 10.1 hung RCCL's all-reduce twice on two cards; serving did not.
+- Fewer copies, bit-exact (on by default): the attention's q / k, its output gate, the GDN gate and the QSA indexer
+  rows are read where their projections wrote them (`FREETOKEN_FEWER_COPIES`), and the router GEMV reduces in its last
+  program (`FREETOKEN_GEMV_LAST_REDUCES`). `xtx-xt` with the MTP head: NVFP4 +2.3 %, EXL3 3.05 bpw +2.9 % decode;
+  identical answers, same prompt reading.
 - Fewer decode kernels, bit-exact (on by default): the MoE epilogue (routed sum, shared-expert gate, mul-add) in one
   kernel (`FREETOKEN_FUSED_MOE_EPILOGUE`), each hyper-connection combine fused with the next grouped RMSNorm
   (`FREETOKEN_FUSED_HC_NORM`), one split-K reduce launch for all the rows of a verify step. `xtx-xt` greedy decode:

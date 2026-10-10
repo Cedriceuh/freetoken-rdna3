@@ -27,12 +27,16 @@ _BF16_CONFIGS: dict[tuple[int, int], tuple[int, int, int, int]] = {
 }
 
 _ENABLED = os.environ.get("FREETOKEN_TRITON_GEMV", "1") != "0"
+# FREETOKEN_GEMV_LAST_REDUCES (default 1): a split-K config's last-arriving program sums the partials (the router:
+# 48 launches fewer per decode step); the same bits as the separate reduce kernel
+_LAST_REDUCES = os.environ.get("FREETOKEN_GEMV_LAST_REDUCES", "1") == "1"
 
 
 @triton.jit
 def _gemv_splitk_bf16(a_ptr, w_ptr, part_ptr, N, K, stride_wn, stride_pk, k_per,
                       BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, ROWS: tl.constexpr = 1, stride_am=0,
-                      stride_pm=0):
+                      stride_pm=0, out_ptr=None, cnt_ptr=None, stride_om=0, SPLIT: tl.constexpr = 1,
+                      LAST_REDUCES: tl.constexpr = False):
     """ROWS > 1 (several decoding requests): the unchanged per-row body runs once per activation row (unrolled), so
     each request gets the bits it gets alone -- F.linear at M > 1 would pick another BLAS reduction order."""
     pid_n = tl.program_id(0)
@@ -50,6 +54,19 @@ def _gemv_splitk_bf16(a_ptr, w_ptr, part_ptr, N, K, stride_wn, stride_pk, k_per,
                         mask=n_mask[:, None] & k_mask[None, :], other=0.0).to(tl.float32)
             acc += tl.sum(w * a[None, :], axis=1)
         tl.store(part_ptr + r * stride_pm + pid_k * stride_pk + offs_n, acc, mask=n_mask)
+    if LAST_REDUCES:
+        # the last of a tile's SPLIT programs to arrive reduces its partial sums, element by element in split
+        # order as _reduce_to_bf16 does (the same bits, one launch fewer); acq_rel at device scope publishes the
+        # partials before the count and makes the last program read them after it, then the count is reset for
+        # the next call (stream order)
+        arrived = tl.atomic_add(cnt_ptr + pid_n, 1, sem="acq_rel", scope="gpu")
+        if arrived == SPLIT - 1:
+            for r in tl.static_range(ROWS):
+                red = tl.zeros((BLOCK_N,), dtype=tl.float32)
+                for k in tl.static_range(SPLIT):
+                    red += tl.load(part_ptr + r * stride_pm + k * stride_pk + offs_n, mask=n_mask, other=0.0)
+                tl.store(out_ptr + r * stride_om + offs_n, red.to(tl.bfloat16), mask=n_mask)
+            tl.atomic_xchg(cnt_ptr + pid_n, 0, sem="relaxed", scope="gpu")
 
 
 @triton.jit
@@ -71,9 +88,19 @@ def gemv_config(weight: torch.Tensor) -> tuple[int, int, int, int] | None:
     return _BF16_CONFIGS.get(tuple(weight.shape))
 
 
-def gemv_bf16(x: torch.Tensor, weight: torch.Tensor, cfg: tuple[int, int, int, int]) -> torch.Tensor:
+def gemv_counters(weight: torch.Tensor, cfg: tuple[int, int, int, int] | None) -> torch.Tensor | None:
+    """Zeroed arrival counters for the last-program reduce of a split-K config (one per N tile), or None (one
+    split, or FREETOKEN_GEMV_LAST_REDUCES=0). Allocate once, outside graph capture (layer finalize)."""
+    if cfg is None or cfg[2] <= 1 or not _LAST_REDUCES:
+        return None
+    return torch.zeros(triton.cdiv(weight.shape[0], cfg[0]), dtype=torch.int32, device=weight.device)
+
+
+def gemv_bf16(x: torch.Tensor, weight: torch.Tensor, cfg: tuple[int, int, int, int],
+              counters: torch.Tensor | None = None) -> torch.Tensor:
     """``x`` [M, K] bf16 (contiguous, M small), ``weight`` [N, K] bf16 -> [M, N] bf16, fp32 accumulation; every row
-    is computed exactly as it would be alone."""
+    is computed exactly as it would be alone. ``counters`` (gemv_counters): the reduce runs in the GEMV's last
+    program instead of its own launch."""
     N, K = weight.shape
     M = x.shape[0] if x.dim() == 2 else 1
     x2 = x.reshape(M, K)
@@ -81,13 +108,17 @@ def gemv_bf16(x: torch.Tensor, weight: torch.Tensor, cfg: tuple[int, int, int, i
     k_per = triton.cdiv(triton.cdiv(K, split), block_k) * block_k
     part = torch.empty((M, split, N), dtype=torch.float32, device=x.device)
     out = torch.empty((M, N), dtype=torch.bfloat16, device=x.device)
+    last = counters is not None and split > 1
     _gemv_splitk_bf16[(triton.cdiv(N, block_n), split)](
         x2, weight, part, N, K, weight.stride(0), part.stride(1), k_per,
-        BLOCK_N=block_n, BLOCK_K=block_k, ROWS=M, stride_am=x2.stride(0), stride_pm=part.stride(0), num_warps=warps,
+        BLOCK_N=block_n, BLOCK_K=block_k, ROWS=M, stride_am=x2.stride(0), stride_pm=part.stride(0),
+        out_ptr=out if last else None, cnt_ptr=counters if last else None, stride_om=out.stride(0), SPLIT=split,
+        LAST_REDUCES=last, num_warps=warps,
     )
-    _reduce_to_bf16[(triton.cdiv(N, 512), M)](part, out, N, part.stride(1), part.stride(0), out.stride(0), SPLIT=split,
-                                              BLOCK=512, num_warps=4)
+    if not last:
+        _reduce_to_bf16[(triton.cdiv(N, 512), M)](part, out, N, part.stride(1), part.stride(0), out.stride(0),
+                                                  SPLIT=split, BLOCK=512, num_warps=4)
     return out
 
 
-__all__ = ["gemv_bf16", "gemv_config"]
+__all__ = ["gemv_bf16", "gemv_config", "gemv_counters"]
