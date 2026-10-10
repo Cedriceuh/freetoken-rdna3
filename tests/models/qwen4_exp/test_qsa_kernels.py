@@ -362,12 +362,17 @@ def _split_topk_case(n_blocks: int, chunk: int, width: int, bs: int, mode: str, 
     if mode != "boundary":
         return _topk_case(n_blocks, bs, mode, seed)
     # width - 212 columns beat the tie, so the 212 remaining winners start 100 columns below
-    # a chunk boundary and run past it into a chunk that is all tie. The last row cuts at the
-    # middle split boundary, which is where a reduction level divides the candidates.
+    # a chunk boundary and run past it into a chunk that is all tie. The last row cuts where a
+    # reduction level divides the candidates (one reduce program per _MAX_RESIDENT of them), or
+    # at the middle split boundary when the row has no reduction level.
+    from freetoken.kernel.triton.qsa.topk import _MAX_RESIDENT
+
     logits = torch.zeros(bs, n_blocks, device="cuda")
     splits = n_blocks // chunk
+    per_reduce = _MAX_RESIDENT // width
+    last = per_reduce if splits > per_reduce else splits // 2
     for row in range(bs):
-        cut = chunk * (splits // 2 if row == bs - 1 else 1 + row % (splits - 1))
+        cut = chunk * (last if row == bs - 1 else 1 + row % (splits - 1))
         logits[row, : width - 212] = 2.0
         logits[row, cut - 100 :] = 1.0
     return logits, torch.full((bs,), n_blocks, dtype=torch.int32, device="cuda")

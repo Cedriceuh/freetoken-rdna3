@@ -52,15 +52,16 @@ _DECODE_MARLIN_DEEPK_THRESHOLD = 2048
 # FREETOKEN_NVFP4_DECODE_TUNED=1: decode tiles swept on the 7900 XTX / XT for Qwen3.8-Flash-Next (per rank at
 # FREETOKEN_TP_SPLIT=0.55: gate_up N 704 / 576, K 2560; down N 2560, K 352 / 288) inside a 48-launch CUDA graph
 # (rdna3/bench/nvfp4_decode_sweep.py). Every entry is bit-identical to the shipped tiles. (N, K) -> (tiles for one
-# decoding request, tiles for two or more): (BLOCK_N, BLOCK_KW, num_warps). Measured 1 request: gate_up 22.3 -> 19.3
-# (XTX) / 26.0 -> 22.1 us (XT), down 15.6 -> 13.5 us (XTX); 2-4 requests x1.06-1.20.
+# decoding request, tiles for two or more): (BLOCK_N, BLOCK_KW, num_warps, UNROLL). gate_up keeps the shipped tiles,
+# the best of the sweep; down takes one trip per tile (3 tiles of 16 words, which UNROLL 2 pads to 4): 1 request
+# 14.7 -> 13.9 us (XTX) / 14.8 -> 13.4 us (XT), 2-4 requests x1.10-1.19.
 NVFP4_DECODE_TUNED = os.environ.get("FREETOKEN_NVFP4_DECODE_TUNED", "0") == "1"
 _DECODE_UNTUNED_SEEN: set[tuple[int, int]] = set()
-_DECODE_TUNED: dict[tuple[int, int], tuple[tuple[int, int, int], tuple[int, int, int]]] = {
-    (704, 2560): ((8, 128, 2), (32, 128, 4)),
-    (576, 2560): ((8, 128, 2), (32, 128, 4)),
-    (2560, 352): ((32, 16, 4), (32, 16, 4)),
-    (2560, 288): ((16, 16, 4), (16, 16, 2)),
+_DECODE_TUNED: dict[tuple[int, int], tuple[tuple[int, int, int, int], tuple[int, int, int, int]]] = {
+    (704, 2560): ((8, 32, 4, 2), (8, 32, 4, 2)),
+    (576, 2560): ((8, 32, 4, 2), (8, 32, 4, 2)),
+    (2560, 352): ((16, 16, 4, 1), (16, 16, 4, 1)),
+    (2560, 288): ((16, 16, 2, 1), (16, 16, 2, 1)),
 }
 
 
@@ -140,7 +141,7 @@ def _decode_gemm_marlin(
         _DECODE_UNTUNED_SEEN.add((N, K))  # the table is per (N, K) of one model and split: say when it does nothing
         logger.info(f"FREETOKEN_NVFP4_DECODE_TUNED: no tuned tiles for (N, K) = ({N}, {K}), shipped config used")
     if tuned is not None:
-        block_n, block_kw, warps = tuned[0] if M == 1 else tuned[1]
+        block_n, block_kw, warps, unroll = tuned[0] if M == 1 else tuned[1]
     # int64 activation loads need contiguous 16-bit rows that start 16-byte aligned
     a_wide = (
         a.dtype in (torch.bfloat16, torch.float16)
