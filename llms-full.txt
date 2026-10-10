@@ -211,8 +211,8 @@ rdna3/serve.sh xt     --model ~/models/Qwen3.8-Flash-Next-NVFP4       # one XT
 
 The script picks the cards by itself (for `xtx-xt` the larger one becomes rank 0) and prints them; `--gpus 1,0` forces
 a choice, `--dry-run` prints the full `docker run` command instead of running it. Other options: `--port`
-(default 1919), `--host` (default 127.0.0.1; 0.0.0.0 serves your network, and the API has no authentication:
-[limits.md](limits.md#anything-else-to-know)), `--ctx`, `--served-name`, `--name`,
+(default 1919), `--host` (default 127.0.0.1; 0.0.0.0 serves your network, and the API has no authentication unless
+started with `-- --api-key KEY`: [limits.md](limits.md#anything-else-to-know)), `--ctx`, `--served-name`, `--name`,
 `--image`, `--memory`, `--vision` (image input, off by default:
 [limits.md](limits.md#images-vision)), `--no-mtp` (decode without the MTP draft head the profiles turn on:
 [limits.md](limits.md#speculative-decoding-mtp)), and `-- <extra ft serve flags>`.
@@ -250,7 +250,8 @@ curl -s http://127.0.0.1:1919/v1/chat/completions -H 'Content-Type: application/
 ## 6. Connect a client
 
 Endpoints: OpenAI-compatible `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/models`;
-Anthropic-compatible `/v1/messages`. The API key is not checked (use any string).
+Anthropic-compatible `/v1/messages`. The API key is not checked (use any string) unless the server was started with
+`--api-key`.
 
 - **OpenAI-compatible clients** (OpenCode, Codex, most SDKs): base URL `http://127.0.0.1:1919/v1`, model
   `qwen3.8-flash-next`.
@@ -352,7 +353,7 @@ A comment may follow a value on the same line. Copy a file to make your own prof
 | `FREETOKEN_TP_ALLOW_IMBALANCE` | `1` | plan memory on the smaller card (upstream refuses ranks whose free memory differs by more than 2 GiB) |
 | `FREETOKEN_INT8_DENSE` | `1` | dense layers in int8 (weights only, routers stay bf16): +28 % decode, frees ~2.4 GiB per card for the expert cache; lossy, agent-validated |
 | `FREETOKEN_HOST_ALLREDUCE` | `1` | small all-reduces through shared host memory instead of RCCL's proxies (no GPU peer-to-peer here): +2.5-4.8 % decode, bit-exact |
-| `FREETOKEN_NVFP4_PREFILL_TUNED` / `_DECODE_TUNED` | `1` | expert GEMM tiles swept on these cards for this model (the decode ones for this split's shapes): long prompts -11 %, decode GEMMs ~13 % faster in the kernel sweep, bit-exact |
+| `FREETOKEN_NVFP4_PREFILL_TUNED` / `_DECODE_TUNED` | `1` | expert GEMM tiles swept on these cards for this model (the decode ones for this split's shapes): long prompts -11 %, the down decode GEMV x1.06-1.19 in the kernel sweep, bit-exact against the default tiles |
 | `FREETOKEN_HOST_KV` | `1` | conversations evicted from the GPUs go to RAM (9.5 GiB locked) and come back in ~2 s; exact |
 | `FREETOKEN_MTP` / `FREETOKEN_SPEC_VERIFY_M` | `1` / `4` | the checkpoint's MTP head drafts up to 3 tokens a step for a request decoding alone (two at once in `xtx-xt`, `FREETOKEN_SPEC_BS_MAX=2`: +8-15 % each): +34 % decode at the model's sampling (+7-8 % on one card), greedy answers unchanged; `rdna3/serve.sh --no-mtp` turns it off ([limits.md](limits.md#speculative-decoding-mtp)) |
 | `--moe-strategy offload --moe-cache-auto` | | experts live in RAM; every byte of VRAM left after the dense weights and the KV is an expert cache (7.1k of the 24,576 experts, on each card) |
@@ -462,8 +463,7 @@ Every tunable this build adds on top of upstream FreeToken is switched by an env
 profile, or with `-e` on `docker run`). Unless stated otherwise the default is upstream's behavior. A few fixes have
 no switch: the ROCm sampling routes, CUDA graphs for every batch size up to an explicit `--cuda-graph-max-bs` (8 or
 less), the GDN boundary carried across prefill chunks, the TP>1 relay handshake, the refusal of a cache rebuild under
-an uneven split, YaRN under the multi-axis rope, the split top-k past 16 chunks on page tables wider than 131,072
-block columns (contexts over 524,288 tokens), and RCCL instead of PyNCCL on ROCm ([limits.md](limits.md#does-it-work-on-nvidia-gpus)).
+an uneven split, and RCCL instead of PyNCCL on ROCm ([limits.md](limits.md#does-it-work-on-nvidia-gpus)).
 Measurements are from the reference machine (RX 7900 XTX + RX 7900 XT, Qwen3.8-Flash-Next NVFP4, TP=2): see
 [benchmarks.md](benchmarks.md).
 
@@ -529,7 +529,7 @@ disagreements over ~8k sampled tokens in `check` mode). It is on the torch.distr
 | Variable | Default | Effect |
 |---|---|---|
 | `FREETOKEN_NVFP4_PREFILL_TUNED` | unset | `1`: NVFP4 expert GEMM tiles for prefill swept on RX 7900 XTX / XT for this model, chosen by token count (any split, one or two cards). Only the M / N tiles, warps and stages change (a different K tile would reorder the sums): **bit-exact**, long prompts -11 %. |
-| `FREETOKEN_NVFP4_DECODE_TUNED` | unset | `1`: the same for decode, per (N, K) and batch size, for the two-card shapes at a 0.55 split; other shapes (one card, other splits) keep the default tiles, logged once per shape. **Bit-exact**; the tuned decode GEMMs are ~13 % faster at 1 request and 1.06-1.2x at 2-4 (kernel sweep; the full-model gain was not measured on its own). |
+| `FREETOKEN_NVFP4_DECODE_TUNED` | unset | `1`: the same for decode, per (N, K) and batch size, for the two-card shapes at a 0.55 split; other shapes (one card, other splits) keep the default tiles, logged once per shape. **Bit-exact** against the default tiles. Swept again for upstream's marlin decode kernel (`7644984`, merged with `ee9789f`): gate_up keeps the default tiles, the best of the sweep; the down GEMV runs one loop trip per tile, x1.06-1.11 at 1 request and x1.10-1.19 at 2-4 (kernel sweep). That kernel with these tiles takes 8-16 % less time per GEMV at 1 request than the previous kernel with its tuned tiles, but is not bit-exact with it (greedy answers changed on 5 of 15 prompts, all still right); decode with the MTP head on `xtx-xt` 76.4 tok/s against 73.8 (12 sampled answers). |
 | `FREETOKEN_NVFP4_PREFILL_BLOCK` | `4096` | The prefill MoE runs the chunk 4096 tokens at a time on the same expert banks (`0` = the whole chunk). Bit-exact (kernel check); lets 16k-token chunks fit in memory. |
 | `FREETOKEN_EXL3_PREFILL_BLOCK` | `4096` | EXL3 checkpoints ([how-it-works.md](how-it-works.md#exl3-checkpoints)): the prefill MoE runs 4096 tokens at a time (`0` = the whole chunk): 540 MiB of temporaries on the 384-wide expert slice, 620 MiB with a 16k chunk's output (measured; 500 / 580 MiB on the 256-wide slice, by the same formula), which the cache planner keeps free at start. Swept on the XT (one layer, 8192 tokens): 1024-token blocks cost 5.4 ms per 1k tokens before the down GEMM took the rotation out as its epilogue, 4096-token blocks 3.4, then 2.8-3.0 with that epilogue; 8192 saved 5-7 % more before that epilogue, for 0.5 GiB more. A block of 12 tokens or fewer (the last one included) takes the decode kernels for both rotations, one of 13-25 for the step between the products (at top-10), and rounds differently; otherwise the block size changes no result (`rdna3/tests/exl3_moe_check.py`: 1024-token blocks against the whole 3000-token chunk, bit-identical). |
 | `FREETOKEN_BATCH_MEMCPY_ROCM` | unset | Copy engine for `--moe-prefill-hit-d2d` on ROCm: `batch` = `hipMemcpyBatchAsync` (HIP >= 7.1), `loop` = one copy per entry; unset tries `batch`, then `loop`. |
@@ -1981,8 +1981,10 @@ On in the profiles except `gre` (`FREETOKEN_MTP=1 FREETOKEN_SPEC_VERIFY_M=4`); `
 
 ## Anything else to know?
 
-- **No authentication**: the API accepts any request. Keep `--host 127.0.0.1`, or put an authenticating proxy in front
-  before serving a network.
+- **No authentication by default**: the API accepts any request. Keep `--host 127.0.0.1`, or require a key with
+  upstream's `--api-key` (`rdna3/serve.sh <profile> ... -- --api-key KEY`; clients then send `Authorization: Bearer
+  KEY`, every route but `/health` answers 401 without it; the key shows in `docker inspect` and `ps`), or put an
+  authenticating proxy in front before serving a network. `rdna3/bench/` scripts send no key.
 - **Runtime cache rebuild** (`/v1/cache/rebuild`) is refused under an uneven split (the ranks could disagree) and
   with the MTP head (its rollback holds the state pools): change the sizes by restarting the server.
 - **Host settings matter**: unless `vm.compact_unevictable_allowed=0` keeps memory compaction off the engine's locked
@@ -2228,6 +2230,7 @@ docker run --rm --device=/dev/kfd --device=/dev/dri --security-opt seccomp=uncon
 | `exl3_gemv_bench.py`, `exl3_moe_bench.py` | the EXL3 decode GEMV tile sweep against the NVFP4 GEMV, and the 48-layer decode MoE step of both formats |
 | `dense_gemv_bench.py` | decode dense projections, bf16 vs int8 |
 | `router_topk_bench.py` | the MoE router softmax + top-k |
+| `qsa_topk_bench.py` | the QSA indexer's block top-k on the profiles' page tables (250k / 262k and 1M contexts), against `torch.topk` |
 | `allreduce_bench.py` | tiny all-reduce latency between two GPUs (`torchrun --nproc-per-node 2`) |
 | `vision_tower_bench.py` | the vision tower alone on one card: encode time, peak VRAM and attention kernel per image size; `--save` writes the embeddings to compare two cards bit for bit |
 
@@ -2260,18 +2263,16 @@ How this repository relates to upstream FreeToken and how to keep it current. Fo
 
 ## What this tree is
 
-Upstream [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken) at `0d652e7` (2026-09-26, "feat(rocm): add
-RDNA3 and RDNA4 runtime foundation (#132)"), plus the changes listed file by file in
-[changes-from-upstream.md](changes-from-upstream.md). The history is upstream's own up to that commit, then this
-project's commits on top (the first one holds everything up to 0.1.0). Once the `upstream` remote is set up (below),
+Upstream [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken) at `ee9789f` (2026-10-10, "fix(kernel):
+avoid nan in triton sampling softmax when a chunk starts with -inf (#654)"), plus the changes listed file by file in
+[changes-from-upstream.md](changes-from-upstream.md). The history is upstream's own up to `0d652e7` (2026-09-26), then
+this project's commits on top (the first one holds everything up to 0.1.0), then a merge of upstream up to `ee9789f`. Once the `upstream` remote is set up (below),
 `git diff $(git merge-base HEAD upstream/main)` shows every change against the upstream version this tree is based on.
 
 ## The stack on top of upstream (oldest first)
 
 | Piece | Origin | Leaves the stack when |
 |---|---|---|
-| TVM-FFI JIT kernels portable to HIP | upstream PR #133 (zihaomu) | #133 merges |
-| CUDA-only backends gated off on ROCm | upstream PR #134 (zihaomu) | #134 merges |
 | RCCL for tensor-parallel execution | upstream PR #135 (zihaomu) | #135 merges |
 | LDS clamp of the QSA attend kernel for RDNA's 64 KiB | community ROCm port (lukascechovic), upstream issue #349 | upstream fixes #349 |
 | TP>1 relay handshake before the first request | community ROCm port (lukascechovic), upstream issue #364 | upstream fixes #364 |
@@ -2280,6 +2281,10 @@ project's commits on top (the first one holds everything up to 0.1.0). Once the 
 | unequal cards, uneven split, int8 dense, GEMVs, host all-reduce, sampler, tuned tiles, blocked prefill, multi-request, RAM tier, review fixes | this repository | upstream merges it (to be proposed piece by piece) |
 | `Dockerfile.rdna3`, `rdna3/`, `docs/rdna3/` | this repository | never |
 
+Left the stack at the merge of `ee9789f`: upstream merged #134 (CUDA-only backends gated off on ROCm, `9b585b7`) and
+carries #133's HIP-portable JIT kernels since `803a3b4` (#133 itself was closed). Of both, this tree keeps one line: on
+ROCm, `LaunchKernel::with_attr` refuses `use_pdl=True` where upstream ignores it. The YaRN rope table and the split
+top-k past 16 chunks, written here first, are upstream's own since `235e201` and `5031e3d`.
 ## Keeping current
 
 ```bash
@@ -2330,16 +2335,18 @@ and is keyed to this model's 384 / 256 shapes.
 # Changes from upstream
 
 This repository is a modified version of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken) (Apache
-License 2.0), taken at `0d652e7` (2026-09-26). Every file changed or added relative to that commit is listed here with
-the reason. Line counts are `added/removed`. Who wrote what: [credits.md](credits.md).
+License 2.0), taken at `0d652e7` (2026-09-26) and merged with upstream up to `ee9789f` (2026-10-10). Every file changed
+or added relative to upstream is listed here with the reason. Line counts are `added/removed`, against the upstream
+commit of the time (`0d652e7`, or the commit a section names); `git diff ee9789f` gives today's. Files the merge made
+identical to upstream again are gone from the tables ([maintaining.md](maintaining.md#the-stack-on-top-of-upstream-oldest-first)).
+Who wrote what: [credits.md](credits.md).
 
 ## ROCm portability (upstream PRs #133-#135 by zihaomu, and fixes on top)
 
 | File | Lines | Change |
 |---|---:|---|
-| `python/freetoken/kernel/backend.py` | 10/13 | CUDA-only backends (and the NVFP4 CUDA kernels) gated off on ROCm; Triton on ROCm |
-| `python/freetoken/kernel/csrc/include/freetoken/utils.cuh` | 11/1 | TVM-FFI JIT kernels portable to HIP |
-| `python/freetoken/kernel/csrc/jit/index.cu`, `store.cu` | 10/8, 5/5 | same |
+| `python/freetoken/kernel/backend.py` | 2/2 against `ee9789f` | the module docstring (the gating itself is upstream's #134 since `9b585b7`) |
+| `python/freetoken/kernel/csrc/include/freetoken/utils.cuh` | 1/1 against `ee9789f` | on ROCm, `with_attr` refuses `use_pdl=True` (upstream ignores it); the HIP-portable JIT kernels are upstream's since `803a3b4` |
 | `python/freetoken/kernel/pynccl.py` | 7/1 | tensor parallelism routed to RCCL on ROCm |
 | `python/freetoken/kernel/triton/qsa/attend.py` | 51/3 | BLOCK_N clamped to RDNA's 64 KiB LDS; int8 K/V path (experimental) |
 | `tests/engine/test_rocm_communication.py`, `tests/kernels/test_backend.py`, `tests/kernels/test_jit_index_store.py` | new | tests of the above |
@@ -2389,7 +2396,7 @@ the reason. Line counts are `added/removed`. Who wrote what: [credits.md](credit
 
 | File | Lines | Change |
 |---|---:|---|
-| `python/freetoken/moe/fused_nvfp4.py` | 73/8 | tuned NVFP4 prefill / decode tiles for RDNA3 (opt-in, bit-exact); token-blocked prefill MoE |
+| `python/freetoken/moe/fused_nvfp4.py` | 73/8 | tuned NVFP4 prefill / decode tiles for RDNA3 (opt-in, bit-exact); token-blocked prefill MoE (the decode tiles swept again for upstream's marlin decode kernel, `7644984`) |
 | `python/freetoken/moe/offload_cache.py` | 16/2 | expert reuse during prefill on ROCm |
 | `python/freetoken/kernel/batch_memcpy.py`, `kernel/csrc/jit/batch_memcpy.cuh` | 55/0, 86/1 | `hipMemcpyBatchAsync` (HIP >= 7.1) with a per-copy fallback |
 
@@ -2511,14 +2518,13 @@ Line counts here are on top of the lines listed in the sections above.
 
 | File | Lines | Change |
 |---|---:|---|
-| `python/freetoken/layers/rotary.py` | 69/54 | YaRN's frequencies in one helper, also under the multi-axis (vision) rope: Qwen3.8-Flash-Next's checkpoints carry a vision tower, and the model card's 1M-token setting is YaRN |
-| `python/freetoken/models/qwen4_exp/config.py` | 12/1 | the rope table covers YaRN's `original x factor` positions, or `FREETOKEN_ROPE_MAX_POSITION` positions of the plain rope |
+| `python/freetoken/models/qwen4_exp/config.py` | 6/1 | `FREETOKEN_ROPE_MAX_POSITION` positions of the plain rope (YaRN's `original x factor` table is upstream's `RotaryConfig.table_positions` since `235e201`, as is YaRN under the multi-axis rope) |
 | `python/freetoken/kvcache/qsa_pool.py`, `kvcache/mha_pool.py`, `kernel/host_mapped.py`, `kernel/triton/qsa/stage.py`, `attention/qsa_sparse.py`, `kvcache/host_kv_pool.py` | 48/3, 7/8, new, new, 11/2, 4/0 | `FREETOKEN_QSA_KV_HOST`: the K/V slab in pinned, device-mapped host memory seen by torch as a GPU tensor (DLPack), allocated non-coherent on ROCm so that L2 keeps what the verify rows of one request share, a VRAM buffer that a prefill fills with the pages of one layer at a time, the VRAM budget without the slab; refused with `FREETOKEN_QSA_KV_INT8`, the RAM tier off with it |
-| `python/freetoken/kernel/triton/qsa/topk.py` | 27/8 | the split top-k takes more than 16 chunks on a page table wider than 131,072 block columns (a context over 524,288 tokens) instead of falling back to one program per row (504 us per decode layer at 988k against ~80), up to 16,384 merge candidates (the tie count's 16 bits) |
 | `python/freetoken/engine/engine.py` | 8/1 | with `FREETOKEN_QSA_KV_HOST` the planned K/V pool stays at `--kv-reserve-tokens` (a page past it pins ~0.9 MB of RAM); the rope-length error names `FREETOKEN_ROPE_MAX_POSITION` |
 | `python/freetoken/layers/embedding.py` | 32/0 | `FREETOKEN_DUMP_PROMPT_TOPK` (tests only): every prefill row's top-40 log-probabilities and the input ids, saved by rank 0 |
 | `rdna3/serve.sh` | 22/10 | `KV_TOKENS` in a profile: the K/V pool shared by the requests, apart from one request's `CTX`; `--list` prints a table (GPUs, context, pool, status) |
-| `tests/models/qwen4_exp/test_qsa_kernels.py` | 11/1 | the split top-k on a 1M-token page table against `torch.topk` and the tie policy; the plan's bounds |
+| `tests/models/qwen4_exp/test_qsa_kernels.py` | 19/4 against `ee9789f` | upstream's split top-k (`5031e3d`, which replaced this tree's own) also on the 1M profile's 250,000-column table, its boundary row cut where a reduction level divides the candidates; the plan's levels |
+| `rdna3/bench/qsa_topk_bench.py` | new | the block top-k on the profiles' page tables |
 | `tests/layers/test_rotary_yarn.py`, `tests/kernels/test_qsa_kv_host.py`, `rdna3/profiles/xtx-xt-1m.env`, `rdna3/profiles/xtx-xt-4x262k.env` | new | YaRN and the longer table against HF's rotary embedding (CPU); the host-mapped tensor and the page staging (GPU); one conversation of 1M, four of 262,144 at once |
 
 ## Tooling and documentation
@@ -2560,9 +2566,16 @@ Neither profile is agent-validated yet.
   locks ~75 GiB of host RAM; the 7900 XTX peaked at 23.20 of 23.98 GiB (sysfs) during a 1M read with the desktop on it. The
   answers are bit-identical to the K/V in VRAM (the same text at 29k and 118k).
 - **Rope.** Two ways past 262,144 positions:
-  - YaRN from `rope_parameters` (the model card's edit): the checkpoints carry a vision tower, so the rope is the
-    multi-axis one; YaRN now composes with it, and its table covers `original x factor` positions as SGLang / vLLM
-    size it. Bit-identical to HF transformers 5.16.1's rotary embedding (`tests/layers/test_rotary_yarn.py`).
+  - YaRN from `rope_parameters`, the model card's setting. Upstream's `--hf-overrides` (`235e201`) sets it without
+    editing `config.json`; the section is replaced whole, so it carries every key:
+    `rdna3/serve.sh xtx-xt-1m ... -- --hf-overrides '{"text_config": {"rope_parameters": {"rope_type": "yarn", "factor": 4.0,
+    "original_max_position_embeddings": 262144, "rope_theta": 10000000, "partial_rotary_factor": 0.25,
+    "mrope_interleaved": true, "mrope_section": [11, 11, 10]}}}'` (the config it builds is checked on the CPU by
+    `tests/models/qwen4_exp/test_config.py`; on the GPU, EXL3 3.05 at 497k, the same text as the `config.json` edit,
+    12/12, read at 2036 tok/s, decode 85 tok/s). The checkpoints carry a vision tower, so the
+    rope is the multi-axis one; YaRN composes with it and the table covers `original x factor` positions, as SGLang /
+    vLLM size it (upstream's code since the merge of `ee9789f`, written here first). Bit-identical to HF transformers
+    5.16.1's rotary embedding (`tests/layers/test_rotary_yarn.py`).
   - **`FREETOKEN_ROPE_MAX_POSITION=1048576`**: the plain rope with a longer table, no YaRN. Below 262,144 the rows are
     the same bits as without it, so short contexts are unchanged.
 - `rdna3/profiles/xtx-xt-1m.env` puts it together for one long conversation (plain rope, K/V on the host,
@@ -2617,13 +2630,18 @@ Measured in the afternoon of 2026-10-10, after the tables above:
 - **The indexer's top-k fell back to one program per row on a 1M-token table.** Its split path holds at most 16
   chunks of 8192 columns; a 1M-token context's page table is 250,000 block columns wide, so `_split_plan` gave up and
   each row was scanned by a single program: 504 us per decode layer at 988k visible tokens against 77-83 us split
-  (4 rows, the same winners, ties included). The split now takes more chunks past 16, and only a row with more live
-  chunks than one resident tile holds merges in a spilled tile; tables up to 131,072 columns (contexts up to 524,288
-  tokens, so the 250k profiles) keep their plan, and a plan merges at most 16,384 candidates (32 chunks: contexts up to
-  1,048,576 tokens; a longer table takes the one-program path again). Below ~100k visible tokens the wide table's split costs ~40 us per
-  layer more than the one-program scan did. With both changes (a cold read, then 700 tokens): 498k read at 1973 tok/s,
-  decode 91.9 tok/s (85.8 before); 988k read at 1775 tok/s in 9.3 min (1711), decode 83.6 tok/s (72.1); the same text
-  as before both changes.
+  (4 rows, the same winners, ties included). The split now takes more chunks past 16; tables up to 131,072 columns
+  (contexts up to 524,288 tokens, so the 250k profiles) keep their plan. This tree first merged the extra chunks in one
+  spilled tile; since the merge of upstream `ee9789f` it runs upstream's own fix (`5031e3d`): reduction levels, each
+  program keeping the top-k of 8,192 candidates, until the survivors fit one merge, with no length limit. On the 7900
+  XT, one decode layer's top-k at 247,000 visible columns (988k tokens): 53 / 64 / 96 us for 1 / 4 / 8 rows against
+  65 / 75 / 101 with the spilled tile, the same winners; 4-7 us more than the spilled tile at 30,000 visible columns,
+  the same as before on the 65,536-column tables of the 250k profiles (`rdna3/bench/qsa_topk_bench.py`).
+  Below ~100k visible tokens the wide table's split costs ~40 us per layer more than the one-program scan did. With
+  both changes, measured with the spilled tile (a cold read, then 700 tokens): 498k read at 1973 tok/s, decode 91.9
+  tok/s (85.8 before); 988k read at 1775 tok/s in 9.3 min (1711), decode 83.6 tok/s (72.1); the same text as before
+  both changes. With upstream's levels (the image of the merge): the same text again at 498k (read 2014 tok/s, decode
+  93.0) and 988k (1780, 84.7), XTX peak 22.76 GiB.
 - **A/B at 118k** (decode tok/s, EXL3 3.05): K/V in VRAM, 262k table (the `xtx-xt` profile, 9,932 expert slots) 90.6;
   K/V on the host, 262k table (12,667 slots) 86.6; K/V on the host, 1M table (11,261 slots) 84.2. Both the host K/V
   and the wide table cost a few percent there.

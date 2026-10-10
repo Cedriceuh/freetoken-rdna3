@@ -1,16 +1,18 @@
 # Changes from upstream
 
 This repository is a modified version of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken) (Apache
-License 2.0), taken at `0d652e7` (2026-09-26). Every file changed or added relative to that commit is listed here with
-the reason. Line counts are `added/removed`. Who wrote what: [credits.md](credits.md).
+License 2.0), taken at `0d652e7` (2026-09-26) and merged with upstream up to `ee9789f` (2026-10-10). Every file changed
+or added relative to upstream is listed here with the reason. Line counts are `added/removed`, against the upstream
+commit of the time (`0d652e7`, or the commit a section names); `git diff ee9789f` gives today's. Files the merge made
+identical to upstream again are gone from the tables ([maintaining.md](maintaining.md#the-stack-on-top-of-upstream-oldest-first)).
+Who wrote what: [credits.md](credits.md).
 
 ## ROCm portability (upstream PRs #133-#135 by zihaomu, and fixes on top)
 
 | File | Lines | Change |
 |---|---:|---|
-| `python/freetoken/kernel/backend.py` | 10/13 | CUDA-only backends (and the NVFP4 CUDA kernels) gated off on ROCm; Triton on ROCm |
-| `python/freetoken/kernel/csrc/include/freetoken/utils.cuh` | 11/1 | TVM-FFI JIT kernels portable to HIP |
-| `python/freetoken/kernel/csrc/jit/index.cu`, `store.cu` | 10/8, 5/5 | same |
+| `python/freetoken/kernel/backend.py` | 2/2 against `ee9789f` | the module docstring (the gating itself is upstream's #134 since `9b585b7`) |
+| `python/freetoken/kernel/csrc/include/freetoken/utils.cuh` | 1/1 against `ee9789f` | on ROCm, `with_attr` refuses `use_pdl=True` (upstream ignores it); the HIP-portable JIT kernels are upstream's since `803a3b4` |
 | `python/freetoken/kernel/pynccl.py` | 7/1 | tensor parallelism routed to RCCL on ROCm |
 | `python/freetoken/kernel/triton/qsa/attend.py` | 51/3 | BLOCK_N clamped to RDNA's 64 KiB LDS; int8 K/V path (experimental) |
 | `tests/engine/test_rocm_communication.py`, `tests/kernels/test_backend.py`, `tests/kernels/test_jit_index_store.py` | new | tests of the above |
@@ -60,7 +62,7 @@ the reason. Line counts are `added/removed`. Who wrote what: [credits.md](credit
 
 | File | Lines | Change |
 |---|---:|---|
-| `python/freetoken/moe/fused_nvfp4.py` | 73/8 | tuned NVFP4 prefill / decode tiles for RDNA3 (opt-in, bit-exact); token-blocked prefill MoE |
+| `python/freetoken/moe/fused_nvfp4.py` | 73/8 | tuned NVFP4 prefill / decode tiles for RDNA3 (opt-in, bit-exact); token-blocked prefill MoE (the decode tiles swept again for upstream's marlin decode kernel, `7644984`) |
 | `python/freetoken/moe/offload_cache.py` | 16/2 | expert reuse during prefill on ROCm |
 | `python/freetoken/kernel/batch_memcpy.py`, `kernel/csrc/jit/batch_memcpy.cuh` | 55/0, 86/1 | `hipMemcpyBatchAsync` (HIP >= 7.1) with a per-copy fallback |
 
@@ -182,14 +184,13 @@ Line counts here are on top of the lines listed in the sections above.
 
 | File | Lines | Change |
 |---|---:|---|
-| `python/freetoken/layers/rotary.py` | 69/54 | YaRN's frequencies in one helper, also under the multi-axis (vision) rope: Qwen3.8-Flash-Next's checkpoints carry a vision tower, and the model card's 1M-token setting is YaRN |
-| `python/freetoken/models/qwen4_exp/config.py` | 12/1 | the rope table covers YaRN's `original x factor` positions, or `FREETOKEN_ROPE_MAX_POSITION` positions of the plain rope |
+| `python/freetoken/models/qwen4_exp/config.py` | 6/1 | `FREETOKEN_ROPE_MAX_POSITION` positions of the plain rope (YaRN's `original x factor` table is upstream's `RotaryConfig.table_positions` since `235e201`, as is YaRN under the multi-axis rope) |
 | `python/freetoken/kvcache/qsa_pool.py`, `kvcache/mha_pool.py`, `kernel/host_mapped.py`, `kernel/triton/qsa/stage.py`, `attention/qsa_sparse.py`, `kvcache/host_kv_pool.py` | 48/3, 7/8, new, new, 11/2, 4/0 | `FREETOKEN_QSA_KV_HOST`: the K/V slab in pinned, device-mapped host memory seen by torch as a GPU tensor (DLPack), allocated non-coherent on ROCm so that L2 keeps what the verify rows of one request share, a VRAM buffer that a prefill fills with the pages of one layer at a time, the VRAM budget without the slab; refused with `FREETOKEN_QSA_KV_INT8`, the RAM tier off with it |
-| `python/freetoken/kernel/triton/qsa/topk.py` | 27/8 | the split top-k takes more than 16 chunks on a page table wider than 131,072 block columns (a context over 524,288 tokens) instead of falling back to one program per row (504 us per decode layer at 988k against ~80), up to 16,384 merge candidates (the tie count's 16 bits) |
 | `python/freetoken/engine/engine.py` | 8/1 | with `FREETOKEN_QSA_KV_HOST` the planned K/V pool stays at `--kv-reserve-tokens` (a page past it pins ~0.9 MB of RAM); the rope-length error names `FREETOKEN_ROPE_MAX_POSITION` |
 | `python/freetoken/layers/embedding.py` | 32/0 | `FREETOKEN_DUMP_PROMPT_TOPK` (tests only): every prefill row's top-40 log-probabilities and the input ids, saved by rank 0 |
 | `rdna3/serve.sh` | 22/10 | `KV_TOKENS` in a profile: the K/V pool shared by the requests, apart from one request's `CTX`; `--list` prints a table (GPUs, context, pool, status) |
-| `tests/models/qwen4_exp/test_qsa_kernels.py` | 11/1 | the split top-k on a 1M-token page table against `torch.topk` and the tie policy; the plan's bounds |
+| `tests/models/qwen4_exp/test_qsa_kernels.py` | 19/4 against `ee9789f` | upstream's split top-k (`5031e3d`, which replaced this tree's own) also on the 1M profile's 250,000-column table, its boundary row cut where a reduction level divides the candidates; the plan's levels |
+| `rdna3/bench/qsa_topk_bench.py` | new | the block top-k on the profiles' page tables |
 | `tests/layers/test_rotary_yarn.py`, `tests/kernels/test_qsa_kv_host.py`, `rdna3/profiles/xtx-xt-1m.env`, `rdna3/profiles/xtx-xt-4x262k.env` | new | YaRN and the longer table against HF's rotary embedding (CPU); the host-mapped tensor and the page staging (GPU); one conversation of 1M, four of 262,144 at once |
 
 ## Tooling and documentation

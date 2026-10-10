@@ -4,18 +4,16 @@ How this repository relates to upstream FreeToken and how to keep it current. Fo
 
 ## What this tree is
 
-Upstream [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken) at `0d652e7` (2026-09-26, "feat(rocm): add
-RDNA3 and RDNA4 runtime foundation (#132)"), plus the changes listed file by file in
-[changes-from-upstream.md](changes-from-upstream.md). The history is upstream's own up to that commit, then this
-project's commits on top (the first one holds everything up to 0.1.0). Once the `upstream` remote is set up (below),
+Upstream [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken) at `ee9789f` (2026-10-10, "fix(kernel):
+avoid nan in triton sampling softmax when a chunk starts with -inf (#654)"), plus the changes listed file by file in
+[changes-from-upstream.md](changes-from-upstream.md). The history is upstream's own up to `0d652e7` (2026-09-26), then
+this project's commits on top (the first one holds everything up to 0.1.0), then a merge of upstream up to `ee9789f`. Once the `upstream` remote is set up (below),
 `git diff $(git merge-base HEAD upstream/main)` shows every change against the upstream version this tree is based on.
 
 ## The stack on top of upstream (oldest first)
 
 | Piece | Origin | Leaves the stack when |
 |---|---|---|
-| TVM-FFI JIT kernels portable to HIP | upstream PR #133 (zihaomu) | #133 merges |
-| CUDA-only backends gated off on ROCm | upstream PR #134 (zihaomu) | #134 merges |
 | RCCL for tensor-parallel execution | upstream PR #135 (zihaomu) | #135 merges |
 | LDS clamp of the QSA attend kernel for RDNA's 64 KiB | community ROCm port (lukascechovic), upstream issue #349 | upstream fixes #349 |
 | TP>1 relay handshake before the first request | community ROCm port (lukascechovic), upstream issue #364 | upstream fixes #364 |
@@ -24,6 +22,10 @@ project's commits on top (the first one holds everything up to 0.1.0). Once the 
 | unequal cards, uneven split, int8 dense, GEMVs, host all-reduce, sampler, tuned tiles, blocked prefill, multi-request, RAM tier, review fixes | this repository | upstream merges it (to be proposed piece by piece) |
 | `Dockerfile.rdna3`, `rdna3/`, `docs/rdna3/` | this repository | never |
 
+Left the stack at the merge of `ee9789f`: upstream merged #134 (CUDA-only backends gated off on ROCm, `9b585b7`) and
+carries #133's HIP-portable JIT kernels since `803a3b4` (#133 itself was closed). Of both, this tree keeps one line: on
+ROCm, `LaunchKernel::with_attr` refuses `use_pdl=True` where upstream ignores it. The YaRN rope table and the split
+top-k past 16 chunks, written here first, are upstream's own since `235e201` and `5031e3d`.
 ## Keeping current
 
 ```bash

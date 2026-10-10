@@ -21,9 +21,16 @@ Neither profile is agent-validated yet.
   locks ~75 GiB of host RAM; the 7900 XTX peaked at 23.20 of 23.98 GiB (sysfs) during a 1M read with the desktop on it. The
   answers are bit-identical to the K/V in VRAM (the same text at 29k and 118k).
 - **Rope.** Two ways past 262,144 positions:
-  - YaRN from `rope_parameters` (the model card's edit): the checkpoints carry a vision tower, so the rope is the
-    multi-axis one; YaRN now composes with it, and its table covers `original x factor` positions as SGLang / vLLM
-    size it. Bit-identical to HF transformers 5.16.1's rotary embedding (`tests/layers/test_rotary_yarn.py`).
+  - YaRN from `rope_parameters`, the model card's setting. Upstream's `--hf-overrides` (`235e201`) sets it without
+    editing `config.json`; the section is replaced whole, so it carries every key:
+    `rdna3/serve.sh xtx-xt-1m ... -- --hf-overrides '{"text_config": {"rope_parameters": {"rope_type": "yarn", "factor": 4.0,
+    "original_max_position_embeddings": 262144, "rope_theta": 10000000, "partial_rotary_factor": 0.25,
+    "mrope_interleaved": true, "mrope_section": [11, 11, 10]}}}'` (the config it builds is checked on the CPU by
+    `tests/models/qwen4_exp/test_config.py`; on the GPU, EXL3 3.05 at 497k, the same text as the `config.json` edit,
+    12/12, read at 2036 tok/s, decode 85 tok/s). The checkpoints carry a vision tower, so the
+    rope is the multi-axis one; YaRN composes with it and the table covers `original x factor` positions, as SGLang /
+    vLLM size it (upstream's code since the merge of `ee9789f`, written here first). Bit-identical to HF transformers
+    5.16.1's rotary embedding (`tests/layers/test_rotary_yarn.py`).
   - **`FREETOKEN_ROPE_MAX_POSITION=1048576`**: the plain rope with a longer table, no YaRN. Below 262,144 the rows are
     the same bits as without it, so short contexts are unchanged.
 - `rdna3/profiles/xtx-xt-1m.env` puts it together for one long conversation (plain rope, K/V on the host,
@@ -78,13 +85,18 @@ Measured in the afternoon of 2026-10-10, after the tables above:
 - **The indexer's top-k fell back to one program per row on a 1M-token table.** Its split path holds at most 16
   chunks of 8192 columns; a 1M-token context's page table is 250,000 block columns wide, so `_split_plan` gave up and
   each row was scanned by a single program: 504 us per decode layer at 988k visible tokens against 77-83 us split
-  (4 rows, the same winners, ties included). The split now takes more chunks past 16, and only a row with more live
-  chunks than one resident tile holds merges in a spilled tile; tables up to 131,072 columns (contexts up to 524,288
-  tokens, so the 250k profiles) keep their plan, and a plan merges at most 16,384 candidates (32 chunks: contexts up to
-  1,048,576 tokens; a longer table takes the one-program path again). Below ~100k visible tokens the wide table's split costs ~40 us per
-  layer more than the one-program scan did. With both changes (a cold read, then 700 tokens): 498k read at 1973 tok/s,
-  decode 91.9 tok/s (85.8 before); 988k read at 1775 tok/s in 9.3 min (1711), decode 83.6 tok/s (72.1); the same text
-  as before both changes.
+  (4 rows, the same winners, ties included). The split now takes more chunks past 16; tables up to 131,072 columns
+  (contexts up to 524,288 tokens, so the 250k profiles) keep their plan. This tree first merged the extra chunks in one
+  spilled tile; since the merge of upstream `ee9789f` it runs upstream's own fix (`5031e3d`): reduction levels, each
+  program keeping the top-k of 8,192 candidates, until the survivors fit one merge, with no length limit. On the 7900
+  XT, one decode layer's top-k at 247,000 visible columns (988k tokens): 53 / 64 / 96 us for 1 / 4 / 8 rows against
+  65 / 75 / 101 with the spilled tile, the same winners; 4-7 us more than the spilled tile at 30,000 visible columns,
+  the same as before on the 65,536-column tables of the 250k profiles (`rdna3/bench/qsa_topk_bench.py`).
+  Below ~100k visible tokens the wide table's split costs ~40 us per layer more than the one-program scan did. With
+  both changes, measured with the spilled tile (a cold read, then 700 tokens): 498k read at 1973 tok/s, decode 91.9
+  tok/s (85.8 before); 988k read at 1775 tok/s in 9.3 min (1711), decode 83.6 tok/s (72.1); the same text as before
+  both changes. With upstream's levels (the image of the merge): the same text again at 498k (read 2014 tok/s, decode
+  93.0) and 988k (1780, 84.7), XTX peak 22.76 GiB.
 - **A/B at 118k** (decode tok/s, EXL3 3.05): K/V in VRAM, 262k table (the `xtx-xt` profile, 9,932 expert slots) 90.6;
   K/V on the host, 262k table (12,667 slots) 86.6; K/V on the host, 1M table (11,261 slots) 84.2. Both the host K/V
   and the wide table cost a few percent there.

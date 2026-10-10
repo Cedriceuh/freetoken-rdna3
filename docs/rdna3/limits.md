@@ -119,8 +119,10 @@ On in the profiles except `gre` (`FREETOKEN_MTP=1 FREETOKEN_SPEC_VERIFY_M=4`); `
 
 ## Anything else to know?
 
-- **No authentication**: the API accepts any request. Keep `--host 127.0.0.1`, or put an authenticating proxy in front
-  before serving a network.
+- **No authentication by default**: the API accepts any request. Keep `--host 127.0.0.1`, or require a key with
+  upstream's `--api-key` (`rdna3/serve.sh <profile> ... -- --api-key KEY`; clients then send `Authorization: Bearer
+  KEY`, every route but `/health` answers 401 without it; the key shows in `docker inspect` and `ps`), or put an
+  authenticating proxy in front before serving a network. `rdna3/bench/` scripts send no key.
 - **Runtime cache rebuild** (`/v1/cache/rebuild`) is refused under an uneven split (the ranks could disagree) and
   with the MTP head (its rollback holds the state pools): change the sizes by restarting the server.
 - **Host settings matter**: unless `vm.compact_unevictable_allowed=0` keeps memory compaction off the engine's locked

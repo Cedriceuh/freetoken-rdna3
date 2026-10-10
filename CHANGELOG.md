@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Upstream FreeToken merged up to `ee9789f` (23 commits, 2026-09-29 to 2026-10-10); the authors' commits are kept.
+  On this tree's path: a race in the disk PLE staging fixed (the overlap scheduler could rewrite the pinned rows of a
+  batch whose copy was still queued, `d3512b4`); upstream's NVFP4 marlin decode kernel (`7644984`) with the decode
+  tiles swept again: decode GEMVs 8-16 % less time at one request, NVFP4 greedy answers changed (5 of 15 prompts, all
+  still right), decode with the MTP head 76.4 tok/s against 73.8 (`xtx-xt`, 12 sampled answers); the YaRN table, YaRN
+  under the multi-axis rope and the split top-k past 16 chunks are upstream's own now (`235e201`, `5031e3d`; the
+  top-k of one layer at 988k tokens 53-64 us against 65-75); `--hf-overrides` (YaRN without editing `config.json`) and
+  `--api-key` (off unless given); a NaN in the sampling softmax, empty batches in the JIT index / store kernels, radix
+  keys that kept request buffers alive. EXL3: greedy answers identical (15/15, also on `xtx-xt-4x262k`) and decode
+  identical; `xtx-xt-1m` gives the same text as before at 498k and 988k, and YaRN through `--hf-overrides` the same
+  text as the `config.json` edit at 497k. Upstream PR #134 left this tree's stack (merged upstream). Anthropic `/v1/messages` clients: a system
+  message in the middle of a conversation now stays in place (`93b0a59`), which changes their prompt tokens.
+
 - Lower prefill VRAM peaks, all bit-exact and on by default: the hyper-connection combines write in place
   (`FREETOKEN_HC_INPLACE`, which also adds the PLE output in place), the GDN delta rule of a prefill runs 4096 tokens
   of a request at a time (`FREETOKEN_GDN_PREFILL_BLOCK`), the MTP head frees the prompt's streams once read: -0.6 GiB

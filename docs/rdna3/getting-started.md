@@ -63,8 +63,8 @@ rdna3/serve.sh xt     --model ~/models/Qwen3.8-Flash-Next-NVFP4       # one XT
 
 The script picks the cards by itself (for `xtx-xt` the larger one becomes rank 0) and prints them; `--gpus 1,0` forces
 a choice, `--dry-run` prints the full `docker run` command instead of running it. Other options: `--port`
-(default 1919), `--host` (default 127.0.0.1; 0.0.0.0 serves your network, and the API has no authentication:
-[limits.md](limits.md#anything-else-to-know)), `--ctx`, `--served-name`, `--name`,
+(default 1919), `--host` (default 127.0.0.1; 0.0.0.0 serves your network, and the API has no authentication unless
+started with `-- --api-key KEY`: [limits.md](limits.md#anything-else-to-know)), `--ctx`, `--served-name`, `--name`,
 `--image`, `--memory`, `--vision` (image input, off by default:
 [limits.md](limits.md#images-vision)), `--no-mtp` (decode without the MTP draft head the profiles turn on:
 [limits.md](limits.md#speculative-decoding-mtp)), and `-- <extra ft serve flags>`.
@@ -102,7 +102,8 @@ curl -s http://127.0.0.1:1919/v1/chat/completions -H 'Content-Type: application/
 ## 6. Connect a client
 
 Endpoints: OpenAI-compatible `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/models`;
-Anthropic-compatible `/v1/messages`. The API key is not checked (use any string).
+Anthropic-compatible `/v1/messages`. The API key is not checked (use any string) unless the server was started with
+`--api-key`.
 
 - **OpenAI-compatible clients** (OpenCode, Codex, most SDKs): base URL `http://127.0.0.1:1919/v1`, model
   `qwen3.8-flash-next`.

@@ -70,6 +70,7 @@ docker run --rm --device=/dev/kfd --device=/dev/dri --security-opt seccomp=uncon
 | `exl3_gemv_bench.py`, `exl3_moe_bench.py` | the EXL3 decode GEMV tile sweep against the NVFP4 GEMV, and the 48-layer decode MoE step of both formats |
 | `dense_gemv_bench.py` | decode dense projections, bf16 vs int8 |
 | `router_topk_bench.py` | the MoE router softmax + top-k |
+| `qsa_topk_bench.py` | the QSA indexer's block top-k on the profiles' page tables (250k / 262k and 1M contexts), against `torch.topk` |
 | `allreduce_bench.py` | tiny all-reduce latency between two GPUs (`torchrun --nproc-per-node 2`) |
 | `vision_tower_bench.py` | the vision tower alone on one card: encode time, peak VRAM and attention kernel per image size; `--save` writes the embeddings to compare two cards bit for bit |
 
