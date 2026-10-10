@@ -15,7 +15,8 @@ from freetoken.core import Batch, Context, Req, set_global_ctx
 from freetoken.distributed import destroy_distributed, enable_pynccl_distributed, get_tp_info, set_tp_info
 from freetoken.distributed.split import tp_shares
 from freetoken.gpu_select import gpu_identity
-from freetoken.layers import set_rope_device
+from freetoken.checkpoint.ftw import ftw_tensor_names, is_ftw_checkpoint
+from freetoken.layers import OffloadMoELayer, iter_moe_layers, set_rope_device
 from freetoken.layers.quantization import LayerKind, QuantBackend, finalize_quant, set_quant_backend
 from freetoken.moe.offload_cache import iter_offload_moe_layers
 from freetoken.mm.config import ENCODER_SECTIONS
@@ -23,7 +24,7 @@ from freetoken.models.config import VISION_KEY_PREFIXES
 from freetoken.models import create_model, load_weight
 from freetoken.models.weight import ftw_lacks_vision
 from freetoken.moe import is_offload_moe_strategy
-from freetoken.moe.expert_banks import load_expert_banks
+from freetoken.moe.expert_banks import attach_resident_banks, load_expert_banks
 from freetoken.moe.host_banks import PinFailed
 from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache
 from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
@@ -60,6 +61,10 @@ def _flashinfer_available() -> bool:
 
 
 def _sgl_flash_attn_available() -> bool:
+    from freetoken.kernel.backend import is_rocm
+
+    if is_rocm():
+        return False
     try:
         from sgl_kernel.flash_attn import flash_attn_with_kvcache  # noqa: F401
     except Exception as exc:
@@ -167,6 +172,8 @@ def _resolve_auto_attention_backend(required: frozenset[AttnType]) -> str:
     candidates: list[tuple[str, bool]] = []
     if AttnType.DSV4 in required:
         candidates.append(("dsv4_sparse", True))
+    if AttnType.DSV41 in required:
+        candidates.append(("dsv41_sparse", True))
     if required & {AttnType.MLA, AttnType.DSA}:
         candidates.append(("dsa", True))
     if AttnType.BSA in required:
@@ -203,6 +210,7 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
     where a DSV4 or MLA checkpoint rejects a generic backend before weights load,
     and where a generic model rejects dsa/dsv4_sparse."""
     from freetoken.attention import validate_attn_backend
+    from freetoken.kernel.backend import is_rocm
 
     # Name membership first (ArgumentTypeError listing the supported names): the CLI already
     # ran this, but the programmatic EngineConfig path reaches here unvalidated and would
@@ -243,12 +251,22 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
     for part in backend_parts:
         info = attention_backend_info(part)
         if info.requires_flashinfer and not _flashinfer_available():
+            if is_rocm():
+                raise RuntimeError(
+                    f"Attention backend {part!r} uses CUDA-only FlashInfer kernels "
+                    "unavailable on ROCm; use --attention-backend auto or triton."
+                )
             raise RuntimeError(
                 f"Attention backend {config.attention_backend!r} requires flashinfer, which is "
                 "not installed. Install it with `pip install 'freetoken[fi]'` (or "
                 "'freetoken[accel]'), or use --attention-backend triton."
             )
         if info.requires_sgl_kernel and not _sgl_flash_attn_available():
+            if is_rocm():
+                raise RuntimeError(
+                    f"Attention backend {part!r} uses CUDA-only sgl_kernel kernels "
+                    "unavailable on ROCm; use --attention-backend auto or triton."
+                )
             raise RuntimeError(
                 f"Attention backend {config.attention_backend!r} requires sgl_kernel, which is "
                 "not installed. Install it with `pip install 'freetoken[sgl]'` (or "
@@ -643,9 +661,14 @@ class Engine:
                 "family served images. Reconvert it with `ft checkpoint`, add the encoder in place with "
                 "scripts/ftw_hotfix.py (docs/ftw-hotfix.md), or start with --text-model-only"
             )
+        resident = [layer for layer in iter_moe_layers(self.model) if not isinstance(layer, OffloadMoELayer)]
+        if resident and not config.use_dummy_weight and is_ftw_checkpoint(config.model_path) and not ftw_tensor_names(config.model_path, "experts_bank"):
+            raise ValueError(f"{config.model_path} keeps its routed experts as dense weights (an older `ft checkpoint --moe-backend fused`); reconvert it with `ft checkpoint`")
         with _weight_load_context():
             self.model.load_state_dict(self._load_weight_state_dict(config))
         finalize_quant(self.model)
+        if resident:
+            self._load_resident_experts(config, resident)
         from freetoken.layers.quantization import int8_weight_only
 
         if int8_weight_only.enabled():
@@ -664,17 +687,31 @@ class Engine:
             return _make_dummy_weight_state_dict(model_state, device=self.device)
         # _materialize casts each loaded tensor to its model-param dtype (model_state), so
         # models declaring per-tensor dtypes (e.g. DSV4's mixed fp8/fp32/bf16) are preserved;
-        # offload models exclude experts (served from the offload cache, not dense weights).
+        # MoE models exclude routed experts (they load as expert banks, not dense weights).
         return _materialize_loaded_weight_state_dict(
             model_state,
             load_weight(
                 config.model_path,
                 self.device,
-                include_moe_experts=not is_offload_moe_strategy(config.moe_strategy),
+                include_moe_experts=not getattr(config.model_config, "is_moe", False),
                 include_vision=vision,
             ),
             device=self.device,
         )
+
+    def _load_resident_experts(self, config: EngineConfig, layers) -> None:
+        with _weight_load_context():
+            banks = load_expert_banks(
+                config.model_path,
+                config.model_config,
+                method=layers[0].quant_method,
+                device=self.device,
+                dtype=self.dtype,
+                dummy=config.use_dummy_weight,
+                parallel={"serial": False, "parallel": True}.get(config.expert_load, None),
+                resident=True,
+            )
+        attach_resident_banks(layers, banks)
 
     @torch.inference_mode()
     def _warmup_encoders(self) -> None:
@@ -970,6 +1007,7 @@ class Engine:
         # Decode batches never exceed max_running_req, but CUDA-graph padding can
         # round a batch up to the largest captured size; cover both.
         max_tokens = max(config.max_running_req, config.cuda_graph_max_bs or 0, 1)
+        method = sample.quant_method
         executor = CpuMoeExecutor(
             cache,
             top_k=sample.top_k,
@@ -981,7 +1019,8 @@ class Engine:
             swiglu_alpha=float(sample.alpha),
             swiglu_limit=sample.limit,
             # FIXME: the None branch serves GGUF q4_0 banks, which have no quant method yet; drop it once GGUF joins the quant path
-            fmt=sample.quant_method.cpu_format if sample.quant_method is not None else None,
+            fmt=method.cpu_format if method is not None else None,
+            act_block=method.cfg.act_block if method is not None else None,
         )
         cache.set_cpu_executor(executor)
         self.cpu_moe_executor = executor
@@ -1594,15 +1633,14 @@ def _is_unified_memory_gpu(index: "int | None" = None) -> bool:
         return False
 
 
+_RESIDENT_EXPERT_QUANTS = ("none", "fp8_block", "nvfp4")
+
+
 def _fused_resident_ok(model_config) -> bool:
-    """Whether the resident ('fused') MoE path can hold this model's experts.
-   
-       FIXME: auto resolves to fused only for bf16 and fp8_block experts; drop this gate once the other quant formats support fused.
-       """
-    expert_quant = getattr(model_config, "expert_quant", "none")
-    if expert_quant not in ("none", "fp8_block"):
+    """Whether the resident ('fused') MoE path can hold this model's experts; GGUF q4_0 and DeepSeek-V4 experts stay offload."""
+    if getattr(model_config, "expert_quant", "none") not in _RESIDENT_EXPERT_QUANTS:
         return False
-    return getattr(model_config, "moe_weight_format", None) in (None, "bf16")
+    return getattr(model_config, "moe_weight_format", None) in (None, "bf16", "mxfp4")
 
 
 def _ensure_expandable_segments() -> None:
@@ -1638,6 +1676,39 @@ def _resolve_cache_type(has_linear_attention: bool, requested: str) -> str:
     if has_linear_attention:
         return "naive" if requested == "naive" else "hybrid_radix"
     return requested
+
+
+def _adjust_dsv41_config(config: EngineConfig, override) -> None:
+    """DeepSeek-V4.1 config reconciliation, the DSV4 policy with the replay knob: sync the
+    runtime into ``dsv41_args``, page_size = the window page P, radix -> swa_radix, decode graph
+    batches <= max_running_req. Unlike DSV4 the prefill chunk keeps ``max_extend_tokens`` (whole
+    window pages): at a 1M ceiling the window pool alone would admit ~40K-token chunks whose
+    activations (64 x 512 latent queries per token) do not fit next to the expert cache."""
+    model_config = config.model_config
+    args = model_config.dsv41_args
+    args.max_seq_len = config.max_seq_len
+    args.max_batch_size = config.max_running_req + 1  # +1 dummy
+    args.swa_decoder_replay = config.swa_decoder_replay
+    P = args.window_size
+    override("page_size", P)
+    logger.info_rank0(
+        f"DSV41 KV pages are {P}-token window pages; page_size set to {P}; SWA decoder replay: {args.swa_decoder_replay}"
+        + ("" if args.swa_decoder_replay == "exact" else f" (prefix hits stop {P} tokens before the prompt end)")
+    )
+    if getattr(config, "cache_type", "radix") != "naive":
+        override("cache_type", "swa_radix")
+    current = getattr(config, "max_extend_tokens", None)  # a SchedulerConfig field
+    if current is not None and (extend := max(P, current // P * P)) != current:
+        override("max_extend_tokens", extend)
+    mr = config.max_running_req
+    if config.cuda_graph_max_bs is not None and config.cuda_graph_max_bs > mr:
+        logger.warning_rank0(f"cuda_graph_max_bs {config.cuda_graph_max_bs} exceeds max_running_req {mr}; clamping (larger decode batches never occur).")
+        override("cuda_graph_max_bs", mr)
+    if config.cuda_graph_bs is not None:
+        kept = [bs for bs in config.cuda_graph_bs if bs <= mr]
+        if kept != list(config.cuda_graph_bs):
+            logger.warning_rank0(f"dropping cuda_graph_bs entries above max_running_req {mr}: {[bs for bs in config.cuda_graph_bs if bs > mr]}")
+            override("cuda_graph_bs", kept)
 
 
 def _adjust_dsv4_config(config: EngineConfig, override) -> None:
@@ -1917,6 +1988,7 @@ def _adjust_config(config: EngineConfig):
     model_config = config.model_config
     single_stream_only = getattr(model_config, "single_stream_only", False)
     is_dsv4 = getattr(model_config, "dsv4_args", None) is not None
+    is_dsv41 = getattr(model_config, "dsv41_args", None) is not None
     has_swa_attention = getattr(model_config, "has_swa_attention", False)
     has_linear_attention = getattr(model_config, "has_linear_attention", False)
     is_moe = getattr(model_config, "is_moe", False)
@@ -1960,6 +2032,8 @@ def _adjust_config(config: EngineConfig):
 
     if is_dsv4:
         _adjust_dsv4_config(config, override)
+    if is_dsv41:
+        _adjust_dsv41_config(config, override)
 
     if has_swa_attention:
         # Both SWA cache paths use the global-paged swa pool (page_size==1 only for now).
@@ -2053,8 +2127,8 @@ def _adjust_config(config: EngineConfig):
     if is_moe and config.moe_strategy == "auto":
         # A MoE model always defaults to the offload family: experts stream from pinned host
         # banks into an auto-sized GPU slot cache, which is the only default that serves a model
-        # bigger than the GPU. The resident 'fused' path (bf16 / block-fp8 experts, the two
-        # formats MoELayer can allocate) is still reachable, but only when asked for explicitly
+        # bigger than the GPU. The resident 'fused' path (every expert format but GGUF q4_0 and
+        # DeepSeek-V4's) is still reachable, but only when asked for explicitly
         # -- auto never picks it, because nothing here knows whether the experts would fit in
         # HBM and a wrong guess is a weight-load OOM rather than a slower-but-working run.
         default_backend = "offload"
@@ -2073,6 +2147,18 @@ def _adjust_config(config: EngineConfig):
                 "Unified-memory GPU detected; auto-selecting 'fused' MoE strategy "
                 "(resident experts) instead of offload"
             )
+            # the cache sizing flags get their own warning in the 'fused' block below
+            inert = [flag for flag, on in (
+                (f"--moe-cpu-layers={config.moe_cpu_layers}", config.moe_cpu_layers),
+                ("--moe-prefill-hit-d2d", config.moe_prefill_hit_d2d),
+                ("--disable-moe-prefill-overlap", not config.moe_prefill_overlap),
+            ) if on]
+            if inert:
+                logger.warning_rank0(
+                    f"Unified-memory GPU serves MoE experts resident; ignoring {', '.join(inert)} "
+                    "(use --moe-strategy offload to keep the offload flags)"
+                )
+                override("moe_cpu_layers", None)
         # Hardware-adaptive config: a cached `ft bench bw` profile can upgrade
         # the offload default to hybrid when this machine's CPU MoE bandwidth clears its PCIe
         # gather bandwidth by the bench threshold (default 2x). hybrid is VRAM-equivalent to
@@ -2192,7 +2278,7 @@ def _adjust_config(config: EngineConfig):
 
     if (
         is_moe
-        and expert_quant not in ("none", "fp8_block")
+        and expert_quant not in _RESIDENT_EXPERT_QUANTS
         and not is_offload_moe_strategy(config.moe_strategy)
     ):
         raise ValueError(
@@ -2229,19 +2315,18 @@ def _adjust_config(config: EngineConfig):
             )
         override("num_page_override", config.num_token_override // config.page_size)
 
-    # The rope cos/sin table is baked to rotary_config.max_position, and neither rope kernel
+    # The rope cos/sin table covers rotary_config.table_positions, and neither rope kernel
     # bounds-checks the position it gathers with -- a longer ceiling reads past the table.
     # DSV4 is exempt: it sizes its own table from the resolved max_seq_len (_adjust_dsv4_config).
     rotary = getattr(model_config, "rotary_config", None)
     seq_override = getattr(config, "max_seq_len_override", None)
-    if seq_override is not None and rotary is not None and not is_dsv4:
-        if seq_override > rotary.max_position:
+    if seq_override is not None and rotary is not None and not (is_dsv4 or is_dsv41):
+        if seq_override > rotary.table_positions:
             raise ValueError(
                 f"--max-seq-len-override {seq_override} exceeds the model's "
-                f"rope table ({rotary.max_position} positions). Serving past it would read "
-                "out of bounds; extend the checkpoint's rope_scaling / "
-                "max_position_embeddings in config.json instead, or, for Qwen3.8-Flash-Next, "
-                "set FREETOKEN_ROPE_MAX_POSITION."
+                f"rope table ({rotary.table_positions} positions). Serving past it would read "
+                "out of bounds; extend the rope with --hf-overrides (YaRN rope_parameters) instead, or, for "
+                "Qwen3.8-Flash-Next, set FREETOKEN_ROPE_MAX_POSITION."
             )
 
     # The startup ServerArgs dump is the *requested* config, printed in the frontend process

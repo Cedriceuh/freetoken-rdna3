@@ -43,24 +43,21 @@ __always_inline __device__ auto offset(const T *ptr, U... offset) -> const
 
 namespace PDL {
 
+// griddepcontrol needs sm_90+; older archs and HIP keep normal stream ordering.
 template <bool kUsePDL> __always_inline __device__ void wait() {
+#if !FREETOKEN_USE_ROCM && __CUDA_ARCH__ >= 900
   if constexpr (kUsePDL) {
-#if FREETOKEN_USE_ROCM
-    // Programmatic dependent launch is NVIDIA-specific.
-#else
     asm volatile("griddepcontrol.wait;" ::: "memory");
-#endif
   }
+#endif
 }
 
 template <bool kUsePDL> __always_inline __device__ void launch() {
+#if !FREETOKEN_USE_ROCM && __CUDA_ARCH__ >= 900
   if constexpr (kUsePDL) {
-#if FREETOKEN_USE_ROCM
-    // Programmatic dependent launch is NVIDIA-specific.
-#else
     asm volatile("griddepcontrol.launch_dependents;" :::);
-#endif
   }
+#endif
 }
 
 } // namespace PDL

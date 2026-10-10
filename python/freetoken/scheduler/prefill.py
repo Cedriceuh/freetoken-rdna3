@@ -71,7 +71,9 @@ class PrefillAdder:
         if self.table_manager.available_size == 0:
             return None
 
-        mr = self.cache_manager.match_req(req)
+        # TODO: consider host cache match case (it needs the same replay cap)
+        replay = self.cache_manager.prefix_replay_tokens
+        mr = self.cache_manager.match_req(req, max_len=max(0, req.input_len - replay) if replay else None)
         if self.cache_manager.host_kv is not None:
             # host tier: pull a deeper prefix back from host memory when the admission fits
             mr = self.cache_manager.maybe_promote(
@@ -220,6 +222,7 @@ class PrefillAdder:
             uid=pending_req.uid,
             cache_handle=cache_handle,
             sampling_params=pending_req.sampling_params,
+            prompt_len=pending_req.input_len,
         )
         req.mm_items = pending_req.mm_items
         if is_chunked:  # the prompt token after this chunk (the MTP head reads it at the chunk's last row)

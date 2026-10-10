@@ -31,7 +31,9 @@ class TritonExl3MoEKernel(MoEKernel):
     cpu_format = None
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
-        reason = self._common_reject(cfg, resident_ok=False, tp_ok=True, cpu_ok=False, plain_silu_only=True)
+        if cfg.strategy == "resident":
+            return "triton exl3 MoE kernel: not served resident; use --moe-strategy offload"
+        reason = self._common_reject(cfg, tp_ok=True, cpu_ok=False, plain_silu_only=True)
         if reason:
             return f"triton exl3 MoE kernel: {reason}"
         if cfg.apply_router_weight_on_input:

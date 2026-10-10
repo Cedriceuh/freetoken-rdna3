@@ -37,3 +37,11 @@ python -m pip install --no-build-isolation -e .
 
 Set both architecture variables to `gfx1200` for RX 9060 family GPUs, or to the
 actual target reported by `rocminfo`.
+
+## Optional kernel backends
+
+FreeToken's FlashInfer, `sgl_kernel`, and vLLM kernel integrations are CUDA-only.
+On ROCm, these paths use the built-in fallbacks; do not install the `[accel]`,
+`[fi]`, or `[sgl]` extras. Forcing `--attention-backend fi`, `fa`, or `trtllm`,
+or NVFP4 Marlin/b12x (e.g. `--quant-backend moe.nvfp4=marlin` or
+`--quant-backend moe.nvfp4=b12x`), fails with a ROCm-specific error.

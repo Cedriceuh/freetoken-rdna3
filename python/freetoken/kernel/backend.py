@@ -4,6 +4,7 @@ When flashinfer / sgl_kernel / vLLM are installed the call-sites may use their
 fused CUDA ops; otherwise they fall back to the pure-Triton kernels in
 ``freetoken.kernel.triton``. ``find_spec`` only checks that the package is
 importable (no import side effects), and the result is cached.
+On ROCm, the optional-package probes return False so callers use the fallbacks.
 """
 from __future__ import annotations
 
