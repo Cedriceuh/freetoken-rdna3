@@ -57,6 +57,10 @@ _LOGITS_WORKSPACE_BYTES = 128 << 20
 TORCH_TOPK_ENV = "FREETOKEN_QSA_TORCH_TOPK"
 
 
+# FREETOKEN_QSA_PLAN_KERNEL=0: the per-forward index-write plan as torch ops (the kernel computes the same values)
+_PLAN_KERNEL = os.environ.get("FREETOKEN_QSA_PLAN_KERNEL", "1") != "0"
+
+
 def _resolve_block_topk() -> Callable | None:
     """The in-repo Triton block top-k, or None to fall back on torch.topk."""
     if os.getenv(TORCH_TOPK_ENV, "0") == "1":
@@ -286,7 +290,8 @@ class QSASparseAttnBackend(BaseAttnBackend):
         index,  # models.qwen4_exp.attention.QSAIndexerInputs
         layer_id: int,
         batch: Batch,
-    ) -> torch.Tensor:
+        kv_only: bool = False,
+    ) -> torch.Tensor | None:
         from freetoken.kernel.triton.qsa import qsa_sparse_paged_attention
 
         md = batch.attn_metadata
@@ -302,6 +307,8 @@ class QSASparseAttnBackend(BaseAttnBackend):
             self._plan_index_writes(md, batch)
 
         self._update_index_cache(index, md, slot)
+        if kv_only:  # the K/V and the index keys are written: nothing reads this pass's output
+            return None
         indices = self._select(index, md, slot)
         int8 = self.kvcache.kv_int8
         k_cache, v_cache = self.kvcache.k_cache(layer_id), self.kvcache.v_cache(layer_id)
@@ -329,6 +336,20 @@ class QSASparseAttnBackend(BaseAttnBackend):
         """Per-token slab row and ring row for this forward; the other QSA layers reuse it
         (it is layer-invariant). Pure device arithmetic: no host sync, graph-capturable."""
         md.positions = batch.positions
+        if _PLAN_KERNEL:
+            from freetoken.kernel.triton.qsa.plan import qsa_plan_index_writes
+
+            rope = None
+            if self._section_table is not None:
+                rope = batch.get_attn_positions()
+            md.cmp_rows, md.ring_rows, rope_rows, q_rope, k_rope = qsa_plan_index_writes(
+                batch.out_loc, batch.positions, md.token_to_req, md.ring_slots, md.cu_seqlens, self.ratio,
+                self.ring_capacity, self.kvcache.cmp_scratch_base, rope,
+                self.kvcache.rope_positions if rope is not None else None, self._section_table,
+                self._index_rope_cache() if rope is not None else None)
+            if rope is not None:
+                md.rope_rows, md.q_rope_cache, md.k_rope_cache = rope_rows, q_rope, k_rope
+            return
         out_loc = batch.out_loc.to(torch.int64)
         positions = batch.positions.to(torch.int64)
         if self._section_table is not None:

@@ -21,7 +21,8 @@ from freetoken.message import (
     PromptAdmittedMsg,
     UserMsg,
 )
-from freetoken.spec_decode import MTP_ENABLED, SPEC_BS_MAX, SPEC_DYNAMIC, SPEC_M, DepthStats, draft_depth, rows_for
+from freetoken.spec_decode import (MTP_ENABLED, SPEC_BS_MAX, SPEC_DYNAMIC, SPEC_GLUE_KERNELS, SPEC_M, DepthStats,
+                                   draft_depth, rows_for)
 from freetoken.utils import (
     init_logger,
     load_eos_token_ids,
@@ -988,6 +989,15 @@ class Scheduler(SchedulerIOMixin):
             # overwritten later), then the draft right after the last kept one, at L+1+n_acc
             rows, pos = output_mapping
             m = forward_output.next_tokens_gpu.shape[1]
+            if SPEC_GLUE_KERNELS and self.token_pool.stride(1) == 1:
+                from freetoken.kernel.triton.spec_glue import write_step_tokens
+
+                drafts = forward_output.drafts_gpu
+                write_step_tokens(self.token_pool, rows, pos, forward_output.next_tokens_gpu,
+                                  None if drafts is None else drafts.view(rows.numel(), -1),
+                                  forward_output.n_acc_gpu)
+                self.decode_manager.filter_reqs(forward_input.batch.reqs)
+                return forward_output
             cols = pos.unsqueeze(1) + torch.arange(m, device=pos.device)
             cols = torch.where(pos.unsqueeze(1) >= 0, cols, -1)
             self.token_pool[(rows.unsqueeze(1).expand(-1, m), cols)] = forward_output.next_tokens_gpu

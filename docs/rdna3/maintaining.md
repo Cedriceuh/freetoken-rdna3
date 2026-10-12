@@ -64,6 +64,11 @@ After a merge, update the base commit named in `NOTICE`, this file and
 ## Tuned tiles
 
 The NVFP4 tile tables (`FREETOKEN_NVFP4_*_TUNED`) were produced with `rdna3/bench/nvfp4_*_sweep.py`; rerun them for a
-new model, split or card, keeping only tiles that preserve the summation order (M / N tiles, warps, stages).
-The EXL3 decode GEMV table (`_GEMV_TUNED` in `kernel/triton/exl3.py`) came from `rdna3/bench/exl3_gemv_bench.py`
-and is keyed to this model's 384 / 256 shapes.
+new model, split or card, keeping only tiles that preserve the summation order (M / N tiles, warps, stages). The EXL3
+decode GEMV table (`_GEMV_TUNED` in `kernel/triton/exl3.py`) came from `rdna3/bench/exl3_gemv_bench.py` and is keyed
+to this model's 384 / 256 shapes; there the N tiles per program keep the sums, the K tile and split change them, and
+some warp counts do too (check the outputs bit for bit). The int8 GEMV configs (`_CONFIGS` in
+`kernel/triton/int8_gemv.py`): only BLOCK_N keeps the sums; the K block, split and warps change them (checked on the
+uneven split's shapes, 2026-10-11). Sweep cold (48 distinct matrices or 48 layers' own slots, as a decode step reads
+them) with a warm-up pass, and time the current config first and last: a warm microbenchmark keeps the weights in the
+Infinity Cache and promises gains that serving does not see.

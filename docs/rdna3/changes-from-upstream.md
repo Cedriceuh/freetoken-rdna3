@@ -207,6 +207,25 @@ Line counts here are on top of the lines listed in the sections above.
 | `python/freetoken/kernel/triton/nvfp4_fused_moe.py`, `moe/fused_nvfp4.py`, `kernel/triton/exl3.py`, `moe/fused_exl3.py` | 7/0, 4/0, 17/7, 6/3 | the decode GEMVs write zeros for a slot of -1 without a read; the EXL3 rotation and scale kernels read slot 0's scales for it |
 | `tests/moe/test_cpu_moe_exl3.py`, `tests/moe/test_cpu_moe.py`, `tests/moe/test_nvfp4_backends.py` | new, 69/0, 24/0 | the EXL3 path against the reference codec, tensor-parallel slices, skipped routes, rows sharing an expert, the size check; the split / merge path eager and replayed in a graph, with the handshake in the kernels or in memops; the GPU skip of the CPU's routes bit-identical (NVFP4, EXL3) |
 
+## Decode on two cards, bit-exact (night of 2026-10-11)
+
+| File | Lines | Change |
+|---|---:|---|
+| `python/freetoken/kernel/triton/exl3.py` | 6/2 | the output kernel's split count left unspecialized (Triton's constant-1 variant ran ~2x slower: rank 1's single K split); 4 N tiles a program for rank 1's gate\|up GEMV (the same sums) |
+| `python/freetoken/kernel/triton/int8_gemv.py` | 225/15 | `hc_silu` in the store of the int8 GEMV (`silu_hc`); the up projection and `hc_gate_mix` in one kernel (`gemv_int8_hc_mix`, each weight row loaded once for up to 8 rows); a gate \| up GEMV storing SiLU-and-mul (`gemv_int8_act_mul`, tiles shared across rows); K blocks of 512 for the uneven split's shapes, opt-in and not bit-exact (`FREETOKEN_INT8_TP_TILES=1`) |
+| `python/freetoken/models/qwen4_exp/hc.py`, `models/qwen3_5_moe/moe.py` | 37/2, 25/1 | the hyper-connection mix and the shared expert call them on int8 decode rows (`FREETOKEN_HC_SILU_EPILOGUE`, `FREETOKEN_HC_MIX_IN_GEMV`, `FREETOKEN_SHARED_ACT_IN_GEMV`) |
+| `tests/layers/test_int8_weight_only.py`, `tests/moe/test_cpu_moe_exl3.py` | 68/0, 39/0 | each fused kernel bit-identical to the separate path over several random draws, 1-8 rows; one split against two exact halves in the output kernel, rank 1's 4 N tiles against 1 (GPU) |
+
+## Decode glue in kernels, bit-exact (2026-10-12)
+
+| File | Lines | Change |
+|---|---:|---|
+| `python/freetoken/kernel/triton/qsa/plan.py`, `attention/qsa_sparse.py` | 84/0, 22/1 | the QSA layers' per-forward index-write plan in two kernels instead of ~30 torch ops (`FREETOKEN_QSA_PLAN_KERNEL`); `qsa_forward(kv_only=True)` stops once the K/V and the index keys are written |
+| `python/freetoken/models/qwen4_exp/ple_conv_kernel.py`, `models/qwen4_exp/ple.py` | 78/0, 16/3 | the PLE's m-row decode conv in one kernel on gfx11 (`FREETOKEN_PLE_CONV_KERNEL`; no FMA contraction, torch's sum order there); its rollback target described for the fused copy |
+| `python/freetoken/models/qwen4_exp/attention.py`, `models/qwen4_exp/mtp.py` | 16/6, 9/0 | the MTP head's KV-only pass attends to nothing (`FREETOKEN_MTP_KV_ONLY_STOP`; the QSA backend protocol and the dense reference take `kv_only` too) |
+| `python/freetoken/kernel/triton/spec_glue.py`, `spec_decode.py`, `models/qwen4_exp/gdn.py`, `engine/engine.py`, `scheduler/scheduler.py` | 156/0, 27/2, 11/3, 65/11, 11/1 | a verify step's glue in kernels (`FREETOKEN_SPEC_GLUE_KERNELS`): the rollback copies (one kernel per state), the token-pool writes, the kept counts of greedy rows, the MTP head's rows and the chained guesses' addressing; the acceptance tally summed on the host |
+| `tests/kernels/test_decode_glue.py` | 169/0 | each kernel bit-identical to the torch ops it replaces over random batches (GPU) |
+
 ## Tooling and documentation
 
 | File | Change |

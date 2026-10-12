@@ -51,6 +51,9 @@ SPEC_BS_MAX = max(1, int(os.environ.get("FREETOKEN_SPEC_BS_MAX", "1")))
 # own sampling params (exact verify against that distribution) instead of the head's argmax (a point mass). Measured:
 # 2-7 % more tokens kept per step, the same speed (120 items at the model's T 1.0: 434 s argmax, 439 s drawn), so off
 SPEC_SAMPLED_DRAFTS = os.environ.get("FREETOKEN_SPEC_SAMPLED_DRAFTS", "0") == "1"
+# FREETOKEN_SPEC_GLUE_KERNELS=0: a verify step's glue (rollback copies, token-pool writes, kept counts, draft rows) as
+# torch ops; kernel/triton/spec_glue.py does the same integer arithmetic and copies
+SPEC_GLUE_KERNELS = os.environ.get("FREETOKEN_SPEC_GLUE_KERNELS", "1") != "0"
 
 
 # Decode step time per rows per request at one request, measured (FREETOKEN_SPEC_TIMING, GPU time per step: forward +
@@ -180,6 +183,19 @@ class RollbackTarget:
     snapshot: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
     dim: int = 0
     padding_slot: int = 0
+    # the same copy for the fused kernel (kernel/triton/spec_glue.py): (src, src outer / request / step strides,
+    # step offset, dst outer / slot strides, outer count, contiguous elements per row); None: the torch path
+    copy: tuple | None = None
+
+
+def block_contiguous(t: torch.Tensor, lead: int) -> bool:
+    """Whether the dims of ``t`` after the first ``lead`` form one contiguous block."""
+    expect = 1
+    for size, stride in zip(reversed(t.shape[lead:]), reversed(t.stride()[lead:])):
+        if size != 1 and stride != expect:
+            return False
+        expect *= size
+    return True
 
 
 _TARGETS: Dict[str, RollbackTarget] = {}
@@ -194,6 +210,15 @@ def apply_rollback(slots: torch.Tensor, n_acc: torch.Tensor, padding_slot: int |
     """Put every registered state of the ``B`` requests (state rows ``slots``) where row ``n_acc - 1`` left it.
     ``padding_slot``: the slot padded rows use (the engine's dummy request), overriding the targets' own."""
     if not _TARGETS:
+        return
+    if SPEC_GLUE_KERNELS and all(t.copy is not None for t in _TARGETS.values()):
+        from freetoken.kernel.triton.spec_glue import rollback_copy
+
+        mm = SPEC_M if m is None else m
+        for target in _TARGETS.values():
+            pad = target.padding_slot if padding_slot is None else padding_slot
+            src, so, sb, sst, add, do, dslot, outer, inner = target.copy
+            rollback_copy(src, so, sb, sst, add, target.state, do, dslot, outer, inner, slots, n_acc.view(-1), pad, mm)
         return
     slots = slots.to(torch.int64)
     b = torch.arange(slots.numel(), device=slots.device)
@@ -270,5 +295,5 @@ class SpecTimer:
             log.info_rank0(f"[spec-time] {reqs} req x {m} rows, {steps} steps, ms gpu/host: {parts}")
 
 
-__all__ = ["SPEC_BS_MAX", "SPEC_DYNAMIC", "SPEC_M", "SPEC_MS", "DepthStats", "RollbackTarget", "SpecTimer",
-           "apply_rollback", "draft_depth", "register", "rows_for", "rows_of"]
+__all__ = ["SPEC_BS_MAX", "SPEC_DYNAMIC", "SPEC_GLUE_KERNELS", "SPEC_M", "SPEC_MS", "DepthStats", "RollbackTarget",
+           "SpecTimer", "apply_rollback", "block_contiguous", "draft_depth", "register", "rows_for", "rows_of"]

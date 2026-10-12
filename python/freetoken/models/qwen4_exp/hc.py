@@ -3,7 +3,8 @@
 Every layer reads and writes ``hc_count`` residual streams packed as ``R [T, hc_count*hidden]``
 (stream outer, hidden inner -- the checkpoint layout). On CUDA the mix/combine bodies are the
 vendored vLLM Triton kernels (``kernel/triton/hc.py``: grouped_gemma_rmsnorm / hc_silu /
-hc_gate_mix / hc_combine) around two ``F.linear`` GEMMs; the pure-torch chain stays as the CPU
+hc_gate_mix / hc_combine) around two ``F.linear`` GEMMs, or on int8 decode rows the norm and two
+GEMVs that apply hc_silu and hc_gate_mix themselves; the pure-torch chain stays as the CPU
 path and as the reference the kernels are diffed against. Both keep fp32 intermediates and cast
 back at the store, so they agree to fp32 rounding.
 """
@@ -30,6 +31,11 @@ if TYPE_CHECKING:
 # FREETOKEN_HC_INPLACE (default 1): a combine writes the new streams over the old ones, which nothing reads after it
 # (the same bits; one [T, hc * hidden] buffer less: 320 MiB at a 16k-token prefill chunk)
 _HC_INPLACE = os.environ.get("FREETOKEN_HC_INPLACE", "1") == "1"
+# FREETOKEN_HC_SILU_EPILOGUE=0: hc_silu as its own kernel between the int8 down and up projections
+# (GatedResidual._mix_int8)
+_HC_SILU_EPILOGUE = os.environ.get("FREETOKEN_HC_SILU_EPILOGUE", "1") != "0"
+# FREETOKEN_HC_MIX_IN_GEMV=0: hc_gate_mix as its own kernel after the int8 up projection (GatedResidual._mix_int8)
+_HC_MIX_IN_GEMV = os.environ.get("FREETOKEN_HC_MIX_IN_GEMV", "1") != "0"
 
 
 def grouped_plus_one_rms_norm(
@@ -88,7 +94,8 @@ class GatedResidual(BaseOP):
     ``input_mix_weight_down`` [lowrank, hc*hidden], ``block_inject_weight`` [hc_count, hc*hidden]
     and ``pad`` zero rows), ``input_mix_weight_up.weight``.
 
-    Launch budget on CUDA: ``mix`` is 3 kernels around 2 GEMMs, ``combine`` is 1.
+    Launch budget on CUDA: ``mix`` is 3 kernels around 2 GEMMs (on int8 decode rows, the norm and 2
+    GEMVs), ``combine`` is 1.
     """
 
     def __init__(self, config: ModelConfig, use_combine: bool = True, *, prefix: str = "") -> None:
@@ -130,9 +137,37 @@ class GatedResidual(BaseOP):
 
     def mix_normed(self, rn: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor | None]:
         """``mix`` from the already normed streams (``combine_norm`` of the block before computed them)."""
+        fused = self._mix_int8(rn)
+        if fused is not None:
+            return fused
         lora, s = self._down(rn)
         gate = self.input_mix_weight_up.forward(hc_silu(lora, self.hc_count))
         return hc_gate_mix(rn, gate, self.hc_count), s
+
+    def _mix_int8(self, rn: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor | None] | None:
+        """Int8 decode rows: the down GEMV stores the lora columns through ``hc_silu`` (FREETOKEN_HC_SILU_EPILOGUE) and
+        the up GEMV reads them in place and mixes its gates into the streams as it goes (FREETOKEN_HC_MIX_IN_GEMV), the
+        same bits, two kernels less per hyper-connection; None otherwise."""
+        if not (_HC_SILU_EPILOGUE and rn.is_cuda and rn.dim() == 2 and rn.dtype is torch.bfloat16
+                and rn.stride(-1) == 1):
+            return None
+        from freetoken.kernel.triton.int8_gemv import ROWS_MAX, gemv_int8, gemv_int8_hc_mix
+        from freetoken.layers.quantization.int8_weight_only import Int8WeightOnlyLinearMethod
+
+        down = self.input_mix_weight_down_block_inject if self.use_combine else self.input_mix_weight_down
+        up = self.input_mix_weight_up
+        if not all(isinstance(op.quant_method, Int8WeightOnlyLinearMethod) and op.bias is None for op in (down, up)):
+            return None
+        m = rn.shape[0]
+        if not (m == 1 or (1 < m <= ROWS_MAX and rn.is_contiguous())):  # the rows Int8WeightOnlyLinearMethod takes
+            return None
+        out = gemv_int8(rn, down.weight, down.weight_scale, silu_hc=self.hc_count, silu_cols=self.lowrank)
+        s = out[:, self.lowrank : self.lowrank + self.hc_count] if self.use_combine else None
+        lora = out[:, : self.lowrank]
+        mixed = gemv_int8_hc_mix(lora, up.weight, up.weight_scale, rn, self.hc_count) if _HC_MIX_IN_GEMV else None
+        if mixed is None:
+            mixed = hc_gate_mix(rn, gemv_int8(lora, up.weight, up.weight_scale), self.hc_count)
+        return mixed, s
 
     def _mix_torch(self, R: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor | None]:
         rn = grouped_plus_one_rms_norm(R, self.hc_norm.weight, self.hc_norm.eps, self.hc_count)

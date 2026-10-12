@@ -68,7 +68,8 @@ class QSAAttentionBackend(Protocol):
     norm+rope and in the model dtype; the return is [T, num_qo_heads, head_dim] (the layer applies
     the output gate and ``o_proj``). ``layer_id`` is the decoder layer id; the backend maps it to
     its own sparse-layer slot. Everything else -- KV store, per-request lengths, page rows -- comes
-    from ``batch`` exactly as for ``BaseAttnBackend.forward``.
+    from ``batch`` exactly as for ``BaseAttnBackend.forward``. ``kv_only``: store the K/V (and the
+    index keys) and return None.
     """
 
     def qsa_forward(
@@ -79,7 +80,8 @@ class QSAAttentionBackend(Protocol):
         index: QSAIndexerInputs,
         layer_id: int,
         batch: Batch,
-    ) -> torch.Tensor: ...
+        kv_only: bool = False,
+    ) -> torch.Tensor | None: ...
 
 
 class Qwen4ExpIndexer(BaseOP):
@@ -173,7 +175,9 @@ class Qwen4ExpAttention(BaseOP):
         self.indexer = Qwen4ExpIndexer(config, layer_id, prefix=f"{prefix}.indexer")
 
     @nvtx_annotate("QSA")
-    def forward(self, x: torch.Tensor, batch: Batch) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, batch: Batch, kv_only: bool = False) -> torch.Tensor | None:
+        """``kv_only``: write this layer's K/V and index keys, attend to nothing, return None (the MTP head's pass
+        while several requests decode: later drafts read its KV, nothing reads its output)."""
         qg, k, v = self.qkv_proj.forward(x).split(self._qkv_split, dim=-1)
         qg = qg.view(-1, self.num_q, self.head_dim * 2)
         if _FEWER_COPIES:
@@ -194,8 +198,10 @@ class Qwen4ExpAttention(BaseOP):
         )
         index = self.indexer.forward(x)
         o = get_global_ctx().attn_backend.qsa_forward(
-            q.view(-1, self.num_q, self.head_dim), k, v, index, self.layer_id, batch
+            q.view(-1, self.num_q, self.head_dim), k, v, index, self.layer_id, batch, kv_only=kv_only
         )
+        if kv_only:
+            return None
         if _FEWER_COPIES:
             gated = sigmoid_gate_mul(o.view(-1, self.num_q, self.head_dim), gate)
         else:
@@ -243,7 +249,8 @@ class TorchDenseQSAReference:
         index: QSAIndexerInputs,
         layer_id: int,
         batch: Batch,
-    ) -> torch.Tensor:
+        kv_only: bool = False,
+    ) -> torch.Tensor | None:
         del index
         k_cache, v_cache = self._layer_cache(layer_id)
         k = k.view(-1, self.num_kv, self.head_dim)
@@ -255,11 +262,14 @@ class TorchDenseQSAReference:
             rows = slice(offset, offset + n)
             k_cache[slot, prefix : prefix + n] = k[rows]
             v_cache[slot, prefix : prefix + n] = v[rows]
+            if kv_only:
+                offset += n
+                continue
             out[rows] = self._attend(
                 q[rows], k_cache[slot, : prefix + n], v_cache[slot, : prefix + n], prefix
             )
             offset += n
-        return out
+        return None if kv_only else out
 
     def _attend(
         self, q: torch.Tensor, keys: torch.Tensor, values: torch.Tensor, prefix: int

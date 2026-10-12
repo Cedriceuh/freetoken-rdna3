@@ -100,3 +100,71 @@ def test_row_groups_give_each_row_its_single_row_bits(shape):
     alone = torch.stack([gemv_int8(x[i : i + 1], w, s)[0] for i in range(8)])
     for m in (2, 3, 4, 5, 8):
         assert torch.equal(gemv_int8(x[:m], w, s), alone[:m]), (shape, m)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.parametrize("shape", [(336, 10240), (320, 10240)])
+@pytest.mark.parametrize("hc", [2, 4])
+def test_hc_silu_epilogue_matches_the_separate_kernel(shape, hc):
+    """gemv_int8(..., silu_hc=hc, silu_cols=320) (the hyper-connection down projection storing its lora columns through
+    hc_silu) gives the bits of the GEMV then hc_silu on those columns, the inject columns untouched, 1 to 8 rows; the up
+    projection reading that strided slice gives the bits of reading a contiguous copy."""
+    from freetoken.kernel.triton.hc import hc_silu
+    from freetoken.kernel.triton.int8_gemv import gemv_int8
+
+    torch.manual_seed(hc + shape[0])
+    n, k = shape
+    w = torch.randint(-127, 128, (n, k), dtype=torch.int8, device="cuda")
+    s = torch.rand(n, device="cuda") * 0.01
+    w_up = torch.randint(-127, 128, (10240, 320), dtype=torch.int8, device="cuda")
+    s_up = torch.rand(10240, device="cuda") * 0.01
+    x = (torch.randn(8, k, device="cuda") * 0.5).bfloat16()
+    for m in range(1, 9):
+        ref = gemv_int8(x[:m], w, s)
+        ref[:, :320] = hc_silu(ref[:, :320], hc)
+        got = gemv_int8(x[:m], w, s, silu_hc=hc, silu_cols=320)
+        assert torch.equal(got, ref), m
+        assert torch.equal(gemv_int8(got[:, :320], w_up, s_up), gemv_int8(got[:, :320].contiguous(), w_up, s_up)), m
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.parametrize("hc", [2, 4])
+def test_hc_mix_kernel_matches_gemv_then_gate_mix(hc):
+    """gemv_int8_hc_mix (the up projection and hc_gate_mix in one kernel) gives the bits of gemv_int8 then
+    hc_gate_mix, 1 to 8 rows, reading a strided input like the down projection's low-rank slice."""
+    from freetoken.kernel.triton.hc import hc_gate_mix
+    from freetoken.kernel.triton.int8_gemv import gemv_int8, gemv_int8_hc_mix
+
+    hd = 2560
+    for seed in range(6):  # a mismatch can be one value in thousands: several draws
+        torch.manual_seed(10 * seed + hc)
+        w = torch.randint(-127, 128, (hc * hd, 320), dtype=torch.int8, device="cuda")
+        s = torch.rand(hc * hd, device="cuda") * 0.01 * (1 + seed % 3)
+        down = (torch.randn(8, 336, device="cuda") * 0.5).bfloat16()
+        rn = (torch.randn(8, hc * hd, device="cuda") * (0.5 + seed % 4)).bfloat16()
+        for m in range(1, 9):
+            x = down[:m, :320]
+            got = gemv_int8_hc_mix(x, w, s, rn[:m], hc)
+            if got is None:
+                pytest.skip("the up projection's config is not the one-pass (1, 512, 1, 1) one")
+            assert torch.equal(got, hc_gate_mix(rn[:m], gemv_int8(x, w, s), hc)), (seed, m)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.parametrize("d", [384, 256, 352, 288, 320])
+def test_act_mul_kernel_matches_gemv_then_silu_and_mul(d):
+    """gemv_int8_act_mul (the shared expert's gate | up projection storing silu(gate) * up) gives the bits of gemv_int8
+    then the Triton silu_and_mul, 1 to 8 rows (None where the separate kernels run: K-blocked shapes past 2 rows), at
+    each rank's slice width, over several random draws."""
+    from freetoken.kernel.triton.activation import silu_and_mul
+    from freetoken.kernel.triton.int8_gemv import gemv_int8, gemv_int8_act_mul
+
+    for seed in range(6):  # a mismatch can be one value in thousands: several draws
+        torch.manual_seed(10 * seed + d)
+        w = torch.randint(-127, 128, (2 * d, 2560), dtype=torch.int8, device="cuda")
+        s = torch.rand(2 * d, device="cuda") * 0.005 * (1 + seed % 4)
+        x = (torch.randn(8, 2560, device="cuda") * (0.3 + seed % 3)).bfloat16()
+        for m in range(1, 9):
+            got = gemv_int8_act_mul(x[:m], w, s)
+            if got is not None:
+                assert torch.equal(got, silu_and_mul(gemv_int8(x[:m], w, s))), (seed, m)

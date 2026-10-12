@@ -16,12 +16,18 @@ main experts' modelopt NVFP4 layout (same acceptance offline), so they ride the 
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 import torch
 from freetoken.layers import BaseOP, LinearReplicated, OPList
 
 from .hc import GatedResidual, GroupedPlusOneRMSNorm
+
+# FREETOKEN_MTP_KV_ONLY_STOP=0: the head's KV-only pass (several requests decoding) runs its whole attention and the
+# combine after it; by default it stops once the K/V and the index keys are written (the same KV; nothing reads the
+# rest)
+_KV_ONLY_STOP = os.environ.get("FREETOKEN_MTP_KV_ONLY_STOP", "1") != "0"
 
 if TYPE_CHECKING:
     from freetoken.core import Batch
@@ -102,6 +108,9 @@ class Qwen4ExpMTP(BaseOP):
         del e
         layer = self.layers.op_list[0]
         block_input, inject = layer.attn_hyper_connection.mix(x)
+        if kv_only and _KV_ONLY_STOP:
+            layer.self_attn.forward(block_input, batch, kv_only=True)
+            return None
         x = layer.attn_hyper_connection.combine(x, layer.self_attn.forward(block_input, batch), inject)
         if kv_only:
             return None

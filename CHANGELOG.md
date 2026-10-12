@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- Decode, bit-exact and on by default (greedy answers identical): the EXL3 output kernel no longer runs Triton's
+  constant-1 variant for a single K split, and rank 1's gate|up GEMV takes 4 N tiles a program; the hyper-connection's
+  down GEMV applies `hc_silu` as it stores (`FREETOKEN_HC_SILU_EPILOGUE`) and its up GEMV mixes the gates into the
+  streams (`FREETOKEN_HC_MIX_IN_GEMV`); the shared expert's gate | up GEMV stores SiLU-and-mul
+  (`FREETOKEN_SHARED_ACT_IN_GEMV`). Then the small torch ops around them in kernels: the QSA index-write plan
+  (`FREETOKEN_QSA_PLAN_KERNEL`), the PLE's m-row decode conv (`FREETOKEN_PLE_CONV_KERNEL`), the MTP head's KV-only
+  pass stopped after its writes (`FREETOKEN_MTP_KV_ONLY_STOP`), a verify step's rollback, token writes and draft
+  addressing (`FREETOKEN_SPEC_GLUE_KERNELS`): +1.8 % then +1.4 % at one request on top. `xtx-xt-4x262k`: 85.5 -> 93.9
+  tok/s at one request (sampled), 33.9 -> 36.0 at four; NVFP4 `xtx-xt` 77.8 -> 82.5 (runs of different sessions; each
+  change's same-session A/B in [docs/rdna3/long-context.md](docs/rdna3/long-context.md)). K blocks of 512 for the
+  uneven split's int8 shapes are faster at 2-4 rows but not bit-exact: opt-in (`FREETOKEN_INT8_TP_TILES=1`). Measured
+  and dropped: bit-exact int8 tiles, the sampled tokens through the host all-reduce, a RAM cache of the PLE rows, the
+  PLE fill on a helper thread (the PLE waits in the traces come from the tracer), activations computed in the
+  consuming GEMV's prologue (10 % slower), `num_stages` on the decode GEMVs, a packed router top-k, a grouped decode
+  GEMV, the MTP cost table, verifying drafts with four requests (-26 %), MTP drafts over part of the vocabulary (fewer
+  kept, VRAM off the expert cache), `HIP_FORCE_DEV_KERNARG`; with the decode step kernel by kernel (rocprofv3) and the
+  gaps between kernels.
 - `rdna3/serve.sh --hybrid` (experimental): the CPU computes part of each decode step's expert misses from RAM
   (upstream's `--moe-strategy hybrid`, which could not run here). The executor signals with HIP's stream memops (it
   fell back to two host callbacks per layer on ROCm), sizes its scratch for the MTP verify rows up front, runs under

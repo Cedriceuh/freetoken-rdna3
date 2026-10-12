@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 
 import torch
@@ -11,7 +12,7 @@ from freetoken.distributed.split import gdn_head_partition
 from freetoken.layers import BaseOP, GatedRMSNorm, LinearColParallelMerged, LinearRowParallel
 from freetoken.layers.quantization import QuantConfig
 from freetoken.models.qwen3_5_moe.gdn_kernels import gdn_decode_fla, gdn_prefill_chunk_fla
-from freetoken.spec_decode import SPEC_M, RollbackTarget, register, rows_of
+from freetoken.spec_decode import SPEC_M, RollbackTarget, block_contiguous, register, rows_of
 
 
 # FREETOKEN_FEWER_COPIES (default 1 on ROCm, 0 elsewhere, see models/qwen4_exp/attention.py): the gated norm reads z in
@@ -38,8 +39,15 @@ def _spec_buffers(pool, reqs: int, device):
         _SPEC_BUFS[:] = [(inter, snaps)]
         _SPEC_ROWS[:] = [torch.arange(reqs, dtype=torch.int32, device=device)]
         pad = pool.padding_slot
-        register("gdn.recurrent", RollbackTarget(rec, lambda step, b: inter[:, b, step], dim=1, padding_slot=pad))
-        register("gdn.conv", RollbackTarget(conv, lambda step, b: snaps[:, step, b], dim=1, padding_slot=pad))
+        inner_r, inner_c = math.prod(rec.shape[2:]), math.prod(conv.shape[2:])
+        copy_r = ((inter, inter.stride(0), inter.stride(1), inter.stride(2), 0, rec.stride(0), rec.stride(1),
+                   rec.shape[0], inner_r) if block_contiguous(rec, 2) and block_contiguous(inter, 3) else None)
+        copy_c = ((snaps, snaps.stride(0), snaps.stride(2), snaps.stride(1), 0, conv.stride(0), conv.stride(1),
+                   conv.shape[0], inner_c) if block_contiguous(conv, 2) and block_contiguous(snaps, 3) else None)
+        register("gdn.recurrent", RollbackTarget(rec, lambda step, b: inter[:, b, step], dim=1, padding_slot=pad,
+                                                 copy=copy_r))
+        register("gdn.conv", RollbackTarget(conv, lambda step, b: snaps[:, step, b], dim=1, padding_slot=pad,
+                                            copy=copy_c))
     return _SPEC_BUFS[0]
 
 

@@ -31,7 +31,7 @@ from freetoken.layers import BaseOP, LinearReplicated
 from freetoken.mm import restore_placeholder
 from freetoken.utils import div_even
 
-from freetoken.spec_decode import SPEC_M, RollbackTarget, register, rows_of
+from freetoken.spec_decode import SPEC_M, RollbackTarget, block_contiguous, register, rows_of
 
 from .config import PLE_CONV_STATE, PLE_NGRAM_STATE
 from .hc import GroupedPlusOneRMSNorm
@@ -277,6 +277,9 @@ def derive_ngram_hash_constants(
 # time block of the PLE prefill forward (0 = one packed pass): a prefill longer than this many tokens (one request or
 # several packed) runs PLELayer._forward_blocks, which keeps one [T, hc_count * hidden] tensor instead of ~7
 PLE_CONV_BLOCK = int(os.environ.get("FREETOKEN_PLE_CONV_BLOCK", "4096"))
+# FREETOKEN_PLE_CONV_KERNEL=0: the m-row decode conv (verify steps) as torch ops instead of one kernel
+# (ple_conv_kernel.py, the same bits on gfx11; other GPUs keep the torch ops)
+_CONV_KERNEL = os.environ.get("FREETOKEN_PLE_CONV_KERNEL", "1") != "0"
 
 @dataclass
 class PLEMetadata:
@@ -399,8 +402,10 @@ def _spec_context_window(context_pool: torch.Tensor, window: torch.Tensor) -> No
         _SPEC_WINDOW[:] = [buf]
         ctx_len = context_pool.shape[-1]
         cols = torch.arange(ctx_len, device=window.device)
+        copy = ((buf, 0, buf.stride(0), buf.stride(1), 1, 0, context_pool.stride(0), 1, ctx_len)
+                if buf.stride(1) == 1 and context_pool.stride(-1) == 1 and context_pool.dim() == 2 else None)
         register("ple.ngram_ctx", RollbackTarget(
-            context_pool, lambda step, b: buf[b].gather(1, (step + 1).unsqueeze(1) + cols)))
+            context_pool, lambda step, b: buf[b].gather(1, (step + 1).unsqueeze(1) + cols), copy=copy))
     _SPEC_WINDOW[0][:reqs, :width].copy_(window)
 
 
@@ -857,8 +862,16 @@ class PLELayer(BaseOP):
         if snaps is None or snaps.shape[1] < reqs:
             assert not torch.cuda.is_current_stream_capturing(), "spec buffers must exist before the capture"
             snaps = self._spec_snaps = states.new_empty((SPEC_M - 1, reqs, *states.shape[1:]))  # any step's rows
-            register(f"ple{self.layer_id}.conv", RollbackTarget(states, lambda step, b: snaps[step, b]))
+            copy = ((snaps, 0, snaps.stride(1), snaps.stride(0), 0, 0, states.stride(0), 1, math.prod(states.shape[1:]))
+                    if block_contiguous(states, 1) and block_contiguous(snaps, 2) else None)
+            register(f"ple{self.layer_id}.conv", RollbackTarget(states, lambda step, b: snaps[step, b], copy=copy))
         weight = self.conv1d.weight.squeeze(1).float()
+        if _CONV_KERNEL and state.dtype == states.dtype and x.dtype == states.dtype:
+            from .ple_conv_kernel import bits_checked, ple_spec_conv
+
+            if bits_checked(states.device):
+                out = ple_spec_conv(state, rows, weight.contiguous(), snaps, states, meta.state_slots, self.dilation)
+                return F.silu(out)
         outs = []
         for j in range(m):
             column = rows[:, j].unsqueeze(-1)

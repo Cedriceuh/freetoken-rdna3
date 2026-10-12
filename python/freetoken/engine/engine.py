@@ -9,7 +9,7 @@ from datetime import timedelta
 from typing import Any, Dict, Iterable, NamedTuple, Tuple
 
 import torch
-from freetoken.spec_decode import MTP_ENABLED, SPEC_M, apply_rollback
+from freetoken.spec_decode import MTP_ENABLED, SPEC_GLUE_KERNELS, SPEC_M, apply_rollback
 from freetoken.attention import AttnType, attention_backend_info, create_attention_backend
 from freetoken.core import Batch, Context, Req, set_global_ctx
 from freetoken.distributed import destroy_distributed, enable_pynccl_distributed, get_tp_info, set_tp_info
@@ -1349,8 +1349,14 @@ class Engine:
         m, reqs, real = batch.spec_m, batch.padded_size, batch.size
         rows = logits.view(reqs, m, logits.shape[-1])
         tokens = rows.argmax(-1)  # [reqs, m]: the target's choice after each row
-        drafts_in = batch.input_ids.view(reqs, m)[:, 1:].to(tokens.dtype)
-        n_acc = 1 + (tokens[:, :-1] == drafts_in).to(torch.int64).cumprod(-1).sum(-1)
+        if SPEC_GLUE_KERNELS and batch.input_ids.is_contiguous():
+            from freetoken.kernel.triton.spec_glue import greedy_n_acc
+
+            n_acc = greedy_n_acc(tokens, batch.input_ids, m)
+            drafts_in = batch.input_ids.view(reqs, m)[:, 1:].to(tokens.dtype) if args.temperatures is not None else None
+        else:
+            drafts_in = batch.input_ids.view(reqs, m)[:, 1:].to(tokens.dtype)
+            n_acc = 1 + (tokens[:, :-1] == drafts_in).to(torch.int64).cumprod(-1).sum(-1)
         if args.temperatures is not None:  # sampled requests: speculative sampling (exact, spec_sample.py)
             from freetoken.engine.spec_sample import spec_sample
 
@@ -1374,7 +1380,7 @@ class Engine:
         done.record(self.stream)
         self._spec_timer.mark("verify")
         drafts = self._mtp_drafts(batch, tokens, n_acc=n_acc, args=args)
-        self._mtp_tally_accept(kept_n)
+        self._mtp_tally_accept(kept_n, n_acc_cpu)
         return ForwardOutput(kept, tokens_cpu, done, drafts, kept_n, n_acc_cpu)
 
     @staticmethod
@@ -1422,13 +1428,25 @@ class Engine:
             return d.linear_slot_idx
         return d.table_idx
 
-    def _mtp_tally_accept(self, n_acc: torch.Tensor) -> None:
+    def _mtp_tally_accept(self, n_acc: torch.Tensor, n_acc_cpu: torch.Tensor | None = None) -> None:
+        self._mtp_steps = getattr(self, "_mtp_steps", 0) + 1
+        if n_acc_cpu is not None and SPEC_GLUE_KERNELS:
+            # the step's kept counts already go to the host with its copy: summed there every 512 steps (one sync then,
+            # as before), no device op per step
+            pending = self.__dict__.setdefault("_mtp_acc_cpu", [])
+            pending.append(n_acc_cpu)
+            if self._mtp_steps % 512 == 0:
+                self.stream.synchronize()
+                kept = sum(int(t.sum()) for t in pending)
+                n = sum(t.numel() for t in pending)
+                logger.info_rank0(f"[mtp] {kept / max(n, 1):.3f} tokens per request step over the last 512 steps")
+                pending.clear()
+            return
         acc = self.__dict__.get("_mtp_acc")
         if acc is None:
             acc = self._mtp_acc = torch.zeros(2, dtype=torch.int64, device=n_acc.device)
         acc[0] += n_acc.sum()
         acc[1] += n_acc.numel()
-        self._mtp_steps = getattr(self, "_mtp_steps", 0) + 1
         if self._mtp_steps % 512 == 0:
             kept, n = (int(x) for x in acc.tolist())
             logger.info_rank0(f"[mtp] {kept / max(n, 1):.3f} tokens per request step over the last 512 steps")
@@ -1448,7 +1466,7 @@ class Engine:
         model = self.model.model
         mtp = self.model.mtp
         streams = model.last_streams
-        ids = batch.input_ids.to(torch.int64)
+        ids = batch.input_ids if batch.is_decode and SPEC_GLUE_KERNELS else batch.input_ids.to(torch.int64)
         if batch.is_decode:
             m, reqs = batch.spec_m, batch.padded_size
             if n_acc is None:  # a plain decode step (one row per request): its sampled token, nothing to verify
@@ -1466,7 +1484,13 @@ class Engine:
                     mtp.forward(streams, model.embed_tokens.forward(next_ids), batch, kv_only=True)
                 self._spec_timer.mark("mtp_kv")
                 return None
-            pick = torch.arange(reqs, device=ids.device) * m + n_acc - 1
+            chain_pos = None
+            if SPEC_GLUE_KERNELS and batch.positions.is_contiguous():
+                from freetoken.kernel.triton.spec_glue import draft_rows
+
+                pick, chain_pos = draft_rows(batch.positions, n_acc, m, depth)
+            else:
+                pick = torch.arange(reqs, device=ids.device) * m + n_acc - 1
             with self.ctx.forward_batch(batch):
                 # the MoE and the head on each request's last kept row only (one row per request)
                 head_in, streams = mtp.forward(streams, model.embed_tokens.forward(next_ids), batch,
@@ -1476,9 +1500,15 @@ class Engine:
             self._spec_timer.mark("mtp")
             # chained guesses: the head's own streams at the last kept row stand for the next position's, one row
             # per request at the last kept position + j
-            last = batch.positions.view(reqs, m)[:, 0].to(torch.int64) + n_acc - 1
+            if chain_pos is None:
+                last = batch.positions.view(reqs, m)[:, 0].to(torch.int64) + n_acc - 1
+            delta = None
+            if depth > 1 and SPEC_GLUE_KERNELS and batch.mrope_positions is not None:
+                # the requests' mrope deltas copied once for every chained guess
+                delta = torch.tensor([r.mrope_delta for r in batch.padded_reqs], dtype=torch.int32,
+                                     pin_memory=True).to(ids.device, non_blocking=True)
             for j in range(1, depth):
-                chain = self._chain_batch(batch, last + j)
+                chain = self._chain_batch(batch, chain_pos[:, j] if chain_pos is not None else last + j, delta)
                 with self.ctx.forward_batch(chain):
                     head_in, streams = mtp.forward(streams, model.embed_tokens.forward(drafts[-1]), chain)
                     tok, q = self._pick_draft(self.model.lm_head.forward(head_in), batch.size, args)
@@ -1522,7 +1552,15 @@ class Engine:
             req.spec_q = None if q is None else q[i : i + 1]
         return tok.to(torch.int32)[: batch.size].unsqueeze(-1)
 
-    def _chain_batch(self, batch: Batch, pos: torch.Tensor) -> Batch:
+    def _chain_rows(self, reqs: int, device) -> tuple[torch.Tensor, torch.Tensor]:
+        """``arange(reqs)`` and ``arange(reqs + 1)`` int32, made once per request count (never written)."""
+        cache = self.__dict__.setdefault("_chain_rows_cache", {})
+        if reqs not in cache:
+            cache[reqs] = (torch.arange(reqs, dtype=torch.int32, device=device),
+                           torch.arange(reqs + 1, dtype=torch.int32, device=device))
+        return cache[reqs]
+
+    def _chain_batch(self, batch: Batch, pos: torch.Tensor, delta: torch.Tensor | None = None) -> Batch:
         """``batch`` as a one-row-per-request decode step at ``pos [reqs]`` (a chained MTP guess): the same requests,
         pages and blocks, fresh per-row addressing (the first QSA layer re-plans its index writes)."""
         import copy
@@ -1530,6 +1568,22 @@ class Engine:
         from freetoken.attention.qsa_sparse import QSASparseMetadata
 
         reqs = pos.numel()
+        mrope_ready = batch.mrope_positions is None or delta is not None
+        if SPEC_GLUE_KERNELS and self.page_table.stride(1) == 1 and mrope_ready:
+            from freetoken.kernel.triton.spec_glue import chain_meta
+
+            chain = copy.copy(batch)
+            chain.positions, seq_lens, chain.out_loc, mrope = chain_meta(pos, batch.active_table_idx, self.page_table,
+                                                                         delta)
+            if mrope is not None:
+                chain.mrope_positions = mrope
+            md = batch.attn_metadata
+            rows, cu = self._chain_rows(reqs, pos.device)
+            chain.attn_metadata = QSASparseMetadata(
+                is_decode=True, last_indices=rows, qo_indptr_cpu=md.qo_indptr_cpu, kv_len_cpu=md.kv_len_cpu,
+                token_to_req=rows, cu_seqlens=cu, seq_lens=seq_lens, ring_slots=md.ring_slots,
+                block_table=md.block_table)
+            return chain
         pos32 = pos.to(torch.int32)
         chain = copy.copy(batch)
         chain.positions = pos32

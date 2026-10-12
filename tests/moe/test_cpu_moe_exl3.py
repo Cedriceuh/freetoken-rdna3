@@ -143,3 +143,42 @@ def test_gpu_exl3_decode_skips_cpu_routes():
                                              is_prefill=False)
 
     assert torch.equal(run(ids), run(torch.where(cpu, -1, ids)))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_gpu_exl3_out_one_split_matches_two():
+    """exl3_out with one down partial sum (rank 1's 256 slice on xtx-xt; SPLITS left unspecialized, the faster
+    variant) gives the bits of the same sums split in two exact halves."""
+    from freetoken.kernel.triton.exl3 import exl3_out
+
+    dev = torch.device("cuda")
+    gen = torch.Generator(device=dev).manual_seed(4)
+    S, H, top_k = 64, 2560, 10
+    svh = torch.rand(S, H, device=dev, generator=gen).half()
+    for T in (1, 2, 4):
+        c = torch.randn(1, T * top_k, H, device=dev, generator=gen)
+        slots = torch.randint(0, S, (T * top_k,), device=dev, dtype=torch.int32, generator=gen)
+        w = torch.rand(T, top_k, device=dev, generator=gen)
+        one = exl3_out(c, slots, svh, w, torch.empty(T, H, device=dev, dtype=torch.bfloat16))
+        two = exl3_out(torch.cat([c * 0.5, c * 0.5]), slots, svh, w,
+                       torch.empty(T, H, device=dev, dtype=torch.bfloat16))
+        assert torch.equal(one, two), T
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.parametrize("R", [2, 8, 40])
+def test_gpu_exl3_gemv_four_n_tiles_match_one(R):
+    """Rank 1's gate|up GEMV config (kernel/triton/exl3.py ``_GEMV_TUNED[(160, 16)]``: 4 N tiles a program) gives the
+    bits of 1 N tile a program, the same K tile, split and warps."""
+    from freetoken.kernel.triton.exl3 import exl3_gemv
+
+    dev = torch.device("cuda")
+    gen = torch.Generator().manual_seed(R)
+    S, KIN, N, bits = 6, 2560, 512, 3  # gate|up of a 256-wide slice: two halves of 256 columns
+    bank = torch.stack([pack_trellis(torch.randint(0, 1 << bits, (KIN // 16, N // 16, 256), generator=gen), bits)
+                        for _ in range(S)]).to(dev)
+    a = torch.randn(R, 2, KIN, generator=gen).to(dev)
+    slots = torch.randint(0, S, (R,), generator=gen, dtype=torch.int32).to(dev)
+    four = exl3_gemv(a, bank, slots, CB_MUL1, kt=1, nt=4, split_k=8, num_warps=2)
+    one = exl3_gemv(a, bank, slots, CB_MUL1, kt=1, nt=1, split_k=8, num_warps=2)
+    assert torch.equal(four, one)

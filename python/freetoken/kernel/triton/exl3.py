@@ -264,7 +264,8 @@ def _exl3_gemv_kernel(
 _GEMV_TUNED: dict[tuple[int, int], tuple[int, int, int, int]] = {
     (160, 24): (4, 4, 2, 8),  # gate|up, intermediate 384 per rank
     (24, 160): (2, 2, 2, 2),  # down, 384
-    (160, 16): (1, 1, 8, 2),  # gate|up, 256
+    (160, 16): (1, 4, 8, 2),  # gate|up, 256 (rank 1, the XT): 4 N tiles a program, the same sums as (1, 1, 8, 2),
+    # cold 33.8 / 62.2 / 69.7 -> 29.4 / 53.0 / 53.5 us at 2 verify rows / 4 rows / 4 requests
     (16, 160): (1, 2, 1, 2),  # down, 256
 }
 
@@ -541,7 +542,10 @@ def _exl3_mid_kernel(
                  mask=rm[:, None])
 
 
-@triton.jit
+# SPLITS unspecialized: Triton compiles an argument equal to 1 as a constant, and that variant ran ~2x slower (one
+# split: the down projection of rank 1's 256 slice on xtx-xt; the 7900 XT 13.6 -> 7.8 us at 1 token, 20.2 -> 6.8 at 4,
+# cold, the same bits)
+@triton.jit(do_not_specialize=["SPLITS"])
 def _exl3_out_kernel(
     c_ptr, slot_ptr, svh_ptr, w_ptr, h_ptr, out_ptr,
     T, SPLITS, stride_cs, stride_cr, stride_vs, stride_wt, stride_ot,
