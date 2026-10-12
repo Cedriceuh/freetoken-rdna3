@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- `rdna3/serve.sh --hybrid` (experimental): the CPU computes part of each decode step's expert misses from RAM
+  (upstream's `--moe-strategy hybrid`, which could not run here). The executor signals with HIP's stream memops (it
+  fell back to two host callbacks per layer on ROCm), sizes its scratch for the MTP verify rows up front, runs under
+  tensor parallelism with NVFP4 (each rank on half the cores), reads EXL3 experts (AVX2), and reads (NVFP4) or decodes
+  (EXL3) an expert once for the rows that share it. The hybrid layer's GPU ends are one kernel each and carry the
+  handshake themselves (step numbers, system-scope atomics: no stream memop left), and the kernel that picks which
+  misses to fetch reads the routes as vectors (same decisions); the GPU decode kernels skip the routes the CPU
+  computes instead of running them at weight 0 (+1-3 %, `FREETOKEN_HYBRID_SKIP_CPU_ROUTES`). Cores by slice size, SMT
+  siblings and EXL3 column blocks were measured too (off: no gain, or slower in serving). NVFP4: `xtx` 39.4 -> 56.2
+  tok/s, `xt` 31.4 -> 46.6, `xtx-xt` one request 78.2 -> 81.2-82.7, 4 requests 24.4 -> 28.2-28.6 each; EXL3: `xtx`
+  +6 %, a loss on two cards ([docs/rdna3/cpu-experts.md](docs/rdna3/cpu-experts.md)).
 - Upstream FreeToken merged up to `ee9789f` (23 commits, 2026-09-29 to 2026-10-10); the authors' commits are kept.
   On this tree's path: a race in the disk PLE staging fixed (the overlap scheduler could rewrite the pinned rows of a
   batch whose copy was still queued, `d3512b4`); upstream's NVFP4 marlin decode kernel (`7644984`) with the decode

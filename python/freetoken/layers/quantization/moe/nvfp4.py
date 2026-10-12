@@ -88,13 +88,19 @@ class TritonNvfp4MoEKernel(MoEKernel):
     name = "triton"
     cpu_format = "nvfp4"
 
+    @property
+    def supports_inactive_slots(self) -> bool:  # hybrid decode: CPU routes skipped (FREETOKEN_HYBRID_SKIP_CPU_ROUTES)
+        from freetoken.moe.fused_nvfp4 import SKIP_CPU_ROUTES
+
+        return SKIP_CPU_ROUTES
+
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
         reason = self._common_reject(cfg, tp_ok=True, cpu_ok=True, plain_silu_only=False)
         if reason:
             return reason
         if cfg.tp_size > 1:
-            if cfg.decode_target != "gpu":
-                return "triton nvfp4 MoE kernel: the CPU executor is not TP-aware"
+            # cpu / hybrid decode: each rank's executor reads its own bank slices (shapes from the banks) and its
+            # partial output joins the GPU partial before the all-reduce, like the GPU path
             reason = _tp_shard_reason(cfg)
             if reason:
                 return f"triton nvfp4 MoE kernel: {reason}"

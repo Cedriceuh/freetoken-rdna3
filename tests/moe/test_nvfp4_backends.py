@@ -440,6 +440,30 @@ def test_triton_decode_marlin_matches_baseline_kernel():
 
 
 @cuda
+def test_triton_decode_marlin_skips_cpu_routes():
+    """Hybrid decode: a route the CPU computes reaches the GPU as slot -1 with weight 0, and the GEMV writes zeros for
+    it without a read (FREETOKEN_HYBRID_SKIP_CPU_ROUTES): bit-identical to running it on a valid slot at weight 0."""
+    from freetoken.moe import fused_nvfp4
+
+    if not fused_nvfp4.SKIP_CPU_ROUTES:
+        pytest.skip("FREETOKEN_HYBRID_SKIP_CPU_ROUTES=0")
+    device = torch.device("cuda")
+    cache, _ = _triton_cache(device)
+    torch.manual_seed(13)
+    hidden = torch.randn(3, H, dtype=torch.bfloat16, device=device) / 4
+    ids = torch.tensor([[1, 6], [6, 2], [3, 1]], dtype=torch.int32, device=device)
+    cache.ensure_experts(0, ids)  # rewritten to slots
+    cache.copy_missing()
+    banks = cache.bank_views()
+    cpu = torch.tensor([[False, True], [True, False], [False, False]], device=device)
+    w = torch.where(cpu, 0.0, torch.rand(3, TOPK, dtype=torch.float32, device=device))
+    full = fused_nvfp4.fused_experts_decode_nvfp4_marlin(hidden, *banks, w, ids, "silu", False)
+    skipped = fused_nvfp4.fused_experts_decode_nvfp4_marlin(hidden, *banks, w, torch.where(cpu, -1, ids), "silu",
+                                                            False)
+    assert torch.equal(full, skipped)
+
+
+@cuda
 def test_b12x_decode_matches_dequant_reference():
     """sm_120 + CUDA>=13 only: the flashinfer b12x W4A16 fused MoE over the slot cache
     vs the dequant reference (skipped on hardware/toolkits where b12x cannot run)."""

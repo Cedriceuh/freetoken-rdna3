@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import torch
 
-from freetoken.layers.quantization.exl3_codec import HAD_DIM
+from freetoken.layers.quantization.exl3_codec import CB_MUL1, HAD_DIM
 
 from ..registry import LayerKind, register_method
 from ..scheme import QuantKind, exl3_params
@@ -28,14 +28,25 @@ class TritonExl3MoEKernel(MoEKernel):
     """Decode: per-route split-K GEMVs; prefill: expert-sorted grouped GEMMs; rotations fused around both."""
 
     name = "triton"
-    cpu_format = None
+    cpu_format = "exl3"
+
+    @property
+    def supports_inactive_slots(self) -> bool:  # hybrid decode: CPU routes skipped (FREETOKEN_HYBRID_SKIP_CPU_ROUTES)
+        from freetoken.moe.fused_exl3 import SKIP_CPU_ROUTES
+
+        return SKIP_CPU_ROUTES
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
         if cfg.strategy == "resident":
             return "triton exl3 MoE kernel: not served resident; use --moe-strategy offload"
-        reason = self._common_reject(cfg, tp_ok=True, cpu_ok=False, plain_silu_only=True)
+        reason = self._common_reject(cfg, tp_ok=True, cpu_ok=True, plain_silu_only=True)
         if reason:
             return f"triton exl3 MoE kernel: {reason}"
+        if cfg.decode_target != "gpu":
+            bits, codebook = exl3_params(cfg.scheme)
+            if codebook != CB_MUL1 or not 2 <= bits <= 4:
+                return (f"triton exl3 MoE kernel: the CPU executor reads mul1 experts of 2-4 bits, not codebook "
+                        f"{codebook} at {bits} bits")
         if cfg.apply_router_weight_on_input:
             return "triton exl3 MoE kernel: the router weight applies to the output only"
         if cfg.hidden % HAD_DIM or cfg.intermediate % HAD_DIM:

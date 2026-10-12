@@ -510,6 +510,75 @@ def test_cpu_moe_decode_cuda_graph_replay():
     print("cpu moe cuda graph replay OK")
 
 
+@pytest.mark.parametrize("in_kernel", [True, False])
+def test_cpu_moe_hybrid_split_cuda_graph_replay(monkeypatch, in_kernel):
+    """The hybrid layer's split / merge path (decode_submit_split, decode_sync_merge): routes with a cache slot stay on
+    the GPU (weight zeroed for the CPU), the others are summed by the CPU into the GPU partial. Eager, then a captured
+    graph replayed with new data, with the handshake carried by the kernels (step numbers) or by stream memops."""
+    from freetoken.moe import cpu_executor
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    monkeypatch.setattr(cpu_executor, "_FLAG_IN_KERNEL", in_kernel)
+    torch.manual_seed(0)
+    L, E, H, I, top_k = 3, 8, 512, 256, 4
+    layer, bs = 2, 3
+    cache = _make_cache(L, E, H, I)
+    dev = torch.device("cuda")
+    stream = torch.cuda.Stream()
+    torch.cuda.set_stream(stream)
+    ex = CpuMoeExecutor(cache, top_k=top_k, activation="silu", apply_router_weight_on_input=False, num_threads=8,
+                        max_tokens=bs, device=dev)
+    if not ex.can_split(torch.empty(1, H, device=dev, dtype=torch.bfloat16)):
+        pytest.skip("split path off")
+    hidden = torch.empty(bs, H, device=dev, dtype=torch.bfloat16)
+    raw = torch.empty(bs, top_k, device=dev, dtype=torch.int32)
+    slots = torch.empty(bs, top_k, device=dev, dtype=torch.int32)
+    w = torch.empty(bs, top_k, device=dev, dtype=torch.float32)
+    g = torch.empty(bs, H, device=dev, dtype=torch.bfloat16)
+
+    def fill(seed):
+        gen = torch.Generator().manual_seed(seed)
+        data = (torch.randn(bs, H, generator=gen).bfloat16(), torch.randint(0, E, (bs, top_k), generator=gen).int(),
+                torch.rand(bs, top_k, generator=gen), torch.randn(bs, H, generator=gen).bfloat16())
+        on_gpu = torch.rand(bs, top_k, generator=gen) < 0.5
+        hidden.copy_(data[0]); raw.copy_(data[1]); w.copy_(data[2]); g.copy_(data[3])
+        slots.copy_(torch.where(on_gpu, 7, -1).int())
+        ref = _reference(cache, layer, data[0], torch.where(on_gpu, -1, data[1]), data[2]) + data[3].float()
+        return ref
+
+    def step():
+        pending, gpu_w, gpu_slots = ex.decode_submit_split(layer, hidden, raw, slots.clone(), w, clamp=True)
+        return ex.decode_sync_merge(pending, g), gpu_w, gpu_slots
+
+    ref = fill(1)
+    out, gpu_w, gpu_slots = step()
+    torch.cuda.synchronize()
+    on_gpu = slots >= 0
+    assert torch.equal(gpu_w.cpu(), torch.where(on_gpu, w, 0.0).cpu())
+    assert int(gpu_slots.min()) >= 0
+    assert ((out.float().cpu() - ref).abs().max() / ref.abs().max()) < 2e-2
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        out_cap, _, _ = step()
+    for it in range(4):
+        ref = fill(10 + it)
+        graph.replay()
+        torch.cuda.synchronize()
+        rel = (out_cap.float().cpu() - ref).abs().max() / ref.abs().max()
+        assert rel < 2e-2, f"replay {it} rel err {rel}"
+
+    if ex._flag_sync:  # stream memops available: the handshake was the flags, not host callbacks
+        slot = ex._flag_slots[(layer, bs)]
+        assert ex._ext.flag_served_count(slot) >= 5
+        if in_kernel:
+            assert bool(ex._seq_mask[slot]) and int(ex._ready[slot]) == int(ex._done[slot]) == int(ex._seq[slot]) == 5
+        else:
+            assert int(ex._done[slot]) == 1 and int(ex._ready[slot]) == 0
+        assert int(ex._err.sum()) == 0
+        ex.raise_if_unhealthy()
+
+
 def test_cpu_moe_decode_cuda_graph_replay_mxfp4():
     """gpt-oss mxfp4 path under capture/replay: the host nodes must recompute the
     clamped-swiglu+bias GEMV from the freshly written pinned routing on each replay."""

@@ -86,6 +86,13 @@ def host_mapped_empty(shape: tuple[int, ...], dtype: torch.dtype, device: torch.
         host = _alloc_noncoherent(shape, dtype)
     else:
         host = alloc_pinned_tensor(*shape, dtype=dtype)
+    return device_view(host, device)
+
+
+def device_view(host: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """``device`` tensor over the memory of ``host``, a pinned, device-mapped CPU tensor: the coherent mapping of
+    ``alloc_pinned_tensor`` (a kernel's writes reach the host, its reads see the host's latest writes), or on ROCm
+    the non-coherent block :func:`host_mapped_empty` allocates (the GPU may keep its lines in L2)."""
     capsule = torch.utils.dlpack.to_dlpack(host)  # the capsule's deleter keeps ``host`` alive with the new tensor
     managed = ctypes.cast(_get_pointer(capsule, b"dltensor"), ctypes.POINTER(_DLTensor)).contents
     managed.data = device_ptr(host)

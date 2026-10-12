@@ -24,6 +24,10 @@ TopK = Tuple[torch.Tensor, torch.Tensor]
 # default. Set FREETOKEN_HYBRID_OVERLAP=0 to force the serial path (CPU sync before the
 # GPU work) -- a measurement-only escape hatch to A/B the overlap benefit.
 _HYBRID_OVERLAP = os.getenv("FREETOKEN_HYBRID_OVERLAP", "1") != "0"
+# FREETOKEN_HYBRID_MIN_REQS=n: under --moe-strategy hybrid, decode steps of fewer requests fetch every miss (the
+# offload path): on two cards one request's few misses cost less than the CPU round trip of each layer. Graphs are
+# captured per batch size, so each size takes one path.
+_HYBRID_MIN_REQS = int(os.getenv("FREETOKEN_HYBRID_MIN_REQS", "1"))
 
 
 class MoELayer(BaseOP):
@@ -318,7 +322,9 @@ class OffloadMoELayer(MoELayer):
             executor = cache.cpu_executor
             assert executor is not None, "CPU MoE executor was not initialized"
             return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
-        if cache.decode_target == "hybrid":
+        if cache.decode_target == "hybrid" and (
+            _HYBRID_MIN_REQS <= 1 or len(get_global_ctx().batch.reqs) >= _HYBRID_MIN_REQS
+        ):
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
         cache.ensure_experts(self.layer_id, topk_ids)
         cache.copy_missing()
@@ -345,7 +351,9 @@ class OffloadMoELayer(MoELayer):
 
         The CPU pool is kicked off (``decode_submit``) before the GPU PCIe fetch + GEMM so
         the CPU overflow GEMV runs concurrently with the GPU work. Capture-safe: the
-        routing split is device-side elementwise and the CPU submit/sync are host nodes.
+        routing split runs on the device (one kernel with the split kernels, elementwise ops
+        otherwise) and the CPU submit/sync are in-kernel flags, stream memops or (past the flag
+        slots) host functions.
         Each route is computed exactly once -- CPU-assigned routes reach the GPU as slot -1 with
         weight 0 (a kernel with ``supports_inactive_slots`` skips them without a read; any other reads
         slot 0, whose storage is a payload or the bank's zero fill) and the CPU ids are -1 for
@@ -353,6 +361,30 @@ class OffloadMoELayer(MoELayer):
         """
         executor = cache.cpu_executor
         assert executor is not None, "CPU MoE executor was not initialized"
+        clamp = not (self.quant_method is not None and self.quant_method.kernel.supports_inactive_slots)
+        if _HYBRID_OVERLAP and executor.can_split(hidden_states, topk_ids, topk_weights):
+            # the routing split, the CPU's inputs and its partial cross through the pinned buffers in place: one
+            # kernel at each end instead of eight small nodes (kernel/triton/hybrid_split.py); the ensure kernel
+            # writes the slots apart, so the routing needs no copy
+            slots = torch.empty_like(topk_ids)
+            cache.ensure_experts_hybrid(self.layer_id, topk_ids, out=slots)
+            if cache.collect_stats:
+                cache.record_decode_stats_hybrid(self.layer_id)
+            pending, gpu_w, gpu_slots = executor.decode_submit_split(
+                self.layer_id, hidden_states, topk_ids, slots, topk_weights, clamp
+            )
+            cache.copy_missing()
+            gpu_routed = self._expert_gemm(
+                cache,
+                hidden_states,
+                gpu_w,
+                gpu_slots,
+                views=cache.bank_views(),
+                n=None,
+                alphas=cache.alphas_for_slots(self.layer_id),
+                is_prefill=False,
+            )
+            return executor.decode_sync_merge(pending, gpu_routed)
         raw_ids = topk_ids.clone()
         cache.ensure_experts_hybrid(self.layer_id, topk_ids)
         on_gpu = topk_ids >= 0
@@ -370,7 +402,7 @@ class OffloadMoELayer(MoELayer):
         )
 
         cache.copy_missing()
-        if not (self.quant_method is not None and self.quant_method.kernel.supports_inactive_slots):
+        if clamp:
             # the kernel reads every route's slot: give the inactive ones slot 0, which holds a
             # complete payload or the bank's zero fill (never uninitialized storage), times weight 0
             gpu_slots = gpu_slots.clamp_min(0)

@@ -41,7 +41,8 @@ def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
 
 
 def ensure_experts_hybrid(
-    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, fetch_fraction: float = 0.0
+    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, fetch_fraction: float = 0.0,
+    out: torch.Tensor | None = None,
 ) -> None:
     """Capped-fetch variant of ``ensure_experts`` (hybrid backend).
 
@@ -52,12 +53,15 @@ def ensure_experts_hybrid(
     split (fraction = pcie_bw / cpu_bw): fetch ~fraction of the step's misses, rounded to
     the integer that makes the PCIe fetch and the CPU overflow compute finish closest to
     together. ``num_indices`` = capped fetch count (copy_missing); ``num_missing_full`` =
-    pre-cap miss count (stats)."""
+    pre-cap miss count (stats). ``out``: write the slot ids there and leave ``expert_ids`` as routed (saves the
+    caller a copy of the routing)."""
     # Q16 fixed point so the GPU kernel and the CPU reference cap identically (no float).
     frac_q16 = min(1 << 16, max(0, round(fetch_fraction * (1 << 16))))
     if not expert_ids.is_cuda:
+        if out is not None:
+            expert_ids = out.copy_(expert_ids)
         return _ensure_experts_hybrid_cpu(cache, layer_id, expert_ids, max_fetch, frac_q16)
-    _ensure_experts_hybrid_gpu(cache, layer_id, expert_ids, max_fetch, frac_q16)
+    _ensure_experts_hybrid_gpu(cache, layer_id, expert_ids, max_fetch, frac_q16, expert_ids if out is None else out)
 
 
 def prefill_hit_compact(cache, layer_id: int, buffer_id: int) -> None:
@@ -95,13 +99,14 @@ def reset_cache(cache) -> None:
 
 
 def _ensure_experts_hybrid_gpu(
-    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, frac_q16: int
+    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, frac_q16: int, out: torch.Tensor
 ) -> None:
     block_e = triton.next_power_of_2(cache.num_experts)
     block_c = triton.next_power_of_2(cache.cache_size)
     num_warps = 8 if block_c >= 2048 else 4
     _ensure_experts_hybrid_kernel[(1,)](
         expert_ids,
+        out,
         cache.slot_for_id,
         cache.id_of_slot,
         cache.usage,
@@ -120,6 +125,7 @@ def _ensure_experts_hybrid_gpu(
         cache.cache_size,
         BLOCK_E=block_e,
         BLOCK_C=block_c,
+        BLOCK_K=max(16, triton.next_power_of_2(expert_ids.numel())),
         BY_RECENCY=_HYBRID_FETCH_BY_RECENCY,
         num_warps=num_warps,
     )
@@ -290,6 +296,7 @@ def _materialize_layer_kernel(
 @triton.jit(do_not_specialize=["layer_id", "num_active", "max_fetch", "fetch_frac_q16"])
 def _ensure_experts_hybrid_kernel(
     expert_ids_ptr,
+    out_ptr,
     slot_for_id_ptr,
     id_of_slot_ptr,
     usage_ptr,
@@ -308,6 +315,7 @@ def _ensure_experts_hybrid_kernel(
     cache_size: tl.constexpr,
     BLOCK_E: tl.constexpr,
     BLOCK_C: tl.constexpr,
+    BLOCK_K: tl.constexpr,
     BY_RECENCY: tl.constexpr,
 ):
     """Capped-fetch timestamp-LRU (hybrid backend).
@@ -325,7 +333,11 @@ def _ensure_experts_hybrid_kernel(
     most-recently active before this step (LRU on the expert, via ``expert_recency``),
     breaking ties toward the lower expert id -- this prioritizes *recurring* misses for
     caching, lowering the steady miss rate. Otherwise the lowest expert ids are fetched
-    (``missing_rank``), the original routing-blind heuristic."""
+    (``missing_rank``), the original routing-blind heuristic.
+
+    The routes are read 16 at a time as vectors (a loop of dependent scalar loads per route cost several us a layer
+    on RDNA3), and a slot used this step is told apart by its usage stamp (``step`` is unique to the call) instead of a
+    compare of the whole cache per route."""
     step = tl.load(step_ptr) + 1
     tl.store(step_ptr, step)
     base = layer_id * num_experts
@@ -333,11 +345,13 @@ def _ensure_experts_hybrid_kernel(
     # ---- Phase 1: active + missing over experts ----
     off_e = tl.arange(0, BLOCK_E)
     e_mask = off_e < num_experts
-    is_active = tl.zeros((BLOCK_E,), dtype=tl.int1)
-    for i in tl.range(num_active):
-        e = tl.load(expert_ids_ptr + i)
-        is_active = is_active | (off_e == e)
-    tl.store(active_mask_ptr + off_e, is_active.to(tl.int32), mask=e_mask)
+    active = tl.zeros((BLOCK_E,), dtype=tl.int32)
+    for k0 in tl.static_range(0, BLOCK_K, 16):
+        kk = k0 + tl.arange(0, 16)
+        ids = tl.load(expert_ids_ptr + kk, mask=kk < num_active, other=-1)
+        active = tl.maximum(active, tl.max((ids[:, None] == off_e[None, :]).to(tl.int32), axis=0))
+    is_active = active > 0
+    tl.store(active_mask_ptr + off_e, active, mask=e_mask)
     slot = tl.load(slot_for_id_ptr + base + off_e, mask=e_mask, other=-1)
     is_missing = is_active & (slot == -1) & e_mask
     num_missing = tl.sum(is_missing.to(tl.int32))
@@ -371,18 +385,15 @@ def _ensure_experts_hybrid_kernel(
 
     # ---- Phase 2: evict victims by argmin(usage), only for the capped fetches ----
     if num_fetch > 0:
+        tl.debug_barrier()  # the hits' usage stamps above, before the load below
         off_c = tl.arange(0, BLOCK_C)
         c_mask = off_c < cache_size
-        oid = tl.load(id_of_slot_ptr + off_c, mask=c_mask, other=-1)
         u = tl.load(usage_ptr + off_c, mask=c_mask, other=9223372036854775807).to(tl.int64)
-        owner_active = c_mask & False
-        for i in tl.range(num_active):
-            ei = tl.load(expert_ids_ptr + i)
-            owner_active = owner_active | (oid == base + ei)
-        u = tl.where(owner_active | (~c_mask), 9223372036854775807, u)
+        # a slot stamped this step holds an active expert of this layer (a hit): never a victim
+        u = tl.where((u >= step) | (~c_mask), 9223372036854775807, u)
         for i in tl.range(num_fetch):
             victim = tl.argmin(u, axis=0).to(tl.int32)
-            old_id = tl.sum(tl.where(off_c == victim, oid, 0))
+            old_id = tl.load(id_of_slot_ptr + victim)
             if old_id >= 0:
                 tl.store(slot_for_id_ptr + old_id, -1)
             if BY_RECENCY:
@@ -398,10 +409,13 @@ def _ensure_experts_hybrid_kernel(
             u = tl.where(off_c == victim, 9223372036854775807, u)
 
     # ---- Phase 3: rewrite expert_ids -> slot id (hit/fetched) or -1 (overflow -> CPU) ----
-    for i in tl.range(num_active):
-        e = tl.load(expert_ids_ptr + i)
-        s = tl.load(slot_for_id_ptr + base + e)
-        tl.store(expert_ids_ptr + i, s)
+    tl.debug_barrier()  # phase 2's slot_for_id stores, before the gathers below
+    for k0 in tl.static_range(0, BLOCK_K, 16):
+        kk = k0 + tl.arange(0, 16)
+        km = kk < num_active
+        e = tl.load(expert_ids_ptr + kk, mask=km, other=0)
+        s = tl.load(slot_for_id_ptr + base + e, mask=km, other=-1)
+        tl.store(out_ptr + kk, s, mask=km)
 
     # Bump every active expert's recency to this step (LRU on the expert): an overflow miss
     # computed on the CPU now ranks high if it recurs, so it gets fetched next time.

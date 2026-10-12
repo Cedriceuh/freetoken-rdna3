@@ -183,6 +183,7 @@ def _decode_nvfp4_marlin_kernel(
     A_WIDE: tl.constexpr,         # activation rows are contiguous bf16/fp16, 16-byte aligned
     MUL_ROUTED_WEIGHT: tl.constexpr,
     compute_type: tl.constexpr,
+    SKIP_INACTIVE: tl.constexpr = False,  # a slot of -1 (a route the CPU computes, hybrid): zeros, no weight read
 ):
     """Marlin-style NVFP4 decode GEMV: wide int32 weight loads + deferred reduction.
 
@@ -213,6 +214,12 @@ def _decode_nvfp4_marlin_kernel(
     n_mask = offs_n < N
 
     slot = tl.load(topk_ids_ptr + token_id * stride_tid_m + route_k * stride_tid_k).to(tl.int64)
+    if SKIP_INACTIVE:
+        if slot < 0:
+            c_ptrs = c_ptr + token_id * stride_cm + route_k * stride_ck + offs_n * stride_cn
+            tl.store(c_ptrs, tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32).to(compute_type),
+                     mask=(route_id < total_routes) & n_mask)
+            return
     a_row = route_id if A_ROW_IS_ROUTE else token_id
     a_base = a_ptr + a_row * stride_am
 

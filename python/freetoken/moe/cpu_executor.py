@@ -53,6 +53,11 @@ _FLAG_SYNC = os.getenv("FREETOKEN_CPU_MOE_FLAG_SYNC", "1") != "0"
 # sizes plus any eager padded sizes); more than that is unheard of, and the overflow
 # just keeps the host-func path for the extra combos.
 _FLAG_SLOTS_PER_LAYER = 16
+# FREETOKEN_HYBRID_FLAG_IN_KERNEL=0: the hybrid layer's split and merge kernels leave the handshake to the three stream
+# memops (reset done, raise ready, wait) instead of carrying it with step numbers (kernel/triton/hybrid_split.py).
+_FLAG_IN_KERNEL = os.getenv("FREETOKEN_HYBRID_FLAG_IN_KERNEL", "1") != "0"
+# FREETOKEN_HYBRID_SPLIT_KERNEL=0: upstream's masks, copies and add around the CPU's part instead of the two split kernels
+_SPLIT_KERNEL = os.getenv("FREETOKEN_HYBRID_SPLIT_KERNEL", "1") != "0"
 # Pool threads spin up to 50 ms before they park. FREETOKEN_CPU_MOE_SPIN=0 opts out.
 _SPIN_WAIT = os.getenv("FREETOKEN_CPU_MOE_SPIN", "1") != "0"
 
@@ -71,7 +76,7 @@ _ACT_IDS = {
 }
 
 # Weight-format ids must match WFmt in csrc/cpu_moe/cpu_moe_ext.cpp.
-_WFMT_IDS = {"bf16": 0, "nvfp4": 1, "mxfp4_triton": 2, "ds_fp4": 3, "q4_0": 4}
+_WFMT_IDS = {"bf16": 0, "nvfp4": 1, "mxfp4_triton": 2, "ds_fp4": 3, "q4_0": 4, "exl3": 5}
 
 
 def compiled_extension_supports(activation: str) -> bool:
@@ -129,7 +134,56 @@ def _spin_wait_ok(core_ids: list[int], coord_core: int) -> bool:
     return len(spare) >= 2
 
 
-def resolve_threads_and_affinity(requested: int) -> tuple[int, list[int]]:
+# FREETOKEN_CPU_MOE_CORES_BY_SLICE=1: under tensor parallelism the ranks' pools take shares of the cores proportional
+# to their expert slices (an uneven FREETOKEN_TP_SPLIT gives rank 0 the larger one) instead of equal shares. Measured
+# without gain (docs/rdna3/cpu-experts.md): at these miss rates the step does not wait for the CPU.
+_CORES_BY_SLICE = os.getenv("FREETOKEN_CPU_MOE_CORES_BY_SLICE", "0") != "0"
+# FREETOKEN_CPU_MOE_SMT=1: the auto-sized pool also runs on the SMT siblings of its worker cores (all but one). Faster
+# alone on the CPU for EXL3, 14-42 % slower in serving (docs/rdna3/cpu-experts.md).
+_SMT = os.getenv("FREETOKEN_CPU_MOE_SMT", "0") != "0"
+
+
+def rank_core_cpus(weights: list[int] | None = None) -> list[int]:
+    """This rank's physical cores: under tensor parallelism each rank runs its own pool on its expert slices, so the
+    ranks take contiguous, disjoint shares of the cores (pools spinning on the same cores starve each other), in
+    proportion to ``weights`` (one per rank: its slice size) when given, else equal."""
+    reps = physical_core_cpus()
+    try:
+        from freetoken.distributed import get_tp_info
+
+        tp = get_tp_info()
+        rank, size = tp.rank, tp.size
+    except Exception:  # no distributed context (ft bench bw, tests)
+        return reps
+    if size <= 1 or len(reps) < 2 * size:
+        return reps
+    n = len(reps)
+    if weights is not None and len(weights) == size and all(w > 0 for w in weights):
+        total, acc, bounds = sum(weights), 0, [0]
+        for i, w in enumerate(weights[:-1], 1):
+            acc += w
+            bounds.append(min(max(round(n * acc / total), 2 * i), n - 2 * (size - i)))  # two cores each at least
+        bounds.append(n)
+        return reps[bounds[rank]:bounds[rank + 1]]
+    return reps[rank * n // size:(rank + 1) * n // size]
+
+
+def _smt_siblings(cpu: int) -> list[int]:
+    try:
+        with open(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list") as f:
+            raw = f.read().strip()
+    except OSError:
+        return []
+    out: list[int] = []
+    for part in raw.split(","):
+        lo, _, hi = part.partition("-")
+        out += list(range(int(lo), int(hi or lo) + 1))
+    allowed = os.sched_getaffinity(0) if hasattr(os, "sched_getaffinity") else set(out)
+    return [c for c in out if c != cpu and c in allowed]
+
+
+def resolve_threads_and_affinity(requested: int, weights: list[int] | None = None,
+                                 smt: bool = False) -> tuple[int, list[int]]:
     """Return (num_threads, core_ids) for the worker pool.
 
     ``requested == 0`` -> one thread per physical core, pinned to it (best for the
@@ -138,7 +192,7 @@ def resolve_threads_and_affinity(requested: int) -> tuple[int, list[int]]:
     spreading first across physical cores, then across the remaining logical CPUs
     (so distinct hardware threads are used before any core is doubled up).
     """
-    reps = physical_core_cpus()
+    reps = rank_core_cpus(weights)
     if requested and requested > 0:
         n = int(requested)
         try:
@@ -151,6 +205,11 @@ def resolve_threads_and_affinity(requested: int) -> tuple[int, list[int]]:
             order = [0]
         core_ids = [order[i % len(order)] for i in range(n)]
         return n, core_ids
+    if smt and len(reps) > 2:
+        # the siblings of every worker core but the last one; the last core (the coordinator's, when auto sizing
+        # gives it one) stays whole and last in the list
+        sib = [c for r in reps[:-2] for c in _smt_siblings(r)]
+        return len(reps) + len(sib), reps[:-1] + sib + reps[-1:]
     return len(reps), list(reps)
 
 
@@ -172,6 +231,7 @@ class CpuMoeExecutor:
         swiglu_limit: float | None = None,
         fmt: str | None = None,
         act_block: int | None = None,
+        tp_cpu_group=None,
     ) -> None:
         from freetoken.kernel import _cpu_moe
         from freetoken.moe.legacy_format import canonical_role
@@ -232,7 +292,17 @@ class CpuMoeExecutor:
                 )
                 self._flag_sync = False
 
-        nthreads, core_ids = resolve_threads_and_affinity(num_threads)
+        # the ranks' slice sizes, for their shares of the cores (an uneven split gives rank 0 more of each expert)
+        self._rank_weights = None
+        if tp_cpu_group is not None and _CORES_BY_SLICE:
+            import torch.distributed as dist
+
+            world = dist.get_world_size(tp_cpu_group)
+            if world > 1:
+                sizes = [torch.zeros(1, dtype=torch.int64) for _ in range(world)]
+                dist.all_gather(sizes, torch.tensor([self.I], dtype=torch.int64), group=tp_cpu_group)
+                self._rank_weights = [int(t) for t in sizes]
+        nthreads, core_ids = resolve_threads_and_affinity(num_threads, self._rank_weights, _SMT)
         coord_core = -1
         if self._flag_sync and num_threads == 0 and nthreads > 2:
             # Auto sizing: give the coordinator the last physical core instead of
@@ -259,11 +329,13 @@ class CpuMoeExecutor:
         )
         self.num_threads = nthreads
         self.core_ids = core_ids
+        if fmt == "exl3":
+            self._ext.set_exl3(self._exl3_bits)
         self.isa = self._ext.isa_name()
         self.spin_wait = _spin_wait_ok(core_ids, coord_core)
         self._ext.set_spin_wait(self.spin_wait)
 
-        spare = len(physical_core_cpus()) - nthreads - (1 if coord_core >= 0 else 0) - 1
+        spare = len(rank_core_cpus(self._rank_weights)) - nthreads - (1 if coord_core >= 0 else 0) - 1
         clamp = max(1, min(torch.get_num_threads(), spare))
         if clamp < torch.get_num_threads():
             logger.info_rank0(
@@ -287,6 +359,7 @@ class CpuMoeExecutor:
         # self so the coordinator's pinned pointers stay valid for the executor's
         # lifetime (flag_sync itself was decided above, before thread sizing).
         self._ready = self._done = self._err = None
+        self._seq = None
         self._flag_slots: dict[tuple[int, int], int] = {}  # (layer_id, bs) -> slot
         self._flag_capacity = self.num_layers * _FLAG_SLOTS_PER_LAYER
         if self._flag_sync:
@@ -300,6 +373,16 @@ class CpuMoeExecutor:
                 self._ready.data_ptr(), self._done.data_ptr(), self._flag_capacity,
                 self._coord_core,
             )
+            # slots switched to step numbers by the split path (set_flag_seq), their counters and the flag views
+            self._seq_mask = torch.zeros(self._flag_capacity, dtype=torch.bool)
+            if _FLAG_IN_KERNEL and device.type == "cuda":
+                from freetoken.kernel.host_mapped import device_view
+                from freetoken.kernel.triton.hybrid_split import fence_lanes
+
+                self._seq = torch.zeros(self._flag_capacity, dtype=torch.int64, device=device)
+                self._fence = torch.zeros(fence_lanes(device), dtype=torch.int32, device=device)
+                self._ready_d = device_view(self._ready, device)
+                self._done_d = device_view(self._done, device)
             self._watchdog_stop = False
             # The thread target holds a WEAKREF and re-derefs it each tick: a bound
             # method would strong-reference the executor forever (the loop never ends
@@ -336,6 +419,10 @@ class CpuMoeExecutor:
                 "(bit-identical grid; the CPU-side scalar round-trip is skipped)"
             )
 
+        logger.info(  # every rank: under tensor parallelism each pool takes its own cores
+            f"CPU MoE pool: {nthreads} workers on CPUs {sorted(core_ids)}, coordinator {coord_core}"
+            + (f", slice sizes {self._rank_weights}" if self._rank_weights else "") + f", spin_wait={self.spin_wait}"
+        )
         logger.info_rank0(
             f"CPU MoE executor ready: threads={nthreads} (pinned to cores "
             f"{core_ids[0]}..{core_ids[-1]}) isa={self.isa} fmt={fmt} "
@@ -394,6 +481,9 @@ class CpuMoeExecutor:
         if fmt == "q4_0":
             return self._resolve_q4_0_banks(banks)
 
+        if fmt == "exl3":
+            return self._resolve_exl3_banks(banks)
+
         if fmt == "mxfp4_triton":
             return self._resolve_mxfp4_banks(banks)
 
@@ -421,6 +511,30 @@ class CpuMoeExecutor:
             gate_up_global_ptr=self._make_table(gug).data_ptr(),
             down_scale_ptr=self._make_table(dns).data_ptr(),
             down_global_ptr=self._make_table(dng).data_ptr(),
+            gate_up_bias_ptr=0,
+            down_bias_ptr=0,
+        )
+        return ptrs, (H, I)
+
+    def _resolve_exl3_banks(self, banks: dict) -> tuple[dict, tuple[int, int]]:
+        """EXL3 trellis banks (layers/quantization/moe/exl3.py), read in place: gate_up [S, H/16, 2I/16, 16K] and
+        down [S, I/16, H/16, 16K] int16, the fp16 input / output channel scales ride the scale / global tables."""
+        gu, dn = banks["gate_up"], banks["down"]
+        gs, gv, ds, dv = banks["gate_up_suh"], banks["gate_up_svh"], banks["down_suh"], banks["down_svh"]
+        assert gu[0].dtype == torch.int16 and dn[0].dtype == torch.int16, (gu[0].dtype, dn[0].dtype)
+        H, I = int(gu[0].shape[1] * 16), int(gu[0].shape[2] * 8)
+        self._exl3_bits = int(gu[0].shape[3] // 16)
+        assert tuple(dn[0].shape[1:]) == (I // 16, H // 16, 16 * self._exl3_bits), (dn[0].shape, H, I)
+        assert tuple(gs[0].shape[1:]) == (2, H) and tuple(gv[0].shape[1:]) == (2 * I,), (gs[0].shape, gv[0].shape)
+        assert tuple(ds[0].shape[1:]) == (I,) and tuple(dv[0].shape[1:]) == (H,), (ds[0].shape, dv[0].shape)
+        assert all(t[0].dtype == torch.float16 for t in (gs, gv, ds, dv))
+        ptrs = dict(
+            gate_up_ptr=self._make_table(gu).data_ptr(),
+            down_ptr=self._make_table(dn).data_ptr(),
+            gate_up_scale_ptr=self._make_table(gs).data_ptr(),
+            gate_up_global_ptr=self._make_table(gv).data_ptr(),
+            down_scale_ptr=self._make_table(ds).data_ptr(),
+            down_global_ptr=self._make_table(dv).data_ptr(),
             gate_up_bias_ptr=0,
             down_bias_ptr=0,
         )
@@ -521,6 +635,11 @@ class CpuMoeExecutor:
                 "w": alloc_pinned_tensor(bs, self.top_k, dtype=torch.float32),
                 "y": alloc_pinned_tensor(bs, self.H, dtype=torch.bfloat16),
             }
+            if self.device.type == "cuda":
+                from freetoken.kernel.host_mapped import device_view
+
+                for name in ("x", "ids", "w", "y"):
+                    io[name + "_d"] = device_view(io[name], self.device)
             self._io[bs] = io
         return io
 
@@ -608,6 +727,65 @@ class CpuMoeExecutor:
             self._ext.submit_with_cuda_stream(stream, task)
         return (bs, task, out, slot)
 
+    def can_split(self, hidden_states: torch.Tensor, topk_ids: torch.Tensor | None = None,
+                  topk_weights: torch.Tensor | None = None) -> bool:
+        """Whether :meth:`decode_submit_split` serves this layer call (bf16 activations, no DSV4 pre-quant; the split
+        kernels index the rows flat, so contiguous inputs)."""
+        return (_SPLIT_KERNEL and self.device.type == "cuda" and not self._gpu_prequant
+                and hidden_states.dtype == torch.bfloat16
+                and all(t is None or t.is_contiguous() for t in (hidden_states, topk_ids, topk_weights)))
+
+    def decode_submit_split(
+        self,
+        layer_id: int,
+        hidden_states: torch.Tensor,
+        raw_ids: torch.Tensor,
+        slots: torch.Tensor,
+        topk_weights: torch.Tensor,
+        clamp: bool,
+    ) -> tuple:
+        """:meth:`decode_submit` for the hybrid layer with the routing split and the three device-to-host copies in one
+        kernel that writes the pinned buffers in place (kernel/triton/hybrid_split.py). ``slots`` is the routing after
+        the capped fetch (-1: the CPU computes the route). Returns (pending, GPU weights, GPU slots)."""
+        from freetoken.kernel.triton.hybrid_split import hybrid_split, hybrid_split_signal
+
+        bs = hidden_states.shape[0]
+        io = self._io_for(bs)
+        task = self._task_for(layer_id, bs)
+        slot = self._flag_slots.get((layer_id, bs)) if self._flag_sync else None
+        if slot is not None and self._seq is not None:
+            if not bool(self._seq_mask[slot]):
+                self._ext.set_flag_seq(slot)
+                self._seq_mask[slot] = True
+            gpu_w, gpu_slots = hybrid_split_signal(hidden_states, raw_ids, slots, topk_weights, io["x_d"], io["ids_d"],
+                                                   io["w_d"], clamp, self._seq[slot:slot + 1],
+                                                   self._ready_d[slot:slot + 1], self._fence)
+            return (bs, task, None, slot), gpu_w, gpu_slots
+        gpu_w, gpu_slots = hybrid_split(hidden_states, raw_ids, slots, topk_weights, io["x_d"], io["ids_d"],
+                                        io["w_d"], clamp)
+        stream = torch.cuda.current_stream().cuda_stream
+        if slot is not None:
+            self._cpu_moe.memop_submit(stream, self._done.data_ptr(), self._ready.data_ptr(), slot)
+        else:
+            self._ext.submit_with_cuda_stream(stream, task)
+        return (bs, task, None, slot), gpu_w, gpu_slots
+
+    def decode_sync_merge(self, pending: tuple, gpu_routed: torch.Tensor) -> torch.Tensor:
+        """:meth:`decode_sync` then gpu_routed + the CPU partial, read in place from its pinned buffer (one kernel
+        instead of a host-to-device copy and an add)."""
+        from freetoken.kernel.triton.hybrid_split import hybrid_merge, hybrid_merge_wait
+
+        bs, task, _, slot = pending
+        if slot is not None and self._seq is not None and bool(self._seq_mask[slot]):
+            return hybrid_merge_wait(gpu_routed, self._io[bs]["y_d"], self._seq[slot:slot + 1],
+                                     self._done_d[slot:slot + 1])
+        stream = torch.cuda.current_stream().cuda_stream
+        if slot is not None:
+            self._cpu_moe.memop_sync(stream, self._done.data_ptr(), slot)
+        else:
+            self._ext.sync_with_cuda_stream(stream, task)
+        return hybrid_merge(gpu_routed, self._io[bs]["y_d"])
+
     def decode_sync(self, pending: tuple) -> torch.Tensor:
         """Issue the CPU-pool sync + the H2D result copy for a prior :meth:`decode_submit`,
         and return the GPU output tensor. With flag-sync the wait is a front-end stream
@@ -630,14 +808,17 @@ class CpuMoeExecutor:
         """One watchdog sampling round (called every 2 s by ``_watchdog_main``).
 
         A slot is only declared dead when THREE things hold across >=10 s: its doorbell
-        is still pending (ready==1 && done==0), it was already pending when first
+        is still pending (ready==1 && done==0; a step-number slot: done != ready), it was already pending when first
         suspected, and the coordinator has served NOTHING on it since (flag_served_count
         unchanged). The served-count criterion kills the false-positive window: two
         point samples can land on the same slot's (independent, us-scale) pending
         windows under heavy external load, but a coordinator that made progress in
         between is alive by definition. ``suspects`` maps slot -> (first_seen,
         served_at_first_sight) and persists across ticks."""
-        stuck = (self._ready == 1) & (self._done == 0)
+        # a step-number slot is pending while done lags ready
+        seq = self._seq_mask
+        stuck = ((self._ready == 1) & (self._done == 0) & ~seq) | (seq & (self._ready != self._done))
+        stuck &= self._err == 0  # a slot declared dead stays poisoned: not reported again
         if not bool(stuck.any()):
             suspects.clear()
             return
@@ -664,7 +845,8 @@ class CpuMoeExecutor:
         for i in dead:
             self._err[i] = 1
         for i in dead:
-            self._done[i] = 1  # after err: unblock the stream into a checked failure
+            # after err: unblock the stream into a checked failure (a step-number wait needs done >= its number)
+            self._done[i] = 2**63 - 1 if bool(self._seq_mask[i]) else 1
             suspects.pop(i, None)
 
     def raise_if_unhealthy(self) -> None:

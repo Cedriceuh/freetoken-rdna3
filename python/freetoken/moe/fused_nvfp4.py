@@ -31,6 +31,9 @@ logger = init_logger(__name__)
 
 # set by a caller that sums the decode experts' outputs itself (one element: mutable, read at call time)
 PER_EXPERT_OUTPUT = [False]
+# FREETOKEN_HYBRID_SKIP_CPU_ROUTES=0: under --moe-strategy hybrid the decode GEMV still runs the routes the CPU computes
+# (on slot 0, weight 0) instead of writing zeros for them without a read
+SKIP_CPU_ROUTES = os.environ.get("FREETOKEN_HYBRID_SKIP_CPU_ROUTES", "1") != "0"
 
 # Decode is captured into a CUDA graph, so the config must be fixed (no triton.autotune,
 # which benchmarks at run time). Tuned offline against the NVFP4 decode kernels.
@@ -166,6 +169,7 @@ def _decode_gemm_marlin(
         A_WIDE=a_wide,
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         compute_type=_tl_dtype(c.dtype),
+        SKIP_INACTIVE=SKIP_CPU_ROUTES,
         num_warps=warps,
     )
 

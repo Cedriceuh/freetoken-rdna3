@@ -21,6 +21,9 @@
 #                      `-- --image-max-tokens N` changes it
 #   --no-mtp           decode without the MTP draft head the profiles except gre turn on (it speeds up one request at a time;
 #                      docs/rdna3/limits.md)
+#   --hybrid           compute part of each decode step's expert misses on the CPU instead of copying them (experimental,
+#                      NVFP4: +43 % on xtx, +48 % on xt, on xtx-xt +4-6 % for one request and +16-17 % with 4;
+#                      EXL3: +6 % on xtx, a loss on two cards; docs/rdna3/cpu-experts.md)
 #   --dry-run          print the docker command instead of running it
 #
 # The kernel cache (JIT + autotune results) lives in a docker volume named after the image id, so it is built once
@@ -29,7 +32,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DOCKER="$(command -v docker || echo docker)"
 image="freetoken-rdna3:latest" name="freetoken-rdna3" served="qwen3.8-flash-next" host=127.0.0.1 port=1919
-model="" ctx="" gpus="" memory="" dry="" no_mtp="" profile="" extra=() mm_args=(--text-model-only)
+model="" ctx="" gpus="" memory="" dry="" no_mtp="" hybrid="" profile="" extra=() mm_args=(--text-model-only)
 
 list_gpus() {  # "hip_index vram_bytes pci_address" per GPU, from the kernel's KFD topology (no GPU context opened):
   # HIP numbers the GPU nodes in topology order
@@ -59,6 +62,7 @@ while [ $# -gt 0 ]; do
     --vision) mm_args=(--image-max-tokens 1024); shift ;;
     --dry-run) dry=1; shift ;;
     --no-mtp) no_mtp=1; shift ;;
+    --hybrid) hybrid=1; shift ;;
     --list)
       printf '%-14s %-4s %9s %9s  %-8s %s\n' profile GPUs context "K/V pool" status description
       for f in "$HERE"/profiles/*.env; do
@@ -120,6 +124,21 @@ if [[ "$cfg" == *'"quant_method":"exl3"'* ]] && [ "$p_gpus" = 2 ]; then
   awk -v b="${bits:-0}" 'BEGIN { exit !(b >= 4) }' && ratio=0.76
   ft_args+=(--memory-ratio "$ratio")
   echo "note: EXL3 checkpoint (${bits:-?} bpw) on two cards: --memory-ratio $ratio instead of the profile's ('-- --memory-ratio X' overrides)" >&2
+fi
+
+# --hybrid (docs/rdna3/cpu-experts.md): the split measured best on the Threadripper 3970X + PCIe 4.0: for NVFP4 a quarter
+# of each step's misses fetched on one card (as `ft bench bw` picks), 40 % on two, where each rank's pool has half the
+# cores and the RAM's bandwidth but its own PCIe link; 60 % for EXL3, whose experts cost the CPU more to decode
+if [ -n "$hybrid" ]; then
+  ft_args+=(--moe-strategy hybrid)
+  if [[ "$cfg" == *'"quant_method":"exl3"'* ]]; then
+    envs+=(-e FREETOKEN_HYBRID_FETCH_FRACTION=0.6)
+    [ "$p_gpus" = 1 ] || echo "note: --hybrid with EXL3 experts on two cards measured 2-4 % slower than without (docs/rdna3/cpu-experts.md)" >&2
+  elif [ "$p_gpus" = 1 ]; then
+    envs+=(-e FREETOKEN_HYBRID_FETCH_FRACTION=0.25)
+  else
+    envs+=(-e FREETOKEN_HYBRID_FETCH_FRACTION=0.4)
+  fi
 fi
 
 if [ -z "$gpus" ]; then

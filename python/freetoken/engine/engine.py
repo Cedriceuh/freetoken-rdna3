@@ -970,7 +970,12 @@ class Engine:
         from freetoken.moe.bench_profile import load_hybrid_fetch_fraction
 
         gpu_name, gpu_uuid = _profile_gpu(self.device.index)
-        fraction = load_hybrid_fetch_fraction(
+        # FREETOKEN_HYBRID_FETCH_FRACTION=f sets the split by hand (formats `ft bench bw` does not bench, e.g. exl3)
+        forced = os.environ.get("FREETOKEN_HYBRID_FETCH_FRACTION")
+        if forced and not 0.0 < float(forced) < 1.0:
+            raise ValueError(f"FREETOKEN_HYBRID_FETCH_FRACTION={forced}: the share of the misses fetched, strictly "
+                             "between 0 and 1 (the capped-fetch kernel takes 0 and 1 as no cap)")
+        fraction = float(forced) if forced else load_hybrid_fetch_fraction(
             cache.quant_format, gpu_name=gpu_name, gpu_uuid=gpu_uuid
         )
         if fraction is None:
@@ -983,8 +988,9 @@ class Engine:
         cache.hybrid_max_fetch = cache.num_experts  # inert: the fraction is the cap
         cache.hybrid_fetch_fraction = fraction
         logger.info_rank0(
-            f"--moe-hybrid-max-fetch auto: fetching {fraction:.1%} of each decode step's "
-            "expert misses over PCIe (benched PCIe/CPU bandwidth ratio), the rest on the CPU"
+            f"--moe-hybrid-max-fetch auto: fetching {fraction:.1%} of each decode step's expert misses over PCIe "
+            f"({'FREETOKEN_HYBRID_FETCH_FRACTION' if forced else 'benched PCIe/CPU bandwidth ratio'}), the rest on the "
+            "CPU"
         )
 
     def _init_cpu_moe_executor(self, config: EngineConfig, cache, layers) -> None:
@@ -1005,8 +1011,9 @@ class Engine:
                 f"(MoE layer {type(sample).__name__} is missing {required})."
             )
         # Decode batches never exceed max_running_req, but CUDA-graph padding can
-        # round a batch up to the largest captured size; cover both.
-        max_tokens = max(config.max_running_req, config.cuda_graph_max_bs or 0, 1)
+        # round a batch up to the largest captured size; cover both. A speculative verify step runs up to SPEC_M rows
+        # per request: the executor's buffers are sized for them up front (create_task refuses a larger task).
+        max_tokens = max(config.max_running_req, config.cuda_graph_max_bs or 0, 1) * SPEC_M
         method = sample.quant_method
         executor = CpuMoeExecutor(
             cache,
@@ -1021,6 +1028,7 @@ class Engine:
             # FIXME: the None branch serves GGUF q4_0 banks, which have no quant method yet; drop it once GGUF joins the quant path
             fmt=method.cpu_format if method is not None else None,
             act_block=method.cfg.act_block if method is not None else None,
+            tp_cpu_group=getattr(self, "tp_cpu_group", None),
         )
         cache.set_cpu_executor(executor)
         self.cpu_moe_executor = executor

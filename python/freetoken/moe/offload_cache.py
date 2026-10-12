@@ -870,7 +870,7 @@ class OffloadMoeCache:
         self._pending_whole_layer = False
         ensure_experts(self, layer_id, expert_ids)
 
-    def ensure_experts_hybrid(self, layer_id: int, expert_ids: torch.Tensor) -> None:
+    def ensure_experts_hybrid(self, layer_id: int, expert_ids: torch.Tensor, out: torch.Tensor | None = None) -> None:
         """Capped-fetch LRU for the hybrid backend.
 
         Like :meth:`ensure_experts` but assigns slots to (and schedules copies for) at
@@ -888,7 +888,7 @@ class OffloadMoeCache:
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
         ensure_experts_hybrid(
-            self, layer_id, expert_ids, self.hybrid_max_fetch, self.hybrid_fetch_fraction
+            self, layer_id, expert_ids, self.hybrid_max_fetch, self.hybrid_fetch_fraction, out
         )
 
     def materialize_layer(self, layer_id: int) -> None:

@@ -193,6 +193,20 @@ Line counts here are on top of the lines listed in the sections above.
 | `rdna3/bench/qsa_topk_bench.py` | new | the block top-k on the profiles' page tables |
 | `tests/layers/test_rotary_yarn.py`, `tests/kernels/test_qsa_kv_host.py`, `rdna3/profiles/xtx-xt-1m.env`, `rdna3/profiles/xtx-xt-4x262k.env` | new | YaRN and the longer table against HF's rotary embedding (CPU); the host-mapped tensor and the page staging (GPU); one conversation of 1M, four of 262,144 at once |
 
+## Expert misses on the CPU (`--hybrid`, experimental)
+
+| File | Lines | Change |
+|---|---:|---|
+| `python/freetoken/kernel/csrc/cpu_moe/cpu_moe_ext.cpp` | 586/10 | HIP's own stream memops for the executor's flag handshake (upstream finds only `libcuda`'s, so ROCm fell back to two host callbacks per layer); flag slots served by step numbers (the GPU kernels signal and wait, nothing is reset); a task larger than the scratch refused; EXL3 experts (mul1, 2-4 bits, AVX2 + F16C, software prefetch, one decode for the rows sharing an expert, column blocks `FREETOKEN_CPU_MOE_EXL3_COLS`); the routes of rows sharing an expert run back to back (`FREETOKEN_CPU_MOE_GROUP`); a step that leaves the CPU no route answered with zeros at once; `FREETOKEN_CPU_MOE_ROUTE_STATS` |
+| `python/freetoken/moe/cpu_executor.py` | 190/8 | each tensor-parallel rank's pool on its own half of the cores; the EXL3 banks read in place; device views of the pinned IO buffers and the split / merge path (`FREETOKEN_HYBRID_SPLIT_KERNEL`), with the handshake in the kernels (`FREETOKEN_HYBRID_FLAG_IN_KERNEL`) and a watchdog that knows step-number slots; the pools' cores by slice size (`FREETOKEN_CPU_MOE_CORES_BY_SLICE`, off) or with SMT siblings (`FREETOKEN_CPU_MOE_SMT`, off) |
+| `python/freetoken/kernel/triton/hybrid_split.py`, `kernel/host_mapped.py` | new, 7/0 | the hybrid layer's two GPU ends as one kernel each, with or without the handshake (system-scope atomics on the host flags); a device view of an existing pinned tensor |
+| `python/freetoken/moe/offload_kernels.py`, `moe/offload_cache.py` | 35/21, 2/2 | the hybrid capped-fetch kernel reads the routes as vectors and tells this step's slots by their usage stamp (same decisions; 1.1-2.2x faster at 4 rows, 1.5-8.5x at 16, synthetic routing), and can write the slots apart from the routing |
+| `python/freetoken/layers/moe.py` | 35/3 | the split / merge path without a copy of the routing; steps of fewer than `FREETOKEN_HYBRID_MIN_REQS` requests take the offload path |
+| `python/freetoken/engine/engine.py` | 13/5 | the executor's row bound counts the MTP verify rows (sized up front, a larger task refused); `FREETOKEN_HYBRID_FETCH_FRACTION`; the TP CPU group handed to the executor |
+| `python/freetoken/layers/quantization/moe/nvfp4.py`, `layers/quantization/moe/exl3.py` | 8/2, 14/3 | CPU decode allowed under tensor parallelism with NVFP4; an EXL3 CPU format (mul1, 2-4 bits); both kernels take inactive slots (`FREETOKEN_HYBRID_SKIP_CPU_ROUTES`) |
+| `python/freetoken/kernel/triton/nvfp4_fused_moe.py`, `moe/fused_nvfp4.py`, `kernel/triton/exl3.py`, `moe/fused_exl3.py` | 7/0, 4/0, 17/7, 6/3 | the decode GEMVs write zeros for a slot of -1 without a read; the EXL3 rotation and scale kernels read slot 0's scales for it |
+| `tests/moe/test_cpu_moe_exl3.py`, `tests/moe/test_cpu_moe.py`, `tests/moe/test_nvfp4_backends.py` | new, 69/0, 24/0 | the EXL3 path against the reference codec, tensor-parallel slices, skipped routes, rows sharing an expert, the size check; the split / merge path eager and replayed in a graph, with the handshake in the kernels or in memops; the GPU skip of the CPU's routes bit-identical (NVFP4, EXL3) |
+
 ## Tooling and documentation
 
 | File | Change |
@@ -200,6 +214,6 @@ Line counts here are on top of the lines listed in the sections above.
 | `python/freetoken/engine/ftprof.py` (106/0) | env-gated decode profiling (`FT_STATS_EVERY`, `FT_PROF_*`) |
 | `python/freetoken/server/args.py` (3/1) | `--cuda-graph-max-bs` help |
 | `Dockerfile.rdna3`, `.dockerignore` | the ROCm image |
-| `rdna3/` | profiles (the MTP head on), `serve.sh` (`--no-mtp`; a lower `--memory-ratio` for EXL3 on two cards), GPU checks, micro-benchmarks and `bench/depth_sweep.py`, maintenance tools |
+| `rdna3/` | profiles (the MTP head on), `serve.sh` (`--no-mtp`; `--hybrid`; a lower `--memory-ratio` for EXL3 on two cards), GPU checks, micro-benchmarks and `bench/depth_sweep.py`, maintenance tools |
 | `README.md`, `NOTICE`, `CHANGELOG.md`, `llms.txt`, `llms-full.txt`, `AGENTS.md`, `CONTRIBUTING.md`, `SECURITY.md`, `docs/rdna3/` | this repository's documentation (the banner rendered from `docs/rdna3/assets/social-preview.html`); upstream's README moved to `docs/FREETOKEN_UPSTREAM_README.md` |
 | `.github/` | upstream's release workflows and issue templates replaced by this repository's |

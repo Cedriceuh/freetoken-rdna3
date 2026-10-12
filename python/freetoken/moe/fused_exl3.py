@@ -22,6 +22,9 @@ from freetoken.moe.fused import moe_align_block_size
 # the memory. With 32-row tiles, a 4096-token block still feeds every expert ~80 routes on average.
 EXL3_PREFILL_BLOCK = int(os.environ.get("FREETOKEN_EXL3_PREFILL_BLOCK", "4096"))
 _PREFILL_BLOCK_M = 32
+# FREETOKEN_HYBRID_SKIP_CPU_ROUTES=0: under --moe-strategy hybrid the decode GEMVs still decode the routes the CPU
+# computes (on slot 0, weight 0) instead of writing zeros for them without a read
+SKIP_CPU_ROUTES = os.environ.get("FREETOKEN_HYBRID_SKIP_CPU_ROUTES", "1") != "0"
 
 
 def fused_experts_exl3(
@@ -69,10 +72,10 @@ def fused_experts_exl3(
         moe_sum_reduce_triton(y.view(M, top_k, -1), out)
         return out
     a1 = exl3_rotate_in(hidden_states, gate_up_suh, slots, top_k)
-    c1 = exl3_gemv(a1, gate_up, slots, codebook)
+    c1 = exl3_gemv(a1, gate_up, slots, codebook, skip_inactive=SKIP_CPU_ROUTES)
     a2 = exl3_mid(c1, slots, gate_up_svh, down_suh)
-    c2 = exl3_gemv(a2, down, slots, codebook)
+    c2 = exl3_gemv(a2, down, slots, codebook, skip_inactive=SKIP_CPU_ROUTES)
     return exl3_out(c2, slots, down_svh, weights, out)
 
 
-__all__ = ["EXL3_PREFILL_BLOCK", "fused_experts_exl3"]
+__all__ = ["EXL3_PREFILL_BLOCK", "SKIP_CPU_ROUTES", "fused_experts_exl3"]

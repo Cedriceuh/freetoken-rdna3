@@ -32,7 +32,9 @@ same way on upstream
 
 To test source changes without rebuilding, mount your tree instead (`-v "$PWD":/src:ro -w /src -e
 PYTHONPATH=/src/python`); `test_swiglu_clamp.py::test_cpu_extension_supports_swiglu_clamp` then fails too, because the
-compiled CPU extension lives in the image's tree, not in yours.
+compiled CPU extension lives in the image's tree, not in yours. So does `test_cpu_moe_exl3.py` (EXL3 on the CPU
+executor) until the image is rebuilt from a tree that has it; or build the extensions in your tree first (`python3
+setup.py build_ext --inplace` in the container, your tree mounted at `/opt/FreeToken`).
 
 ## GPU checks (`rdna3/tests/`)
 

@@ -222,15 +222,23 @@ def _exl3_gemv_kernel(
     stride_ts, stride_ta, stride_tb,
     stride_cs, stride_cr,
     K: tl.constexpr, CB: tl.constexpr, G: tl.constexpr, KT: tl.constexpr, NT: tl.constexpr, DOT4: tl.constexpr,
+    SKIP_INACTIVE: tl.constexpr,
 ):
     """c[split, r, n] = sum over this split's k of a[r, half(n), k] * Wq[slot[r]][k, n], NT column tiles of one route.
 
     ``a`` holds the rotated inputs, one row per (route, half): a gate|up bank has two halves whose inputs differ
-    (each projection has its own suh), any other bank one."""
+    (each projection has its own suh), any other bank one. ``SKIP_INACTIVE``: a slot of -1 (a route the CPU
+    computes, hybrid decode) writes zeros without decoding any trellis."""
     r = tl.program_id(0)
     nb0 = tl.program_id(1) * NT
     split = tl.program_id(2)
     slot = tl.load(slot_ptr + r).to(tl.int64)
+    if SKIP_INACTIVE:
+        if slot < 0:
+            col = (nb0 + tl.arange(0, NT)[:, None, None]) * 16 + 8 * tl.arange(0, 2)[None, None, :] + \
+                tl.arange(0, 8)[None, :, None]
+            tl.store(c_ptr + split * stride_cs + r.to(tl.int64) * stride_cr + col, tl.zeros((NT, 8, 2), tl.float32))
+            return
     half = nb0 // HALF_TILES
     a_base = a_ptr + r.to(tl.int64) * stride_ar + half * stride_ah
     t_base = t_ptr + slot * stride_ts + nb0 * stride_tb
@@ -281,6 +289,7 @@ def exl3_gemv(
     nt: int | None = None,
     split_k: int | None = None,
     num_warps: int | None = None,
+    skip_inactive: bool = False,
 ) -> torch.Tensor:
     """Per-route GEMV over a slot bank of EXL3 trellises, in the rotation domain.
 
@@ -306,7 +315,8 @@ def exl3_gemv(
         a.stride(0), a.stride(1),
         t.stride(0), t.stride(1), t.stride(2),
         out.stride(0), out.stride(1),
-        K=K, CB=codebook, G=group_size(K), KT=KT, NT=NT, DOT4=_dot4(a.device), num_warps=num_warps,
+        K=K, CB=codebook, G=group_size(K), KT=KT, NT=NT, DOT4=_dot4(a.device), SKIP_INACTIVE=skip_inactive,
+        num_warps=num_warps,
     )
     return out
 
@@ -481,7 +491,7 @@ def _exl3_rotate_in_kernel(
     r = q // NH
     half = q % NH
     t = (r // TOP_K).to(tl.int64)
-    slot = tl.load(slot_ptr + r, mask=qm, other=0).to(tl.int64)
+    slot = tl.maximum(tl.load(slot_ptr + r, mask=qm, other=0).to(tl.int64), 0)  # -1: a CPU route, weight 0
     if HOIST:
         hm = _load_had(h_ptr)
     else:
@@ -507,7 +517,7 @@ def _exl3_mid_kernel(
     then rotate into down's domain (suh_down, H)."""
     r = tl.program_id(0) * BR + tl.arange(0, BR)
     rm = r < R
-    slot = tl.load(slot_ptr + r, mask=rm, other=0).to(tl.int64)
+    slot = tl.maximum(tl.load(slot_ptr + r, mask=rm, other=0).to(tl.int64), 0)  # -1: a CPU route, weight 0
     if HOIST:
         hm = _load_had(h_ptr)
     else:
@@ -544,7 +554,7 @@ def _exl3_out_kernel(
     m = (k < TOP_K) & (t < T)
     r = tl.reshape(t.to(tl.int64) * TOP_K + k, (BT * BK,))
     rm = tl.reshape(m, (BT * BK,))
-    slot = tl.load(slot_ptr + r, mask=rm, other=0).to(tl.int64)
+    slot = tl.maximum(tl.load(slot_ptr + r, mask=rm, other=0).to(tl.int64), 0)  # -1: a CPU route, weight 0
     w = tl.load(w_ptr + t * stride_wt + k, mask=m, other=0.0).to(tl.float32)
     tm = tl.program_id(0) * BT + tl.arange(0, BT)
     if HOIST:
@@ -571,7 +581,7 @@ def _exl3_rotate_in_vec_kernel(
 ):
     q = tl.program_id(0)
     r = q // NH
-    slot = tl.load(slot_ptr + r).to(tl.int64)
+    slot = tl.maximum(tl.load(slot_ptr + r).to(tl.int64), 0)  # -1: a CPU route, weight 0
     cols = tl.program_id(1) * 128 + tl.arange(0, 128)
     x = tl.load(x_ptr + (r // TOP_K).to(tl.int64) * stride_xt + cols).to(tl.float32)
     s = tl.load(s_ptr + slot * stride_ss + (q % NH) * stride_sh + cols).to(tl.float32)
@@ -585,7 +595,7 @@ def _exl3_mid_vec_kernel(
     SPLITS: tl.constexpr,
 ):
     r = tl.program_id(0).to(tl.int64)
-    slot = tl.load(slot_ptr + r).to(tl.int64)
+    slot = tl.maximum(tl.load(slot_ptr + r).to(tl.int64), 0)  # -1: a CPU route, weight 0
     cols = tl.program_id(1) * 128 + tl.arange(0, 128)
     g = tl.zeros((128,), tl.float32)
     u = tl.zeros((128,), tl.float32)
