@@ -350,3 +350,30 @@ def test_graph_sync_protocol(tmp_path, monkeypatch):
     gated, _, _ = _make_table(tmp_path)
     assert not gated._wait_sync
     assert gated.host_fill_batch(_decode_batch([3, 4], 5), use_graph=True) is None
+
+
+def test_auto_sync_gates_one_gpu_with_overlapped_steps(monkeypatch):
+    """FREETOKEN_PLE_SYNC=auto: launch-gating on one GPU when the scheduler overlaps its decode steps (no MTP head), the
+    probe everywhere else (two GPUs, the MTP head, overlap off, no engine); an explicit mode is kept."""
+    import freetoken.distributed as dist
+    import freetoken.spec_decode as spec
+    from freetoken.env import ENV
+    from freetoken.models.qwen4_exp.ple_disk import _sync_mode
+
+    monkeypatch.delenv("FREETOKEN_PLE_SYNC", raising=False)
+    monkeypatch.setattr(ENV, "DISABLE_OVERLAP_SCHEDULING", False)
+    for tp, mtp, want in ((1, False, "gate"), (1, True, "auto"), (2, False, "auto"), (2, True, "auto")):
+        monkeypatch.setattr(dist, "try_get_tp_info", lambda tp=tp: SimpleNamespace(size=tp))
+        monkeypatch.setattr(spec, "MTP_ENABLED", mtp)
+        assert _sync_mode() == want, (tp, mtp)
+    monkeypatch.setattr(dist, "try_get_tp_info", lambda: SimpleNamespace(size=1))
+    monkeypatch.setattr(spec, "MTP_ENABLED", False)
+    monkeypatch.setattr(ENV, "DISABLE_OVERLAP_SCHEDULING", True)
+    assert _sync_mode() == "auto"
+    monkeypatch.setattr(ENV, "DISABLE_OVERLAP_SCHEDULING", False)
+    monkeypatch.setattr(dist, "try_get_tp_info", lambda: None)
+    assert _sync_mode() == "auto"
+    monkeypatch.setattr(dist, "try_get_tp_info", lambda: SimpleNamespace(size=1))
+    for mode in ("wait", "gate"):
+        monkeypatch.setenv("FREETOKEN_PLE_SYNC", mode)
+        assert _sync_mode() == mode

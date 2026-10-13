@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- One card without the MTP head (`--no-mtp`): a decode step's PLE disk rows are filled before its launch
+  (`FREETOKEN_PLE_SYNC=auto` takes launch-gating on one GPU when the scheduler overlaps the steps): there the captured
+  wait cost ~11 ms a step. NVFP4 `xtx --no-mtp`: 26.6 -> 38.3 tok/s greedy, the same tokens. Two cards, and one card
+  with the head, keep the wait-sync, 2-4 % faster there.
 - Decode, bit-exact and on by default (greedy answers identical): the EXL3 output kernel no longer runs Triton's
   constant-1 variant for a single K split, and rank 1's gate|up GEMV takes 4 N tiles a program; the hyper-connection's
   down GEMV applies `hc_silu` as it stores (`FREETOKEN_HC_SILU_EPILOGUE`) and its up GEMV mixes the gates into the

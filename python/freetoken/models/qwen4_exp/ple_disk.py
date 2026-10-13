@@ -54,6 +54,23 @@ _SYNC_ENV = "FREETOKEN_PLE_SYNC"  # auto | wait | gate
 logger = init_logger(__name__)
 
 
+def _sync_mode() -> str:
+    """FREETOKEN_PLE_SYNC, with ``auto`` taking launch-gating on one GPU when the scheduler overlaps its decode steps
+    (no MTP head): there the host waits on the readback for the whole previous step before it fills, and a step takes
+    ~11 ms longer with wait-sync (NVFP4 on one 7900 XTX, 512-token greedy answers: 26.6 tok/s, 38.3 with launch-gating,
+    the same tokens). On two cards, and one step at a time (MTP head), wait-sync stays 2-4 % faster."""
+    mode = os.getenv(_SYNC_ENV, "auto")
+    if mode != "auto":
+        return mode
+    from freetoken.distributed import try_get_tp_info
+    from freetoken.env import ENV
+    from freetoken.spec_decode import MTP_ENABLED
+
+    tp = try_get_tp_info()  # None outside an engine (module tests): the probe decides
+    overlapped = not ENV.DISABLE_OVERLAP_SCHEDULING and not MTP_ENABLED
+    return "gate" if overlapped and tp is not None and tp.size == 1 else "auto"
+
+
 def _context(ids: torch.Tensor, position: int, eos: int) -> list[int]:
     """The two token ids before ``position``; eos pads past the start."""
     return [int(ids[position - 2]) if position >= 2 else eos,
@@ -247,7 +264,7 @@ class DiskRowTable:
         # probe picks flag-sync (graph WAITs at the consume, host fills then signals) or launch-gating
         from freetoken.kernel.row_store import probe_wait_sync
 
-        self._wait_sync = probe_wait_sync(os.getenv(_SYNC_ENV, "auto"), self._device)
+        self._wait_sync = probe_wait_sync(_sync_mode(), self._device)
         # one flag for all graphs: the readback event orders a fill after the previous graph, so signals never overlap
         self._flag = alloc_pinned_tensor(1, dtype=torch.int64)
         self._flag.zero_()
