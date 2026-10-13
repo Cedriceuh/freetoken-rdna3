@@ -22,8 +22,8 @@
 #   --no-mtp           decode without the MTP draft head the profiles except gre turn on (it speeds up one request at a time;
 #                      docs/rdna3/limits.md)
 #   --hybrid           compute part of each decode step's expert misses on the CPU instead of copying them (experimental,
-#                      NVFP4: +43 % on xtx, +48 % on xt, on xtx-xt +4-6 % for one request and +16-17 % with 4;
-#                      EXL3: +6 % on xtx, a loss on two cards; docs/rdna3/cpu-experts.md)
+#                      NVFP4: +46 % on xtx, +51 % on xt, on xtx-xt +2 % for one request and +15 % with 4;
+#                      EXL3: +5 % on xtx, even on xtx-xt; docs/rdna3/cpu-experts.md)
 #   --dry-run          print the docker command instead of running it
 #
 # The kernel cache (JIT + autotune results) lives in a docker volume named after the image id, so it is built once

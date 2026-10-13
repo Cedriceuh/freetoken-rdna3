@@ -50,10 +50,9 @@ agent turns (~90k-token contexts of code, temperature 0.6, 2026-10-03): 71 tok/s
 when two sub-agents decode at once ([benchmarks](docs/rdna3/benchmarks.md#agent-turns-on-real-code-xtx-xt)).
 
 Experimental: `rdna3/serve.sh <profile> --hybrid` has the CPU compute part of each decode step's missing experts
-straight from RAM instead of copying them to the GPU. With NVFP4, measured on 2026-10-11 before the decode kernels of
-35afbb3: one request on `xtx` from 39.4 to 56.2 tok/s (`xt`: 31.4 to 46.6), on `xtx-xt` from 78.2 to 81.2-82.7 for
-one request and from 24.4 to 28.2-28.6 tok/s each for four at once; EXL3: +6 % on `xtx`, a loss on two cards
-([docs/rdna3/cpu-experts.md](docs/rdna3/cpu-experts.md)).
+straight from RAM instead of copying them to the GPU. With NVFP4 (2026-10-13): one request on `xtx` from 42.7 to
+62.3 tok/s (`xt`: 34.6 to 52.1), on `xtx-xt` 82.9 to 84.5 for one request and 25.2 to 28.9 tok/s each for four at
+once; EXL3 3.05 bpw: +5 % on `xtx`, even on `xtx-xt` ([docs/rdna3/cpu-experts.md](docs/rdna3/cpu-experts.md)).
 
 Four agents with 82-117k-token conversations, 3 turns each: after the first reads, the three rounds of turns take
 **35 s instead of 599 s** without the RAM tier, because a conversation pushed off the GPUs is kept in system RAM and

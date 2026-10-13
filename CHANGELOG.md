@@ -12,7 +12,9 @@
   maximum context on `xtx-xt` 77-96 tok/s with NVFP4 (72-86 before), 98-117 at EXL3 3.05 bpw (83-107), 86-94 at 4.05
   bpw (76-87); one card 36-57 tok/s across the checkpoints on `xtx` (33-52), 29-46 on `xt` (27-42); without the MTP
   head 66 tok/s at the model's sampling on `xtx-xt` (58.5), 41 on `xtx` (35.8), 34 on `xt` (29.5). RAM locked, to the
-  nearest GiB, two cards / one: NVFP4 82 / 73 GiB, 3.05 bpw 60 / 52, 4.05 bpw 75 / 66.
+  nearest GiB, two cards / one: NVFP4 82 / 73 GiB, 3.05 bpw 60 / 52, 4.05 bpw 75 / 66. `--hybrid` again on 2026-10-13:
+  NVFP4 `xtx` 42.7 -> 62.3 tok/s, `xt` 34.6 -> 52.1, `xtx-xt` +2 % alone and +15 % each with four; EXL3 3.05 bpw +5 %
+  on `xtx`, even on `xtx-xt`.
 - Decode, bit-exact and on by default (greedy answers identical): the EXL3 output kernel no longer runs Triton's
   constant-1 variant for a single K split, and rank 1's gate|up GEMV takes 4 N tiles a program; the hyper-connection's
   down GEMV applies `hc_silu` as it stores (`FREETOKEN_HC_SILU_EPILOGUE`) and its up GEMV mixes the gates into the

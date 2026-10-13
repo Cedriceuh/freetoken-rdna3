@@ -20,8 +20,8 @@ decode at every context step from 9k to the profile's maximum (248k on two cards
 time to the first token when ~1k new tokens are added to a cached conversation, over the same steps. The profiles turn
 the MTP head on; `rdna3/serve.sh <profile> --no-mtp` turns it off (numbers in brackets). All numbers:
 [benchmarks.md](benchmarks.md). `--hybrid` (experimental) has the CPU compute part of the expert misses: NVFP4 on
-`xtx` 56.2 tok/s instead of 39.4, on `xt` 46.6 instead of 31.4, on `xtx-xt` 81.2-82.7 instead of 78.2 (2026-10-11,
-before the decode kernels of 35afbb3; [cpu-experts.md](cpu-experts.md)).
+`xtx` 62.3 tok/s instead of 42.7, on `xt` 52.1 instead of 34.6, on `xtx-xt` 84.5 instead of 82.9 (2026-10-13;
+[cpu-experts.md](cpu-experts.md)).
 
 ## File format
 

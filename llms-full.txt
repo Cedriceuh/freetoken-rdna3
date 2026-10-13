@@ -60,10 +60,9 @@ agent turns (~90k-token contexts of code, temperature 0.6, 2026-10-03): 71 tok/s
 when two sub-agents decode at once ([benchmarks](docs/rdna3/benchmarks.md#agent-turns-on-real-code-xtx-xt)).
 
 Experimental: `rdna3/serve.sh <profile> --hybrid` has the CPU compute part of each decode step's missing experts
-straight from RAM instead of copying them to the GPU. With NVFP4, measured on 2026-10-11 before the decode kernels of
-35afbb3: one request on `xtx` from 39.4 to 56.2 tok/s (`xt`: 31.4 to 46.6), on `xtx-xt` from 78.2 to 81.2-82.7 for
-one request and from 24.4 to 28.2-28.6 tok/s each for four at once; EXL3: +6 % on `xtx`, a loss on two cards
-([docs/rdna3/cpu-experts.md](docs/rdna3/cpu-experts.md)).
+straight from RAM instead of copying them to the GPU. With NVFP4 (2026-10-13): one request on `xtx` from 42.7 to
+62.3 tok/s (`xt`: 34.6 to 52.1), on `xtx-xt` 82.9 to 84.5 for one request and 25.2 to 28.9 tok/s each for four at
+once; EXL3 3.05 bpw: +5 % on `xtx`, even on `xtx-xt` ([docs/rdna3/cpu-experts.md](docs/rdna3/cpu-experts.md)).
 
 Four agents with 82-117k-token conversations, 3 turns each: after the first reads, the three rounds of turns take
 **35 s instead of 599 s** without the RAM tier, because a conversation pushed off the GPUs is kept in system RAM and
@@ -332,8 +331,8 @@ decode at every context step from 9k to the profile's maximum (248k on two cards
 time to the first token when ~1k new tokens are added to a cached conversation, over the same steps. The profiles turn
 the MTP head on; `rdna3/serve.sh <profile> --no-mtp` turns it off (numbers in brackets). All numbers:
 [benchmarks.md](benchmarks.md). `--hybrid` (experimental) has the CPU compute part of the expert misses: NVFP4 on
-`xtx` 56.2 tok/s instead of 39.4, on `xt` 46.6 instead of 31.4, on `xtx-xt` 81.2-82.7 instead of 78.2 (2026-10-11,
-before the decode kernels of 35afbb3; [cpu-experts.md](cpu-experts.md)).
+`xtx` 62.3 tok/s instead of 42.7, on `xt` 52.1 instead of 34.6, on `xtx-xt` 84.5 instead of 82.9 (2026-10-13;
+[cpu-experts.md](cpu-experts.md)).
 
 ## File format
 
@@ -2964,8 +2963,9 @@ profiles (14 / 14).
 
 # Expert misses computed on the CPU (`--hybrid`)
 
-Experimental, measured on 2026-10-11 (Threadripper 3970X: 32 Zen 2 cores, AVX2, 4 x 32 GB DDR4-3200, STREAM read
-72-74 GB/s; RX 7900 XTX + 7900 XT on PCIe 4.0 x16). Not agent-validated.
+Experimental, measured on 2026-10-11 and again on 2026-10-13 after the decode kernels of 35afbb3 (Threadripper
+3970X: 32 Zen 2 cores, AVX2, 4 x 32 GB DDR4-3200, STREAM read 72-74 GB/s; RX 7900 XTX + 7900 XT on PCIe 4.0 x16). Not
+agent-validated.
 
 With `--moe-strategy offload` (every profile), the experts live in RAM and the free VRAM is a cache of them; an expert
 a token routes to that is not in the cache (a miss) is copied over PCIe first (26-28 GB/s). Upstream's `hybrid`
@@ -2977,7 +2977,26 @@ into the cache as before, the rest go to a pool of pinned CPU threads that runs 
 the share of each step's misses fetched): with NVFP4 a quarter on one card (what `ft bench bw` picks on this machine)
 and 40 % on two, 60 % with EXL3.
 
-## Measured with NVFP4 (decode tok/s, 12 sampled 512-token answers, MTP head on; 4 at once: per request, 3 rounds)
+## Re-measured on 2026-10-13 (image of 0205cb3)
+
+Decode tok/s, MTP head on, the profiles' splits: one request = median of 12 sampled 512-token answers (6 prompts x 2,
+as in [benchmarks.md](benchmarks.md#how-the-numbers-are-taken)), its `offload` column the benchmark cell of 2026-10-12
+on the same code; 4 at once = 3 rounds of 4 sampled answers, both columns the same evening.
+
+| Profile | `offload` | `--hybrid` |
+|---|---:|---:|
+| NVFP4 `xtx`, one request | 42.7 | **62.3 (+46 %)** |
+| NVFP4 `xt`, one request | 34.6 | **52.1 (+51 %)** |
+| NVFP4 `xtx-xt`, one request | 82.9 | 84.5 (+2 %) |
+| NVFP4 `xtx-xt`, 4 at once | 25.2 each, 92-100 in total | **28.9 each (+15 %), 89-114 in total** |
+| EXL3 3.05 bpw `xtx`, one request | 54.8 | 57.8 (+5 %) |
+| EXL3 3.05 bpw `xtx-xt`, one request | 88.9 | 89.1 (0 %) |
+
+The decode kernels sped up both columns; on one card the CPU's share now gains a little more than on 2026-10-11 (+46 /
++51 % against +43 / +48 %). The two-card one-request differences are within the spread of sampled answers (below).
+The first round of 4 is the slowest in both columns (92.0 and 89.0 tok/s in total).
+
+## Measured with NVFP4 on 2026-10-11 (decode tok/s, 12 sampled answers, MTP head on; 4 at once: per request, 3 rounds)
 
 | Profile | `offload` | `--hybrid` |
 |---|---:|---:|
