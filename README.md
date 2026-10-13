@@ -3,7 +3,7 @@
 ![freetoken-rdna3: Qwen3.8-Flash-Next on RX 7900 XTX / XT, NVFP4 and EXL3 checkpoints](docs/rdna3/assets/social-preview.png)
 
 **Fast local inference of big Mixture-of-Experts models on AMD Radeon RX 7900 XTX / 7900 XT (RDNA3, ROCm), on one or
-two consumer GPUs** (Linux; the server locks 51-82 GiB of system RAM, depending on the checkpoint and the cards). A
+two consumer GPUs** (Linux; the server locks 52-82 GiB of system RAM, depending on the checkpoint and the cards). A
 tuned build of the [FreeToken](https://github.com/FlashML-org/FreeToken) MoE engine: tensor parallelism across two
 unequal cards, a GPU expert cache fed from system RAM, int8 dense layers, exact sampling on ROCm, up to 4 concurrent
 requests (parallel sub-agents), and a RAM tier that keeps conversations pushed off the GPUs instead of recomputing
@@ -23,37 +23,37 @@ the server has never seen, like large tool results ([method](docs/rdna3/benchmar
 
 | Decode (TG) | NVFP4 | EXL3 3.05 bpw | EXL3 4.05 bpw |
 |---|---:|---:|---:|
-| `xtx-xt`: RX 7900 XTX + XT, 9k to 248k tokens | 72-86 tok/s | 83-107 tok/s | 76-87 tok/s |
-| `xtx`: one RX 7900 XTX, 9k to 124k tokens | 33-42 tok/s | 42-52 tok/s | 36-44 tok/s |
-| `xt`: one RX 7900 XT, 9k to 124k tokens | 27-34 tok/s | 33-42 tok/s | 28-35 tok/s |
+| `xtx-xt`: RX 7900 XTX + XT, 9k to 248k tokens | 77-96 tok/s | 98-117 tok/s | 86-94 tok/s |
+| `xtx`: one RX 7900 XTX, 9k to 124k tokens | 36-43 tok/s | 52-57 tok/s | 37-47 tok/s |
+| `xt`: one RX 7900 XT, 9k to 124k tokens | 29-34 tok/s | 41-46 tok/s | 29-36 tok/s |
 
 | Reading a new 6-41k-token block (PP); agent turn, time to first token | NVFP4 | EXL3 3.05 bpw | EXL3 4.05 bpw |
 |---|---:|---:|---:|
-| `xtx-xt`, 9k to 248k tokens | 1670-1990 tok/s; 1.3-2.0 s | 1730-2050 tok/s; 0.9-1.6 s | 1710-2050 tok/s; 1.2-1.9 s |
-| `xtx`, 9k to 124k tokens | 1130-1510 tok/s; 2.4-2.7 s | 1280-1590 tok/s; 1.5-1.9 s | 1200-1590 tok/s; 2.1-2.4 s |
-| `xt`, 9k to 124k tokens | 1040-1340 tok/s; 2.5-2.8 s | 1200-1420 tok/s; 1.6-2.0 s | 1120-1420 tok/s; 2.2-2.6 s |
+| `xtx-xt`, 9k to 248k tokens | 1780-2080 tok/s; 1.3-2.1 s | 1870-2190 tok/s; 0.9-1.7 s | 1850-2200 tok/s; 1.2-2.1 s |
+| `xtx`, 9k to 124k tokens | 1440-1650 tok/s; 2.4-2.7 s | 1560-1760 tok/s; 1.5-1.9 s | 1530-1770 tok/s; 2.1-2.4 s |
+| `xt`, 9k to 124k tokens | 1310-1460 tok/s; 2.5-2.8 s | 1420-1560 tok/s; 1.6-2.0 s | 1380-1560 tok/s; 2.2-2.5 s |
 
 | Size and memory | NVFP4 | EXL3 3.05 bpw | EXL3 4.05 bpw |
 |---|---:|---:|---:|
 | Download | 135 GB | 85 GB | 108 GB |
-| RAM while serving (locked): two cards; one card | 82 GiB; 72 GiB | 59 GiB; 51 GiB | 74 GiB; 65 GiB |
+| RAM while serving (locked): two cards; one card | 82 GiB; 73 GiB | 60 GiB; 52 GiB | 75 GiB; 66 GiB |
 | Experts cached per card, `xtx-xt` (of 24,576) | 7.1k | 9.9k | 7.3k |
 
-NVFP4's speeds were measured on the release image (2026-10-03), its one-card RAM and every EXL3 figure on this build
-(2026-10-04), same machine and method. The 3 bpw experts are smaller, so more of them stay in VRAM (9.9k instead of
-7.1k per card on `xtx-xt`); the checkpoints also answer differently, which changes how many of the MTP head's guesses
-are kept.
+Measured on 2026-10-12 with the image of 35afbb3, one server per cell started by `rdna3/serve.sh`. The 3 bpw experts
+are smaller, so more of them stay in VRAM (9.9k instead of 7.1k per card on `xtx-xt`); the checkpoints also answer
+differently, which changes how many of the MTP head's guesses are kept.
 
 The MTP head (the model's own draft layer) guesses the next tokens and one step checks them; greedy answers are
-identical with and without it. On `xtx-xt` with NVFP4 it takes one request from 57.5 to 77 tok/s at the model's
-sampling; with 3-4 requests at once it costs 3-4 %; `rdna3/serve.sh --no-mtp` turns it off. On real agent turns
-(~90k-token contexts of code, temperature 0.6): 71 tok/s for a request alone, ~34 tok/s each when two sub-agents
-decode at once ([benchmarks](docs/rdna3/benchmarks.md#agent-turns-on-real-code-xtx-xt)).
+identical with and without it. On `xtx-xt` with NVFP4 it takes one request from 66 to 83 tok/s at the model's
+sampling; with 3-4 requests at once it cost 3-4 % (2026-10-06); `rdna3/serve.sh --no-mtp` turns it off. On real
+agent turns (~90k-token contexts of code, temperature 0.6, 2026-10-03): 71 tok/s for a request alone, ~34 tok/s each
+when two sub-agents decode at once ([benchmarks](docs/rdna3/benchmarks.md#agent-turns-on-real-code-xtx-xt)).
 
 Experimental: `rdna3/serve.sh <profile> --hybrid` has the CPU compute part of each decode step's missing experts
-straight from RAM instead of copying them to the GPU. With NVFP4: one request on `xtx` from 39.4 to 56.2 tok/s (`xt`:
-31.4 to 46.6), on `xtx-xt` from 78.2 to 81.2-82.7 for one request and from 24.4 to 28.2-28.6 tok/s each for four at
-once; EXL3: +6 % on `xtx`, a loss on two cards ([docs/rdna3/cpu-experts.md](docs/rdna3/cpu-experts.md)).
+straight from RAM instead of copying them to the GPU. With NVFP4, measured on 2026-10-11 before the decode kernels of
+35afbb3: one request on `xtx` from 39.4 to 56.2 tok/s (`xt`: 31.4 to 46.6), on `xtx-xt` from 78.2 to 81.2-82.7 for
+one request and from 24.4 to 28.2-28.6 tok/s each for four at once; EXL3: +6 % on `xtx`, a loss on two cards
+([docs/rdna3/cpu-experts.md](docs/rdna3/cpu-experts.md)).
 
 Four agents with 82-117k-token conversations, 3 turns each: after the first reads, the three rounds of turns take
 **35 s instead of 599 s** without the RAM tier, because a conversation pushed off the GPUs is kept in system RAM and
@@ -64,7 +64,7 @@ Full numbers, methods and the cold-read times: [docs/rdna3/benchmarks.md](docs/r
 ## Quick start
 
 You need Linux with the `amdgpu` driver, Docker, an RX 7900 XTX and/or 7900 XT, and enough RAM for the checkpoint: the
-server locks 51-82 GiB (a 128 GB machine for NVFP4; why: [limits](docs/rdna3/limits.md)). Everything runs in the Docker image below; the `install.sh` at the root is
+server locks 52-82 GiB (a 128 GB machine for NVFP4; why: [limits](docs/rdna3/limits.md)). Everything runs in the Docker image below; the `install.sh` at the root is
 upstream's NVIDIA / CUDA installer and is not used here.
 
 ```bash

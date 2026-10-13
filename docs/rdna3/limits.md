@@ -4,9 +4,9 @@
 
 | Profile | NVFP4 | EXL3 3.05 bpw | EXL3 4.05 bpw | Machine (NVFP4) |
 |---|---:|---:|---:|---|
-| `xtx-xt` | 82 GiB | 59 GiB | 74 GiB | 128 GB |
-| `xtx-xtx`, `xt-xt` *(untested)* | ~82 GiB (estimated) | ~59 GiB (estimated) | ~74 GiB (estimated) | 128 GB |
-| `xtx`, `xt` | 72 GiB | 51 GiB | 65 GiB | 96 GB is tight, 128 GB comfortable |
+| `xtx-xt` | 82 GiB | 60 GiB | 75 GiB | 128 GB |
+| `xtx-xtx`, `xt-xt` *(untested)* | ~82 GiB (estimated) | ~60 GiB (estimated) | ~75 GiB (estimated) | 128 GB |
+| `xtx`, `xt` | 73 GiB | 52 GiB | 66 GiB | 96 GB is tight, 128 GB comfortable |
 | `gre` *(untested)* | ~70 GiB (estimated) | | | 96 GB |
 
 Where it goes, for Qwen3.8-Flash-Next: ~63 GiB of experts (the engine keeps **every** expert in pinned RAM, each rank

@@ -172,24 +172,24 @@ branch `3.05bpw_h5_ng5` (routed experts at 3 bits per weight, most other linears
   executor, the encoder-only weight reader. FTW conversion is untested. The vision tower reads the checkpoint's bf16
   `qkv` (image input checked with one image per branch).
 
-Measured on 2026-10-04 with the profiles as shipped, MTP head on, one request (decode: greedy, from 9k tokens to the
-profile's maximum context; RAM: locked while serving; [benchmarks.md](benchmarks.md#depth-sweep-exl3-checkpoints) has
-every step, the cold reads and the sampled decode):
+Measured on 2026-10-12 (image of 35afbb3) with the profiles as shipped, MTP head on, one request (decode: greedy,
+from 9k tokens to the profile's maximum context; RAM: locked while serving;
+[benchmarks.md](benchmarks.md#depth-sweep-exl3-checkpoints) has every step, the cold reads and the sampled decode):
 
 | | NVFP4 | EXL3 3.05 bpw | EXL3 4.05 bpw |
 |---|---:|---:|---:|
 | download | 135 GB | 85 GB | 108 GB |
 | experts in RAM (without the MTP head's) | 63.3 GiB | 42.6 GiB | 56.7 GiB |
-| decode, `xtx-xt` / `xtx` / `xt` | 72-86 / 33-42 / 27-34 tok/s | 83-107 / 42-52 / 33-42 tok/s | 76-87 / 36-44 / 28-35 tok/s |
-| reading a new block, `xtx-xt` | 1670-1990 tok/s | 1730-2050 tok/s | 1710-2050 tok/s |
-| agent turn, first token, `xtx-xt` | 1.3-2.0 s | 0.9-1.6 s | 1.2-1.9 s |
-| RAM locked, `xtx-xt` / one card | 82 / 72 GiB | 59 / 51 GiB | 74 / 65 GiB |
+| decode, `xtx-xt` / `xtx` / `xt` | 77-96 / 36-43 / 29-34 tok/s | 98-117 / 52-57 / 41-46 tok/s | 86-94 / 37-47 / 29-36 tok/s |
+| reading a new block, `xtx-xt` | 1780-2080 tok/s | 1870-2190 tok/s | 1850-2200 tok/s |
+| agent turn, first token, `xtx-xt` | 1.3-2.1 s | 0.9-1.7 s | 1.2-2.1 s |
+| RAM locked, `xtx-xt` / one card | 82 / 73 GiB | 60 / 52 GiB | 75 / 66 GiB |
 | expert cache per card, `xtx-xt` | 7.1k | 9.9k | 7.3k |
 | agentic benchmark (29 bugs) | 12 and 18 (two runs) | 13 (one run) | 12 (one run) |
 
-The NVFP4 speeds are the release image's (2026-10-03). The checkpoints answer differently, so the MTP head keeps a
-different share of its guesses: compare decode rates as an order of magnitude. Greedy answers are identical with and
-without the head. With the RAM tier off and `--expert-load serial`, the 3.05 bpw server started and served under a
+The agentic benchmark rows come from runs on earlier builds. The checkpoints answer differently, so the MTP head
+keeps a different share of its guesses: compare decode rates as an order of magnitude. Greedy answers are identical
+with and without the head. With the RAM tier off and `--expert-load serial`, the 3.05 bpw server started and served under a
 56 GiB container limit at 52.3 GiB used (`quick_bench.py` then: 70.1 tok/s decode at the model's sampling, 8.3k-token
 cold read in 4.41 s, agent turn 0.89 s, tool call parsed); a real 64 GB machine is untested.
 

@@ -7,7 +7,7 @@ From a fresh Linux machine to an OpenAI-compatible endpoint serving Qwen3.8-Flas
 | | Two cards (`xtx-xt`) | One card (`xtx` or `xt`) |
 |---|---|---|
 | GPUs | RX 7900 XTX 24 GB + RX 7900 XT 20 GB | one RX 7900 XTX 24 GB or RX 7900 XT 20 GB |
-| System RAM (NVFP4; EXL3 3.05 / 4.05 bpw) | 82 GiB used while serving: **128 GB** machine (59 / 74 GiB) | 72 GiB used: **96 GB** is tight, 128 GB comfortable (51 / 65 GiB) |
+| System RAM (NVFP4; EXL3 3.05 / 4.05 bpw) | 82 GiB used while serving: **128 GB** machine (60 / 75 GiB) | 73 GiB used: **96 GB** is tight, 128 GB comfortable (52 / 66 GiB) |
 | Disk | 135 GB for the NVFP4 model (85 / 108 GB in EXL3 3.05 / 4.05 bpw), ~27 GB for the image (its ROCm 10.1 base included), ~29 GB more while building | same |
 | Software | Linux x86_64 with the in-kernel `amdgpu` driver (`/dev/kfd` present), Docker | same |
 | Tested on | Ubuntu 26.04 LTS, kernel 7.0 (older kernels untested) | same |

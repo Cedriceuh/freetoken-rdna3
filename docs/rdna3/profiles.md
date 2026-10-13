@@ -6,9 +6,9 @@ it).
 
 | Profile | GPUs | Context | Decode, MTP head on (off) | Deep decode, greedy | Cold 8.3k prompt | Agent turn | At once |
 |---|---|---:|---:|---:|---:|---:|---:|
-| `xtx-xt` | RX 7900 XTX 24 GB + RX 7900 XT 20 GB | 250,000 | 77 (57.5) tok/s | 72-86 (52-57) tok/s | 4.1 s | 1.3-2.0 s | 4 requests |
-| `xtx` | RX 7900 XTX 24 GB | 131,072 | 39 (36) tok/s | 33-42 (29.5-39) tok/s | 7.7 s | 2.4-2.7 s | 1 request |
-| `xt` | RX 7900 XT 20 GB | 131,072 | 32 (29.5) tok/s | 27-34 (25-32) tok/s | 8.3 s | 2.5-2.8 s | 1 request |
+| `xtx-xt` | RX 7900 XTX 24 GB + RX 7900 XT 20 GB | 250,000 | 83 (66) tok/s | 77-96 (57-66) tok/s | 3.9 s | 1.3-2.1 s | 4 requests |
+| `xtx` | RX 7900 XTX 24 GB | 131,072 | 43 (41) tok/s | 36-43 (32-39) tok/s | 7.4 s | 2.4-2.7 s | 1 request |
+| `xt` | RX 7900 XT 20 GB | 131,072 | 35 (34) tok/s | 29-34 (26-31) tok/s | 7.9 s | 2.5-2.8 s | 1 request |
 | `xtx-xtx` *(untested)* | 2x RX 7900 XTX 24 GB | 250,000 | expected >= `xtx-xt` | – | – | – | 4 requests |
 | `xt-xt` *(untested)* | 2x RX 7900 XT 20 GB | 250,000 | expected a little below `xtx-xt` | – | – | – | 4 requests |
 | `gre` *(untested)* | RX 7900 GRE 16 GB | 65,536 | expected ~20 tok/s at best (head off) | – | – | – | 1 request |
@@ -20,8 +20,8 @@ decode at every context step from 9k to the profile's maximum (248k on two cards
 time to the first token when ~1k new tokens are added to a cached conversation, over the same steps. The profiles turn
 the MTP head on; `rdna3/serve.sh <profile> --no-mtp` turns it off (numbers in brackets). All numbers:
 [benchmarks.md](benchmarks.md). `--hybrid` (experimental) has the CPU compute part of the expert misses: NVFP4 on
-`xtx` 56.2 tok/s instead of 39.4, on `xt` 46.6 instead of 31.4, on `xtx-xt` 81.2-82.7 instead of 78.2
-([cpu-experts.md](cpu-experts.md)).
+`xtx` 56.2 tok/s instead of 39.4, on `xt` 46.6 instead of 31.4, on `xtx-xt` 81.2-82.7 instead of 78.2 (2026-10-11,
+before the decode kernels of 35afbb3; [cpu-experts.md](cpu-experts.md)).
 
 ## File format
 
@@ -67,7 +67,7 @@ With several requests, each one's decode is computed row by row as if it were al
 batch can differ at rounding level. The 4-request setting, the tuned decode tiles and the RAM tier were added after
 the agentic benchmark runs and are checked for exactness instead ([benchmarks.md](benchmarks.md#precision)).
 
-RAM: 82 GiB while serving, all of it locked (measured: ~63 GiB of experts, 9.5 GiB for the RAM tier, the rest the two processes); 59 GiB with the EXL3 3.05 bpw checkpoint, 74 GiB with 4.05 bpw.
+RAM: 82 GiB while serving, all of it locked (measured: ~63 GiB of experts, 9.5 GiB for the RAM tier, the rest the two processes); 60 GiB with the EXL3 3.05 bpw checkpoint, 75 GiB with 4.05 bpw.
 
 With an experimental EXL3 checkpoint
 ([how-it-works.md](how-it-works.md#exl3-checkpoints)) the same profile applies: the
@@ -102,7 +102,7 @@ verify steps mostly stay at 2 rows, the extra rows' missing experts crossing PCI
 | `FREETOKEN_HOST_KV_TOKENS` / `_SNAPSHOTS` | `131072` / `16` | the RAM tier sized to the context (~5 GiB locked, estimated) |
 | context | 131,072 | what fits: the XT ends a 124k-token conversation with 0.8 GiB of VRAM left |
 
-RAM: 72 GiB while serving, locked (measured on each card; EXL3: 51 GiB at 3.05 bpw, 65 GiB at 4.05 bpw).
+RAM: 73 GiB while serving, locked (measured on each card; EXL3: 52 GiB at 3.05 bpw, 66 GiB at 4.05 bpw).
 
 The cards are picked by VRAM: `xt` takes the smallest card with at least 20 GiB, `xtx` the smallest with 24 GiB, so a
 machine with both keeps the other card free. The one-card profiles were measured for speed, not run on the agentic

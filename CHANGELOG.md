@@ -6,6 +6,13 @@
   (`FREETOKEN_PLE_SYNC=auto` takes launch-gating on one GPU when the scheduler overlaps the steps): there the captured
   wait cost ~11 ms a step. NVFP4 `xtx --no-mtp`: 26.6 -> 38.3 tok/s greedy, the same tokens. Two cards, and one card
   with the head, keep the wait-sync, 2-4 % faster there.
+- The README and its banner, `docs/rdna3/benchmarks.md` (summary, depth sweeps, locked RAM, expert caches), the
+  profiles' figures and `llms.txt` re-measured on the image of 35afbb3 (2026-10-12; one card with `--no-mtp` on
+  2026-10-13 with the PLE fill above), one server per profile and checkpoint: greedy decode from 9k tokens to the
+  maximum context on `xtx-xt` 77-96 tok/s with NVFP4 (72-86 before), 98-117 at EXL3 3.05 bpw (83-107), 86-94 at 4.05
+  bpw (76-87); one card 36-57 tok/s across the checkpoints on `xtx` (33-52), 29-46 on `xt` (27-42); without the MTP
+  head 66 tok/s at the model's sampling on `xtx-xt` (58.5), 41 on `xtx` (35.8), 34 on `xt` (29.5). RAM locked, to the
+  nearest GiB, two cards / one: NVFP4 82 / 73 GiB, 3.05 bpw 60 / 52, 4.05 bpw 75 / 66.
 - Decode, bit-exact and on by default (greedy answers identical): the EXL3 output kernel no longer runs Triton's
   constant-1 variant for a single K split, and rank 1's gate|up GEMV takes 4 N tiles a program; the hyper-connection's
   down GEMV applies `hc_silu` as it stores (`FREETOKEN_HC_SILU_EPILOGUE`) and its up GEMV mixes the gates into the

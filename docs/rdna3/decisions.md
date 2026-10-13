@@ -23,7 +23,7 @@ benchmark with the MTP head: 12 and 18 of 29 in two runs.
 |---|---|
 | Choice | Split every layer over the XTX and the XT, both working on every token |
 | Alternatives | One card with more experts offloaded; each card serving its own requests |
-| For | Decode 77 tok/s instead of 39 at the model's sampling (57.5 against 35.8 without the MTP head); 250k context instead of 131k; 44 GB of VRAM for one expert cache |
+| For | Decode 83 tok/s instead of 43 at the model's sampling (66 against 41 without the MTP head; 2026-10-12/13); 250k context instead of 131k; 44 GB of VRAM for one expert cache |
 | Against | Every layer ends with an all-reduce through system RAM (no GPU peer-to-peer on the reference machine); both cards are busy for every request; more code (uneven split, host all-reduce) |
 | Evidence | Depth sweeps of `xtx-xt` vs `xtx` ([benchmarks.md](benchmarks.md)) |
 
@@ -129,7 +129,7 @@ benchmark with the MTP head: 12 and 18 of 29 in two runs.
 |---|---|
 | Choice | Keep the routed experts in EXL3 (host banks and GPU cache) behind gfx1100 Triton kernels; decode every other linear to bf16 at load (then int8 like NVFP4's); expert slices cut on whole 128-wide Hadamard blocks (384 / 256 on two cards); the expert kernel declares its prefill temporaries and the cache planner keeps them free |
 | Alternatives | Converting the experts to NVFP4 (loses the 3-bit size); serving every linear in EXL3; cutting the slices inside a Hadamard block (would need re-encoding); a bigger generic VRAM headroom |
-| For | 42.6 GiB of experts instead of 63.3 at 3.05 bpw, 9.9k experts cached per card instead of 7.1k; at 3.05 bpw decode 83-107 tok/s up to 248k on `xtx-xt` (NVFP4 72-86), agent turns 0.9-1.6 s (1.3-2.0), 59 GiB of RAM instead of 82; the dense layers keep the tested int8 path |
+| For | 42.6 GiB of experts instead of 63.3 at 3.05 bpw, 9.9k experts cached per card instead of 7.1k; at 3.05 bpw decode 98-117 tok/s up to 248k on `xtx-xt` (NVFP4 77-96; 2026-10-12), agent turns 0.9-1.7 s (1.3-2.1), 60 GiB of RAM instead of 82; the dense layers keep the tested int8 path |
 | Against | One agentic-benchmark run per checkpoint so far (13 and 12 of 29; NVFP4 12 and 18 in two runs); the 60 / 40 split NVFP4 avoids; the even split of two equal cards refused; 0.6 GiB per card of prefill temporaries; more kernels to maintain (rotations per routed expert) |
 | Evidence | [how-it-works.md](how-it-works.md#exl3-checkpoints), [journey.md](journey.md#16-exl3-checkpoints-2026-10-04) (the first agent test crashed on a full 7900 XTX before the temporaries were kept free) |
 
