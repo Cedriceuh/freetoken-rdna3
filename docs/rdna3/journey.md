@@ -652,7 +652,20 @@ Found on the way:
   at random, and that rank fell back to one copy per expert: full-layer short prefills ~10 % slower. Fixed (the copy
   waits for the fill), and a failed mode is now logged.
 
-## 28. Still open
+## 28. Upstream up to 9b68e00 (2026-10-16)
+
+Five commits cherry-picked, then the rest merged. Upstream had rewritten the files this tree's `--hybrid` lives in: its
+CPU MoE executor split into weight formats and GPU sync backends (with HIP memops of its own), its hybrid ensure kernel
+now splitting the routes (what this tree's split kernel did), and the expert cache cut into slot pools. The port kept
+upstream's structure and moved this tree's pieces onto it: the EXL3 CPU experts behind a whole-task hook of the format
+interface, the publish / merge kernels on upstream's task-word handshake (two pinned words, rung and reset by one lane:
+a review of the port found that a reset repeated by every thread could make the coordinator run a step twice), the
+prefill through the cache gated to one slot pool of at least two layers of experts. transformers 5.18 rounds two rows of
+its YaRN reference two ulps away from 5.16: the test now allows that, the engine's rows are unchanged. Upstream's fix of
+the Triton 3.8 histogram bug (a staged align, `0bca88f`) was left out: `moe_align.py` here has no such compare. Through
+both launcher entries the answers stayed the same, bit for bit ([CHANGELOG](../../CHANGELOG.md)).
+
+## 29. Still open
 
 - In NVFP4 the model needs ~63 GiB of RAM for its experts alone (the engine keeps every expert in RAM). The EXL3 3.05
   bpw checkpoint needs 42.6 GiB and served under a 56 GiB container limit, but a real 64 GB machine is untested

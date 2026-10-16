@@ -68,16 +68,26 @@
   siblings and EXL3 column blocks were measured too (off: no gain, or slower in serving). NVFP4: `xtx` 39.4 -> 56.2
   tok/s, `xt` 31.4 -> 46.6, `xtx-xt` one request 78.2 -> 81.2-82.7, 4 requests 24.4 -> 28.2-28.6 each; EXL3: `xtx`
   +6 %, a loss on two cards ([docs/rdna3/cpu-experts.md](docs/rdna3/cpu-experts.md)).
-- Four later upstream commits cherry-picked with their authors (`git cherry-pick -x`): `74a3877` and `9c635a1`
-  (dependency pins: torch 2.14, Triton below 3.9, flashlib 0.4.0, numpy below 3), `7d6490c` (upstream's own QSA LDS
-  clamp, which runs after this tree's and changes no tile) and `9b68e00` (CUDA graphs uploaded at capture; CUDA only,
-  a no-op on ROCm). The image lowers pyproject's new torchvision floor to ROCm's 0.29.0a0, keeps the base's numpy
-  2.5.3 (2.4.6 before) and no longer installs numba or the NVIDIA cutlass-dsl / cuda-bindings packages flashlib 0.3.0
-  pulled in. The same answers through both launcher entries (2026-10-16, NVFP4 `xtx-xt-4x262k` and EXL3 3.05 bpw
-  `xtx-xt-4x262k`, against the previous image: greedy with the MTP head 14/14, a 25k agent conversation 9/9 with the
-  same decode speeds), a 259,728-token prompt served on NVFP4 and a longer one refused; the CPU suite and the GPU tests of
-  the touched paths fail only where they failed before. The other eleven upstream commits are not taken
-  ([maintaining.md](docs/rdna3/maintaining.md#the-stack-on-top-of-upstream-oldest-first)).
+- Upstream FreeToken merged up to `9b68e00` (15 commits, 2026-10-10 to 2026-10-15); the authors' commits are kept
+  (five cherry-picked first, the rest merged). On this tree's path: transformers 5.18 (the Qwen3.8-Flash-Next config,
+  the chat-template tokens, tool calls and a ~105k-token text, and the image preprocessing read the same as with 5.16,
+  bit for bit); upstream's CPU MoE executor split into weight formats, now carrying this tree's EXL3 experts, its
+  grouping of routes by expert and the hybrid publish / merge kernels on upstream's task-word handshake; upstream's
+  slot pools for the expert cache (one pool for this model, so agent turns keep the prefill through the cache); the
+  hybrid route split inside upstream's ensure kernel; presence / frequency penalties, also on MTP verify steps;
+  upstream's vendored ggml kernels for GGUF checkpoints (they build for gfx1100) in place of this tree's ROCm build of
+  the old ones; flashlib 0.4.0, numpy 2.5.3 in the image (numba and the NVIDIA cutlass / cuda-bindings packages gone).
+  ROCm keeps `kernel/triton/moe_align.py` over upstream's staged align (`0bca88f`). Against the previous image through
+  both launcher entries (2026-10-16, `xtx-xt-4x262k`, NVFP4 with three 262k contexts and EXL3 3.05 bpw with four):
+  greedy with the MTP head 14/14 and a 25k-token agent conversation 9/9, the same answers on both; decode per turn
+  -0.8 to +0.9 %; agent-turn time to the first token 0.59-1.69 s against 0.59-1.66 (NVFP4), 0.40-1.46 against
+  0.40-1.45 (EXL3); cold reads of 36k / 46k tokens 2375 / 2512 tok/s against 2387 / 2525 (NVFP4), 2565 / 2680 against
+  2552 / 2661 (EXL3); four 20k-token requests decoding together (NVFP4) 29.0-29.9 tok/s each against 28.9-29.9; a
+  259,728-token prompt read at 2338 tok/s, 400 tokens at 74.7 tok/s, a longer one refused. One card without
+  `--hybrid`: greedy 14/14 the same. `--hybrid` was not compared: two runs of the previous image already
+  gave different greedy answers (7 of 14 the same; not investigated).
+  The CPU suite fails only where it failed before, plus one test that fails on upstream as well (two GGUF architectures
+  without an AOT entry); the GPU tests of the touched paths as before.
 - Upstream FreeToken merged up to `ee9789f` (23 commits, 2026-09-29 to 2026-10-10); the authors' commits are kept.
   On this tree's path: a race in the disk PLE staging fixed (the overlap scheduler could rewrite the pinned rows of a
   batch whose copy was still queued, `d3512b4`); upstream's NVFP4 marlin decode kernel (`7644984`) with the decode

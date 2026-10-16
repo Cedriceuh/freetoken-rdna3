@@ -32,7 +32,8 @@ Neither profile is agent-validated yet.
     12/12, read at 2036 tok/s, decode 85 tok/s). The checkpoints carry a vision tower, so the
     rope is the multi-axis one; YaRN composes with it and the table covers `original x factor` positions, as SGLang /
     vLLM size it (upstream's code since the merge of `ee9789f`, written here first). Bit-identical to HF transformers
-    5.16.1's rotary embedding (`tests/layers/test_rotary_yarn.py`).
+    5.16.1's rotary embedding, within two float32 ulps of 5.18's, which rounds a few rows differently
+    (`tests/layers/test_rotary_yarn.py`).
   - **`FREETOKEN_ROPE_MAX_POSITION=1048576`**: the plain rope with a longer table, no YaRN. Below 262,144 the rows are
     the same bits as without it, so short contexts are unchanged.
 - `rdna3/profiles/xtx-xt-1m.env` puts it together for one long conversation (plain rope, K/V on the host,

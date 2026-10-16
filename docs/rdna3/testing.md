@@ -23,12 +23,14 @@ slower (one-time kernel preparation): run it twice.
 docker run --rm -w /opt/FreeToken --entrypoint python3 freetoken-rdna3:latest -m pytest -q -p no:cacheprovider tests
 ```
 
-About 2.5 minutes (143 s on the reference machine), no GPU needed, on the tree the image was built from: 1738 passed,
-909 skipped and 3 failures that come from the environment (they need flashinfer, an NVIDIA-only package) and fail the
-same way on upstream
-(`test_cache_budget.py::test_adjust_config_defaults_moe_cache_auto_for_auto_resolved_offload_backend`,
+About 3.5 minutes (210 s on the reference machine), no GPU needed, on the tree the image was built from: 1756 passed,
+951 skipped and 4 failures that fail the same way on upstream: 3 come from the environment (they need flashinfer, an
+NVIDIA-only package:
+`test_cache_budget.py::test_adjust_config_defaults_moe_cache_auto_for_auto_resolved_offload_backend`,
 `test_cache_budget.py::test_adjust_config_resolves_num_tokens_generic`,
-`test_offload.py::test_adjust_config_converts_moe_cache_rate_to_cache_size`).
+`test_offload.py::test_adjust_config_converts_moe_cache_rate_to_cache_size`), and
+`qwen4_exp/test_weight.py::test_every_registry_architecture_is_claimed_by_an_aot_entry` finds two of upstream's GGUF
+architectures without an AOT entry (upstream `9b68e00`).
 
 To test source changes without rebuilding, mount your tree instead (`-v "$PWD":/src:ro -w /src -e
 PYTHONPATH=/src/python`); `test_swiglu_clamp.py::test_cpu_extension_supports_swiglu_clamp` then fails too, because the

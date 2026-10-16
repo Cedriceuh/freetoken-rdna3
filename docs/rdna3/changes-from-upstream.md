@@ -1,10 +1,10 @@
 # Changes from upstream
 
 This repository is a modified version of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken) (Apache
-License 2.0), taken at `0d652e7` (2026-09-26) and merged with upstream up to `ee9789f` (2026-10-10), plus four later
-upstream commits cherry-picked with their authors (`74a3877`, `9c635a1`, `7d6490c`, `9b68e00`). Every file changed
+License 2.0), taken at `0d652e7` (2026-09-26) and merged with upstream up to `ee9789f` (2026-10-10), then up to
+`9b68e00` (2026-10-16; four of its commits cherry-picked first, then the rest merged). Every file changed
 or added relative to upstream is listed here with the reason. Line counts are `added/removed`, against the upstream
-commit of the time (`0d652e7`, or the commit a section names); `git diff ee9789f` gives today's. Files the merge made
+commit of the time (`0d652e7`, or the commit a section or row names); `git diff 9b68e00` gives today's. Files the merge made
 identical to upstream again are gone from the tables ([maintaining.md](maintaining.md#the-stack-on-top-of-upstream-oldest-first)).
 Who wrote what: [credits.md](credits.md).
 
@@ -73,7 +73,7 @@ Who wrote what: [credits.md](credits.md).
 |---|---:|---|
 | `python/freetoken/kernel/triton/sampling_topk.py` | 71/0 | top-k-first sampler for small `top_k` |
 | `python/freetoken/kernel/triton/sampling.py` | 55/4 | on ROCm, top-k / top-p from an exact sorted threshold + the barrier-free draw kernels (upstream's cooperative kernels hang on RDNA3); renormalize API from the same threshold |
-| `python/freetoken/engine/sample.py` | 38/2 | routing between the two paths |
+| `python/freetoken/engine/sample.py` | 38/4 against `9b68e00` | routing between the two paths, under upstream's presence / frequency penalties (`c818639`), which `engine.py` also applies on MTP verify rows |
 
 ## Several requests and scheduling
 
@@ -115,13 +115,12 @@ Line counts in this section and the next are relative to `d72e5cb` (0.1.0 plus i
 | `python/freetoken/tokenizer/detokenize.py` | 20/0 | several tokens of one request in a step |
 | `tests/test_spec_decode.py`, `tests/engine/test_spec_sample.py`, `tests/kernels/test_conv1d_decode_rows.py`, `tests/models/qwen4_exp/test_mtp.py`, `test_qsa_spec_rows.py`, `test_gdn.py`, `tests/scheduler/test_spec_alloc_ahead.py`, `test_scheduler_status.py`, `tests/tokenizer/test_detokenize_multi_token.py`, `tests/layers/test_int8_weight_only.py`, `tests/kvcache/test_qsa_pool.py` | new, except `test_gdn.py` 88/0, `test_scheduler_status.py` 11/0, `test_int8_weight_only.py` 18/0, `test_qsa_pool.py` 1/1 | tests of the above (`test_qsa_spec_rows.py` computes its toy projections a row at a time: ROCm 10's `F.linear` changes its sums with the row count for such shapes) |
 
-## ROCm 10 image, PLE wait-sync, GGUF on ROCm, memory lock
+## ROCm 10 image, PLE wait-sync, memory lock
 
 | File | Lines | Change |
 |---|---:|---|
 | `Dockerfile.rdna3` | 13/5 | ROCm 10.1 / PyTorch 2.14 base with its own Triton 3.8; pyproject's torchvision floor lowered to ROCm's pre-release (0.29.0a0) at install |
-| `python/freetoken/kernel/triton/moe_align.py`, `tests/kernels/test_moe_align.py` | 13/9, new | no comparison on `tl.histogram` counts: Triton 3.8's AMD range analysis gives them an empty range and folds such comparisons to false, which left the expert ids unwritten (up to 1024 routes) or every count at zero (more), and the expert GEMMs then read wild addresses |
-| `python/freetoken/kernel/gguf.py`, `kernel/csrc/gguf/gguf_kernel.cu`, `dispatch.h`, `gguf_bind.cpp` | 41/8, 249/328, 37/9, new | the GGUF kernels build on ROCm: the torch wrappers in a host-only file (under HIP torch's headers include rocThrust, which the pip SDK lacks), nvcc-only flags for CUDA only, HIP's shuffles for the full-mask ones, the SDK's HIP headers, the shared ROCm link flags |
+| `python/freetoken/kernel/triton/moe_align.py`, `tests/kernels/test_moe_align.py`, `moe/fused.py` | 13/9, new, 10/12 against `9b68e00` | ROCm keeps this align over upstream's staged one (`0bca88f`, upstream's fix for the same bug); no comparison on `tl.histogram` counts: Triton 3.8's AMD range analysis gives them an empty range and folds such comparisons to false, which left the expert ids unwritten (up to 1024 routes) or every count at zero (more), and the expert GEMMs then read wild addresses |
 | `python/freetoken/kernel/csrc/row_store/row_store_ext.cpp`, `kernel/row_store.py`, `models/qwen4_exp/ple_disk.py` | 32/4, 40/1, 18/1 | HIP stream memops for the PLE wait-sync (the probe used to look for the CUDA driver's only); a captured wait must hold three replays with the PLE copy behind it (`FREETOKEN_PLE_SYNC`); on one GPU without the MTP head (overlapped decode steps) `auto` takes launch-gating, 44 % faster there |
 | `python/freetoken/kernel/host_allreduce.py`, `kernel/csrc/jit/host_allreduce.cuh` | 20/5, 11/5 | the optional wait log (`FREETOKEN_HOST_ALLREDUCE_WAITLOG`), removed at a clean shutdown |
 | `python/freetoken/layers/moe.py`, `moe/offload_cache.py`, `models/qwen4_exp/moe.py` | 35/0, 20/0, 13/1 | the optional side-stream copy of the missing experts (`FREETOKEN_MOE_COPY_OVERLAP`) |
@@ -197,15 +196,15 @@ Line counts here are on top of the lines listed in the sections above.
 
 | File | Lines | Change |
 |---|---:|---|
-| `python/freetoken/kernel/csrc/cpu_moe/cpu_moe_ext.cpp` | 586/10 | HIP's own stream memops for the executor's flag handshake (upstream finds only `libcuda`'s, so ROCm fell back to two host callbacks per layer); flag slots served by step numbers (the GPU kernels signal and wait, nothing is reset); a task larger than the scratch refused; EXL3 experts (mul1, 2-4 bits, AVX2 + F16C, software prefetch, one decode for the rows sharing an expert, column blocks `FREETOKEN_CPU_MOE_EXL3_COLS`); the routes of rows sharing an expert run back to back (`FREETOKEN_CPU_MOE_GROUP`); a step that leaves the CPU no route answered with zeros at once; `FREETOKEN_CPU_MOE_ROUTE_STATS` |
-| `python/freetoken/moe/cpu_executor.py` | 190/8 | each tensor-parallel rank's pool on its own half of the cores; the EXL3 banks read in place; device views of the pinned IO buffers and the split / merge path (`FREETOKEN_HYBRID_SPLIT_KERNEL`), with the handshake in the kernels (`FREETOKEN_HYBRID_FLAG_IN_KERNEL`) and a watchdog that knows step-number slots; the pools' cores by slice size (`FREETOKEN_CPU_MOE_CORES_BY_SLICE`, off) or with SMT siblings (`FREETOKEN_CPU_MOE_SMT`, off) |
-| `python/freetoken/kernel/triton/hybrid_split.py`, `kernel/host_mapped.py` | new, 7/0 | the hybrid layer's two GPU ends as one kernel each, with or without the handshake (system-scope atomics on the host flags); a device view of an existing pinned tensor |
-| `python/freetoken/moe/offload_kernels.py`, `moe/offload_cache.py` | 35/21, 2/2 | the hybrid capped-fetch kernel reads the routes as vectors and tells this step's slots by their usage stamp (same decisions; 1.1-2.2x faster at 4 rows, 1.5-8.5x at 16, synthetic routing), and can write the slots apart from the routing |
-| `python/freetoken/layers/moe.py` | 35/3 | the split / merge path without a copy of the routing; steps of fewer than `FREETOKEN_HYBRID_MIN_REQS` requests take the offload path |
+| `python/freetoken/kernel/csrc/cpu_moe/cpu_moe_ext.cpp`, `format.h`, `kernels/exl3.cpp` | 125/6, 19/0, new against `9b68e00` | on upstream's executor split into formats and GPU sync backends (`2010271`, which also brought HIP's own memops): EXL3 experts (mul1, 2-4 bits, AVX2 + F16C, software prefetch, one decode for the rows sharing an expert, column blocks `FREETOKEN_CPU_MOE_EXL3_COLS`) as a format that runs its tasks whole (`MoeFormat::run_task`); the routes of rows sharing an expert run back to back (`FREETOKEN_CPU_MOE_GROUP`); two pinned flag words polled beside the doorbell for the hybrid kernels, and the task word exported; `FREETOKEN_CPU_MOE_ROUTE_STATS` |
+| `python/freetoken/moe/cpu_executor.py` | 144/4 against `9b68e00` | each tensor-parallel rank's pool on its own half of the cores; the EXL3 banks read in place; the hybrid publish / merge path (`FREETOKEN_HYBRID_FLAG_IN_KERNEL`) over device views of the pinned IO rows and flag words; the pools' cores by slice size (`FREETOKEN_CPU_MOE_CORES_BY_SLICE`, off) or with SMT siblings (`FREETOKEN_CPU_MOE_SMT`, off) |
+| `python/freetoken/kernel/triton/hybrid_split.py`, `kernel/host_mapped.py` | new, 7/0 | the hybrid layer's two GPU ends as one kernel each, carrying the handshake (system-scope atomics on the pinned flag words); a device view of an existing pinned tensor |
+| `python/freetoken/moe/offload_kernels.py`, `moe/offload_cache.py` | 35/21, 2/2 | upstream's hybrid ensure kernel (which splits the routes since `f02fbb1`) reads the routes as vectors and tells this step's slots by their usage stamp (same decisions; 1.1-2.2x faster at 4 rows, 1.5-8.5x at 16, synthetic routing), with barriers between its phases |
+| `python/freetoken/layers/moe.py` | 35/3 | the publish / merge path; steps of fewer than `FREETOKEN_HYBRID_MIN_REQS` requests take the offload path |
 | `python/freetoken/engine/engine.py` | 13/5 | the executor's row bound counts the MTP verify rows (sized up front, a larger task refused); `FREETOKEN_HYBRID_FETCH_FRACTION`; the TP CPU group handed to the executor |
 | `python/freetoken/layers/quantization/moe/nvfp4.py`, `layers/quantization/moe/exl3.py` | 8/2, 14/3 | CPU decode allowed under tensor parallelism with NVFP4; an EXL3 CPU format (mul1, 2-4 bits); both kernels take inactive slots (`FREETOKEN_HYBRID_SKIP_CPU_ROUTES`) |
 | `python/freetoken/kernel/triton/nvfp4_fused_moe.py`, `moe/fused_nvfp4.py`, `kernel/triton/exl3.py`, `moe/fused_exl3.py` | 7/0, 4/0, 17/7, 6/3 | the decode GEMVs write zeros for a slot of -1 without a read; the EXL3 rotation and scale kernels read slot 0's scales for it |
-| `tests/moe/test_cpu_moe_exl3.py`, `tests/moe/test_cpu_moe.py`, `tests/moe/test_nvfp4_backends.py` | new, 69/0, 24/0 | the EXL3 path against the reference codec, tensor-parallel slices, skipped routes, rows sharing an expert, the size check; the split / merge path eager and replayed in a graph, with the handshake in the kernels or in memops; the GPU skip of the CPU's routes bit-identical (NVFP4, EXL3) |
+| `tests/moe/test_cpu_moe_exl3.py`, `tests/moe/test_cpu_moe.py`, `tests/moe/test_nvfp4_backends.py` | new, 69/0, 24/0 | the EXL3 path against the reference codec, tensor-parallel slices, skipped routes, rows sharing an expert, the size check; the publish / merge path eager and replayed in a graph, a step without a CPU route among them; the GPU skip of the CPU's routes bit-identical (NVFP4, EXL3) |
 
 ## Decode on two cards, bit-exact (night of 2026-10-11)
 
@@ -230,7 +229,7 @@ Line counts here are on top of the lines listed in the sections above.
 
 | File | Lines | Change |
 |---|---:|---|
-| `python/freetoken/moe/offload_cache.py`, `moe/offload_kernels.py` | 134/1, 115/0 | `ensure_prefill_routed`: a short prefill chunk's routed experts made resident in the slot cache (LRU by (usage, slot), the routed hits and the predicted ones protected), the misses copied by decode's copy, the next layer's predicted experts by the copy engine on the copy stream; the bookkeeping in three Triton kernels and one top-k a layer; the experts brought in demoted after their GEMMs |
+| `python/freetoken/moe/offload_cache.py`, `moe/offload_kernels.py` | 134/1, 115/0 | with one slot pool (upstream's default for a model whose MoE layers share one layout, since `b416f85`), `ensure_prefill_routed`: a short prefill chunk's routed experts made resident in the slot cache (LRU by (usage, slot), the routed hits and the predicted ones protected), the misses copied by decode's copy, the next layer's predicted experts by the copy engine on the copy stream; the bookkeeping in three Triton kernels and one top-k a layer; the experts brought in demoted after their GEMMs |
 | `python/freetoken/layers/moe.py`, `layers/quantization/moe/base.py`, `exl3.py`, `nvfp4.py` | 56/5, 5/0, 2/0, 3/1 | `FREETOKEN_PREFILL_CACHED_MAX` (default 1280 for the layers of a model that predicts); `ExpertView.slot_map` for the EXL3 / NVFP4 Triton prefill |
 | `python/freetoken/moe/fused.py`, `moe/fused_exl3.py`, `moe/fused_nvfp4.py` | 7/0, 8/3, 9/3 | `blocks_to_slots`: the tiles of the expert-id alignment read their weights from the slots (the same tiles, the same bits) |
 | `python/freetoken/models/qwen4_exp/moe.py`, `models/qwen4_exp/mtp.py` | 18/0, 1/0 | layer L+1's router on layer L's MoE input, each token's top-10, as the prediction (`FREETOKEN_PREFILL_PREDICT`) |

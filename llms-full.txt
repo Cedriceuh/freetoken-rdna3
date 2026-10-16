@@ -553,8 +553,7 @@ disagreements over ~8k sampled tokens in `check` mode). It is on the torch.distr
 | `FREETOKEN_EXL3_PREFILL_BLOCK` | `4096` | EXL3 checkpoints ([how-it-works.md](how-it-works.md#exl3-checkpoints)): the prefill MoE runs 4096 tokens at a time (`0` = the whole chunk): 540 MiB of temporaries on the 384-wide expert slice, 620 MiB with a 16k chunk's output (measured; 500 / 580 MiB on the 256-wide slice, by the same formula), which the cache planner keeps free at start. Swept on the XT (one layer, 8192 tokens): 1024-token blocks cost 5.4 ms per 1k tokens before the down GEMM took the rotation out as its epilogue, 4096-token blocks 3.4, then 2.8-3.0 with that epilogue; 8192 saved 5-7 % more before that epilogue, for 0.5 GiB more. A block of 12 tokens or fewer (the last one included) takes the decode kernels for both rotations, one of 13-25 for the step between the products (at top-10), and rounds differently; otherwise the block size changes no result (`rdna3/tests/exl3_moe_check.py`: 1024-token blocks against the whole 3000-token chunk, bit-identical). End to end on EXL3 3.05 bpw `xtx-xt-4x262k` (2026-10-16, the same texts): 8192 read 98k and 116k tokens 2-2.5 % faster (38.2-38.3 -> 37.6 s, 44.4-44.6 -> 43.5 s) but left 504 fewer expert slots (11,117 -> 10,613), 16384 1,437 fewer and its first read slower (43.5 s): 4096 stays. |
 | `FREETOKEN_HYBRID_FETCH_FRACTION` | unset | With `--moe-strategy hybrid` ([cpu-experts.md](cpu-experts.md)): the share of each decode step's expert misses fetched over PCIe (strictly between 0 and 1), the rest computed on the CPU (`rdna3/serve.sh --hybrid` sets `0.25` on one card and `0.4` on two with NVFP4, `0.6` with EXL3). Unset: the split `ft bench bw` measured for the expert format, or a fixed cap of one fetch per layer without a profile (EXL3 is not benched). |
 | `FREETOKEN_HYBRID_MIN_REQS` | `1` | With `--moe-strategy hybrid`: decode steps of fewer requests fetch every miss (the offload path). CUDA graphs are captured per batch size, so each size takes one path. It held one request on two cards on the offload path while the hybrid one was slower there (NVFP4 `xtx-xt`: 71.0 tok/s against 78.4); since the hybrid path's fixed cost came down, `rdna3/serve.sh --hybrid` no longer sets it. |
-| `FREETOKEN_HYBRID_SPLIT_KERNEL` | `1` | With `--moe-strategy hybrid`: the routing split and the CPU's inputs written into its pinned buffers by one kernel, its partial added back by another (`0`: upstream's masks, copies and add, ~8 more graph nodes per MoE layer). |
-| `FREETOKEN_HYBRID_FLAG_IN_KERNEL` | `1` | With `--moe-strategy hybrid` and the split kernels: the handshake with the CPU coordinator carried by those two kernels with step numbers (`0`: three stream memops per MoE layer, ~3.2 us each). Bit-identical; with the other hybrid changes of 2026-10-11, one request on NVFP4 `xtx-xt` 74.3 -> 78.3 tok/s ([cpu-experts.md](cpu-experts.md)). |
+| `FREETOKEN_HYBRID_FLAG_IN_KERNEL` | `1` | With `--moe-strategy hybrid`: the CPU's inputs written into its pinned IO rows by one kernel that also rings the coordinator, its partial added back by another that waits for it, over two pinned flag words (`0`: upstream's copies around the doorbell's stream memops, ~3.2 us a node). The routing split itself runs in the hybrid ensure kernel (upstream's since `f02fbb1`). Bit-identical; with the other hybrid changes of 2026-10-11, one request on NVFP4 `xtx-xt` 74.3 -> 78.3 tok/s ([cpu-experts.md](cpu-experts.md)). Replaces `FREETOKEN_HYBRID_SPLIT_KERNEL` (2026-10-16). |
 | `FREETOKEN_CPU_MOE_GROUP` | `1` | CPU expert executor, NVFP4 / bf16 / Q4_0: one task per (expert, row block) for the routes of rows that share an expert, so its rows are read from RAM once (`0`: one task per route). Bit-identical. |
 | `FREETOKEN_CPU_MOE_ROUTE_STATS` | unset | Measurement: every `n` CPU expert tasks, print how many of the CPU's routes repeat an expert of another row of the same step (8-13 % in the `--hybrid` runs). |
 | `FREETOKEN_HYBRID_SKIP_CPU_ROUTES` | `1` | With `--moe-strategy hybrid`, NVFP4 and EXL3: the GPU decode kernels write zeros for the routes the CPU computes (slot -1) instead of computing them on slot 0 at weight 0. Bit-identical; +1-3 % decode ([cpu-experts.md](cpu-experts.md)). |
@@ -2079,7 +2078,20 @@ Found on the way:
   at random, and that rank fell back to one copy per expert: full-layer short prefills ~10 % slower. Fixed (the copy
   waits for the fill), and a failed mode is now logged.
 
-## 28. Still open
+## 28. Upstream up to 9b68e00 (2026-10-16)
+
+Five commits cherry-picked, then the rest merged. Upstream had rewritten the files this tree's `--hybrid` lives in: its
+CPU MoE executor split into weight formats and GPU sync backends (with HIP memops of its own), its hybrid ensure kernel
+now splitting the routes (what this tree's split kernel did), and the expert cache cut into slot pools. The port kept
+upstream's structure and moved this tree's pieces onto it: the EXL3 CPU experts behind a whole-task hook of the format
+interface, the publish / merge kernels on upstream's task-word handshake (two pinned words, rung and reset by one lane:
+a review of the port found that a reset repeated by every thread could make the coordinator run a step twice), the
+prefill through the cache gated to one slot pool of at least two layers of experts. transformers 5.18 rounds two rows of
+its YaRN reference two ulps away from 5.16: the test now allows that, the engine's rows are unchanged. Upstream's fix of
+the Triton 3.8 histogram bug (a staged align, `0bca88f`) was left out: `moe_align.py` here has no such compare. Through
+both launcher entries the answers stayed the same, bit for bit ([CHANGELOG](../../CHANGELOG.md)).
+
+## 29. Still open
 
 - In NVFP4 the model needs ~63 GiB of RAM for its experts alone (the engine keeps every expert in RAM). The EXL3 3.05
   bpw checkpoint needs 42.6 GiB and served under a 56 GiB container limit, but a real 64 GB machine is untested
@@ -2461,12 +2473,14 @@ slower (one-time kernel preparation): run it twice.
 docker run --rm -w /opt/FreeToken --entrypoint python3 freetoken-rdna3:latest -m pytest -q -p no:cacheprovider tests
 ```
 
-About 2.5 minutes (143 s on the reference machine), no GPU needed, on the tree the image was built from: 1738 passed,
-909 skipped and 3 failures that come from the environment (they need flashinfer, an NVIDIA-only package) and fail the
-same way on upstream
-(`test_cache_budget.py::test_adjust_config_defaults_moe_cache_auto_for_auto_resolved_offload_backend`,
+About 3.5 minutes (210 s on the reference machine), no GPU needed, on the tree the image was built from: 1756 passed,
+951 skipped and 4 failures that fail the same way on upstream: 3 come from the environment (they need flashinfer, an
+NVIDIA-only package:
+`test_cache_budget.py::test_adjust_config_defaults_moe_cache_auto_for_auto_resolved_offload_backend`,
 `test_cache_budget.py::test_adjust_config_resolves_num_tokens_generic`,
-`test_offload.py::test_adjust_config_converts_moe_cache_rate_to_cache_size`).
+`test_offload.py::test_adjust_config_converts_moe_cache_rate_to_cache_size`), and
+`qwen4_exp/test_weight.py::test_every_registry_architecture_is_claimed_by_an_aot_entry` finds two of upstream's GGUF
+architectures without an AOT entry (upstream `9b68e00`).
 
 To test source changes without rebuilding, mount your tree instead (`-v "$PWD":/src:ro -w /src -e
 PYTHONPATH=/src/python`); `test_swiglu_clamp.py::test_cpu_extension_supports_swiglu_clamp` then fails too, because the
@@ -2550,11 +2564,12 @@ How this repository relates to upstream FreeToken and how to keep it current. Fo
 
 ## What this tree is
 
-Upstream [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken) at `ee9789f` (2026-10-10, "fix(kernel):
-avoid nan in triton sampling softmax when a chunk starts with -inf (#654)"), plus the changes listed file by file in
-[changes-from-upstream.md](changes-from-upstream.md). The history is upstream's own up to `0d652e7` (2026-09-26), then
-this project's commits on top (the first one holds everything up to 0.1.0), then a merge of upstream up to `ee9789f`,
-then four later upstream commits cherry-picked (`74a3877`, `9c635a1`, `7d6490c`, `9b68e00`, authors kept). Once the `upstream` remote is set up (below),
+Upstream [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken) at `9b68e00` (2026-10-15, "fix(engine):
+upload cuda graphs at capture so a stream wait cannot block the first launch (#697)"), plus the changes listed file by
+file in [changes-from-upstream.md](changes-from-upstream.md). The history is upstream's own up to `0d652e7`
+(2026-09-26), then this project's commits on top (the first one holds everything up to 0.1.0), a merge of upstream up
+to `ee9789f`, five upstream commits cherry-picked (`74a3877`, `9c635a1`, `7d6490c`, `9b68e00`, `b6193e8`, authors
+kept) and a merge of the rest up to `9b68e00`. Once the `upstream` remote is set up (below),
 `git diff $(git merge-base HEAD upstream/main)` shows every change against the upstream version this tree is based on.
 
 ## The stack on top of upstream (oldest first)
@@ -2574,12 +2589,12 @@ carries #133's HIP-portable JIT kernels since `803a3b4` (#133 itself was closed)
 ROCm, `LaunchKernel::with_attr` refuses `use_pdl=True` where upstream ignores it. The YaRN rope table and the split
 top-k past 16 chunks, written here first, are upstream's own since `235e201` and `5031e3d`.
 
-Not taken from upstream after `ee9789f` (2026-10-16): the GGUF move to vendored ggml-cuda kernels (`e5d3bd3` and the
-three GGUF commits on top), which deletes this tree's ROCm build of the GGUF kernels; the CPU-MoE executor split and
-the offload slot pools (`95ac86f`, `2010271`, `f02fbb1`, `b416f85`), which rewrite the files that carry `--hybrid`;
-transformers 5.18 (`b6193e8`: its qwen4_exp change follows a layer-type rename of 5.18, the image has 5.16);
-presence / frequency penalties (`c818639`: applied in `Sampler.sample` only, which the MTP verify step does not call);
-the staged moe_align on Triton 3.8 (`0bca88f`: `kernel/triton/moe_align.py` is fixed here instead).
+At the merge of `9b68e00` (2026-10-16): upstream's vendored ggml-cuda kernels (`e5d3bd3`, they build for gfx1100)
+replaced this tree's ROCm build of the old GGUF kernels; upstream's hybrid ensure kernel splits the routes (`f02fbb1`),
+which this tree's split kernel did, and its executor speaks HIP's memops (`2010271`), which this tree added: both left
+the stack. Kept over upstream: `kernel/triton/moe_align.py` on ROCm instead of the staged align of `0bca88f` (the same
+Triton 3.8 bug, fixed in the kernel here); the hybrid publish / merge kernels instead of upstream's copies around the
+doorbell, which it keeps on ROCm. The prefill through the slot cache needs one slot pool (`b416f85`'s default here).
 ## Keeping current
 
 ```bash
@@ -2637,10 +2652,10 @@ Infinity Cache and promises gains that serving does not see.
 # Changes from upstream
 
 This repository is a modified version of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken) (Apache
-License 2.0), taken at `0d652e7` (2026-09-26) and merged with upstream up to `ee9789f` (2026-10-10), plus four later
-upstream commits cherry-picked with their authors (`74a3877`, `9c635a1`, `7d6490c`, `9b68e00`). Every file changed
+License 2.0), taken at `0d652e7` (2026-09-26) and merged with upstream up to `ee9789f` (2026-10-10), then up to
+`9b68e00` (2026-10-16; four of its commits cherry-picked first, then the rest merged). Every file changed
 or added relative to upstream is listed here with the reason. Line counts are `added/removed`, against the upstream
-commit of the time (`0d652e7`, or the commit a section names); `git diff ee9789f` gives today's. Files the merge made
+commit of the time (`0d652e7`, or the commit a section or row names); `git diff 9b68e00` gives today's. Files the merge made
 identical to upstream again are gone from the tables ([maintaining.md](maintaining.md#the-stack-on-top-of-upstream-oldest-first)).
 Who wrote what: [credits.md](credits.md).
 
@@ -2709,7 +2724,7 @@ Who wrote what: [credits.md](credits.md).
 |---|---:|---|
 | `python/freetoken/kernel/triton/sampling_topk.py` | 71/0 | top-k-first sampler for small `top_k` |
 | `python/freetoken/kernel/triton/sampling.py` | 55/4 | on ROCm, top-k / top-p from an exact sorted threshold + the barrier-free draw kernels (upstream's cooperative kernels hang on RDNA3); renormalize API from the same threshold |
-| `python/freetoken/engine/sample.py` | 38/2 | routing between the two paths |
+| `python/freetoken/engine/sample.py` | 38/4 against `9b68e00` | routing between the two paths, under upstream's presence / frequency penalties (`c818639`), which `engine.py` also applies on MTP verify rows |
 
 ## Several requests and scheduling
 
@@ -2751,13 +2766,12 @@ Line counts in this section and the next are relative to `d72e5cb` (0.1.0 plus i
 | `python/freetoken/tokenizer/detokenize.py` | 20/0 | several tokens of one request in a step |
 | `tests/test_spec_decode.py`, `tests/engine/test_spec_sample.py`, `tests/kernels/test_conv1d_decode_rows.py`, `tests/models/qwen4_exp/test_mtp.py`, `test_qsa_spec_rows.py`, `test_gdn.py`, `tests/scheduler/test_spec_alloc_ahead.py`, `test_scheduler_status.py`, `tests/tokenizer/test_detokenize_multi_token.py`, `tests/layers/test_int8_weight_only.py`, `tests/kvcache/test_qsa_pool.py` | new, except `test_gdn.py` 88/0, `test_scheduler_status.py` 11/0, `test_int8_weight_only.py` 18/0, `test_qsa_pool.py` 1/1 | tests of the above (`test_qsa_spec_rows.py` computes its toy projections a row at a time: ROCm 10's `F.linear` changes its sums with the row count for such shapes) |
 
-## ROCm 10 image, PLE wait-sync, GGUF on ROCm, memory lock
+## ROCm 10 image, PLE wait-sync, memory lock
 
 | File | Lines | Change |
 |---|---:|---|
 | `Dockerfile.rdna3` | 13/5 | ROCm 10.1 / PyTorch 2.14 base with its own Triton 3.8; pyproject's torchvision floor lowered to ROCm's pre-release (0.29.0a0) at install |
-| `python/freetoken/kernel/triton/moe_align.py`, `tests/kernels/test_moe_align.py` | 13/9, new | no comparison on `tl.histogram` counts: Triton 3.8's AMD range analysis gives them an empty range and folds such comparisons to false, which left the expert ids unwritten (up to 1024 routes) or every count at zero (more), and the expert GEMMs then read wild addresses |
-| `python/freetoken/kernel/gguf.py`, `kernel/csrc/gguf/gguf_kernel.cu`, `dispatch.h`, `gguf_bind.cpp` | 41/8, 249/328, 37/9, new | the GGUF kernels build on ROCm: the torch wrappers in a host-only file (under HIP torch's headers include rocThrust, which the pip SDK lacks), nvcc-only flags for CUDA only, HIP's shuffles for the full-mask ones, the SDK's HIP headers, the shared ROCm link flags |
+| `python/freetoken/kernel/triton/moe_align.py`, `tests/kernels/test_moe_align.py`, `moe/fused.py` | 13/9, new, 10/12 against `9b68e00` | ROCm keeps this align over upstream's staged one (`0bca88f`, upstream's fix for the same bug); no comparison on `tl.histogram` counts: Triton 3.8's AMD range analysis gives them an empty range and folds such comparisons to false, which left the expert ids unwritten (up to 1024 routes) or every count at zero (more), and the expert GEMMs then read wild addresses |
 | `python/freetoken/kernel/csrc/row_store/row_store_ext.cpp`, `kernel/row_store.py`, `models/qwen4_exp/ple_disk.py` | 32/4, 40/1, 18/1 | HIP stream memops for the PLE wait-sync (the probe used to look for the CUDA driver's only); a captured wait must hold three replays with the PLE copy behind it (`FREETOKEN_PLE_SYNC`); on one GPU without the MTP head (overlapped decode steps) `auto` takes launch-gating, 44 % faster there |
 | `python/freetoken/kernel/host_allreduce.py`, `kernel/csrc/jit/host_allreduce.cuh` | 20/5, 11/5 | the optional wait log (`FREETOKEN_HOST_ALLREDUCE_WAITLOG`), removed at a clean shutdown |
 | `python/freetoken/layers/moe.py`, `moe/offload_cache.py`, `models/qwen4_exp/moe.py` | 35/0, 20/0, 13/1 | the optional side-stream copy of the missing experts (`FREETOKEN_MOE_COPY_OVERLAP`) |
@@ -2833,15 +2847,15 @@ Line counts here are on top of the lines listed in the sections above.
 
 | File | Lines | Change |
 |---|---:|---|
-| `python/freetoken/kernel/csrc/cpu_moe/cpu_moe_ext.cpp` | 586/10 | HIP's own stream memops for the executor's flag handshake (upstream finds only `libcuda`'s, so ROCm fell back to two host callbacks per layer); flag slots served by step numbers (the GPU kernels signal and wait, nothing is reset); a task larger than the scratch refused; EXL3 experts (mul1, 2-4 bits, AVX2 + F16C, software prefetch, one decode for the rows sharing an expert, column blocks `FREETOKEN_CPU_MOE_EXL3_COLS`); the routes of rows sharing an expert run back to back (`FREETOKEN_CPU_MOE_GROUP`); a step that leaves the CPU no route answered with zeros at once; `FREETOKEN_CPU_MOE_ROUTE_STATS` |
-| `python/freetoken/moe/cpu_executor.py` | 190/8 | each tensor-parallel rank's pool on its own half of the cores; the EXL3 banks read in place; device views of the pinned IO buffers and the split / merge path (`FREETOKEN_HYBRID_SPLIT_KERNEL`), with the handshake in the kernels (`FREETOKEN_HYBRID_FLAG_IN_KERNEL`) and a watchdog that knows step-number slots; the pools' cores by slice size (`FREETOKEN_CPU_MOE_CORES_BY_SLICE`, off) or with SMT siblings (`FREETOKEN_CPU_MOE_SMT`, off) |
-| `python/freetoken/kernel/triton/hybrid_split.py`, `kernel/host_mapped.py` | new, 7/0 | the hybrid layer's two GPU ends as one kernel each, with or without the handshake (system-scope atomics on the host flags); a device view of an existing pinned tensor |
-| `python/freetoken/moe/offload_kernels.py`, `moe/offload_cache.py` | 35/21, 2/2 | the hybrid capped-fetch kernel reads the routes as vectors and tells this step's slots by their usage stamp (same decisions; 1.1-2.2x faster at 4 rows, 1.5-8.5x at 16, synthetic routing), and can write the slots apart from the routing |
-| `python/freetoken/layers/moe.py` | 35/3 | the split / merge path without a copy of the routing; steps of fewer than `FREETOKEN_HYBRID_MIN_REQS` requests take the offload path |
+| `python/freetoken/kernel/csrc/cpu_moe/cpu_moe_ext.cpp`, `format.h`, `kernels/exl3.cpp` | 125/6, 19/0, new against `9b68e00` | on upstream's executor split into formats and GPU sync backends (`2010271`, which also brought HIP's own memops): EXL3 experts (mul1, 2-4 bits, AVX2 + F16C, software prefetch, one decode for the rows sharing an expert, column blocks `FREETOKEN_CPU_MOE_EXL3_COLS`) as a format that runs its tasks whole (`MoeFormat::run_task`); the routes of rows sharing an expert run back to back (`FREETOKEN_CPU_MOE_GROUP`); two pinned flag words polled beside the doorbell for the hybrid kernels, and the task word exported; `FREETOKEN_CPU_MOE_ROUTE_STATS` |
+| `python/freetoken/moe/cpu_executor.py` | 144/4 against `9b68e00` | each tensor-parallel rank's pool on its own half of the cores; the EXL3 banks read in place; the hybrid publish / merge path (`FREETOKEN_HYBRID_FLAG_IN_KERNEL`) over device views of the pinned IO rows and flag words; the pools' cores by slice size (`FREETOKEN_CPU_MOE_CORES_BY_SLICE`, off) or with SMT siblings (`FREETOKEN_CPU_MOE_SMT`, off) |
+| `python/freetoken/kernel/triton/hybrid_split.py`, `kernel/host_mapped.py` | new, 7/0 | the hybrid layer's two GPU ends as one kernel each, carrying the handshake (system-scope atomics on the pinned flag words); a device view of an existing pinned tensor |
+| `python/freetoken/moe/offload_kernels.py`, `moe/offload_cache.py` | 35/21, 2/2 | upstream's hybrid ensure kernel (which splits the routes since `f02fbb1`) reads the routes as vectors and tells this step's slots by their usage stamp (same decisions; 1.1-2.2x faster at 4 rows, 1.5-8.5x at 16, synthetic routing), with barriers between its phases |
+| `python/freetoken/layers/moe.py` | 35/3 | the publish / merge path; steps of fewer than `FREETOKEN_HYBRID_MIN_REQS` requests take the offload path |
 | `python/freetoken/engine/engine.py` | 13/5 | the executor's row bound counts the MTP verify rows (sized up front, a larger task refused); `FREETOKEN_HYBRID_FETCH_FRACTION`; the TP CPU group handed to the executor |
 | `python/freetoken/layers/quantization/moe/nvfp4.py`, `layers/quantization/moe/exl3.py` | 8/2, 14/3 | CPU decode allowed under tensor parallelism with NVFP4; an EXL3 CPU format (mul1, 2-4 bits); both kernels take inactive slots (`FREETOKEN_HYBRID_SKIP_CPU_ROUTES`) |
 | `python/freetoken/kernel/triton/nvfp4_fused_moe.py`, `moe/fused_nvfp4.py`, `kernel/triton/exl3.py`, `moe/fused_exl3.py` | 7/0, 4/0, 17/7, 6/3 | the decode GEMVs write zeros for a slot of -1 without a read; the EXL3 rotation and scale kernels read slot 0's scales for it |
-| `tests/moe/test_cpu_moe_exl3.py`, `tests/moe/test_cpu_moe.py`, `tests/moe/test_nvfp4_backends.py` | new, 69/0, 24/0 | the EXL3 path against the reference codec, tensor-parallel slices, skipped routes, rows sharing an expert, the size check; the split / merge path eager and replayed in a graph, with the handshake in the kernels or in memops; the GPU skip of the CPU's routes bit-identical (NVFP4, EXL3) |
+| `tests/moe/test_cpu_moe_exl3.py`, `tests/moe/test_cpu_moe.py`, `tests/moe/test_nvfp4_backends.py` | new, 69/0, 24/0 | the EXL3 path against the reference codec, tensor-parallel slices, skipped routes, rows sharing an expert, the size check; the publish / merge path eager and replayed in a graph, a step without a CPU route among them; the GPU skip of the CPU's routes bit-identical (NVFP4, EXL3) |
 
 ## Decode on two cards, bit-exact (night of 2026-10-11)
 
@@ -2866,7 +2880,7 @@ Line counts here are on top of the lines listed in the sections above.
 
 | File | Lines | Change |
 |---|---:|---|
-| `python/freetoken/moe/offload_cache.py`, `moe/offload_kernels.py` | 134/1, 115/0 | `ensure_prefill_routed`: a short prefill chunk's routed experts made resident in the slot cache (LRU by (usage, slot), the routed hits and the predicted ones protected), the misses copied by decode's copy, the next layer's predicted experts by the copy engine on the copy stream; the bookkeeping in three Triton kernels and one top-k a layer; the experts brought in demoted after their GEMMs |
+| `python/freetoken/moe/offload_cache.py`, `moe/offload_kernels.py` | 134/1, 115/0 | with one slot pool (upstream's default for a model whose MoE layers share one layout, since `b416f85`), `ensure_prefill_routed`: a short prefill chunk's routed experts made resident in the slot cache (LRU by (usage, slot), the routed hits and the predicted ones protected), the misses copied by decode's copy, the next layer's predicted experts by the copy engine on the copy stream; the bookkeeping in three Triton kernels and one top-k a layer; the experts brought in demoted after their GEMMs |
 | `python/freetoken/layers/moe.py`, `layers/quantization/moe/base.py`, `exl3.py`, `nvfp4.py` | 56/5, 5/0, 2/0, 3/1 | `FREETOKEN_PREFILL_CACHED_MAX` (default 1280 for the layers of a model that predicts); `ExpertView.slot_map` for the EXL3 / NVFP4 Triton prefill |
 | `python/freetoken/moe/fused.py`, `moe/fused_exl3.py`, `moe/fused_nvfp4.py` | 7/0, 8/3, 9/3 | `blocks_to_slots`: the tiles of the expert-id alignment read their weights from the slots (the same tiles, the same bits) |
 | `python/freetoken/models/qwen4_exp/moe.py`, `models/qwen4_exp/mtp.py` | 18/0, 1/0 | layer L+1's router on layer L's MoE input, each token's top-10, as the prediction (`FREETOKEN_PREFILL_PREDICT`) |
@@ -2929,7 +2943,8 @@ Neither profile is agent-validated yet.
     12/12, read at 2036 tok/s, decode 85 tok/s). The checkpoints carry a vision tower, so the
     rope is the multi-axis one; YaRN composes with it and the table covers `original x factor` positions, as SGLang /
     vLLM size it (upstream's code since the merge of `ee9789f`, written here first). Bit-identical to HF transformers
-    5.16.1's rotary embedding (`tests/layers/test_rotary_yarn.py`).
+    5.16.1's rotary embedding, within two float32 ulps of 5.18's, which rounds a few rows differently
+    (`tests/layers/test_rotary_yarn.py`).
   - **`FREETOKEN_ROPE_MAX_POSITION=1048576`**: the plain rope with a longer table, no YaRN. Below 262,144 the rows are
     the same bits as without it, so short contexts are unchanged.
 - `rdna3/profiles/xtx-xt-1m.env` puts it together for one long conversation (plain rope, K/V on the host,
@@ -3314,6 +3329,10 @@ change after the first working version kept the greedy answers bit for bit (14/1
 here too, which moves the answers as the cache's contents do. Time to the first token of a 132-337-token turn at 25k:
 NVFP4 `xtx-xt` 1.19-1.24 -> 0.78-0.89 s, EXL3 3.05 `xtx` 1.50-1.52 -> 1.05-1.18, NVFP4 `xtx` 2.32-2.34 -> 1.63-1.80.
 
+On 2026-10-16 two runs of one image (`xtx`, NVFP4, the same settings, greedy) gave the same answers on only 7 of 14
+prompts: since some change after 2026-10-12, when they were the same, `--hybrid` is not reproducible from one run to
+the next (the cause was not looked for).
+
 The CPU pool spins on its cores while a decode runs and parks 50 ms after the last layer: with `--hybrid` on one card,
 31 of the 32 cores are busy during generation (15 + 1 per card on two).
 
@@ -3336,19 +3355,23 @@ The CPU pool spins on its cores while a decode runs and parks 50 ms after the la
   node of a captured graph costs ~3.2 us here, a memop as much as a tiny kernel. On two cards, where one layer of a
   one-request step lasts ~270 us, that cost ~9 % at one request whatever share of the misses the CPU took. What is
   left of it:
-  - one kernel writes the CPU's inputs straight into its pinned buffers (a device view of them) and splits the
-    routing, another adds the CPU's partial back from them (`FREETOKEN_HYBRID_SPLIT_KERNEL`);
-  - the two kernels carry the handshake (`FREETOKEN_HYBRID_FLAG_IN_KERNEL`): the first bumps the layer slot's step
-    number and raises the host `ready` flag to it with a system-scope release, the coordinator hands the number back
-    in `done`, the second spins on `done` with a system-scope atomic; no flag is reset, so no memop is left. A first
-    try of this spun with a `volatile` load and hung the server: in a bounded test that load returned in 0.03 us a
-    poll, too fast to reach host memory, and never saw the CPU's store; the atomic took 1.46 us a poll and saw it;
+  - one kernel writes the CPU's inputs straight into its pinned IO rows (a device view of them), another adds the
+    CPU's partial back from them; the routing split runs in the hybrid ensure kernel (upstream's design since
+    `f02fbb1`, which this tree first had as a split kernel of its own);
+  - the two kernels carry the handshake (`FREETOKEN_HYBRID_FLAG_IN_KERNEL`) over two pinned words the coordinator
+    polls beside upstream's doorbell, with its protocol: the first resets `done` and raises `ready` to the step's task
+    word (layer, rows) with system-scope releases, or sets `done` at once when no route goes to the CPU; the
+    coordinator takes the task and sets `done`; the second spins on `done` with a system-scope atomic; no stream memop
+    is left (until 2026-10-16 the kernels counted step numbers in per-(layer, batch) slots). A first try spun with a
+    `volatile` load and hung the server: in a bounded test that load returned in 0.03 us a poll, too fast to reach
+    host memory, and never saw the CPU's store; the atomic took 1.46 us a poll and saw it;
   - the kernel that picks which misses to fetch read the routes one dependent scalar load at a time and compared
     the whole cache per route: with vector loads and the slots used this step told apart by their usage stamp, it
     takes the same decisions (state compared after every call at the profiles' cache sizes, synthetic Zipf routing)
     in 11.5-19.4 us a layer instead of 17.3-30.4 at 4 rows (159 -> 31 us at 16 rows and an 11k-slot cache), and
     writes the slots apart, so the routing needs no copy;
-  - the coordinator answers a step that leaves the CPU no route with zeros without waking its pool.
+  - a step that leaves the CPU no route rings nothing (the publish kernel sets `done` itself; upstream's coordinator
+    also answers such a doorbell with zeros without waking its pool).
 
   EXL3 `xtx-xt-4x262k` with every miss fetched (the CPU gets nothing), against offload 85.8 / 33.9 tok/s: 80.3 / 31.6
   before the last three changes, 82.8 / 33.1 after; NVFP4 `xtx-xt`, one request: 71.0 (first version), 74.3 (fused

@@ -62,6 +62,10 @@ change after the first working version kept the greedy answers bit for bit (14/1
 here too, which moves the answers as the cache's contents do. Time to the first token of a 132-337-token turn at 25k:
 NVFP4 `xtx-xt` 1.19-1.24 -> 0.78-0.89 s, EXL3 3.05 `xtx` 1.50-1.52 -> 1.05-1.18, NVFP4 `xtx` 2.32-2.34 -> 1.63-1.80.
 
+On 2026-10-16 two runs of one image (`xtx`, NVFP4, the same settings, greedy) gave the same answers on only 7 of 14
+prompts: since some change after 2026-10-12, when they were the same, `--hybrid` is not reproducible from one run to
+the next (the cause was not looked for).
+
 The CPU pool spins on its cores while a decode runs and parks 50 ms after the last layer: with `--hybrid` on one card,
 31 of the 32 cores are busy during generation (15 + 1 per card on two).
 
@@ -84,19 +88,23 @@ The CPU pool spins on its cores while a decode runs and parks 50 ms after the la
   node of a captured graph costs ~3.2 us here, a memop as much as a tiny kernel. On two cards, where one layer of a
   one-request step lasts ~270 us, that cost ~9 % at one request whatever share of the misses the CPU took. What is
   left of it:
-  - one kernel writes the CPU's inputs straight into its pinned buffers (a device view of them) and splits the
-    routing, another adds the CPU's partial back from them (`FREETOKEN_HYBRID_SPLIT_KERNEL`);
-  - the two kernels carry the handshake (`FREETOKEN_HYBRID_FLAG_IN_KERNEL`): the first bumps the layer slot's step
-    number and raises the host `ready` flag to it with a system-scope release, the coordinator hands the number back
-    in `done`, the second spins on `done` with a system-scope atomic; no flag is reset, so no memop is left. A first
-    try of this spun with a `volatile` load and hung the server: in a bounded test that load returned in 0.03 us a
-    poll, too fast to reach host memory, and never saw the CPU's store; the atomic took 1.46 us a poll and saw it;
+  - one kernel writes the CPU's inputs straight into its pinned IO rows (a device view of them), another adds the
+    CPU's partial back from them; the routing split runs in the hybrid ensure kernel (upstream's design since
+    `f02fbb1`, which this tree first had as a split kernel of its own);
+  - the two kernels carry the handshake (`FREETOKEN_HYBRID_FLAG_IN_KERNEL`) over two pinned words the coordinator
+    polls beside upstream's doorbell, with its protocol: the first resets `done` and raises `ready` to the step's task
+    word (layer, rows) with system-scope releases, or sets `done` at once when no route goes to the CPU; the
+    coordinator takes the task and sets `done`; the second spins on `done` with a system-scope atomic; no stream memop
+    is left (until 2026-10-16 the kernels counted step numbers in per-(layer, batch) slots). A first try spun with a
+    `volatile` load and hung the server: in a bounded test that load returned in 0.03 us a poll, too fast to reach
+    host memory, and never saw the CPU's store; the atomic took 1.46 us a poll and saw it;
   - the kernel that picks which misses to fetch read the routes one dependent scalar load at a time and compared
     the whole cache per route: with vector loads and the slots used this step told apart by their usage stamp, it
     takes the same decisions (state compared after every call at the profiles' cache sizes, synthetic Zipf routing)
     in 11.5-19.4 us a layer instead of 17.3-30.4 at 4 rows (159 -> 31 us at 16 rows and an 11k-slot cache), and
     writes the slots apart, so the routing needs no copy;
-  - the coordinator answers a step that leaves the CPU no route with zeros without waking its pool.
+  - a step that leaves the CPU no route rings nothing (the publish kernel sets `done` itself; upstream's coordinator
+    also answers such a doorbell with zeros without waking its pool).
 
   EXL3 `xtx-xt-4x262k` with every miss fetched (the CPU gets nothing), against offload 85.8 / 33.9 tok/s: 80.3 / 31.6
   before the last three changes, 82.8 / 33.1 after; NVFP4 `xtx-xt`, one request: 71.0 (first version), 74.3 (fused
