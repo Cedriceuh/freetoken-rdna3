@@ -12,12 +12,15 @@ from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextCo
 _YARN = {"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 262144, "rope_theta": 10000000,
          "partial_rotary_factor": 0.25, "mrope_section": [11, 11, 10], "mrope_interleaved": True}
 _POS = torch.tensor([0, 1, 7, 4095, 65537, 262143, 262144, 500001, 999999, 1048575])
+# two float32 ulps: transformers 5.18 rounds a few of its rows differently (5.16 gave these rows bit for bit)
+_TOL = dict(atol=0, rtol=2**-22)
 
 
 def _hf_rows(rope_parameters: dict) -> tuple[torch.Tensor, torch.Tensor]:
     cfg = Qwen4ExpTextConfig(head_dim=256, num_attention_heads=24, hidden_size=2560, max_position_embeddings=262144,
                              rope_parameters=dict(rope_parameters))
-    cos, sin = qwen4.Qwen4ExpTextRotaryEmbedding(cfg)(torch.zeros(1), _POS[None])
+    # (3, batch, positions): transformers 5.18 indexes the three mrope axes, 5.16 took (batch, positions) as well
+    cos, sin = qwen4.Qwen4ExpTextRotaryEmbedding(cfg)(torch.zeros(1), _POS[None, None].expand(3, 1, -1))
     return cos[0, :, :32], sin[0, :, :32]
 
 
@@ -31,8 +34,8 @@ def test_yarn_rows_match_hf(mrope: bool) -> None:
     else:
         rows = rope._cos_sin_cache[_POS]
     cos, sin = _hf_rows(_YARN)
-    torch.testing.assert_close(rows[:, :32], cos, atol=0, rtol=0)
-    torch.testing.assert_close(rows[:, 32:], sin, atol=0, rtol=0)
+    torch.testing.assert_close(rows[:, :32], cos, **_TOL)
+    torch.testing.assert_close(rows[:, 32:], sin, **_TOL)
     assert abs(float(rows[0, 0]) - (0.1 * torch.log(torch.tensor(4.0)).item() + 1.0)) < 1e-6  # cos(0) * mscale
 
 
@@ -44,8 +47,8 @@ def test_default_rows_unchanged_and_exact() -> None:
     rows = mrope_cos_sin_rows(rope._cos_sin_cache, pos[None].expand(3, -1), rope._section_table)
     cos, sin = _hf_rows(plain)
     keep = _POS < 262144
-    torch.testing.assert_close(rows[:, :32], cos[keep], atol=0, rtol=0)
-    torch.testing.assert_close(rows[:, 32:], sin[keep], atol=0, rtol=0)
+    torch.testing.assert_close(rows[:, :32], cos[keep], **_TOL)
+    torch.testing.assert_close(rows[:, 32:], sin[keep], **_TOL)
 
 
 def test_extended_plain_table_keeps_the_native_rows() -> None:
