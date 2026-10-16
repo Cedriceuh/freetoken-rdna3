@@ -82,7 +82,7 @@ routes to only part of the experts, so it reads its routed experts from the slot
 that layer's router and copied while this one computes, and only the missing ones cross PCIe (the same bits, the GEMM
 tiles are those of the expert ids). With the K/V in host RAM it copies to VRAM only the K/V rows its tokens select, and
 the tokenizer reuses the previous prompt's tokens instead of encoding the whole conversation again. An agent turn of
-130-360 tokens takes 0.39-0.47 s to its first token at 25k and 0.46-0.59 s at 224k on `xtx-xt-4x262k` with EXL3 3.05 bpw
+130-340 tokens takes 0.40-0.48 s to its first token at 25k and 0.46-0.59 s at 224k on `xtx-xt-4x262k` with EXL3 3.05 bpw
 (NVFP4 0.58-0.70 s at 25k)
 ([journey.md](journey.md#27-agent-turns-short-prefills-through-the-expert-cache-2026-10-14)).
 
@@ -181,7 +181,7 @@ branch `3.05bpw_h5_ng5` (routed experts at 3 bits per weight, most other linears
   weight reader (the CPU expert executor of `--hybrid` reads EXL3 experts since 2026-10-11: [cpu-experts.md](cpu-experts.md)). FTW conversion is untested. The vision tower reads the checkpoint's bf16
   `qkv` (image input checked with one image per branch).
 
-Measured on 2026-10-16 (the image of this release) with the profiles as shipped, MTP head on, one request (decode: greedy,
+Measured on 2026-10-16 (the image of 8899710) with the profiles as shipped, MTP head on, one request (decode: greedy,
 from 9k tokens to the profile's maximum context; RAM: locked while serving;
 [benchmarks.md](benchmarks.md#depth-sweep-exl3-checkpoints) has every step, the cold reads and the sampled decode):
 

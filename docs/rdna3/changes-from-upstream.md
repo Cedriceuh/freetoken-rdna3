@@ -2,7 +2,7 @@
 
 This repository is a modified version of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken) (Apache
 License 2.0), taken at `0d652e7` (2026-09-26) and merged with upstream up to `ee9789f` (2026-10-10), then up to
-`9b68e00` (2026-10-16; four of its commits cherry-picked first, then the rest merged). Every file changed
+`9b68e00` (2026-10-15; five of its commits cherry-picked first, then the rest merged). Every file changed
 or added relative to upstream is listed here with the reason. Line counts are `added/removed`, against the upstream
 commit of the time (`0d652e7`, or the commit a section or row names); `git diff 9b68e00` gives today's. Files the merge made
 identical to upstream again are gone from the tables ([maintaining.md](maintaining.md#the-stack-on-top-of-upstream-oldest-first)).
@@ -122,6 +122,7 @@ Line counts in this section and the next are relative to `d72e5cb` (0.1.0 plus i
 | `Dockerfile.rdna3` | 13/5 | ROCm 10.1 / PyTorch 2.14 base with its own Triton 3.8; pyproject's torchvision floor lowered to ROCm's pre-release (0.29.0a0) at install |
 | `python/freetoken/kernel/triton/moe_align.py`, `tests/kernels/test_moe_align.py`, `moe/fused.py` | 13/9, new, 10/12 against `9b68e00` | ROCm keeps this align over upstream's staged one (`0bca88f`, upstream's fix for the same bug); no comparison on `tl.histogram` counts: Triton 3.8's AMD range analysis gives them an empty range and folds such comparisons to false, which left the expert ids unwritten (up to 1024 routes) or every count at zero (more), and the expert GEMMs then read wild addresses |
 | `python/freetoken/kernel/csrc/row_store/row_store_ext.cpp`, `kernel/row_store.py`, `models/qwen4_exp/ple_disk.py` | 32/4, 40/1, 18/1 | HIP stream memops for the PLE wait-sync (the probe used to look for the CUDA driver's only); a captured wait must hold three replays with the PLE copy behind it (`FREETOKEN_PLE_SYNC`); on one GPU without the MTP head (overlapped decode steps) `auto` takes launch-gating, 44 % faster there |
+| `tests/models/qwen4_exp/test_ple_disk.py` | 27/0 | `FREETOKEN_PLE_SYNC=auto` takes launch-gating on one GPU when the decode steps overlap (no MTP head) |
 | `python/freetoken/kernel/host_allreduce.py`, `kernel/csrc/jit/host_allreduce.cuh` | 20/5, 11/5 | the optional wait log (`FREETOKEN_HOST_ALLREDUCE_WAITLOG`), removed at a clean shutdown |
 | `python/freetoken/layers/moe.py`, `moe/offload_cache.py`, `models/qwen4_exp/moe.py` | 35/0, 20/0, 13/1 | the optional side-stream copy of the missing experts (`FREETOKEN_MOE_COPY_OVERLAP`) |
 | `python/freetoken/engine/engine.py` | 30/0 | the process's memory locked once loaded (`FREETOKEN_MLOCK`) so that, with `vm.compact_unevictable_allowed=0`, memory compaction leaves the pages the GPU driver maps alone; a warning while it is 1 |
@@ -204,7 +205,7 @@ Line counts here are on top of the lines listed in the sections above.
 | `python/freetoken/engine/engine.py` | 13/5 | the executor's row bound counts the MTP verify rows (sized up front, a larger task refused); `FREETOKEN_HYBRID_FETCH_FRACTION`; the TP CPU group handed to the executor |
 | `python/freetoken/layers/quantization/moe/nvfp4.py`, `layers/quantization/moe/exl3.py` | 8/2, 14/3 | CPU decode allowed under tensor parallelism with NVFP4; an EXL3 CPU format (mul1, 2-4 bits); both kernels take inactive slots (`FREETOKEN_HYBRID_SKIP_CPU_ROUTES`) |
 | `python/freetoken/kernel/triton/nvfp4_fused_moe.py`, `moe/fused_nvfp4.py`, `kernel/triton/exl3.py`, `moe/fused_exl3.py` | 7/0, 4/0, 17/7, 6/3 | the decode GEMVs write zeros for a slot of -1 without a read; the EXL3 rotation and scale kernels read slot 0's scales for it |
-| `tests/moe/test_cpu_moe_exl3.py`, `tests/moe/test_cpu_moe.py`, `tests/moe/test_nvfp4_backends.py` | new, 69/0, 24/0 | the EXL3 path against the reference codec, tensor-parallel slices, skipped routes, rows sharing an expert, the size check; the publish / merge path eager and replayed in a graph, a step without a CPU route among them; the GPU skip of the CPU's routes bit-identical (NVFP4, EXL3) |
+| `tests/moe/test_cpu_moe_exl3.py`, `tests/moe/test_cpu_moe.py`, `tests/moe/test_nvfp4_backends.py` | new, 56/0 against `9b68e00`, 24/0 | the EXL3 path against the reference codec, tensor-parallel slices, skipped routes, rows sharing an expert, the size check; the publish / merge path eager and replayed in a graph, a step without a CPU route among them; the GPU skip of the CPU's routes bit-identical (NVFP4, EXL3) |
 
 ## Decode on two cards, bit-exact (night of 2026-10-11)
 
@@ -240,6 +241,7 @@ Line counts here are on top of the lines listed in the sections above.
 | `python/freetoken/kernel/triton/causal_conv1d_triton.py`, `models/qwen4_exp/gdn.py`, `tests/kernels/test_conv_rows.py` | 46/0, 38/3, new | the GatedDeltaNet prefill conv token-major (`FREETOKEN_GDN_CONV_ROWS`): the projection's q / k / v columns read in place, each group written to its own contiguous buffer, the same kernel and taps |
 | `python/freetoken/server/args.py`, `server/api_server.py`, `docs/cli.md`, `tests/server/test_default_temperature.py` | 13/0, 16/3, 1/0, 43/0 | `--default-temperature`: the temperature of requests that send none, in place of the checkpoint's |
 | `python/freetoken/tokenizer/prefix_cache.py`, `tokenizer/tokenize.py`, `tests/tokenizer/test_prefix_cache.py` | 167/0, 11/5, 133/0 | `PromptPrefixCache`: a templated prompt reuses an earlier prompt's tokens up to the last `<\|im_start\|>` of their shared prefix and encodes the rest, the same tokens (`FREETOKEN_TOKENIZE_PREFIX_CACHE`) |
+| `tests/README.md` | 1/0 | `FREETOKEN_TOKENIZE_CACHE_MODEL`, the checkpoint the prefix-cache test tokenizes with |
 | `tests/moe/test_prefill_cached.py` | 273/0 | prefill from slots bit-identical to the full-layer buffers (EXL3, NVFP4), the LRU claims and demotion, the predicted prefetch then the fix-up copy, the split prefetch by DMA or shader copy (GPU) |
 
 ## Tooling and documentation

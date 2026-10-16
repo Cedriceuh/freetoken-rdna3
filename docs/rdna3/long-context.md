@@ -85,21 +85,21 @@ Measured in the afternoon of 2026-10-10, after the tables above:
   now the default on ROCm): 129 us (8 rows: 220 us), the same bits. In the server it gave less than the kernel time
   suggests: decode 84.2 tok/s at 118k (84.3 before), 88.5 at 237k, 87.9 at 498k (85.8 before); the MoE weights going
   through the same L2 probably evict the K/V lines between rows (not measured).
-- **The indexer's top-k fell back to one program per row on a 1M-token table.** Its split path holds at most 16
-  chunks of 8192 columns; a 1M-token context's page table is 250,000 block columns wide, so `_split_plan` gave up and
-  each row was scanned by a single program: 504 us per decode layer at 988k visible tokens against 77-83 us split
-  (4 rows, the same winners, ties included). The split now takes more chunks past 16; tables up to 131,072 columns
-  (contexts up to 524,288 tokens, so the 262k profiles) keep their plan. This tree first merged the extra chunks in one
-  spilled tile; since the merge of upstream `ee9789f` it runs upstream's own fix (`5031e3d`): reduction levels, each
-  program keeping the top-k of 8,192 candidates, until the survivors fit one merge, with no length limit. On the 7900
-  XT, one decode layer's top-k at 247,000 visible columns (988k tokens): 53 / 64 / 96 us for 1 / 4 / 8 rows against
-  65 / 75 / 101 with the spilled tile, the same winners; 4-7 us more than the spilled tile at 30,000 visible columns,
-  the same as before on the 65,536-column tables of the 262k profiles (`rdna3/bench/qsa_topk_bench.py`).
-  Below ~100k visible tokens the wide table's split costs ~40 us per layer more than the one-program scan did. With
-  both changes, measured with the spilled tile (a cold read, then 700 tokens): 498k read at 1973 tok/s, decode 91.9
-  tok/s (85.8 before); 988k read at 1775 tok/s in 9.3 min (1711), decode 83.6 tok/s (72.1); the same text as before
-  both changes. With upstream's levels (the image of the merge): the same text again at 498k (read 2014 tok/s, decode
-  93.0) and 988k (1780, 84.7), XTX peak 22.76 GiB.
+- **The indexer's top-k fell back to one program per row on a 1M-token table.** Its split path holds at most 16 chunks
+  of 8192 columns; a 1M-token context's page table is 250,000 block columns wide, so `_split_plan` gave up and each row
+  was scanned by a single program: 504 us per decode layer at 988k visible tokens against 77-83 us split (4 rows, the
+  same winners, ties included). The split now takes more chunks past 16; tables up to 131,072 columns (contexts up to
+  524,288 tokens, so the 262k profiles) keep their plan. This tree first merged the extra chunks in one spilled tile;
+  since the merge of upstream `ee9789f` it runs upstream's own fix (`5031e3d`): reduction levels, each program keeping
+  the top-k of 8,192 candidates, until the survivors fit one merge, with no length limit. On the 7900 XT, one decode
+  layer's top-k at 247,000 visible columns (988k tokens): 53 / 64 / 96 us for 1 / 4 / 8 rows against 65 / 75 / 101 with
+  the spilled tile, the same winners; 4-7 us more than the spilled tile at 30,000 visible columns, the same as before on
+  the 65,536-column tables of the 262k profiles (`rdna3/bench/qsa_topk_bench.py`). Below ~100k visible tokens the wide
+  table's split costs ~40 us per layer more than the one-program scan did. With both changes, measured with the spilled
+  tile (a cold read, then 700 tokens): 498k read at 1973 tok/s, decode 91.9 tok/s (85.8 before); 988k read at 1775 tok/s
+  in 9.3 min (1711), decode 83.6 tok/s (72.1); the same text as before both changes. With upstream's levels (the image
+  of the `ee9789f` merge): the same text again at 498k (read 2014 tok/s, decode 93.0) and 988k (1780, 84.7), XTX peak
+  22.76 GiB.
 - **A/B at 118k** (decode tok/s, EXL3 3.05): K/V in VRAM, 262k table (the `xtx-xt` profile as it was then: 250k, 9,932 expert slots) 90.6;
   K/V on the host, 262k table (12,667 slots) 86.6; K/V on the host, 1M table (11,261 slots) 84.2. Both the host K/V
   and the wide table cost a few percent there.

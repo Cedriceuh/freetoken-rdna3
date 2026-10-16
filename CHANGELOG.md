@@ -33,7 +33,7 @@
   wait cost ~11 ms a step. NVFP4 `xtx --no-mtp`: 26.6 -> 38.3 tok/s greedy, the same tokens. Two cards, and one card
   with the head, keep the wait-sync, 2-4 % faster there.
 - The README and its banner, `docs/rdna3/benchmarks.md` (summary, depth sweeps, locked RAM, expert caches), the
-  profiles' figures and `llms.txt` re-measured on the image of this release (2026-10-16), one server per profile and
+  profiles' figures and `llms.txt` re-measured on the image of 8899710 (2026-10-16), one server per profile and
   checkpoint, the 2026-10-12 protocol, two cards to 260k tokens: greedy decode along the context on `xtx-xt` 78-96 tok/s
   with NVFP4, 95-117 at EXL3 3.05 bpw, 86-94 at 4.05 bpw, on one card about as before; agent turns on `xtx-xt` 0.7-1.0 s
   at every depth (0.9-2.1 s before), on `xtx` / `xt` 1.0-1.8 s (1.5-2.8 s); cold 8.3k-token reads 3.6-3.8 s on two
@@ -58,16 +58,17 @@
   kept, VRAM off the expert cache), `HIP_FORCE_DEV_KERNARG`; with the decode step kernel by kernel (rocprofv3) and the
   gaps between kernels.
 - `rdna3/serve.sh --hybrid` (off by default): the CPU computes part of each decode step's expert misses from RAM
-  (upstream's `--moe-strategy hybrid`, which could not run here). The executor signals with HIP's stream memops (it
-  fell back to two host callbacks per layer on ROCm), sizes its scratch for the MTP verify rows up front, runs under
-  tensor parallelism with NVFP4 (each rank on half the cores), reads EXL3 experts (AVX2), and reads (NVFP4) or decodes
-  (EXL3) an expert once for the rows that share it. The hybrid layer's GPU ends are one kernel each and carry the
-  handshake themselves (step numbers, system-scope atomics: no stream memop left), and the kernel that picks which
-  misses to fetch reads the routes as vectors (same decisions); the GPU decode kernels skip the routes the CPU
-  computes instead of running them at weight 0 (+1-3 %, `FREETOKEN_HYBRID_SKIP_CPU_ROUTES`). Cores by slice size, SMT
-  siblings and EXL3 column blocks were measured too (off: no gain, or slower in serving). NVFP4: `xtx` 39.4 -> 56.2
-  tok/s, `xt` 31.4 -> 46.6, `xtx-xt` one request 78.2 -> 81.2-82.7, 4 requests 24.4 -> 28.2-28.6 each; EXL3: `xtx`
-  +6 %, a loss on two cards ([docs/rdna3/cpu-experts.md](docs/rdna3/cpu-experts.md)).
+  (upstream's `--moe-strategy hybrid`, which could not run here). The executor signals with HIP's stream memops (it fell
+  back to two host callbacks per layer on ROCm; upstream's own since `2010271`), sizes its scratch for the MTP verify
+  rows up front, runs under tensor parallelism with NVFP4 (each rank on half the cores), reads EXL3 experts (AVX2), and
+  reads (NVFP4) or decodes (EXL3) an expert once for the rows that share it. The hybrid layer's GPU ends are one kernel
+  each and carry the handshake themselves (since the merge of `9b68e00`, the step's task word on two pinned flag words;
+  system-scope atomics: no stream memop left), and the kernel that picks which misses to fetch reads the routes as
+  vectors (same decisions); the GPU decode kernels skip the routes the CPU computes instead of running them at weight 0
+  (+1-3 %, `FREETOKEN_HYBRID_SKIP_CPU_ROUTES`). Cores by slice size, SMT siblings and EXL3 column blocks were measured
+  too (off: no gain, or slower in serving). NVFP4: `xtx` 39.4 -> 56.2 tok/s, `xt` 31.4 -> 46.6, `xtx-xt` one request
+  78.2 -> 81.2-82.7, 4 requests 24.4 -> 28.2-28.6 each; EXL3: `xtx` +6 %, a loss on two cards
+  ([docs/rdna3/cpu-experts.md](docs/rdna3/cpu-experts.md)).
 - Upstream FreeToken merged up to `9b68e00` (15 commits, 2026-10-10 to 2026-10-15); the authors' commits are kept
   (five cherry-picked first, the rest merged). On this tree's path: transformers 5.18 (the Qwen3.8-Flash-Next config,
   the chat-template tokens, tool calls and a ~105k-token text, and the image preprocessing read the same as with 5.16,
@@ -149,7 +150,6 @@
   `tl.histogram` an empty range and folds comparisons on its counts to false, which broke `moe_align_block_size`
   (an illegal memory access in the first prefill, then a hang): the kernel no longer compares those counts. HIP stream memops make the PLE wait-sync work there (`FREETOKEN_PLE_SYNC`, +3.5-4 % decode). TunableOp and its
   files are gone (< 0.2 % on prompt reading once tuned for this image).
-- The GGUF kernels build on ROCm.
 - Optional switches: `FREETOKEN_MOE_COPY_OVERLAP` (expert copies on a side stream; measured 33 % slower end to end, leave
   it off), `FREETOKEN_HOST_ALLREDUCE_WAITLOG`
   (debug), `FREETOKEN_INT8_ROW_GROUPS` (on: up to 4 rows share each int8 weight tile).

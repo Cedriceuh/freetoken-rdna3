@@ -22,6 +22,11 @@ kept) and a merge of the rest up to `9b68e00`. Once the `upstream` remote is set
 | GDN boundary carried across the prefill chunk seam | community ROCm port (lukascechovic) | upstream carries it |
 | qwen4_exp tensor parallelism | rewritten from the community port's | upstream supports qwen4_exp at TP>1 |
 | unequal cards, uneven split, int8 dense, GEMVs, host all-reduce, sampler, tuned tiles, blocked prefill, multi-request, RAM tier, review fixes | this repository | upstream merges it (to be proposed piece by piece) |
+| MTP head, EXL3 checkpoints, K/V in host RAM, short prefills through the expert cache, `--hybrid` on ROCm | this repository | upstream merges it |
+| `kernel/triton/moe_align.py` on ROCm, over upstream's staged align (`0bca88f`) | this repository (Triton 3.8 histogram fix) | upstream's align is checked on ROCm's Triton 3.8, or Triton fixes the histogram range |
+| hybrid publish / merge kernels over pinned flag words | this repository | upstream drops its copies around the doorbell on ROCm |
+| HIP stream memops for the PLE wait-sync (`row_store_ext.cpp`) | this repository | upstream's row store finds HIP's memops |
+| `LaunchKernel::with_attr` refuses `use_pdl=True` on ROCm | this repository | upstream refuses it too |
 | `Dockerfile.rdna3`, `rdna3/`, `docs/rdna3/` | this repository | never |
 
 Left the stack at the merge of `ee9789f`: upstream merged #134 (CUDA-only backends gated off on ROCm, `9b585b7`) and

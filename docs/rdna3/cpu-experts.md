@@ -71,11 +71,12 @@ The CPU pool spins on its cores while a decode runs and parks 50 ms after the la
 
 ## What it took on this hardware
 
-- **The GPU <-> CPU handshake.** Upstream signals the CPU pool with stream memory operations (`cuStreamWriteValue64` /
-  `cuStreamWaitValue64`) looked up in `libcuda`; on ROCm there is none, so every MoE layer fell back to two
-  `hipLaunchHostFunc` callbacks, ~1-1.5 ms each: a test on 2026-10-01 decoded at 5.9-8.3 tok/s against 55-56
-  (`xtx-xt`) and the idea was dropped on that number. HIP's own `hipStreamWriteValue64` / `hipStreamWaitValue64` work,
-  in captured graphs too, on ROCm 10.1 (the PLE disk reads already rely on them).
+- **The GPU <-> CPU handshake.** Upstream signalled the CPU pool with stream memory operations
+  (`cuStreamWriteValue64` / `cuStreamWaitValue64`) looked up in `libcuda`; on ROCm there was none, so every MoE layer
+  fell back to two `hipLaunchHostFunc` callbacks, ~1-1.5 ms each: a test on 2026-10-01 decoded at 5.9-8.3 tok/s against
+  55-56 (`xtx-xt`) and the idea was dropped on that number. HIP's own `hipStreamWriteValue64` / `hipStreamWaitValue64`
+  work, in captured graphs too, on ROCm 10.1 (the PLE disk reads already rely on them); upstream has its own HIP
+  backend for them since `2010271`, which replaced this tree's at the merge of `9b68e00`.
 - **MTP verify rows.** The executor was sized for `max(--max-running-requests, --cuda-graph-max-bs)` rows, but a
   verify step runs up to `FREETOKEN_SPEC_VERIFY_M` rows per request: the C++ scratch then grew on the first verify
   step, in the middle of serving (and the EXL3 scratch below has no such path). The bound now counts the verify rows,
@@ -108,7 +109,8 @@ The CPU pool spins on its cores while a decode runs and parks 50 ms after the la
 
   EXL3 `xtx-xt-4x262k` with every miss fetched (the CPU gets nothing), against offload 85.8 / 33.9 tok/s: 80.3 / 31.6
   before the last three changes, 82.8 / 33.1 after; NVFP4 `xtx-xt`, one request: 71.0 (first version), 74.3 (fused
-  kernels), 78.3 (all).
+  kernels), 78.3 (all). Measured on 2026-10-11 with the step-number handshake; the task-word one of 2026-10-16 was not
+  measured again.
 - **Rows routed to the same expert.** The CPU computed each (row, expert) route on its own, so an expert two rows of a
   step use (MTP verify rows, several requests) was read from RAM, or for EXL3 decoded, once per row: 8-13 % of the
   CPU's routes in these runs (`FREETOKEN_CPU_MOE_ROUTE_STATS=n` prints the share). NVFP4: one task per (expert, row

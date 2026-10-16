@@ -19,7 +19,7 @@ Two tiers ride alongside the shadow slab and are NOT per-token:
 The slab is amortized into the per-token KV price (``unit_bytes``); the ring and scratch are
 fixed and priced through ``kv_cost``'s ``fixed_cache_size``.
 
-``FREETOKEN_QSA_KV_INT8=1`` (EXPERIMENTAL, NOT RECOMMENDED: on a long-context agentic bench it cut the
+``FREETOKEN_QSA_KV_INT8=1`` (NOT RECOMMENDED: on a long-context agentic bench it cut the
 success rate by about a third and changed the agent's behaviour, although short scored benches and needle
 tests saw no loss -- one scale per (token, kv head) over 256 dims lets the keys' outlier channels crush the
 others) stores the paged K/V as symmetric int8 with one fp32 scale per
@@ -51,8 +51,9 @@ def kv_int8_enabled() -> bool:
     return os.environ.get(KV_INT8_ENV) == "1"
 
 
-# FREETOKEN_QSA_KV_HOST=1 (experiment): the K/V slab lives in pinned, device-mapped host memory; the kernels read the
-# selected tokens across PCIe and the VRAM it frees goes to the expert cache (the index tiers stay in VRAM)
+# FREETOKEN_QSA_KV_HOST=1 (set by the K/V-in-RAM profiles): the K/V slab lives in pinned, device-mapped host memory;
+# the kernels read the selected tokens across PCIe and the VRAM it frees goes to the expert cache (the index tiers
+# stay in VRAM)
 KV_HOST_ENV = "FREETOKEN_QSA_KV_HOST"
 # FREETOKEN_QSA_STAGE_SELECTED (default 1): with the host K/V, a prefill stages only the K/V rows of the tokens it
 # selects (marked per layer from the attention's indices, by the attention kernel's own mapping) instead of every page

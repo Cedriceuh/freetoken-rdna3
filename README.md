@@ -39,9 +39,10 @@ the server has never seen, like large tool results ([method](docs/rdna3/benchmar
 | RAM while serving (locked): two cards; one card | 82 GiB; 73 GiB | 60 GiB; 51 GiB | 75 GiB; 66 GiB |
 | Experts cached per card, `xtx-xt` (of 24,576) | 7.0k | 9.8k | 7.2k |
 
-Measured on 2026-10-16 with the image of this release, one server per cell started by `rdna3/serve.sh`. The 3 bpw
-experts are smaller, so more of them stay in VRAM (9.8k instead of 7.0k per card on `xtx-xt`); the checkpoints also answer
-differently, which changes how many of the MTP head's guesses are kept.
+Measured on 2026-10-16 with the image of 8899710 (the merge of upstream `9b68e00` after it measured -0.8 to +0.9 %
+against it on `xtx-xt-4x262k`, [CHANGELOG](CHANGELOG.md)), one server per cell started by `rdna3/serve.sh`. The 3 bpw
+experts are smaller, so more of them stay in VRAM (9.8k instead of 7.0k per card on `xtx-xt`); the checkpoints also
+answer differently, which changes how many of the MTP head's guesses are kept.
 
 The MTP head (the model's own draft layer) guesses the next tokens and one step checks them; greedy answers are
 identical with and without it. On `xtx-xt` with NVFP4 it takes one request from 65.5 to 88 tok/s at the
@@ -98,7 +99,7 @@ One ready-made profile per hardware setup, measured for the tested ones and deri
 | `xtx-xtx` | two RX 7900 XTX 24 GB | 262k | 4 | untested: decode expected >= `xtx-xt`; EXL3 needs `FREETOKEN_TP_SPLIT=0.6` |
 | `xt-xt` | two RX 7900 XT 20 GB | 262k | 4 | untested: decode expected a little below `xtx-xt`; same EXL3 note |
 | `gre` | one RX 7900 GRE 16 GB | 65k | 1 | untested: ~20 tok/s at best expected (NVFP4, head off) |
-| `xtx-xt-4x262k` | RX 7900 XTX 24 GB + RX 7900 XT 20 GB | 262k each | 4 | EXL3 3.05 bpw measured: the K/V in RAM, 4 full contexts at once ([long-context](docs/rdna3/long-context.md)) |
+| `xtx-xt-4x262k` | RX 7900 XTX 24 GB + RX 7900 XT 20 GB | 262k each | 4 | EXL3 3.05 bpw (4 contexts) and NVFP4 (3) measured: the K/V in RAM, full contexts at once ([long-context](docs/rdna3/long-context.md)) |
 | `xtx-xt-1m` | RX 7900 XTX 24 GB + RX 7900 XT 20 GB | 1M | 4 (sharing 1M) | EXL3 3.05 bpw measured: the K/V in RAM, one conversation up to 1M ([long-context](docs/rdna3/long-context.md)) |
 
 Untested profiles are derived from the measured ones and the engine's memory plans; the script says so when you start

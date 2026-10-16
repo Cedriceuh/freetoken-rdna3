@@ -487,14 +487,15 @@ greedy answers changed on 5 of 15 prompts ([options.md](options.md)).
 
 ## 24. Expert misses on the CPU: `--hybrid` (2026-10-11)
 
-`rdna3/serve.sh --hybrid` runs upstream's `--moe-strategy hybrid`: part of each decode step's expert misses is
-computed by the CPU from RAM instead of crossing PCIe. It could not run as shipped on ROCm. The executor now signals
-with HIP's stream memops (it fell back to two host callbacks per layer), sizes its buffers for the MTP verify rows, runs
-under tensor parallelism with NVFP4 (each rank's pool on half the cores) and reads EXL3 experts (AVX2). Opt-in: greedy
-answers differ from the offload path's at rounding level, the CPU summing in fp32 in another order (measured as
-precise as the GPU, section 27). Decode, one request, re-measured on 2026-10-13: NVFP4 `xtx` 42.7 -> 62.3 tok/s
-(+46 %), `xt` 34.6 -> 52.1 (+51 %), `xtx-xt` 82.9 -> 84.5 and 25.2 -> 28.9 each with four at once; EXL3 3.05 bpw `xtx`
-54.8 -> 57.8 (+5 %), `xtx-xt` even. Details and the settings tried without gain: [cpu-experts.md](cpu-experts.md).
+`rdna3/serve.sh --hybrid` runs upstream's `--moe-strategy hybrid`: part of each decode step's expert misses is computed
+by the CPU from RAM instead of crossing PCIe. It could not run as shipped on ROCm. The executor now signals with HIP's
+stream memops, upstream's own since `2010271` (it fell back to two host callbacks per layer), sizes its buffers for the
+MTP verify rows, runs under tensor parallelism with NVFP4 (each rank's pool on half the cores) and reads EXL3 experts
+(AVX2). Opt-in: greedy answers differ from the offload path's at rounding level, the CPU summing in fp32 in another
+order (measured as precise as the GPU, section 27). Decode, one request, re-measured on 2026-10-13: NVFP4 `xtx` 42.7 ->
+62.3 tok/s (+46 %), `xt` 34.6 -> 52.1 (+51 %), `xtx-xt` 82.9 -> 84.5 and 25.2 -> 28.9 each with four at once; EXL3 3.05
+bpw `xtx` 54.8 -> 57.8 (+5 %), `xtx-xt` even. Details and the settings tried without gain:
+[cpu-experts.md](cpu-experts.md).
 
 ## 25. A decode step, kernel by kernel (2026-10-11 and 12)
 
@@ -660,10 +661,11 @@ now splitting the routes (what this tree's split kernel did), and the expert cac
 upstream's structure and moved this tree's pieces onto it: the EXL3 CPU experts behind a whole-task hook of the format
 interface, the publish / merge kernels on upstream's task-word handshake (two pinned words, rung and reset by one lane:
 a review of the port found that a reset repeated by every thread could make the coordinator run a step twice), the
-prefill through the cache gated to one slot pool of at least two layers of experts. transformers 5.18 rounds two rows of
-its YaRN reference two ulps away from 5.16: the test now allows that, the engine's rows are unchanged. Upstream's fix of
-the Triton 3.8 histogram bug (a staged align, `0bca88f`) was left out: `moe_align.py` here has no such compare. Through
-both launcher entries the answers stayed the same, bit for bit ([CHANGELOG](../../CHANGELOG.md)).
+prefill through the cache gated to one slot pool of at least two layers of experts. transformers 5.18 rounds a few
+values of its YaRN reference up to two ulps away from 5.16: the test now allows that, the engine's rows are unchanged.
+Upstream's fix of the Triton 3.8 histogram bug (a staged align, `0bca88f`) was left out: `moe_align.py` here has no such
+compare. On `xtx-xt-4x262k` with NVFP4 and EXL3 3.05 bpw the answers stayed the same, bit for bit
+([CHANGELOG](../../CHANGELOG.md)).
 
 ## 29. Still open
 
