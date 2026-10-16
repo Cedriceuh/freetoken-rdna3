@@ -59,7 +59,7 @@ docker run --rm --device=/dev/kfd --device=/dev/dri --security-opt seccomp=uncon
 | `moe_block_check.py` | the token-blocked NVFP4 prefill MoE returns exactly what the one-shot call returns |
 | `host_allreduce_check.py` (2 GPUs: `HIP_VISIBLE_DEVICES=0,1`) | the host-memory all-reduce against RCCL |
 | `host_kv_check.py` | the RAM-tier copies (device -> RAM -> device) are exact |
-| `qsa_kv_int8_check.py` | the experimental int8 attention KV against bf16 and an fp32 reference |
+| `qsa_kv_int8_check.py` | the int8 attention KV (off, not recommended) against bf16 and an fp32 reference |
 | `run_sampling_tests.sh <module>` + `sampling_test.py` | sampling kernels in four modes, each killed after 90 s (hang detector). Runs on the host and starts its own containers (image: `FREETOKEN_IMAGE`, default `freetoken-rdna3:latest`) |
 | `shape_check.py` (CPU) | the loader's per-rank tensors match the buffers the model declares, per TP rank; `--vision` includes the vision tower; needs the checkpoint mounted at `/models/m` (`-v <model dir>:/models/m:ro`) |
 

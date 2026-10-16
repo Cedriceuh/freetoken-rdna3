@@ -12,14 +12,14 @@ it).
 | `xtx-xtx` *(untested)* | 2x RX 7900 XTX 24 GB | 262,144 | expected >= `xtx-xt` | – | – | – | 4 requests |
 | `xt-xt` *(untested)* | 2x RX 7900 XT 20 GB | 262,144 | expected a little below `xtx-xt` | – | – | – | 4 requests |
 | `gre` *(untested)* | RX 7900 GRE 16 GB | 65,536 | expected ~20 tok/s at best (head off) | – | – | – | 1 request |
-| `xtx-xt-4x262k` *(experimental)* | RX 7900 XTX 24 GB + RX 7900 XT 20 GB | 262,144 per request, 4 at once | EXL3 3.05: 91 tok/s alone at 261k, 29-30 each with 4 | – | – | 3.0-4.2 s at 257-260k with 4 at once, 1.8 s alone (2026-10-10); 0.46-0.59 s alone at 224k (2026-10-15); 130-340-token turns alone at 25k 0.40-0.48 s, NVFP4 0.58-0.70 s (2026-10-16) | 4 requests |
-| `xtx-xt-1m` *(experimental)* | RX 7900 XTX 24 GB + RX 7900 XT 20 GB | 1,000,000 | EXL3 3.05: 84-92 tok/s from 118k to 988k | – | – | – | 4 requests, sharing 1M |
+| `xtx-xt-4x262k` | RX 7900 XTX 24 GB + RX 7900 XT 20 GB | 262,144 per request, 4 at once | EXL3 3.05: 91 tok/s alone at 261k, 29-30 each with 4 | – | – | 3.0-4.2 s at 257-260k with 4 at once, 1.8 s alone (2026-10-10); 0.46-0.59 s alone at 224k (2026-10-15); 130-340-token turns alone at 25k 0.40-0.48 s, NVFP4 0.58-0.70 s (2026-10-16) | 4 requests |
+| `xtx-xt-1m` | RX 7900 XTX 24 GB + RX 7900 XT 20 GB | 1,000,000 | EXL3 3.05: 84-92 tok/s from 118k to 988k | – | – | – | 4 requests, sharing 1M |
 
 "Decode" is one request's 512-token answers at the sampling `rdna3/serve.sh` gives (temperature 0.6; median of 12,
 2026-10-16); "deep decode" is greedy decode at every context step from 9k to 260k on two cards and 124k on one; "agent turn" is the
 time to the first token when ~1k new tokens are added to a cached conversation, over the same steps. The profiles turn
 the MTP head on; `rdna3/serve.sh <profile> --no-mtp` turns it off (numbers in brackets). All numbers:
-[benchmarks.md](benchmarks.md). `--hybrid` (experimental) has the CPU compute part of the expert misses: NVFP4 on
+[benchmarks.md](benchmarks.md). `--hybrid` (off by default) has the CPU compute part of the expert misses: NVFP4 on
 `xtx` 62.3 tok/s instead of 42.7, on `xt` 52.1 instead of 34.6, on `xtx-xt` 84.5 instead of 82.9 (2026-10-13;
 [cpu-experts.md](cpu-experts.md)).
 
@@ -71,7 +71,7 @@ the agentic benchmark runs and are checked for exactness instead ([benchmarks.md
 
 RAM: 82 GiB while serving, all of it locked (measured: ~63 GiB of experts, 9.5 GiB for the RAM tier, the rest the two processes); 60 GiB with the EXL3 3.05 bpw checkpoint, 75 GiB with 4.05 bpw.
 
-With an experimental EXL3 checkpoint
+With an EXL3 checkpoint
 ([how-it-works.md](how-it-works.md#exl3-checkpoints)) the same profile applies: the
 experts go through the EXL3 kernels (the start log says `MoE experts: exl3 via triton`), so `--quant-backend
 moe.nvfp4=triton` and the `FREETOKEN_NVFP4_*_TUNED` tiles do nothing; the split rounds to whole 128-wide blocks (384 /
@@ -80,7 +80,7 @@ instead of 51. On two cards `serve.sh` lowers `--memory-ratio` to 0.77 (0.76 fro
 384-wide slice bounds the expert cache, and at 0.80 the 7900 XTX peaked 200 MiB under full VRAM
 ([journey.md](journey.md#16-exl3-checkpoints-2026-10-04)); `-- --memory-ratio X` overrides it.
 
-## `xtx-xt-4x262k` and `xtx-xt-1m`: the K/V in host RAM (experimental)
+## `xtx-xt-4x262k` and `xtx-xt-1m`: the K/V in host RAM
 
 The `xtx-xt` settings with the attention K/V in pinned host memory (`FREETOKEN_QSA_KV_HOST=1`), so the K/V pool is no
 longer bounded by VRAM: `xtx-xt-4x262k` keeps each request to the model's native 262,144 positions and holds four of
@@ -148,7 +148,7 @@ Nothing below has been measured; treat it as a starting point and check with the
   gfx1101) needs its own image (`--build-arg GPU_ARCH=gfx1101`) and can start from `gre`; the 7700 XT (12 GB,
   gfx1101) and 7600 (8 GB, gfx1102) have less VRAM than any profile plans for. None of them is tested.
 - **Less RAM**: `FREETOKEN_HOST_KV=0` saves the RAM tier (9.5 GiB on two cards, ~5 GiB on one; evicted conversations
-  are re-read instead). In NVFP4 the experts themselves cannot go below ~63 GiB; the experimental EXL3 3 bpw
+  are re-read instead). In NVFP4 the experts themselves cannot go below ~63 GiB; the EXL3 3 bpw
   checkpoint needs 42.6 GiB: [limits.md](limits.md).
 
 Every environment variable in these files is explained in [options.md](options.md); the `ft serve` flags in the tables

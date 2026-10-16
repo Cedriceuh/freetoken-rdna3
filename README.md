@@ -49,7 +49,7 @@ sampling `rdna3/serve.sh` gives (temperature 0.6, 2026-10-16); with 3-4 requests
 agent turns (~90k-token contexts of code, temperature 0.6, 2026-10-03): 71 tok/s for a request alone, ~34 tok/s each
 when two sub-agents decode at once ([benchmarks](docs/rdna3/benchmarks.md#agent-turns-on-real-code-xtx-xt)).
 
-Experimental: `rdna3/serve.sh <profile> --hybrid` has the CPU compute part of each decode step's missing experts
+Off by default: `rdna3/serve.sh <profile> --hybrid` has the CPU compute part of each decode step's missing experts
 straight from RAM instead of copying them to the GPU. With NVFP4 (2026-10-13): one request on `xtx` from 42.7 to
 62.3 tok/s (`xt`: 34.6 to 52.1), on `xtx-xt` 82.9 to 84.5 for one request and 25.2 to 28.9 tok/s each for four at
 once; EXL3 3.05 bpw: +5 % on `xtx`, even on `xtx-xt` ([docs/rdna3/cpu-experts.md](docs/rdna3/cpu-experts.md)).
@@ -98,8 +98,8 @@ One ready-made profile per hardware setup, measured for the tested ones and deri
 | `xtx-xtx` | two RX 7900 XTX 24 GB | 262k | 4 | untested: decode expected >= `xtx-xt`; EXL3 needs `FREETOKEN_TP_SPLIT=0.6` |
 | `xt-xt` | two RX 7900 XT 20 GB | 262k | 4 | untested: decode expected a little below `xtx-xt`; same EXL3 note |
 | `gre` | one RX 7900 GRE 16 GB | 65k | 1 | untested: ~20 tok/s at best expected (NVFP4, head off) |
-| `xtx-xt-4x262k` | RX 7900 XTX 24 GB + RX 7900 XT 20 GB | 262k each | 4 | experimental, EXL3 3.05 bpw measured: the K/V in RAM, 4 full contexts at once ([long-context](docs/rdna3/long-context.md)) |
-| `xtx-xt-1m` | RX 7900 XTX 24 GB + RX 7900 XT 20 GB | 1M | 4 (sharing 1M) | experimental, EXL3 3.05 bpw measured: the K/V in RAM, one conversation up to 1M ([long-context](docs/rdna3/long-context.md)) |
+| `xtx-xt-4x262k` | RX 7900 XTX 24 GB + RX 7900 XT 20 GB | 262k each | 4 | EXL3 3.05 bpw measured: the K/V in RAM, 4 full contexts at once ([long-context](docs/rdna3/long-context.md)) |
+| `xtx-xt-1m` | RX 7900 XTX 24 GB + RX 7900 XT 20 GB | 1M | 4 (sharing 1M) | EXL3 3.05 bpw measured: the K/V in RAM, one conversation up to 1M ([long-context](docs/rdna3/long-context.md)) |
 
 Untested profiles are derived from the measured ones and the engine's memory plans; the script says so when you start
 one. Measured something? Please open an issue with your numbers.

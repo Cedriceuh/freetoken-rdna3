@@ -1,4 +1,4 @@
-"""Speculative decoding scaffolding (experimental; qwen4_exp).
+"""Speculative decoding scaffolding (qwen4_exp).
 
 ``FREETOKEN_SPEC_VERIFY_M=m`` (default 1 = off): every decode step runs ``m`` rows per request -- its last token at
 position L and ``m - 1`` draft rows at L+1.. -- through the normal decode path, captured graphs included. The

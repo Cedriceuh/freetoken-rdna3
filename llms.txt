@@ -20,8 +20,8 @@ variables (docs/rdna3/options.md gives each default); what is on by default is b
 release's sampler rework, exact by kernel tests, and its token broadcast, checked in `check`-mode server runs) new and
 not agent-validated. Precision rule: a change is either bit-exact (identical greedy answers) or validated on an agentic
 benchmark (the ROCm 10 base with the MTP head scored 12 and 18 of 29 there); an int8 KV cache that passed every short
-test cut the agentic score from 12-14 to 8-9 and is off in every profile (kept as an experimental option). Tested only
-on RX 7900 XTX + XT; NVIDIA, RDNA4 and TP>2 untested (this model cannot run above TP=2 in this build).
+test cut the agentic score from 12-14 to 8-9 and is off in every profile (kept as an option, not recommended).
+Tested only on RX 7900 XTX + XT; NVIDIA, RDNA4 and TP>2 untested (this model cannot run above TP=2 in this build).
 
 ## Docs
 
@@ -38,7 +38,7 @@ on RX 7900 XTX + XT; NVIDIA, RDNA4 and TP>2 untested (this model cannot run abov
 - [Testing](docs/rdna3/testing.md): CPU suite, GPU checks, micro-benchmarks, the release validation procedure
 - [Maintaining](docs/rdna3/maintaining.md): relation to upstream, sync and release procedure
 - [Changes from upstream](docs/rdna3/changes-from-upstream.md): every modified file with the reason
-- [Long context](docs/rdna3/long-context.md): the K/V in host RAM (experimental): four 262k conversations at once or one of 1M, YaRN or the plain rope, measured to 988k
+- [Long context](docs/rdna3/long-context.md): the K/V in host RAM: four 262k conversations at once or one of 1M, YaRN or the plain rope, measured to 988k
 - [Credits](docs/rdna3/credits.md): who wrote what
 - [All docs in one file](llms-full.txt): the documents above concatenated (README included)
 
@@ -53,7 +53,7 @@ on RX 7900 XTX + XT; NVIDIA, RDNA4 and TP>2 untested (this model cannot run abov
 - [kernel/triton/sampling_topk.py](python/freetoken/kernel/triton/sampling_topk.py): top-k-first sampler; [kernel/triton/sampling.py](python/freetoken/kernel/triton/sampling.py) `_sorted_threshold`: ROCm exact path
 - [kvcache/host_kv_pool.py](python/freetoken/kvcache/host_kv_pool.py) + [kvcache/hybrid_radix_cache.py](python/freetoken/kvcache/hybrid_radix_cache.py): conversations kept in RAM
 - [moe/fused_nvfp4.py](python/freetoken/moe/fused_nvfp4.py): NVFP4 expert kernels, tuned tiles, blocked prefill
-- [kernel/triton/exl3.py](python/freetoken/kernel/triton/exl3.py) + [layers/quantization/exl3_codec.py](python/freetoken/layers/quantization/exl3_codec.py): EXL3 checkpoints (experimental): trellis kernels for gfx1100 and the torch reference; [models/exl3_weights.py](python/freetoken/models/exl3_weights.py) loads them
+- [kernel/triton/exl3.py](python/freetoken/kernel/triton/exl3.py) + [layers/quantization/exl3_codec.py](python/freetoken/layers/quantization/exl3_codec.py): EXL3 checkpoints: trellis kernels for gfx1100 and the torch reference; [models/exl3_weights.py](python/freetoken/models/exl3_weights.py) loads them
 - [models/qwen4_exp/](python/freetoken/models/qwen4_exp/): Qwen3.8-Flash-Next (tensor-parallel port, PLE)
 - [engine/engine.py](python/freetoken/engine/engine.py): memory planning, rank token broadcast, int8 conversion
 - [rdna3/tests/](rdna3/tests/), [rdna3/bench/](rdna3/bench/): GPU checks and micro-benchmarks; `rdna3/bench/quick_bench.py` measures a running server

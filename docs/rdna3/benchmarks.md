@@ -1,7 +1,7 @@
 # Benchmarks
 
 Everything here was measured on one machine: RX 7900 XTX 24 GB + RX 7900 XT 20 GB (gfx1100, PCIe 4.0 x16 each, no GPU
-peer-to-peer), Threadripper 3970X, 128 GB DDR4-3200, Qwen3.8-Flash-Next NVFP4 (RadixArk checkpoint; the experimental
+peer-to-peer), Threadripper 3970X, 128 GB DDR4-3200, Qwen3.8-Flash-Next NVFP4 (RadixArk checkpoint; the
 EXL3 checkpoints in [their depth sweep](#depth-sweep-exl3-checkpoints) and
 [how-it-works.md](how-it-works.md#exl3-checkpoints)). The summary and the three depth-sweep sections were measured
 on 2026-10-16 on the image of this release (ROCm 10.1 / PyTorch 2.14 with its own Triton 3.8): one server per row started

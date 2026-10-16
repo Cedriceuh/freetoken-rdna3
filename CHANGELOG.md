@@ -57,7 +57,7 @@
   GEMV, the MTP cost table, verifying drafts with four requests (-26 %), MTP drafts over part of the vocabulary (fewer
   kept, VRAM off the expert cache), `HIP_FORCE_DEV_KERNARG`; with the decode step kernel by kernel (rocprofv3) and the
   gaps between kernels.
-- `rdna3/serve.sh --hybrid` (experimental): the CPU computes part of each decode step's expert misses from RAM
+- `rdna3/serve.sh --hybrid` (off by default): the CPU computes part of each decode step's expert misses from RAM
   (upstream's `--moe-strategy hybrid`, which could not run here). The executor signals with HIP's stream memops (it
   fell back to two host callbacks per layer on ROCm), sizes its scratch for the MTP verify rows up front, runs under
   tensor parallelism with NVFP4 (each rank on half the cores), reads EXL3 experts (AVX2), and reads (NVFP4) or decodes

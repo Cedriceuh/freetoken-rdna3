@@ -67,8 +67,8 @@ a choice, `--dry-run` prints the full `docker run` command instead of running it
 started with `-- --api-key KEY`: [limits.md](limits.md#anything-else-to-know)), `--ctx`, `--served-name`, `--name`,
 `--image`, `--memory`, `--vision` (image input, off by default:
 [limits.md](limits.md#images-vision)), `--no-mtp` (decode without the MTP draft head the profiles turn on:
-[limits.md](limits.md#speculative-decoding-mtp)), `--hybrid` (experimental: the CPU computes part of the expert misses,
-[cpu-experts.md](cpu-experts.md)), and `-- <extra ft serve flags>`.
+[limits.md](limits.md#speculative-decoding-mtp)), `--hybrid` (off by default: the CPU computes part of the expert
+misses, [cpu-experts.md](cpu-experts.md)), and `-- <extra ft serve flags>`.
 
 Loading takes about 2.5 minutes on the reference machine (it reads ~68 GB of experts). The very first start of a new image also compiles and autotunes GPU kernels for a few
 more minutes; the results are kept in a Docker volume (`freetoken-rdna3-kcache-<image id>`), so later starts are fast.

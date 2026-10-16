@@ -1,4 +1,4 @@
-# Long contexts with the K/V in host RAM (experimental)
+# Long contexts with the K/V in host RAM
 
 Qwen3.8-Flash-Next is trained to 262,144 positions, and Qwen's model card extends it to 1,000,000 with YaRN
 (`rope_type: yarn`, `factor: 4`, `original_max_position_embeddings: 262144`). With the attention K/V in host RAM, two

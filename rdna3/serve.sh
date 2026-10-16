@@ -21,8 +21,8 @@
 #                      `-- --image-max-tokens N` changes it
 #   --no-mtp           decode without the MTP draft head the profiles except gre turn on (it speeds up one request at a time;
 #                      docs/rdna3/limits.md)
-#   --hybrid           compute part of each decode step's expert misses on the CPU instead of copying them (experimental,
-#                      NVFP4: +46 % on xtx, +51 % on xt, on xtx-xt +2 % for one request and +15 % with 4;
+#   --hybrid           compute part of each decode step's expert misses on the CPU instead of copying them (off by
+#                      default, NVFP4: +46 % on xtx, +51 % on xt, on xtx-xt +2 % for one request and +15 % with 4;
 #                      EXL3: +5 % on xtx, even on xtx-xt; docs/rdna3/cpu-experts.md)
 #   --dry-run          print the docker command instead of running it
 #
@@ -117,7 +117,7 @@ kv="${p_kv:-$ctx}"
 [ "$kv" -ge "$ctx" ] || kv="$ctx"
 [ "$p_tested" = 1 ] || echo "note: profile $profile is UNTESTED (derived from measured profiles, see its header); please report what you measure" >&2
 
-# EXL3 checkpoints (experimental) on two cards: the expert slices round to 384 / 256, so the card holding 384 bounds the
+# EXL3 checkpoints on two cards: the expert slices round to 384 / 256, so the card holding 384 bounds the
 # expert cache, and at the profiles' 0.80 the 7900 XTX peaked 200 MiB under full VRAM (two agents at 50k tokens: 24,341
 # of 24,560 MiB at 0.78 with 4.05 bpw); 0.77 / 0.76 keep ~0.5 GiB free (xtx-xt, 2026-10-04). `-- --memory-ratio X` wins.
 cfg="$(tr -d ' \t\n' < "$model/config.json" 2>/dev/null || true)"

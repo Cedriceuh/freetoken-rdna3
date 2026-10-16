@@ -1,4 +1,4 @@
-"""Experimental weight-only INT8 conversion: routers stay bf16, converted linears stay close to bf16 (CPU)."""
+"""Weight-only INT8 conversion: routers stay bf16, converted linears stay close to bf16 (CPU)."""
 import pytest
 import torch
 

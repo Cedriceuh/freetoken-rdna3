@@ -15,7 +15,7 @@ Who wrote what: [credits.md](credits.md).
 | `python/freetoken/kernel/backend.py` | 2/2 against `ee9789f` | the module docstring (the gating itself is upstream's #134 since `9b585b7`) |
 | `python/freetoken/kernel/csrc/include/freetoken/utils.cuh` | 1/1 against `ee9789f` | on ROCm, `with_attr` refuses `use_pdl=True` (upstream ignores it); the HIP-portable JIT kernels are upstream's since `803a3b4` |
 | `python/freetoken/kernel/pynccl.py` | 7/1 | tensor parallelism routed to RCCL on ROCm |
-| `python/freetoken/kernel/triton/qsa/attend.py` | 51/3 | BLOCK_N clamped to RDNA's 64 KiB LDS, sized with q's itemsize (upstream's own clamp, `7d6490c`, sized with the K/V cache's, runs after it and changes no tile; alone it would keep 64 with 1-byte K/V); int8 K/V path (experimental) |
+| `python/freetoken/kernel/triton/qsa/attend.py` | 51/3 | BLOCK_N clamped to RDNA's 64 KiB LDS, sized with q's itemsize (upstream's own clamp, `7d6490c`, sized with the K/V cache's, runs after it and changes no tile; alone it would keep 64 with 1-byte K/V); int8 K/V path (off, not recommended) |
 | `tests/engine/test_rocm_communication.py`, `tests/kernels/test_backend.py`, `tests/kernels/test_jit_index_store.py` | new | tests of the above |
 
 ## Qwen3.8-Flash-Next (qwen4_exp) on several GPUs
@@ -90,8 +90,8 @@ Who wrote what: [credits.md](credits.md).
 |---|---:|---|
 | `python/freetoken/kvcache/host_kv_pool.py` | 334/0 | the RAM tier's buffers and copies (`FREETOKEN_HOST_KV`) |
 | `python/freetoken/kvcache/hybrid_radix_cache.py` | 296/27 | demotion on eviction (with node split), promotion on match, pins |
-| `python/freetoken/kvcache/radix_cache.py`, `kvcache/mha_pool.py`, `kvcache/qsa_pool.py` | 13/0, 3/0, 74/1 | node state for the tier; pools opt in explicitly; experimental int8 QSA K/V |
-| `python/freetoken/attention/qsa_sparse.py`, `kernel/triton/qsa/kv_int8.py` | 3/0, 67/0 | experimental int8 QSA K/V (not recommended) |
+| `python/freetoken/kvcache/radix_cache.py`, `kvcache/mha_pool.py`, `kvcache/qsa_pool.py` | 13/0, 3/0, 74/1 | node state for the tier; pools opt in explicitly; int8 QSA K/V (off, not recommended) |
+| `python/freetoken/attention/qsa_sparse.py`, `kernel/triton/qsa/kv_int8.py` | 3/0, 67/0 | int8 QSA K/V (off, not recommended) |
 | `tests/kvcache/test_host_kv_tier.py`, `tests/kvcache/test_qsa_kv_int8.py` | new | |
 
 ## Speculative decoding with the MTP head
@@ -127,7 +127,7 @@ Line counts in this section and the next are relative to `d72e5cb` (0.1.0 plus i
 | `python/freetoken/engine/engine.py` | 30/0 | the process's memory locked once loaded (`FREETOKEN_MLOCK`) so that, with `vm.compact_unevictable_allowed=0`, memory compaction leaves the pages the GPU driver maps alone; a warning while it is 1 |
 | `tests/kernels/test_row_store.py`, `tests/engine/test_lock_memory.py` | 32/0, new | the captured-wait probe; when the memory lock applies |
 
-## EXL3 checkpoints (experimental)
+## EXL3 checkpoints
 
 Line counts here are on top of the lines listed in the sections above.
 
@@ -179,7 +179,7 @@ Line counts here are on top of the lines listed in the sections above.
 | `python/freetoken/kernel/fla/utils.py`, `chunk_delta_h.py`, `wy_fast.py` | 6/0, 2/1, 3/2 | two GDN prefill kernels at 8 warps on ROCm (`FREETOKEN_GDN_PREFILL_WARPS`) |
 | `tests/kernels/test_gdn_prefill_blocks.py`, `test_prefill_warps.py`, `test_fewer_copies.py`, `tests/models/qwen4_exp/test_ple_conv_blocks.py` | new, new, 20/0, 34/0 | bit-exactness (GPU; the PLE one on the CPU) |
 
-## Long contexts with the K/V in host RAM (experimental)
+## Long contexts with the K/V in host RAM
 
 | File | Lines | Change |
 |---|---:|---|
@@ -192,7 +192,7 @@ Line counts here are on top of the lines listed in the sections above.
 | `rdna3/bench/qsa_topk_bench.py` | new | the block top-k on the profiles' page tables |
 | `tests/layers/test_rotary_yarn.py`, `tests/kernels/test_qsa_kv_host.py`, `rdna3/profiles/xtx-xt-1m.env`, `rdna3/profiles/xtx-xt-4x262k.env` | new | YaRN and the longer table against HF's rotary embedding (CPU); the host-mapped tensor and the page staging (GPU); one conversation of 1M, four of 262,144 at once |
 
-## Expert misses on the CPU (`--hybrid`, experimental)
+## Expert misses on the CPU (`--hybrid`, off by default)
 
 | File | Lines | Change |
 |---|---:|---|

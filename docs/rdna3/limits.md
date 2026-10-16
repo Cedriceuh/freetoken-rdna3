@@ -17,7 +17,7 @@ in EXL3 3.05 bpw) stay on disk and only use the free page cache.
 ## Can it run with 64 GB of RAM?
 
 Not with the NVFP4 checkpoint: its experts alone need ~63 GiB of RAM, and the engine has no mode that reads experts
-from disk. An **EXL3 checkpoint at 3 bits per weight** (experimental, [how-it-works.md](how-it-works.md#exl3-checkpoints))
+from disk. An **EXL3 checkpoint at 3 bits per weight** ([how-it-works.md](how-it-works.md#exl3-checkpoints))
 needs 42.6 GiB for its experts (63.3 in NVFP4; 43.5 and ~64.6 with the MTP head's experts, which an NVFP4 checkpoint stores in bf16, 4.7 GiB,
 and the engine quantizes to NVFP4 at load): on `xtx-xt`, with the RAM
 tier off and the experts loaded one file at a time, the server ran under a 56 GiB container limit at 52.3 GiB used
@@ -94,7 +94,7 @@ With `--vision`:
 ## Speculative decoding (MTP)?
 
 On in the profiles except `gre` (`FREETOKEN_MTP=1 FREETOKEN_SPEC_VERIFY_M=4`); `rdna3/serve.sh --no-mtp` serves without it
-([options.md](options.md#speculative-decoding-with-the-mtp-head-qwen38-flash-next-experimental)). Measured on `xtx-xt`,
+([options.md](options.md#speculative-decoding-with-the-mtp-head-qwen38-flash-next)). Measured on `xtx-xt`,
 `xtx` and `xt` with Qwen3.8-Flash-Next ([benchmarks.md](benchmarks.md#speculative-decoding-mtp-head)):
 
 - **One request at a time gains (two in `xtx-xt` and its K/V-in-RAM variants), more do not.** On `xtx-xt`, a request alone decodes 35 % faster at the

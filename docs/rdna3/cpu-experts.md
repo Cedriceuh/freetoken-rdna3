@@ -1,6 +1,6 @@
 # Expert misses computed on the CPU (`--hybrid`)
 
-Experimental, measured on 2026-10-11 and again on 2026-10-13 after the decode kernels of 35afbb3 (Threadripper
+Off by default, measured on 2026-10-11 and again on 2026-10-13 after the decode kernels of 35afbb3 (Threadripper
 3970X: 32 Zen 2 cores, AVX2, 4 x 32 GB DDR4-3200, STREAM read 72-74 GB/s; RX 7900 XTX + 7900 XT on PCIe 4.0 x16). Not
 agent-validated.
 
