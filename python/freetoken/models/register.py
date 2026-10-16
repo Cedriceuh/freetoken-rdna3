@@ -201,6 +201,25 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         packed_modules_mapping=_QWEN3_5_PACKED,
         unquantized_modules=_QWEN3_5_UNQUANTIZED,
     ),
+    # llama.cpp qwen35 / qwen35moe GGUF (text only): the same model classes with every tensor in its packed ggml type
+    "Qwen3_5GGUFForCausalLM": ModelSpec(
+        "freetoken.models.qwen3_5_moe",
+        "Qwen3_5ForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+        checkpoint_roots=_LANGUAGE_MODEL_ROOT,
+        packed_modules_mapping=_QWEN3_5_PACKED,
+        unquantized_modules=_QWEN3_5_UNQUANTIZED,
+    ),
+    "Qwen3_5MoeGGUFForCausalLM": ModelSpec(
+        "freetoken.models.qwen3_5_moe",
+        "Qwen3_5MoeForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+        checkpoint_roots=_LANGUAGE_MODEL_ROOT,
+        packed_modules_mapping=_QWEN3_5_PACKED,
+        unquantized_modules=_QWEN3_5_UNQUANTIZED,
+    ),
     # Qwen3.8-Flash-Next (model_type qwen4_exp): multimodal wrapper config (text tower in
     # text_config, weights under model.language_model.). 36 GDN + 12 QSA
     # compressed-sparse attention layers on 4 hyper-connection residual streams, a PLE
@@ -211,6 +230,15 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         checkpoint_roots=_QWEN_VL_ROOTS,
         mm_processor=_QWEN_VL_PROCESSOR,
         encoders=_QWEN_VL_ENCODERS,
+        packed_modules_mapping=_QWEN4_EXP_PACKED,
+    ),
+    # llama.cpp qwen4exp GGUF (text only): the same model classes with every tensor in its packed ggml type
+    "Qwen4ExpGGUFForCausalLM": ModelSpec(
+        "freetoken.models.qwen4_exp",
+        "Qwen4ExpForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+        checkpoint_roots=_LANGUAGE_MODEL_ROOT,
         packed_modules_mapping=_QWEN4_EXP_PACKED,
     ),
     # Dense Qwen3.x (no "Moe" in the arch name, num_experts==0, e.g. Qwen3.6-27B). Shares the
@@ -282,12 +310,14 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         checkpoint_segments=_GEMMA4_SEGMENTS,
         packed_modules_mapping=_GEMMA4_PACKED,
     ),
-    # GGUF (native Q4_0/Q6_K) gemma4: same model classes, GGUF config + weight loaders.
+    # llama.cpp gemma4 GGUF (text only): the same model classes with every tensor in its packed ggml type
     "Gemma4GGUFForCausalLM": ModelSpec(
         "freetoken.models.gemma4",
         "Gemma4ForCausalLM",
         parse_config="parse_gguf_config",
         iter_weights="iter_gguf_weights",
+        checkpoint_segments=_GEMMA4_SEGMENTS,
+        packed_modules_mapping=_GEMMA4_PACKED,
     ),
     "GptOssForCausalLM": ModelSpec(
         "freetoken.models.gpt_oss",
@@ -342,17 +372,19 @@ def _load_attr(module_path: str, attr_name: str) -> Any:
 
 
 def checkpoint_quant_config(model_path: str, hf_config: Any, spec: ModelSpec):
-    """The checkpoint's QuantConfig under the family's naming, or None for GGUF, whose native-quant ops the shared parser does not model yet."""
-    from freetoken.layers.quantization import NameMap, QuantConfig
+    """The checkpoint's QuantConfig under the family's naming.
 
+    A GGUF family gets the GGUF dialect over the file's tensor table, named through the ``to_gguf`` its module exports."""
+    from freetoken.layers.quantization import GGUFConfig, NameMap, QuantConfig
+
+    name_map = NameMap(roots=spec.checkpoint_roots, segments=spec.checkpoint_segments, packed=spec.packed_modules_mapping)
     if spec.parse_config == "parse_gguf_config":
-        return None
-    return QuantConfig.from_hf(
-        hf_config,
-        name_map=NameMap(roots=spec.checkpoint_roots, segments=spec.checkpoint_segments, packed=spec.packed_modules_mapping),
-        unquantized=spec.unquantized_modules,
-        model_path=model_path,
-    )
+        to_gguf = _load_attr(spec.module, "to_gguf")
+        from freetoken.models.gguf.reader import gguf_tensor_index
+
+        types = {name: info.ggml_type for name, info in gguf_tensor_index(hf_config.model_path).items()}
+        return GGUFConfig(types, to_gguf, name_map=name_map, unquantized=spec.unquantized_modules)
+    return QuantConfig.from_hf(hf_config, name_map=name_map, unquantized=spec.unquantized_modules, model_path=model_path)
 
 
 def get_model_class(model_architecture: str, model_config: ModelConfig):

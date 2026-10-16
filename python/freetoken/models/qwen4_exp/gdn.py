@@ -79,9 +79,10 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
     def __init__(
         self, hidden_size, num_k_heads, num_v_heads, head_k_dim, head_v_dim,
         conv_kernel_size, rms_norm_eps, layer_id, output_gate: str = "sigmoid",
-        *, quant_config: QuantConfig | None = None, prefix: str = "",
+        *, quant_config: QuantConfig | None = None, prefix: str = "", out_heads_tiled: bool = False,
     ):
         self.layer_id = layer_id
+        self._out_heads_tiled = out_heads_tiled
         # The fla chunk/decode kernels read+write the recurrent state and the per-chunk h as
         # [V, K] while the LinearStatePool declares it [K, V]; these coincide (and the
         # hybrid-radix snapshot scatter h[h_row]->slot is a plain copy) only when the two head
@@ -326,6 +327,10 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
             z = z.reshape(-1, self.head_v_dim)  # a copy when z is a strided slice of several rows
         # decode: one row per norm program, so a verify step's rows (and a batch's) get their single-row bits
         out = self.norm.forward(core_out, z, rows_per_block=1 if batch.is_decode else None).reshape(total, -1)
+        if self._out_heads_tiled:
+            # grouped value heads (k-head major) -> tiled (k-head minor), the column order of a GGUF ssm_out
+            r = self.num_v_heads // self.num_k_heads
+            out = out.view(total, self.num_k_heads, r, self.head_v_dim).transpose(1, 2).reshape(total, -1)
         return self.out_proj.forward(out)
 
 

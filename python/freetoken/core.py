@@ -24,6 +24,8 @@ class SamplingParams:
     # Stop strings (OpenAI `stop` / Anthropic `stop_sequences`). Generation finishes when one
     # appears in the decoded output; the matched substring (and anything after) is trimmed.
     stop_strs: list[str] = field(default_factory=list)
+    presence_penalty: float = 0.0
+    frequency_penalty: float = 0.0
 
     @property
     def is_greedy(self) -> bool:
@@ -70,6 +72,7 @@ class Req:
     # allocated for: a spec_decode verify step allocates its draft rows ahead of device_len, so the next step must not
     # allocate those pages again.
     alloc_len: int = 0
+    output_token_counts: torch.Tensor | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu

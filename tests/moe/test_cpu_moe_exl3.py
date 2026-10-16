@@ -1,4 +1,4 @@
-"""CPU MoE executor, EXL3 experts (cpu_moe_ext.cpp fmt 5): one decode step on synthetic mul1 trellis banks, packed as
+"""CPU MoE executor, EXL3 experts (csrc/cpu_moe/kernels/exl3.cpp): one decode step on synthetic mul1 trellis banks, packed as
 layers/quantization/moe/exl3.py packs them, against the reference codec (exl3_codec.reconstruct); then GPU checks of
 the EXL3 decode kernels these banks feed (skipped without a GPU)."""
 
@@ -48,6 +48,16 @@ def _cache(experts, lo, i):
                            num_layers=1, quant_format="exl3")
 
 
+def _run(ex, x, ids, w):
+    """One task on the executor's IO rows: x, ids, w in, y out."""
+    M = x.shape[0]
+    ex._io["x"][:M].copy_(x)
+    ex._io["ids"][:M].copy_(ids)
+    ex._io["w"][:M].copy_(w)
+    ex._ext.run(0, M)
+    return ex._io["y"][:M].clone()
+
+
 def _reference(experts, x, ids, w, lo, i):
     cols = slice(lo, lo + i)
     y = torch.zeros(x.shape[0], x.shape[1], dtype=torch.float64)
@@ -77,8 +87,7 @@ def test_cpu_exl3_matches_reference_codec(bits, M, lo, i):
     ids = torch.stack([torch.randperm(E, generator=gen)[:top_k] for _ in range(M)]).int()
     ids[0, 0] = -1  # a route the GPU computes: skipped here
     w = torch.softmax(torch.randn(M, top_k, generator=gen), 1).float()
-    y = torch.zeros(M, H, dtype=torch.bfloat16)
-    ex._ext.run_task(ex._ext.create_task(0, M, x.data_ptr(), ids.data_ptr(), w.data_ptr(), y.data_ptr()))
+    y = _run(ex, x, ids, w)
     ref = _reference(experts, x.float(), ids, w, lo, i)
     err = ((y.double() - ref).norm() / ref.norm()).item()
     assert err < 5e-3, err  # bf16 input/output and no per-weight fp16 rounding
@@ -90,12 +99,8 @@ def test_cpu_moe_task_larger_than_max_tokens_is_refused():
     experts = _experts(2, 128, 128, 3, seed=0)
     ex = CpuMoeExecutor(_cache(experts, 0, 128), top_k=1, activation="silu", apply_router_weight_on_input=False,
                         num_threads=2, max_tokens=2, device=torch.device("cpu"), fmt="exl3")
-    x = torch.zeros(3, 128, dtype=torch.bfloat16)
-    ids = torch.zeros(3, 1, dtype=torch.int32)
-    w = torch.ones(3, 1)
-    y = torch.zeros(3, 128, dtype=torch.bfloat16)
-    with pytest.raises(Exception, match="exceeds max_tokens"):
-        ex._ext.create_task(0, 3, x.data_ptr(), ids.data_ptr(), w.data_ptr(), y.data_ptr())
+    with pytest.raises(Exception, match="outside the executor's layers or IO"):
+        ex._ext.run(0, 3)
 
 
 def test_cpu_exl3_rows_sharing_an_expert_match_one_row_at_a_time():
@@ -111,12 +116,9 @@ def test_cpu_exl3_rows_sharing_an_expert_match_one_row_at_a_time():
     x = (torch.randn(M, H, generator=gen) * 0.5).bfloat16()
     ids = torch.tensor([[0, 1], [1, 0], [0, 2], [2, 1]], dtype=torch.int32)  # every expert on two or three rows
     w = torch.softmax(torch.randn(M, top_k, generator=gen), 1).float()
-    y = torch.zeros(M, H, dtype=torch.bfloat16)
-    ex._ext.run_task(ex._ext.create_task(0, M, x.data_ptr(), ids.data_ptr(), w.data_ptr(), y.data_ptr()))
+    y = _run(ex, x, ids, w)
     for m in range(M):
-        xm, im, wm = x[m:m + 1].clone(), ids[m:m + 1].clone(), w[m:m + 1].clone()
-        ym = torch.zeros(1, H, dtype=torch.bfloat16)
-        ex._ext.run_task(ex._ext.create_task(0, 1, xm.data_ptr(), im.data_ptr(), wm.data_ptr(), ym.data_ptr()))
+        ym = _run(ex, x[m:m + 1], ids[m:m + 1], w[m:m + 1])
         assert torch.equal(ym[0], y[m]), m
 
 

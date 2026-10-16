@@ -88,6 +88,9 @@ class PleRowSource:
     row_bytes: int
     row_stride: int
     scale: float
+    # packed ggml rows (a GGUF table) of ``row_values`` values each; None for one fp8 byte per value
+    ggml_type: int | None = None
+    row_values: int | None = None
     # EXL3 n-gram rings (exllamav3 exl3_ngram_trellis): K bits per element, row_dim elements per row, a bias per hash head;
     # exl3_bits == 0 is the fp8 table, one byte per element
     exl3_bits: int = 0
@@ -181,8 +184,29 @@ def source_from_exl3_ngram(path: str) -> PleRowSource:
                         exl3_bits=K, row_dim=dim, head_bias=head_bias)
 
 
-def resolve_row_source(folder: str) -> PleRowSource:
+
+
+def source_from_gguf(model_path: str) -> PleRowSource:
+    """The GGUF ``per_layer_token_embd`` table in place: one extent of packed ggml rows."""
+    from freetoken.layers.quantization.ggml_types import row_bytes
+
+    from .gguf import ple_table_info
+
+    info = ple_table_info(model_path)
+    values, rows = info.ne
+    nbytes = row_bytes(info.ggml_type, values)
+    return PleRowSource([info.path], [0], [info.offset], rows, nbytes, nbytes, 1.0, info.ggml_type, values)
+
+
+def resolve_row_source(model_path: str) -> PleRowSource:
     """Pick the row source for a checkpoint; the seam where a repacked format would plug in."""
+    from freetoken.models.gguf.reader import gguf_config_source
+
+    if (gguf_src := gguf_config_source(model_path)) is not None:
+        return source_from_gguf(gguf_src)
+    from freetoken.utils import download_hf_weight
+
+    folder = download_hf_weight(model_path)
     exl3 = os.path.join(folder, _EXL3_NGRAM_FILE)
     if os.path.exists(exl3):
         return source_from_exl3_ngram(exl3)
@@ -206,11 +230,15 @@ class DiskRowTable:
         dtype: torch.dtype = torch.bfloat16,
     ) -> None:
         from freetoken.kernel.row_store import PleStore
+        from freetoken.layers.quantization.ggml_types import float_dtype
 
         self.num_rows = source.total_rows
-        self.head_dim = source.row_dim or source.row_bytes  # fp8: one byte per element
+        self.head_dim = source.row_dim or source.row_values or source.row_bytes  # fp8: one byte per element
+        self._ggml_type = source.ggml_type
         self._row_bytes = source.row_bytes
         self._exl3_bits = source.exl3_bits
+        # float rows (fp8, or F32 / F16 / BF16 in a GGUF) are only cast; quantized ggml rows go through ggml
+        self._row_dtype = torch.float8_e4m3fn if source.ggml_type is None else float_dtype(source.ggml_type)
         self.dtype = dtype
         self.heads = int(hash_constants["num_ngram_heads"])
         self.scale = source.scale
@@ -387,10 +415,15 @@ class DiskRowTable:
             packed = dev[:nbytes].view(torch.int16).view(rows * self.heads, self._row_bytes // 2)
             values = exl3_ngram_dequant(packed, self._exl3_bits, self._head_bias,
                                         torch.empty((rows * self.heads, self.head_dim), dtype=self.dtype, device=self._device))
+        elif self._row_dtype is not None:
+            # copy=True: rows already in self.dtype must not alias the staging buffer the next fill reuses
+            values = dev[:nbytes].view(self._row_dtype).to(self.dtype, copy=True)
         else:
-            values = dev[:nbytes].view(torch.float8_e4m3fn).to(self.dtype)
-            if self.scale != 1.0:
-                values = values * self.scale
+            from freetoken.kernel import ggml
+
+            values = ggml.dequantize(dev[:nbytes].view(-1, self._row_bytes), self._ggml_type, self.head_dim, self.dtype)
+        if self.scale != 1.0:
+            values = values * self.scale
         values = values.view(*row_ids.shape[:-1], -1)
         if out is None:
             return values

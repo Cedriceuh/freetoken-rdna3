@@ -440,6 +440,111 @@ def _reference(cache, layer, hidden, ids, w, act="silu", apply_in=False):
     return out
 
 
+@pytest.fixture(scope="module")
+def hip_probe_fault_library(tmp_path_factory):
+    import importlib.util
+    import os
+    from pathlib import Path
+    import shutil
+    import subprocess
+
+    if not torch.version.hip:
+        pytest.skip("requires the HIP sync backend")
+    compiler = shutil.which("c++")
+    if compiler is None:
+        pytest.skip("requires a C++ compiler for HIP fault injection")
+    candidates = [Path(os.getenv("ROCM_HOME", "/opt/rocm")), Path("/opt/rocm")]
+    spec = importlib.util.find_spec("_rocm_sdk_core")
+    if spec and spec.submodule_search_locations:
+        candidates.append(Path(next(iter(spec.submodule_search_locations))))
+    include = next((root / "include" for root in candidates if (root / "include/hip/hip_runtime.h").exists()), None)
+    if include is None:
+        pytest.skip("requires HIP SDK headers for fault injection")
+    library = tmp_path_factory.mktemp("hip_probe") / "faults.so"
+    command = [
+        compiler, "-std=c++20", "-shared", "-fPIC", "-D__HIP_PLATFORM_AMD__=1",
+        f"-I{include}", str(Path(__file__).with_name("hip_probe_faults.cpp")),
+        "-ldl", "-o", str(library),
+    ]
+    result = subprocess.run(command, capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stdout + result.stderr
+    return library
+
+
+@pytest.mark.parametrize("fault", ["dependency", "end-capture", "pending"])
+def test_cpu_moe_hip_probe_error_recovery(hip_probe_fault_library, fault):
+    """Rejected probes leave eager usable and preserve errors predating the probe."""
+    import os
+    from pathlib import Path
+    import subprocess
+    import sys
+    import textwrap
+
+    script = textwrap.dedent("""
+        import ctypes
+        import os
+        import runpy
+        import sys
+
+        import pytest
+        import torch
+        from freetoken.kernel import _cpu_moe
+        from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+        shim = ctypes.CDLL(os.environ["LD_PRELOAD"])
+        stream_ptr = torch.cuda.current_stream().cuda_stream
+        fault = os.environ["FREETOKEN_TEST_HIP_PROBE_FAULT"]
+        if fault == "pending":
+            assert shim.probe_test_make_error() != 0
+            pending = shim.probe_test_peek_error()
+            with pytest.raises(RuntimeError, match="pending error before probe"):
+                _cpu_moe.memops_probe(stream_ptr)
+            assert shim.probe_test_peek_error() == pending
+            assert shim.probe_test_begins() == 0
+            sys.exit(0)
+
+        helpers = runpy.run_path(sys.argv[1])
+        torch.manual_seed(17)
+        cache = helpers["_make_cache"](2, 8, 256, 128, scale=0.03)
+        ex = CpuMoeExecutor(
+            cache, top_k=4, activation="silu", apply_router_weight_on_input=False,
+            num_threads=4, max_tokens=3, device=torch.device("cuda"),
+        )
+        assert not ex._flag_sync and not ex._graph_capture_safe
+        assert shim.probe_test_injected() > 0
+        assert shim.probe_test_begins() == shim.probe_test_ends()
+        assert shim.probe_test_peek_error() == 0
+        if fault == "dependency":
+            assert shim.probe_test_removed_nodes() == 1
+            assert shim.probe_test_last_end_rc() == 0
+        else:
+            assert shim.probe_test_last_end_rc() != 0
+
+        for index in range(2):
+            torch.manual_seed(23 + index)
+            hidden = (torch.randn(3, 256) * 0.3).bfloat16().cuda()
+            ids = torch.randint(0, 8, (3, 4), dtype=torch.int32).cuda()
+            weights = torch.rand(3, 4).cuda()
+            actual = ex.decode(1, hidden, weights, ids).float().cpu()
+            expected = helpers["_reference"](cache, 1, hidden, ids.cpu(), weights.cpu())
+            relative = (actual - expected).abs().max() / (expected.abs().max() + 1e-6)
+            assert relative < 2e-2, relative
+
+        stream = torch.cuda.Stream()
+        with pytest.raises(RuntimeError, match="--cuda-graph-max-bs 0"):
+            with torch.cuda.graph(torch.cuda.CUDAGraph(), stream=stream):
+                ex.decode(1, hidden, weights, ids)
+        assert torch.isfinite(ex.decode(1, hidden, weights, ids).cpu()).all()
+    """)
+    env = dict(os.environ, LD_PRELOAD=str(hip_probe_fault_library),
+               FREETOKEN_TEST_HIP_PROBE_FAULT=fault, FREETOKEN_CPU_MOE_FLAG_SYNC="1")
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(Path(__file__).resolve())],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_cpu_moe_decode_cuda_graph_replay():
     from freetoken.moe.cpu_executor import CpuMoeExecutor
 
@@ -467,7 +572,7 @@ def test_cpu_moe_decode_cuda_graph_replay():
     ids = torch.randint(0, E, (bs, top_k), device=dev, dtype=torch.int32)
     w = torch.rand(bs, top_k, device=dev, dtype=torch.float32)
 
-    # Eager forward: also materializes the per-bs pinned buffers + per-(layer,bs) task.
+    # Eager forward.
     out_eager = ex.decode(layer, hidden, w, ids)
     torch.cuda.synchronize()
     ref_eager = _reference(cache, layer, hidden, ids.cpu(), w.cpu())
@@ -500,25 +605,20 @@ def test_cpu_moe_decode_cuda_graph_replay():
     # must actually have exercised it -- guard against a silent fallback to the
     # host-func path making this test vacuous for the capture-embedded memops.
     if ex._flag_sync:
-        assert (layer, bs) in ex._flag_slots, "flag slot expected for the decode task"
-        slot = ex._flag_slots[(layer, bs)]
-        assert ex._ext.flag_served_count(slot) >= 4, "1 eager + 3 replay dispatches expected"
-        assert int(ex._done[slot]) == 1 and int(ex._ready[slot]) == 0, "handshake at rest"
-        assert int(ex._err.sum()) == 0, "watchdog must not fire in normal operation"
+        assert ex._ext.flag_served() >= 4, "1 eager + 3 replay dispatches expected"
+        assert not ex._ext.flag_pending(), "handshake at rest"
+        assert not ex._unhealthy, "watchdog must not fire in normal operation"
         ex.raise_if_unhealthy()
 
     print("cpu moe cuda graph replay OK")
 
 
-@pytest.mark.parametrize("in_kernel", [True, False])
-def test_cpu_moe_hybrid_split_cuda_graph_replay(monkeypatch, in_kernel):
-    """The hybrid layer's split / merge path (decode_submit_split, decode_sync_merge): routes with a cache slot stay on
-    the GPU (weight zeroed for the CPU), the others are summed by the CPU into the GPU partial. Eager, then a captured
-    graph replayed with new data, with the handshake carried by the kernels (step numbers) or by stream memops."""
-    from freetoken.moe import cpu_executor
+def test_cpu_moe_hybrid_publish_cuda_graph_replay():
+    """The hybrid layer's publish / merge kernels (decode_publish, decode_merge): the CPU sums its routes (ids >= 0)
+    into the GPU partial, the handshake carried by the two kernels over pinned flag words. Eager, then a captured graph
+    replayed with new data, one step without a CPU route among them (nothing rung, the GPU partial passes through)."""
     from freetoken.moe.cpu_executor import CpuMoeExecutor
 
-    monkeypatch.setattr(cpu_executor, "_FLAG_IN_KERNEL", in_kernel)
     torch.manual_seed(0)
     L, E, H, I, top_k = 3, 8, 512, 256, 4
     layer, bs = 2, 3
@@ -528,55 +628,45 @@ def test_cpu_moe_hybrid_split_cuda_graph_replay(monkeypatch, in_kernel):
     torch.cuda.set_stream(stream)
     ex = CpuMoeExecutor(cache, top_k=top_k, activation="silu", apply_router_weight_on_input=False, num_threads=8,
                         max_tokens=bs, device=dev)
-    if not ex.can_split(torch.empty(1, H, device=dev, dtype=torch.bfloat16)):
-        pytest.skip("split path off")
+    if not ex.can_publish(torch.empty(1, H, device=dev, dtype=torch.bfloat16)):
+        pytest.skip("in-kernel flags off")
     hidden = torch.empty(bs, H, device=dev, dtype=torch.bfloat16)
-    raw = torch.empty(bs, top_k, device=dev, dtype=torch.int32)
-    slots = torch.empty(bs, top_k, device=dev, dtype=torch.int32)
+    ids = torch.empty(bs, top_k, device=dev, dtype=torch.int32)
     w = torch.empty(bs, top_k, device=dev, dtype=torch.float32)
     g = torch.empty(bs, H, device=dev, dtype=torch.bfloat16)
 
-    def fill(seed):
+    def fill(seed, cpu_share=0.5):
         gen = torch.Generator().manual_seed(seed)
         data = (torch.randn(bs, H, generator=gen).bfloat16(), torch.randint(0, E, (bs, top_k), generator=gen).int(),
                 torch.rand(bs, top_k, generator=gen), torch.randn(bs, H, generator=gen).bfloat16())
-        on_gpu = torch.rand(bs, top_k, generator=gen) < 0.5
-        hidden.copy_(data[0]); raw.copy_(data[1]); w.copy_(data[2]); g.copy_(data[3])
-        slots.copy_(torch.where(on_gpu, 7, -1).int())
-        ref = _reference(cache, layer, data[0], torch.where(on_gpu, -1, data[1]), data[2]) + data[3].float()
-        return ref
+        cpu_ids = torch.where(torch.rand(bs, top_k, generator=gen) < cpu_share, data[1], -1).int()
+        hidden.copy_(data[0]); ids.copy_(cpu_ids); w.copy_(data[2]); g.copy_(data[3])
+        return _reference(cache, layer, data[0], cpu_ids, data[2]) + data[3].float()
 
     def step():
-        pending, gpu_w, gpu_slots = ex.decode_submit_split(layer, hidden, raw, slots.clone(), w, clamp=True)
-        return ex.decode_sync_merge(pending, g), gpu_w, gpu_slots
+        return ex.decode_merge(ex.decode_publish(layer, hidden, ids, w), g)
 
+    served = ex._ext.flag_served()
     ref = fill(1)
-    out, gpu_w, gpu_slots = step()
+    out = step()
     torch.cuda.synchronize()
-    on_gpu = slots >= 0
-    assert torch.equal(gpu_w.cpu(), torch.where(on_gpu, w, 0.0).cpu())
-    assert int(gpu_slots.min()) >= 0
     assert ((out.float().cpu() - ref).abs().max() / ref.abs().max()) < 2e-2
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
-        out_cap, _, _ = step()
-    for it in range(4):
-        ref = fill(10 + it)
+        out_cap = step()
+    for it, share in enumerate((0.5, 0.0, 0.5, 1.0)):
+        ref = fill(10 + it, share)
         graph.replay()
         torch.cuda.synchronize()
-        rel = (out_cap.float().cpu() - ref).abs().max() / ref.abs().max()
-        assert rel < 2e-2, f"replay {it} rel err {rel}"
-
-    if ex._flag_sync:  # stream memops available: the handshake was the flags, not host callbacks
-        slot = ex._flag_slots[(layer, bs)]
-        assert ex._ext.flag_served_count(slot) >= 5
-        if in_kernel:
-            assert bool(ex._seq_mask[slot]) and int(ex._ready[slot]) == int(ex._done[slot]) == int(ex._seq[slot]) == 5
+        if share == 0.0:
+            assert torch.equal(out_cap.cpu(), g.cpu()), "a step without a CPU route passes the GPU partial through"
         else:
-            assert int(ex._done[slot]) == 1 and int(ex._ready[slot]) == 0
-        assert int(ex._err.sum()) == 0
-        ex.raise_if_unhealthy()
+            rel = (out_cap.float().cpu() - ref).abs().max() / ref.abs().max()
+            assert rel < 2e-2, f"replay {it} rel err {rel}"
+    assert ex._ext.flag_served() - served == 4, "the eager step and the three replays with CPU routes rang"
+    assert not ex._ext.flag_pending()
+    ex.raise_if_unhealthy()
 
 
 def test_cpu_moe_decode_cuda_graph_replay_mxfp4():

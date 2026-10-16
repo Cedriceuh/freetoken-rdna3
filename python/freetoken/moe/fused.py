@@ -93,6 +93,8 @@ def moe_align_block_size(
     """
     from freetoken.kernel.backend import is_sgl_kernel_installed
 
+    # Triton 3.8's AMD backend folds compares on tl.histogram counts to false: kernel/triton/moe_align.py compares none,
+    # so ROCm keeps it (upstream's staged five-kernel align, its fix for the same bug, is not taken)
     if not is_sgl_kernel_installed():
         from freetoken.kernel.triton.moe_align import (
             moe_align_block_size as triton_moe_align_block_size,

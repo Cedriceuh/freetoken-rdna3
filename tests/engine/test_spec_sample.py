@@ -101,3 +101,26 @@ def test_support_is_the_samplers_own():
             p = torch.softmax(logits[0, ids[0]], -1)
             keep = [i == 0 or top_p is None or float(p[:i].sum()) < top_p for i in range(top_k)]
             assert [bool(x) for x in got[0] > 0] == keep, (top_k, top_p)
+
+
+def test_verify_rows_take_the_penalties_of_a_step_by_step_decode():
+    """Presence / frequency penalties on a verify step (Engine._penalize_verify_rows): row j sees the request's
+    counts plus the drafts before it, as the step-by-step decode that kept those drafts would have."""
+    from freetoken.engine.engine import Engine
+
+    torch.manual_seed(0)
+    reqs, m, V = 3, 4, 11
+    rows = torch.randn(reqs, m, V)
+    ids = torch.randint(0, V, (reqs, m))
+    ids[1, 1:] = ids[1, 1]  # one draft repeated: frequency grows row by row
+    counts = torch.randint(0, 3, (V,), dtype=torch.int32)
+    out = Engine._penalize_verify_rows(rows, ids, [(1, counts, 0.5, 0.25)])
+    assert torch.equal(out[0], rows[0]) and torch.equal(out[2], rows[2])  # requests without penalties untouched
+    c = counts.clone()
+    for j in range(m):
+        if j:
+            c[ids[1, j]] += 1
+        assert torch.allclose(out[1, j], rows[1, j] - 0.25 * c - 0.5 * (c > 0).float()), j
+    before = counts.clone()
+    Engine._penalize_verify_rows(rows, ids, [(1, counts, 0.5, 0.25)])
+    assert torch.equal(counts, before)  # the counts move only with the kept tokens

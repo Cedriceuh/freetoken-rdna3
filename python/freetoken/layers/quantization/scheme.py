@@ -21,6 +21,7 @@ class QuantKind(Enum):
     NVFP4 = "nvfp4"
     MXFP4 = "mxfp4"
     EXL3 = "exl3"
+    GGUF = "gguf"
 
     def __str__(self) -> str:
         return self.value
@@ -122,3 +123,13 @@ def exl3_params(scheme: QuantScheme) -> tuple[int, int]:
     """(bits per weight, codebook) of an EXL3 scheme."""
     _, bits, codebook = scheme.weight.elem.split(":")
     return int(bits), int(codebook)
+
+
+def gguf_scheme(types: Iterable[int]) -> QuantScheme:
+    """Packed ggml blocks, one ggml type per fused part (``types`` follows the parts' order)."""
+    return QuantScheme(QuantKind.GGUF, WeightDesc("ggml:" + ",".join(str(int(t)) for t in types), None, None), {"weight"})
+
+
+def gguf_types(scheme: QuantScheme) -> tuple[int, ...]:
+    assert scheme.kind is QuantKind.GGUF, scheme
+    return tuple(int(t) for t in scheme.weight.elem.removeprefix("ggml:").split(","))

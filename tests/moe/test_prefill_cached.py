@@ -83,7 +83,9 @@ def test_ensure_prefill_routed_keeps_hits_and_evicts_lru():
     cache = OffloadMoeCache(num_layers=L, num_experts=E, cache_size=S, device=dev, prefill_overlap=False)
     cache.set_bank_sources(sources)
     cache.reset()
-    assert cache.prefill_cached_ok(1)
+    # fewer slots than two layers of experts: a layer does not take the path (the plan could run out of free slots);
+    # the plan itself runs below on a case that fits
+    assert not cache.prefill_cached_ok(1)
 
     def seed(layer, expert, slot, usage):
         cache.slot_for_id[layer, expert] = slot

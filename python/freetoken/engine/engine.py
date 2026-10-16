@@ -17,7 +17,7 @@ from freetoken.distributed.split import tp_shares
 from freetoken.gpu_select import gpu_identity
 from freetoken.checkpoint.ftw import ftw_tensor_names, is_ftw_checkpoint
 from freetoken.layers import OffloadMoELayer, iter_moe_layers, set_rope_device
-from freetoken.layers.quantization import LayerKind, QuantBackend, finalize_quant, set_quant_backend
+from freetoken.layers.quantization import LayerKind, QuantBackend, QuantKind, finalize_quant, set_quant_backend
 from freetoken.moe.offload_cache import iter_offload_moe_layers
 from freetoken.mm.config import ENCODER_SECTIONS
 from freetoken.models.config import VISION_KEY_PREFIXES
@@ -26,7 +26,8 @@ from freetoken.models.weight import ftw_lacks_vision
 from freetoken.moe import is_offload_moe_strategy
 from freetoken.moe.expert_banks import attach_resident_banks, load_expert_banks
 from freetoken.moe.host_banks import PinFailed
-from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache
+from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache, bank_layouts
+from freetoken.moe.pool_policy import group_layers, make_pools, pool_of_layer, resolve_profile, split_slots
 from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
 
 from .config import EngineConfig
@@ -40,6 +41,25 @@ from freetoken.kvcache.linear_state_pool import (
 )
 
 logger = init_logger(__name__)
+
+def _clamp_decode_batch_to_pools(config: EngineConfig, pool_sizes: list[int]) -> None:
+    """Clamp the decode batch so every GPU-decoded layer's routed experts fit in its pool."""
+    num_experts = config.model_config.num_experts
+    small = [s for s in pool_sizes if s < num_experts]
+    if not small:
+        return
+    limit = min(small) // config.model_config.num_experts_per_tok
+    if config.max_running_req > limit:
+        logger.warning_rank0(
+            f"the smallest MoE slot pool has {min(small)} slots; lowering max_running_req "
+            f"{config.max_running_req} -> {limit} so a decode step fits in it"
+        )
+        object.__setattr__(config, "max_running_req", limit)
+    if config.cuda_graph_max_bs is None or config.cuda_graph_max_bs > limit:
+        object.__setattr__(config, "cuda_graph_max_bs", limit)
+    if config.cuda_graph_bs is not None:
+        object.__setattr__(config, "cuda_graph_bs", [bs for bs in config.cuda_graph_bs if bs <= limit])
+
 
 def _require_offload_cache_size(cache_size: int, num_experts: int) -> None:
     """The offload MoE cache needs at least one slot per expert per layer. A too-small size
@@ -323,7 +343,7 @@ def _make_dummy_weight_state_dict(
             # MXFP8 e8m0 exponent codes: 127 encodes scale 1.0; zeros would collapse
             # every scale to 2^-127 and zero the model. Scoped BY NAME: other uint8
             # buffers are packed payloads whose bytes mean something else entirely
-            # (GGUF qweight blocks embed fp16 scales -- 0x7F7F is fp16 NaN), so they
+            # (GGUF blocks embed fp16 scales -- 0x7F7F is fp16 NaN), so they
             # keep the benign all-zeros fill below.
             state_dict[key] = torch.full(param.shape, 127, dtype=param.dtype, device=device)
         else:
@@ -706,7 +726,6 @@ class Engine:
                 config.model_config,
                 method=layers[0].quant_method,
                 device=self.device,
-                dtype=self.dtype,
                 dummy=config.use_dummy_weight,
                 parallel={"serial": False, "parallel": True}.get(config.expert_load, None),
                 resident=True,
@@ -768,7 +787,7 @@ class Engine:
         if parts:
             batch.mm_embeds = torch.cat([p.to(self.dtype) for p in parts], dim=0)
 
-    def _resolve_auto_moe_cache_size(self, config: EngineConfig, banks, method=None) -> tuple[int, int, bool]:
+    def _resolve_auto_moe_cache_size(self, config: EngineConfig, banks, method=None, max_slots=None) -> tuple[int, int, bool]:
         """Resolve --moe-cache-auto into (moe_cache_size, num_pages, prefill_overlap).
 
         Pure glue over the Phase-1 budget policy; isolated here so it is unit-testable
@@ -806,7 +825,7 @@ class Engine:
             prefill_overlap=config.moe_prefill_overlap,
             kv_reserve_tokens=max(config.kv_reserve_tokens, min_reserve),
             page_size=page_tokens,
-            max_slots=method.slot_limit() if method is not None else None,
+            max_slots=max_slots if max_slots is not None or method is None else method.slot_limit(),
         )
         if kv_host_enabled():
             # FREETOKEN_QSA_KV_HOST: a page past the reserve costs ~0.1 MB of VRAM but ~0.9 MB of pinned host RAM, so the
@@ -881,6 +900,11 @@ class Engine:
                 else HostResidency.PINNED.value
                 for i in range(config.model_config.num_moe_layers)
             ]
+        # read before the expert load, so a bad profile fails in seconds
+        expert_counts = resolve_profile(
+            config.moe_cache_split, config.model_path,
+            config.model_config.num_moe_layers, config.model_config.num_experts,
+        )
         try:
             with _weight_load_context():
                 banks = load_expert_banks(
@@ -888,16 +912,33 @@ class Engine:
                     config.model_config,
                     method=method,
                     device=self.device,
-                    dtype=self.dtype,
                     dummy=config.use_dummy_weight,
                     parallel=expert_parallel,
-                    decode_target=("cpu" if decode_target in ("cpu", "hybrid") else "gpu"),
                     layer_residency=requested_residency,
                 )
         except PinFailed as exc:
             raise RuntimeError(f"{exc}; {_pin_hint(self._host_tables_bytes)}") from exc
+        from freetoken.engine.cache_budget import expert_bytes_per_slot, layer_slot_bytes
+
+        self._moe_layer_slot_bytes = layer_slot_bytes(banks.sources)
+        self._moe_pool_groups = group_layers(config.moe_cache_scope, bank_layouts(banks.sources, banks.layer_tags), self._moe_layer_slot_bytes)
+        if len(self._moe_pool_groups) > 1 and cpu_layer_ids:
+            raise ValueError(
+                "several MoE slot pools (--moe-cache-scope per-layer, or experts in several quant formats) need every MoE "
+                "layer to decode from the GPU slot cache; they do not combine with --moe-strategy cpu or --moe-cpu-layers"
+            )
+        self._moe_expert_counts = expert_counts if len(self._moe_pool_groups) > 1 else None
+        if len(self._moe_pool_groups) == 1 and config.moe_cache_split != "equal":
+            logger.warning_rank0(
+                f"--moe-cache-split {config.moe_cache_split} is ignored: all MoE layers share one slot pool "
+                f"(--moe-cache-scope per-layer gives each layer its own)"
+            )
+        self._moe_slot_limit = method.slot_limit() if method is not None else None
+        # with GPU decode, a pool below num_experts slots bounds the batch; the startup split keeps room for one token per step
+        pools = self._moe_pools(1)
+        size_cap = sum(p.max_num_slots for p in pools)
         if config.moe_cache_auto:
-            size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks, method)
+            size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks, method, max_slots=size_cap)
             object.__setattr__(config, "moe_cache_size", size)
             object.__setattr__(config, "moe_prefill_overlap", overlap)
             if config.num_page_override is None:
@@ -913,7 +954,28 @@ class Engine:
                 f"--moe-cache-auto resolved moe_cache_size={size} "
                 f"num_pages={pages} (prefill_overlap={overlap})"
             )
+        elif config.moe_cache_mem is not None:
+            per_slot = expert_bytes_per_slot(banks.sources)
+            size = min(config.moe_cache_mem // per_slot, size_cap)
+            # per_slot is a mean over layers, so with pools of different slot sizes the split can exceed the budget: shrink until it fits
+            while size > 0 and self._moe_pool_bytes(split_slots(size, pools, self._moe_expert_counts)) > config.moe_cache_mem:
+                size -= 1
+            overlap = config.moe_prefill_overlap and size >= 2 * config.model_config.num_experts
+            object.__setattr__(config, "moe_cache_size", size)
+            object.__setattr__(config, "moe_prefill_overlap", overlap)
+            logger.info_rank0(
+                f"--moe-cache-mem {mem_GB(config.moe_cache_mem)} resolved moe_cache_size={size} "
+                f"({per_slot / 2**20:.2f} MiB per slot, prefill_overlap={overlap})"
+            )
         _require_offload_cache_size(config.moe_cache_size, config.model_config.num_experts)
+        pool_sizes = split_slots(config.moe_cache_size, pools, self._moe_expert_counts)
+        if len(pools) > 1:
+            logger.info_rank0(
+                f"MoE slot pools: {config.moe_cache_scope}, {len(pools)} pools of {min(pool_sizes)}-{max(pool_sizes)} "
+                f"slots ({config.moe_cache_split})"
+            )
+            if decode_target == "gpu":
+                _clamp_decode_batch_to_pools(config, pool_sizes)
         layout = max_slots = None
         if method is not None:
             if banks.kind is not None and (banks.kind, banks.kernel) != (method.kind, method.kernel.name):
@@ -921,7 +983,8 @@ class Engine:
                     f"expert banks were packed for {banks.kind} / {banks.kernel} but the model "
                     f"binds {method.kind} / {method.kernel.name}; reconvert or select that kernel"
                 )
-            layout = method.layout()
+            # GGUF layers keep their own ggml types, so the cache reads each layer's layout off its banks
+            layout = None if method.kind is QuantKind.GGUF else method.layout()
             max_slots = method.slot_limit()
         cache = OffloadMoeCache(
             # Models with leading dense layers (GLM-4) only have experts on the MoE
@@ -938,10 +1001,12 @@ class Engine:
             hybrid_max_fetch=config.moe_hybrid_max_fetch,
             layout=layout,
             max_slots=max_slots,
+            pool_of_layer=pool_of_layer(pools, config.model_config.num_moe_layers),
+            pool_sizes=pool_sizes,
         )
         # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
         cache.cpu_layer_ids = cpu_layer_ids
-        cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
+        cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency, layer_tags=banks.layer_tags, row_tail_bytes=banks.row_tail_bytes)
         cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
         if decode_target == "hybrid":
             self._resolve_hybrid_fetch(config, cache)
@@ -955,6 +1020,16 @@ class Engine:
         self.ctx.moe_offload_cache = cache
         self.moe_offload_cache = cache
         return cache
+
+    def _moe_pool_bytes(self, pool_sizes: list[int]) -> int:
+        return sum(s * self._moe_layer_slot_bytes[g[0]] for g, s in zip(self._moe_pool_groups, pool_sizes))
+
+    def _moe_pools(self, batch: int) -> list:
+        """The slot pools, each with room for the routed experts of ``batch`` decode tokens."""
+        model_config = self.config.model_config
+        num_experts = model_config.num_experts
+        min_num_slots = min(num_experts, model_config.num_experts_per_tok * batch)
+        return make_pools(self._moe_pool_groups, num_experts, min_num_slots, self._moe_slot_limit)
 
     def _resolve_hybrid_fetch(self, config: EngineConfig, cache) -> None:
         """Resolve --moe-hybrid-max-fetch -1 (auto) into a bandwidth-matched fetch fraction.
@@ -997,9 +1072,8 @@ class Engine:
         """Build the persistent CPU MoE executor (decode-time expert compute).
 
         Must run before CUDA graph capture: the worker pool has to be live for the
-        eager warmup forward, and the pinned IO buffers / host-func task pointers
-        must be stable for the captured nodes. Buffers/tasks themselves are
-        allocated lazily on the first (eager) forward at each batch size.
+        eager warmup forward, and the pinned IO block must be stable for the captured
+        nodes.
         """
         from freetoken.moe.cpu_executor import CpuMoeExecutor
 
@@ -1012,9 +1086,12 @@ class Engine:
             )
         # Decode batches never exceed max_running_req, but CUDA-graph padding can
         # round a batch up to the largest captured size; cover both. A speculative verify step runs up to SPEC_M rows
-        # per request: the executor's buffers are sized for them up front (create_task refuses a larger task).
-        max_tokens = max(config.max_running_req, config.cuda_graph_max_bs or 0, 1) * SPEC_M
+        # per request: the executor's IO rows are sized for them up front (a larger task is refused).
+        max_tokens = max(config.max_running_req, config.cuda_graph_max_bs or 0, *(config.cuda_graph_bs or []), 1) * SPEC_M
         method = sample.quant_method
+        formats = {layer.quant_method.cpu_format for layer in layers}
+        if len(formats) > 1:
+            raise NotImplementedError(f"CPU MoE backend needs one expert format across the MoE layers, got {sorted(map(str, formats))}")
         executor = CpuMoeExecutor(
             cache,
             top_k=sample.top_k,
@@ -1025,9 +1102,8 @@ class Engine:
             device=self.device,
             swiglu_alpha=float(sample.alpha),
             swiglu_limit=sample.limit,
-            # FIXME: the None branch serves GGUF q4_0 banks, which have no quant method yet; drop it once GGUF joins the quant path
-            fmt=method.cpu_format if method is not None else None,
-            act_block=method.cfg.act_block if method is not None else None,
+            fmt=method.cpu_format,
+            act_block=method.cfg.act_block,
             tp_cpu_group=getattr(self, "tp_cpu_group", None),
         )
         cache.set_cpu_executor(executor)
@@ -1067,19 +1143,18 @@ class Engine:
 
         return min_free_memory, max_free_memory
 
-    def _target_moe_and_expert_bytes(self, moe_cache_size: int | None) -> tuple[int, int]:
-        from freetoken.engine.cache_budget import expert_bytes_per_slot
-
-        target_moe = (
-            moe_cache_size
-            if moe_cache_size is not None
-            else (self.moe_offload_cache.cache_size if self.moe_offload_cache else 0)
-        )
-        per_expert_bytes = (
-            expert_bytes_per_slot(self.moe_offload_cache.bank_sources)
-            if self.moe_offload_cache is not None else 0
-        )
-        return target_moe, per_expert_bytes
+    def _target_moe_and_expert_bytes(self, moe_cache_size: int | None, pool_sizes: list[int] | None) -> tuple[int, int]:
+        cache = self.moe_offload_cache
+        if cache is None:
+            return moe_cache_size or 0, 0
+        if moe_cache_size is None:
+            target_moe = cache.cache_size
+            nbytes = sum(c.numel() * c.element_size() for _, c in cache.banks)
+        else:
+            target_moe = moe_cache_size
+            nbytes = self._moe_pool_bytes(pool_sizes)
+        # pools of several bank layouts have different slot sizes; round up so target * bytes covers them
+        return target_moe, -(-nbytes // target_moe)
 
     def _resize_kv_pool(self, config, num_pages: int, num_swa_pages: int | None) -> None:
         # IN-PLACE, identity-preserving: the CacheManager's swa_pool reference, ctx.kv_cache and
@@ -1148,7 +1223,10 @@ class Engine:
                     "moe_cache_size requested but this model has no MoE offload cache"
                 )
             try:
-                self.moe_offload_cache.validate_rebuild(moe_cache_size)
+                # a rebuild does not lower max_running_req again, so with GPU decode every pool must hold a full batch; hybrid caps its fetches instead
+                batch = config.max_running_req if self.moe_offload_cache.decode_target == "gpu" else 1
+                moe_pool_sizes = split_slots(moe_cache_size, self._moe_pools(batch), self._moe_expert_counts)
+                self.moe_offload_cache.validate_rebuild(moe_cache_size, moe_pool_sizes)
             except ValueError as e:
                 raise CacheRebuildRejected(str(e)) from e
         if num_pages is not None and num_pages <= 0:
@@ -1185,7 +1263,9 @@ class Engine:
         #     must reject (recoverable) so the old caches stay intact and serving continues,
         #     rather than freeing and then OOMing into permanent failure. The engine supplies
         #     the memory account; the pool answers whether its target geometry fits.
-        target_moe, per_expert_bytes = self._target_moe_and_expert_bytes(moe_cache_size)
+        target_moe, per_expert_bytes = self._target_moe_and_expert_bytes(
+            moe_cache_size, moe_pool_sizes if moe_cache_size is not None else None
+        )
         # Price the sibling GDN state pool at ITS target (physical slots = usable + padding
         # sink) and hand the bytes in -- the KV pool only budgets its own tiers.
         target_mamba = (
@@ -1229,7 +1309,7 @@ class Engine:
             object.__setattr__(config, "swa_num_pages_override", num_swa_pages)
         if moe_cache_size is not None:
             assert self.moe_offload_cache is not None, "no MoE offload cache to resize"
-            self.moe_offload_cache.rebuild(moe_cache_size)
+            self.moe_offload_cache.rebuild(moe_cache_size, moe_pool_sizes)
         if num_pages is not None:
             # sets self.num_pages (rebuilds KV + window)
             self._resize_kv_pool(config, num_pages, num_swa_pages)
@@ -1348,6 +1428,8 @@ class Engine:
         acceptance log reads its running sum once every 512 steps)."""
         m, reqs, real = batch.spec_m, batch.padded_size, batch.size
         rows = logits.view(reqs, m, logits.shape[-1])
+        if args.penalties:
+            rows = self._penalize_verify_rows(rows, batch.input_ids.view(reqs, m), args.penalties)
         tokens = rows.argmax(-1)  # [reqs, m]: the target's choice after each row
         if SPEC_GLUE_KERNELS and batch.input_ids.is_contiguous():
             from freetoken.kernel.triton.spec_glue import greedy_n_acc
@@ -1371,6 +1453,9 @@ class Engine:
             if getattr(self, "_sync_sampled_tokens", False):  # rank 0's draws, before anything reads them
                 torch.distributed.broadcast(tokens, src=0)
                 torch.distributed.broadcast(n_acc, src=0)
+        for r, counts, _, _ in args.penalties:  # the kept tokens join the counts, device-side
+            keep = (torch.arange(m, device=counts.device) < n_acc[r]).to(counts.dtype)
+            counts.scatter_add_(0, tokens[r].long(), keep)
         apply_rollback(batch.linear_table_idx, n_acc, self._spec_pad_slot(), m)
         # the kept tokens go to the host before the draft head runs: the scheduler streams them and builds the next
         # step while the GPU drafts (the next step's kernels queue behind the drafts on this stream)
@@ -1382,6 +1467,20 @@ class Engine:
         drafts = self._mtp_drafts(batch, tokens, n_acc=n_acc, args=args)
         self._mtp_tally_accept(kept_n, n_acc_cpu)
         return ForwardOutput(kept, tokens_cpu, done, drafts, kept_n, n_acc_cpu)
+
+    @staticmethod
+    def _penalize_verify_rows(rows: torch.Tensor, ids: torch.Tensor, penalties: list) -> torch.Tensor:
+        """Presence / frequency penalties on a verify step's rows (Sampler.sample's, one row a request there): row j of
+        a request counts its output so far plus the drafts it verifies before j (``ids[r, 1:j + 1]``), so each row
+        holds the distribution a step-by-step decode would have sampled from."""
+        rows = rows.float().clone()
+        m = rows.shape[1]
+        for r, counts, presence, frequency in penalties:
+            c = counts.unsqueeze(0).repeat(m, 1)
+            for j in range(1, m):
+                c[j:, ids[r, j].long()] += 1
+            rows[r] -= frequency * c + presence * (c > 0)
+        return rows
 
     @staticmethod
     def _draft_q(batch: Batch, drafts: torch.Tensor, vocab: int) -> torch.Tensor | None:
@@ -1695,11 +1794,11 @@ def _is_unified_memory_gpu(index: "int | None" = None) -> bool:
         return False
 
 
-_RESIDENT_EXPERT_QUANTS = ("none", "fp8_block", "nvfp4")
+_RESIDENT_EXPERT_QUANTS = ("none", "fp8_block", "nvfp4", "gguf")
 
 
 def _fused_resident_ok(model_config) -> bool:
-    """Whether the resident ('fused') MoE path can hold this model's experts; GGUF q4_0 and DeepSeek-V4 experts stay offload."""
+    """Whether the resident ('fused') MoE path can hold this model's experts; DeepSeek-V4 experts stay offload."""
     if getattr(model_config, "expert_quant", "none") not in _RESIDENT_EXPERT_QUANTS:
         return False
     return getattr(model_config, "moe_weight_format", None) in (None, "bf16", "mxfp4")
@@ -1886,10 +1985,10 @@ def _cpu_moe_executor_viable(model_config) -> bool:
     """Whether an automatic CPU-decode decision may target the CPU MoE executor.
 
     A default boot must degrade to GPU offload instead of crashing in CpuMoeExecutor after the whole load; explicit cpu/hybrid/--moe-cpu-layers picks still fail loudly."""
-    from freetoken.moe.cpu_executor import _WFMT_IDS, compiled_extension_supports
+    from freetoken.moe.cpu_executor import compiled_extension_supports
 
     try:
-        from freetoken.kernel import _cpu_moe  # noqa: F401
+        from freetoken.kernel import _cpu_moe
     except ImportError:
         return False
     act = getattr(model_config, "hidden_act", "silu")
@@ -1900,7 +1999,7 @@ def _cpu_moe_executor_viable(model_config) -> bool:
         return False
     expert_quant = getattr(model_config, "expert_quant", "none")
     fmt = expert_quant if expert_quant != "none" else (moe_wfmt or "bf16")
-    return fmt == "mxfp4" or fmt in _WFMT_IDS
+    return fmt == "mxfp4" or fmt in _cpu_moe.weight_formats()
 
 
 def _pin_budget_bytes(reserved: int = 0) -> int | None:
@@ -1977,6 +2076,9 @@ _DENSE_MOE_SETTINGS = {
     "moe_cache_size": 0,
     "moe_cache_rate": None,
     "moe_cache_auto": False,
+    "moe_cache_mem": None,
+    "moe_cache_scope": "unified",
+    "moe_cache_split": "equal",
     "moe_cpu_layers": None,
     "moe_cpu_threads": 0,
     "moe_hybrid_max_fetch": -1,
@@ -2189,7 +2291,7 @@ def _adjust_config(config: EngineConfig):
     if is_moe and config.moe_strategy == "auto":
         # A MoE model always defaults to the offload family: experts stream from pinned host
         # banks into an auto-sized GPU slot cache, which is the only default that serves a model
-        # bigger than the GPU. The resident 'fused' path (every expert format but GGUF q4_0 and
+        # bigger than the GPU. The resident 'fused' path (every expert format but
         # DeepSeek-V4's) is still reachable, but only when asked for explicitly
         # -- auto never picks it, because nothing here knows whether the experts would fit in
         # HBM and a wrong guess is a weight-load OOM rather than a slower-but-working run.
@@ -2227,7 +2329,7 @@ def _adjust_config(config: EngineConfig):
         # offload -- same auto-sized GPU slot cache (_resolve_auto_moe_cache_size), plus a
         # host-RAM CPU executor -- so this never raises the OOM risk; with no profile (or one
         # from different hardware) it stays offload. offload remains the always-safe fallback.
-        # Key the lookup on the real expert format: mxfp4/q4_0 live in moe_weight_format when
+        # Key the lookup on the real expert format: mxfp4 lives in moe_weight_format when
         # expert_quant is "none", and "none" with no weight format means plain bf16 experts.
         moe_wfmt = getattr(model_config, "moe_weight_format", None)
         bench_fmt = expert_quant if expert_quant != "none" else (moe_wfmt or "bf16")
@@ -2272,6 +2374,7 @@ def _adjust_config(config: EngineConfig):
             is_offload_moe_strategy(config.moe_strategy)
             and config.moe_cache_size <= 0
             and config.moe_cache_rate is None
+            and config.moe_cache_mem is None
             and not getattr(config, "moe_cache_auto", False)
         ):
             # args.py's "no sizing flag -> default --moe-cache-auto" only fires when the
@@ -2305,11 +2408,13 @@ def _adjust_config(config: EngineConfig):
         # An explicit 'fused' keeps the experts resident, so there is no slot cache to size. The
         # sizing flags no longer redirect the backend, so ignore them here and say so -- the
         # geometry the user asked for is what runs. Report the flag actually passed: --moe-cache-
-        # rate was already folded into moe_cache_size above, and the three are mutually exclusive.
+        # rate was already folded into moe_cache_size above, and the sizing flags are mutually exclusive.
         if config.moe_cache_rate:
             inert = f"--moe-cache-rate={config.moe_cache_rate}"
         elif config.moe_cache_size:
             inert = f"--moe-cache-size={config.moe_cache_size}"
+        elif config.moe_cache_mem is not None:
+            inert = f"--moe-cache-mem={config.moe_cache_mem}"
         elif getattr(config, "moe_cache_auto", False):
             inert = "--moe-cache-auto"
         else:
@@ -2321,6 +2426,7 @@ def _adjust_config(config: EngineConfig):
             )
             override("moe_cache_size", 0)
             override("moe_cache_rate", None)
+            override("moe_cache_mem", None)
             override("moe_cache_auto", False)
 
     if is_moe and config.moe_strategy == "cpu":
@@ -2331,6 +2437,7 @@ def _adjust_config(config: EngineConfig):
         num_experts = config.model_config.num_experts
         if getattr(config, "moe_cache_auto", False):
             override("moe_cache_auto", False)
+        override("moe_cache_mem", None)
         override("moe_cache_size", 2 * num_experts)
         override("moe_prefill_overlap", True)
         logger.info_rank0(
