@@ -318,7 +318,8 @@ class QSASparseAttnBackend(BaseAttnBackend):
             if slot == 0 or md.stage_pages is None:
                 n = ((md.kv_len_cpu + self.page_size - 1) // self.page_size).tolist()
                 md.stage_pages = torch.cat([md.block_table[i, :c] for i, c in enumerate(n)])
-            k_cache, v_cache = self.kvcache.staged_kv(layer_id, md.stage_pages)
+            k_cache, v_cache = self.kvcache.staged_kv(layer_id, md.stage_pages, indices, md.token_to_req,
+                                                      md.block_table)
         return qsa_sparse_paged_attention(
             q,
             k_cache,

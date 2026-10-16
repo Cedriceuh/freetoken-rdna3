@@ -67,6 +67,7 @@ def _load_rocm():
             _probe(fn)
         except Exception as exc:  # noqa: BLE001 -- try the next mode
             errors.append(f"{m}: {exc}")
+            logger.warning(f"batch memcpy on ROCm: the {m} mode failed its probe ({exc}); trying the next")
             continue
         logger.info(f"batch memcpy on ROCm: {m}")
         return fn
@@ -81,6 +82,9 @@ def _probe(fn) -> None:
     src = torch.arange(16, dtype=torch.uint8).pin_memory()
     dst = torch.zeros(16, dtype=torch.uint8, device="cuda")
     stream = torch.cuda.Stream()
+    # the zero fill runs on the current stream: without this the copy could land first and be overwritten (seen once
+    # the module loads from a cache instead of compiling for seconds: the batch mode then failed its probe at random)
+    stream.wait_stream(torch.cuda.current_stream())
     fn(
         torch.tensor([dst.data_ptr()]),
         torch.tensor([src.data_ptr()]),

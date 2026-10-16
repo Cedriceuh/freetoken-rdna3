@@ -22,6 +22,11 @@ _FEWER_COPIES = os.environ.get("FREETOKEN_FEWER_COPIES", "1" if torch.version.hi
 # time, the recurrent state chained through its pool slot: the same bits (the kernels work per 64-token chunk, the
 # state in fp32), a quarter of the temporaries at a 16k-token chunk (~0.8 GiB less on a 7900 XT)
 _GDN_PREFILL_BLOCK = int(os.environ.get("FREETOKEN_GDN_PREFILL_BLOCK", "4096"))
+# FREETOKEN_GDN_CONV_ROWS (default 1): the prefill conv reads the projection's q / k / v columns in place and writes
+# each group token-major into its own buffer (kernel/triton/causal_conv1d_triton.causal_conv1d_varlen_rows): the same
+# kernel and taps, so the same values, without the channel-major transpose of the input and the strided copies of every
+# 4096-token block's q / k / v (~0.2 s of each 16k-token chunk on NVFP4 xtx-xt-4x262k). Triton conv path only.
+_CONV_ROWS = os.environ.get("FREETOKEN_GDN_CONV_ROWS", "1") != "0"
 assert _GDN_PREFILL_BLOCK % 64 == 0, "FREETOKEN_GDN_PREFILL_BLOCK must be a multiple of the 64-token chunk"
 _SPEC_BUFS: list = []  # [(recurrent [layers, reqs, m-1, ...], conv [layers, m-1, reqs, ...])] once allocated
 _SPEC_ROWS: list = []
@@ -169,6 +174,24 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
                                    cu_seqlens, cache_indices, has_initial_state)
         return out.transpose(0, 1)  # [total, conv_dim]
 
+    def _conv_prefill_rows(self, conv_in, pool, cu_seqlens, cache_indices, has_initial_state):
+        """``_conv_prefill`` split into q / k / v, each [total, dim] contiguous (FREETOKEN_GDN_CONV_ROWS)."""
+        from freetoken.kernel.triton.causal_conv1d_triton import causal_conv1d_varlen_rows
+
+        li = pool.local_index(self.layer_id)
+        weight, states = self._conv_weight(), pool.conv_states[li]
+        total = conv_in.shape[0]
+        max_len = int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())
+        outs, start = [], 0
+        for dim in (self.key_dim, self.key_dim, self.value_dim):
+            out = torch.empty((total, dim), dtype=conv_in.dtype, device=conv_in.device)
+            causal_conv1d_varlen_rows(conv_in[:, start:start + dim], weight[start:start + dim],
+                                      states[:, start:start + dim], cu_seqlens, cache_indices, has_initial_state, out,
+                                      max_seq_len=max_len)
+            outs.append(out)
+            start += dim
+        return outs
+
     def _conv_decode(self, conv_in: torch.Tensor, table_idx: torch.Tensor, pool) -> torch.Tensor:
         """Single-token causal conv update (fused sgl_kernel) by ``table_idx`` slot;
         updates conv state in place, no host loop -> CUDA-graph capturable.
@@ -259,10 +282,16 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
                 intermediate_states=inter, intermediate_indices=None if inter is None else self._spec_rows[: inter.shape[0]],
             )
         else:
-            mixed = self._conv_prefill(
-                conv_in, pool, fla.cu_seqlens, fla.cache_indices, fla.has_initial_state)
+            # the rows kernel addresses tokens with int32 offsets (token * projection width): past 2^31 the
+            # channel-major path, which keeps int64 feature offsets (a forward of ~175k+ tokens; chunks are 16k)
+            if _CONV_ROWS and not _sgl_conv() and (total + 1) * conv_in.stride(0) < 2**31:
+                qf, kf, vf = self._conv_prefill_rows(
+                    conv_in, pool, fla.cu_seqlens, fla.cache_indices, fla.has_initial_state)
+            else:
+                mixed = self._conv_prefill(
+                    conv_in, pool, fla.cu_seqlens, fla.cache_indices, fla.has_initial_state)
+                qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
             # fla chunk handles GQA in-kernel: q/k stay at num_k_heads, v at num_v_heads.
-            qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
             q = qf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
             k = kf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
             v = vf.reshape(1, total, self.num_v_heads, self.head_v_dim).to(dtype)
@@ -298,6 +327,12 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         # decode: one row per norm program, so a verify step's rows (and a batch's) get their single-row bits
         out = self.norm.forward(core_out, z, rows_per_block=1 if batch.is_decode else None).reshape(total, -1)
         return self.out_proj.forward(out)
+
+
+def _sgl_conv() -> bool:
+    from freetoken.kernel.backend import is_sgl_kernel_installed
+
+    return is_sgl_kernel_installed()
 
 
 def _gdn_blocks(fla, device: torch.device) -> list:

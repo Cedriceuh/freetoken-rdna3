@@ -12,9 +12,9 @@ python3 rdna3/bench/quick_bench.py --label "2x RX 7900 XT, xt-xt"
 ```
 
 About a minute; it measures decode speed, a cold ~8.3k-token read, an agent turn on the cached conversation and a
-tool call, on text the server has never seen, and prints a Markdown table for an issue. For comparison, `xtx-xt` on
-the ROCm 10 image gives ~60-67 tok/s with the MTP head (a sampled answer, so it varies; ~55-56 with `--no-mtp`),
-~4.0 s and ~1.3 s, tool call parsed. On a fresh image the first run can be
+tool call, on text the server has never seen, and prints a Markdown table for an issue. For comparison, `xtx-xt` with
+the NVFP4 checkpoint on the image of 2026-10-15 gave 70.7 and 73.5 tok/s with the MTP head in two runs (a sampled
+answer, so it varies), 3.86-3.88 s for the cold read and 0.86-0.88 s for the agent turn, tool call parsed. On a fresh image the first run can be
 slower (one-time kernel preparation): run it twice.
 
 ## CPU test suite
@@ -23,8 +23,8 @@ slower (one-time kernel preparation): run it twice.
 docker run --rm -w /opt/FreeToken --entrypoint python3 freetoken-rdna3:latest -m pytest -q -p no:cacheprovider tests
 ```
 
-About 2.5 minutes (139 s on the reference machine), no GPU needed, on the tree the image was built from: 1553 passed,
-624 skipped and 3 failures that come from the environment (they need flashinfer, an NVIDIA-only package) and fail the
+About 2.5 minutes (143 s on the reference machine), no GPU needed, on the tree the image was built from: 1738 passed,
+909 skipped and 3 failures that come from the environment (they need flashinfer, an NVIDIA-only package) and fail the
 same way on upstream
 (`test_cache_budget.py::test_adjust_config_defaults_moe_cache_auto_for_auto_resolved_offload_backend`,
 `test_cache_budget.py::test_adjust_config_resolves_num_tokens_generic`,
@@ -32,8 +32,7 @@ same way on upstream
 
 To test source changes without rebuilding, mount your tree instead (`-v "$PWD":/src:ro -w /src -e
 PYTHONPATH=/src/python`); `test_swiglu_clamp.py::test_cpu_extension_supports_swiglu_clamp` then fails too, because the
-compiled CPU extension lives in the image's tree, not in yours. So does `test_cpu_moe_exl3.py` (EXL3 on the CPU
-executor) until the image is rebuilt from a tree that has it; or build the extensions in your tree first (`python3
+compiled CPU extension lives in the image's tree, not in yours; or build the extensions in your tree first (`python3
 setup.py build_ext --inplace` in the container, your tree mounted at `/opt/FreeToken`).
 
 ## GPU checks (`rdna3/tests/`)
@@ -72,12 +71,16 @@ docker run --rm --device=/dev/kfd --device=/dev/dri --security-opt seccomp=uncon
 | `exl3_gemv_bench.py`, `exl3_moe_bench.py` | the EXL3 decode GEMV tile sweep against the NVFP4 GEMV, and the 48-layer decode MoE step of both formats |
 | `dense_gemv_bench.py` | decode dense projections, bf16 vs int8 |
 | `router_topk_bench.py` | the MoE router softmax + top-k |
-| `qsa_topk_bench.py` | the QSA indexer's block top-k on the profiles' page tables (250k / 262k and 1M contexts), against `torch.topk` |
+| `qsa_topk_bench.py` | the QSA indexer's block top-k on the profiles' page tables (262k and 1M contexts), against `torch.topk` |
 | `allreduce_bench.py` | tiny all-reduce latency between two GPUs (`torchrun --nproc-per-node 2`) |
 | `vision_tower_bench.py` | the vision tower alone on one card: encode time, peak VRAM and attention kernel per image size; `--save` writes the embeddings to compare two cards bit for bit |
 
 Microbenchmarks only locate a cost: the weights stay hot in the 80-96 MB Infinity Cache and the kernel mix is not a
 real step's. Decide on the whole model.
+
+A `rocprofv3 --kernel-trace` of graph-replayed decode can lose records: on 2026-10-16 (ROCm 10.1, four requests) 37 %
+of the dispatches were missing, in whole chunks of 256, 321 or 720 (`Dispatch_Id` jumps), which looked like
+milliseconds of idle GPU. Count gaps only between consecutive `Dispatch_Id`s.
 
 ## Before trusting a change: the procedure used here
 
@@ -89,7 +92,11 @@ real step's. Decide on the whole model.
 3. **Depth**: the growing-conversation sweep to the profile's maximum context ([benchmarks.md](benchmarks.md)).
 4. **Several requests and sampling**: four concurrent agents with sampling, one request per sampler path (greedy,
    top-p only, large and small top-k) alone and batched, with `FREETOKEN_TP_SYNC_TOKENS=check` (no disagreement lines
-   expected), and a smoke test with a tool call.
+   expected), and a smoke test with a tool call. Answers under load are no bit-exactness test: four agents at
+   temperature 0 on one build gave the same answers on only 4 and 11 of 44 turns from one run to the next (measured
+   2026-10-15; which requests share a batch and where a prompt is chunked follow arrival times). Under load, check a
+   new path from inside instead (what it reads against the old path's bytes), and expect an agentic score to move
+   between two runs of one build (6 of 29 tasks measured with sampling).
 5. **Anything not bit-exact**: a scored benchmark to reject it early, then an agentic, multi-turn benchmark to accept
    it (the one used here is private; a long agent workload of your own, run on both builds). Short tests (scored
    items, needles, probes) missed a change that cost a third of the agentic score.

@@ -24,7 +24,7 @@ from freetoken.kernel.triton.nvfp4_fused_moe import (
     _prefill_nvfp4_moe_kernel,
 )
 from freetoken.layers import gated_act_and_mul
-from freetoken.moe.fused import moe_align_block_size
+from freetoken.moe.fused import blocks_to_slots, moe_align_block_size
 from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
@@ -360,10 +360,12 @@ def fused_experts_nvfp4(
     apply_router_weight_on_input: bool = False,
     act_alpha: float = 1.702,
     act_limit: float = 7.0,
+    slot_map: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Prefill inline-NVFP4 MoE. ``topk_ids`` index rows of the bank tensors in
     ``[0, num_experts)``: full-layer banks with position == expert id (the
-    materialized ``[:E]`` slot view or the overlap double buffer), raw ids.
+    materialized ``[:E]`` slot view or the overlap double buffer), raw ids; with ``slot_map`` (expert id -> slot) the
+    banks are the slot cache and each expert's tiles read its slot.
 
     A chunk longer than NVFP4_PREFILL_BLOCK tokens runs block by block on the same banks: the [M, top_k, H]
     intermediate is ~840 MiB at a 16k-token chunk; every token's rows are independent, so the result is the same."""
@@ -375,7 +377,7 @@ def fused_experts_nvfp4(
             out[start:end] = fused_experts_nvfp4(
                 hidden_states[start:end], gate_up_packed, gate_up_scale, gate_up_global, down_packed, down_scale,
                 down_global, topk_weights[start:end], topk_ids[start:end], num_experts, activation,
-                apply_router_weight_on_input, act_alpha, act_limit,
+                apply_router_weight_on_input, act_alpha, act_limit, slot_map,
             )
         return out
     top_k = topk_ids.shape[1]
@@ -387,6 +389,10 @@ def fused_experts_nvfp4(
     align_up = moe_align_block_size(topk_ids, cfg_up["BLOCK_SIZE_M"], num_experts)
     align_down = (align_up if cfg_down["BLOCK_SIZE_M"] == cfg_up["BLOCK_SIZE_M"]
                   else moe_align_block_size(topk_ids, cfg_down["BLOCK_SIZE_M"], num_experts))
+    if slot_map is not None:
+        mapped_up = (align_up[0], blocks_to_slots(align_up[1], slot_map), align_up[2])
+        align_down = mapped_up if align_down is align_up else (align_down[0], blocks_to_slots(align_down[1], slot_map), align_down[2])
+        align_up = mapped_up
     tw = topk_weights.reshape(-1).contiguous()
     num_valid = topk_ids.numel()
 

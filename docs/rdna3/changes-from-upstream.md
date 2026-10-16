@@ -226,6 +226,23 @@ Line counts here are on top of the lines listed in the sections above.
 | `python/freetoken/kernel/triton/spec_glue.py`, `spec_decode.py`, `models/qwen4_exp/gdn.py`, `engine/engine.py`, `scheduler/scheduler.py` | 156/0, 27/2, 11/3, 65/11, 11/1 | a verify step's glue in kernels (`FREETOKEN_SPEC_GLUE_KERNELS`): the rollback copies (one kernel per state), the token-pool writes, the kept counts of greedy rows, the MTP head's rows and the chained guesses' addressing; the acceptance tally summed on the host |
 | `tests/kernels/test_decode_glue.py` | 169/0 | each kernel bit-identical to the torch ops it replaces over random batches (GPU) |
 
+## Agent turns and cold reads, bit-exact: short prefills through the expert cache, the prompt tokens reused, the K/V pages read, the GDN conv token-major; `--default-temperature` (2026-10-14 to 16)
+
+| File | Lines | Change |
+|---|---:|---|
+| `python/freetoken/moe/offload_cache.py`, `moe/offload_kernels.py` | 134/1, 115/0 | `ensure_prefill_routed`: a short prefill chunk's routed experts made resident in the slot cache (LRU by (usage, slot), the routed hits and the predicted ones protected), the misses copied by decode's copy, the next layer's predicted experts by the copy engine on the copy stream; the bookkeeping in three Triton kernels and one top-k a layer; the experts brought in demoted after their GEMMs |
+| `python/freetoken/layers/moe.py`, `layers/quantization/moe/base.py`, `exl3.py`, `nvfp4.py` | 56/5, 5/0, 2/0, 3/1 | `FREETOKEN_PREFILL_CACHED_MAX` (default 1280 for the layers of a model that predicts); `ExpertView.slot_map` for the EXL3 / NVFP4 Triton prefill |
+| `python/freetoken/moe/fused.py`, `moe/fused_exl3.py`, `moe/fused_nvfp4.py` | 7/0, 8/3, 9/3 | `blocks_to_slots`: the tiles of the expert-id alignment read their weights from the slots (the same tiles, the same bits) |
+| `python/freetoken/models/qwen4_exp/moe.py`, `models/qwen4_exp/mtp.py` | 18/0, 1/0 | layer L+1's router on layer L's MoE input, each token's top-10, as the prediction (`FREETOKEN_PREFILL_PREDICT`) |
+| `python/freetoken/kernel/batch_memcpy.py` | 4/0 | the probe's copy waits for its fill; a failed mode is logged |
+| `python/freetoken/kernel/triton/exl3.py`, `tests/kernels/test_exl3_mid_cols.py`, `tests/kernels/test_exl3_gemm_stages.py` | 79/7, 34/0, new | the prefill's mid step 32 Hadamard columns at a time (`FREETOKEN_EXL3_MID_COLS`): the tile kernel's bits without its 2.7 KB of scratch per lane, 1.7-3.3x faster; the prefill GEMMs with two pipeline stages (the same bits, checked against one stage) |
+| `Dockerfile.rdna3`, `rdna3/serve.sh` | 5/2, 2/0 | `TVM_FFI_CACHE_DIR` in the kernel-cache volume |
+| `python/freetoken/kernel/triton/qsa/stage.py`, `kvcache/qsa_pool.py`, `attention/qsa_sparse.py`, `tests/kernels/test_qsa_kv_host.py` | 66/1, 26/5, 2/1, 84/0 | host K/V: a prefill stages only the K/V rows of the tokens it selects (`FREETOKEN_QSA_STAGE_SELECTED`), marked by the attention kernel's mapping |
+| `python/freetoken/kernel/triton/causal_conv1d_triton.py`, `models/qwen4_exp/gdn.py`, `tests/kernels/test_conv_rows.py` | 46/0, 38/3, new | the GatedDeltaNet prefill conv token-major (`FREETOKEN_GDN_CONV_ROWS`): the projection's q / k / v columns read in place, each group written to its own contiguous buffer, the same kernel and taps |
+| `python/freetoken/server/args.py`, `server/api_server.py`, `docs/cli.md`, `tests/server/test_default_temperature.py` | 13/0, 16/3, 1/0, 43/0 | `--default-temperature`: the temperature of requests that send none, in place of the checkpoint's |
+| `python/freetoken/tokenizer/prefix_cache.py`, `tokenizer/tokenize.py`, `tests/tokenizer/test_prefix_cache.py` | 167/0, 11/5, 133/0 | `PromptPrefixCache`: a templated prompt reuses an earlier prompt's tokens up to the last `<\|im_start\|>` of their shared prefix and encodes the rest, the same tokens (`FREETOKEN_TOKENIZE_PREFIX_CACHE`) |
+| `tests/moe/test_prefill_cached.py` | 273/0 | prefill from slots bit-identical to the full-layer buffers (EXL3, NVFP4), the LRU claims and demotion, the predicted prefetch then the fix-up copy, the split prefetch by DMA or shader copy (GPU) |
+
 ## Tooling and documentation
 
 | File | Change |

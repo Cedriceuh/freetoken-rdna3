@@ -533,6 +533,52 @@ def causal_conv1d_varlen(
     return out
 
 
+def causal_conv1d_varlen_rows(
+    x: torch.Tensor,            # [total_tokens, dim] (token-major, a row-strided view is fine)
+    weight: torch.Tensor,       # [dim, kernel]
+    conv_states: torch.Tensor,  # [num_slots, dim, kernel-1] (a channel-sliced view is fine; in place)
+    cu_seqlens: torch.Tensor,   # [batch+1] int32
+    cache_indices: torch.Tensor,      # [batch] int32
+    has_initial_state: torch.Tensor,  # [batch] bool
+    out: torch.Tensor,          # [total_tokens, dim] contiguous
+    max_seq_len: Optional[int] = None,
+    batch: Optional[int] = None,
+    pad_slot_id: int = PAD_SLOT_ID,
+) -> torch.Tensor:
+    """``causal_conv1d_varlen`` (silu) on token-major ``x``, written token-major into ``out``: the same kernel and
+    taps, only the addressing differs, so the same values; the GatedDeltaNet prefill reads the projection's columns in
+    place and gets q / k / v contiguous (FREETOKEN_GDN_CONV_ROWS)."""
+    assert x.stride(1) == 1 and out.is_contiguous() and out.shape == x.shape
+    cu_seqlens = cu_seqlens.to(torch.int32)
+    cache_indices = cache_indices.to(torch.int32)
+    cu_seqlen, dim = x.shape
+    _, width = weight.shape
+    assert 2 <= width <= 4, f"causal_conv1d triton fallback supports width 2..4, got {width}"
+    np2_statelen = triton.next_power_of_2(width - 1)
+    if batch is None:
+        batch = cu_seqlens.numel() - 1
+    if max_seq_len is None:
+        max_seq_len = int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())
+    assert max_seq_len <= 16 * 65535, "chunk prefill: single-call max_seq_len cap is ~1M tokens"
+
+    def grid(META):
+        return (batch, (max_seq_len + META["BLOCK_M"] - 1) // META["BLOCK_M"], triton.cdiv(dim, META["BLOCK_N"]))
+
+    _causal_conv1d_fwd_tiled_kernel[grid](
+        x, weight, None, conv_states, cache_indices, has_initial_state, cu_seqlens, out,
+        dim, cu_seqlen, conv_states.size(0),
+        0, 1, x.stride(0),  # stride_x_seq, stride_x_dim, stride_x_token
+        weight.stride(0), weight.stride(1),
+        conv_states.stride(0), conv_states.stride(1), conv_states.stride(2),
+        0, 1, out.stride(0),  # stride_o_seq, stride_o_dim, stride_o_token
+        pad_slot_id,
+        HAS_BIAS=False, KERNEL_WIDTH=width, SILU_ACTIVATION=True, HAS_INITIAL_STATES=has_initial_state is not None,
+        HAS_CACHE=True, IS_CONTINUOUS_BATCHING=cache_indices is not None, USE_PAD_SLOT=pad_slot_id is not None,
+        NP2_STATELEN=np2_statelen, BLOCK_M=16, BLOCK_N=64, num_warps=2, num_stages=3,
+    )
+    return out
+
+
 def causal_conv1d_decode(
     x: torch.Tensor,                # [batch, conv_dim]
     conv_state: torch.Tensor,       # [num_slots, conv_dim, state_len>=kernel-1] (in place)

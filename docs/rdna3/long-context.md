@@ -3,8 +3,9 @@
 Qwen3.8-Flash-Next is trained to 262,144 positions, and Qwen's model card extends it to 1,000,000 with YaRN
 (`rope_type: yarn`, `factor: 4`, `original_max_position_embeddings: 262144`). With the attention K/V in host RAM, two
 cards hold either one conversation of up to 1M tokens (`xtx-xt-1m`) or four conversations of 262,144 tokens at once
-(`xtx-xt-4x262k`), where `xtx-xt` shares 250,000 tokens between its requests. This page reports what was measured on
-2026-10-10 on the reference machine (RX 7900 XTX + RX 7900 XT, MTP head on) with the EXL3 3.05 bpw checkpoint only.
+(`xtx-xt-4x262k`), where `xtx-xt` shares 262,144 tokens between its requests. This page reports what was measured from
+2026-10-10 to 2026-10-12 on the reference machine (RX 7900 XTX + RX 7900 XT, MTP head on), mostly with the EXL3 3.05
+bpw checkpoint.
 Neither profile is agent-validated yet.
 
 ## What it takes
@@ -15,9 +16,10 @@ Neither profile is agent-validated yet.
   `--memory-ratio 0.77`, and 1M of KV plus the minimum 1024 expert slots needs 14.9 GB.
 - **`FREETOKEN_QSA_KV_HOST=1`** keeps the K/V slab in pinned, device-mapped host memory, handed to torch as a GPU tensor
   (`kernel/host_mapped.py`): the decode and verify kernels read the ~2051 selected tokens of each row in place across
-  PCIe, and a prefill first copies the pages of the batch's history, one layer at a time, to a VRAM buffer
+  PCIe, and a prefill first copies the pages of the batch's history (since 2026-10-14 only the K/V rows its tokens select,
+`FREETOKEN_QSA_STAGE_SELECTED`), one layer at a time, to a VRAM buffer
   (`kernel/triton/qsa/stage.py`, 28 GB/s), so its rows do not each cross PCIe. The index tiers stay in VRAM. At 1M the
-  engine then plans 11,261 expert slots per card (9,932 for the `xtx-xt` profile at 250k with the K/V in VRAM) and
+  engine then plans 11,261 expert slots per card (9,932 for the `xtx-xt` profile when it served 250k with the K/V in VRAM, 2026-10-10; 9,800 at 262k on 2026-10-16) and
   locks ~75 GiB of host RAM; the 7900 XTX peaked at 23.20 of 23.98 GiB (sysfs) during a 1M read with the desktop on it. The
   answers are bit-identical to the K/V in VRAM (the same text at 29k and 118k).
 - **Rope.** Two ways past 262,144 positions:
@@ -41,7 +43,7 @@ Neither profile is agent-validated yet.
 
 Cold reads of contexts that share no prefix (stdlib code, below), then a 700-token greedy answer:
 
-| Context | 250k profile, K/V in VRAM: PP / TG | 1M, K/V on the host: PP / TG | 1M, both decode fixes below |
+| Context | `xtx-xt` at 250k (2026-10-10), K/V in VRAM: PP / TG | 1M, K/V on the host: PP / TG | 1M, both decode fixes below |
 |---|---|---|---|
 | 29k | 2268 / 93.2 tok/s | (first request after a start) | |
 | 118k | 2185 / 90.6 | 2376 / 84.3 | (non-coherent only: TG 84.2) |
@@ -86,18 +88,18 @@ Measured in the afternoon of 2026-10-10, after the tables above:
   chunks of 8192 columns; a 1M-token context's page table is 250,000 block columns wide, so `_split_plan` gave up and
   each row was scanned by a single program: 504 us per decode layer at 988k visible tokens against 77-83 us split
   (4 rows, the same winners, ties included). The split now takes more chunks past 16; tables up to 131,072 columns
-  (contexts up to 524,288 tokens, so the 250k profiles) keep their plan. This tree first merged the extra chunks in one
+  (contexts up to 524,288 tokens, so the 262k profiles) keep their plan. This tree first merged the extra chunks in one
   spilled tile; since the merge of upstream `ee9789f` it runs upstream's own fix (`5031e3d`): reduction levels, each
   program keeping the top-k of 8,192 candidates, until the survivors fit one merge, with no length limit. On the 7900
   XT, one decode layer's top-k at 247,000 visible columns (988k tokens): 53 / 64 / 96 us for 1 / 4 / 8 rows against
   65 / 75 / 101 with the spilled tile, the same winners; 4-7 us more than the spilled tile at 30,000 visible columns,
-  the same as before on the 65,536-column tables of the 250k profiles (`rdna3/bench/qsa_topk_bench.py`).
+  the same as before on the 65,536-column tables of the 262k profiles (`rdna3/bench/qsa_topk_bench.py`).
   Below ~100k visible tokens the wide table's split costs ~40 us per layer more than the one-program scan did. With
   both changes, measured with the spilled tile (a cold read, then 700 tokens): 498k read at 1973 tok/s, decode 91.9
   tok/s (85.8 before); 988k read at 1775 tok/s in 9.3 min (1711), decode 83.6 tok/s (72.1); the same text as before
   both changes. With upstream's levels (the image of the merge): the same text again at 498k (read 2014 tok/s, decode
   93.0) and 988k (1780, 84.7), XTX peak 22.76 GiB.
-- **A/B at 118k** (decode tok/s, EXL3 3.05): K/V in VRAM, 262k table (the `xtx-xt` profile, 9,932 expert slots) 90.6;
+- **A/B at 118k** (decode tok/s, EXL3 3.05): K/V in VRAM, 262k table (the `xtx-xt` profile as it was then: 250k, 9,932 expert slots) 90.6;
   K/V on the host, 262k table (12,667 slots) 86.6; K/V on the host, 1M table (11,261 slots) 84.2. Both the host K/V
   and the wide table cost a few percent there.
 - **Tried and dropped: the first 262,144 tokens' pages also in VRAM** (decode reads them there, the allocator hands
@@ -114,7 +116,7 @@ The K/V pool is shared by the running requests: `rdna3/serve.sh` passes a profil
 (`--max-seq-len-override`) and its `KV_TOKENS` (default `CTX`) as the pool (`--kv-reserve-tokens`). A request is admitted
 when the pool can take its prompt plus its `max_tokens`, which the server lowers to what is left under the cap, so a
 request never reserves more than 262,144 tokens and four of them fit in 4 x 262,144. On `xtx-xt` the pool is the
-250,000 tokens of one context, and the conversations that leave it go to the RAM tier (`FREETOKEN_HOST_KV`).
+262,144 tokens of one context, and the conversations that leave it go to the RAM tier (`FREETOKEN_HOST_KV`).
 
 `xtx-xt-4x262k` (cap 262,144, native rope, pool 1,050,240 tokens, 11,345 expert slots per card), four conversations
 on distinct Python stdlib contexts (no shared prefix, planted values as in the retrieval set above), 2026-10-10:

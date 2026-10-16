@@ -29,6 +29,7 @@ class TritonExl3MoEKernel(MoEKernel):
 
     name = "triton"
     cpu_format = "exl3"
+    supports_prefill_slot_map = True
 
     @property
     def supports_inactive_slots(self) -> bool:  # hybrid decode: CPU routes skipped (FREETOKEN_HYBRID_SKIP_CPU_ROUTES)
@@ -102,6 +103,7 @@ class TritonExl3MoEKernel(MoEKernel):
         return fused_experts_exl3(
             x, t["gate_up"], t["gate_up_suh"], t["gate_up_svh"], t["down"], t["down_suh"], t["down_svh"],
             topk_weights, topk_ids, codebook=codebook, is_prefill=is_prefill, num_experts=view.n,
+            slot_map=view.slot_map,
         )
 
 

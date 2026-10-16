@@ -3,25 +3,25 @@
 > A tuned build of the FreeToken Mixture-of-Experts inference engine for AMD Radeon RX 7900 XTX / 7900 XT (RDNA3,
 > gfx1100, ROCm), serving Qwen3.8-Flash-Next (125B-parameter MoE) from its NVFP4 checkpoint or EXL3 checkpoints at
 > 3.05 / 4.05 bits per weight, on one or two consumer GPUs, with an OpenAI- and Anthropic-compatible API. With NVFP4
-> on an RX 7900 XTX + RX 7900 XT and the model's MTP head drafting tokens (on by default): 83 tok/s decode at the
-> model's sampling (66 without the head), 77-96 tok/s greedy up to 248k tokens of context, 3.9 s to read a cold
-> 8.3k-token prompt (~2130 tok/s), up to 4 concurrent requests; uses ~82 GiB of system RAM for this model. EXL3 3.05
-> bpw on the same cards: 98-117 tok/s greedy up to 248k tokens, 60 GiB of RAM.
+> on an RX 7900 XTX + RX 7900 XT and the model's MTP head drafting tokens (on by default): 88 tok/s decode at the
+> sampling `rdna3/serve.sh` gives (65.5 without the head), 78-96 tok/s greedy up to 260k tokens of context, 3.8 s to
+> read a cold 8.3k-token prompt (~2220 tok/s), up to 4 concurrent requests; uses ~82 GiB of system RAM for this model.
+> EXL3 3.05 bpw on the same cards: 95-117 tok/s greedy up to 260k tokens, 60 GiB of RAM.
 
-Key facts: the engine keeps every expert in pinned system RAM (~63 GiB for this model in NVFP4, ~43 GiB with the
-EXL3 3.05 bpw checkpoint; each rank pins its own share) and caches the most used experts in VRAM; two cards run tensor-parallel
-with an uneven 55/45 split; dense layers are int8 (weights only, lossy but agent-validated); small all-reduces go
-through shared host memory (no GPU peer-to-peer on the reference machine, as usual on consumer boards); sampling on
-ROCm uses a top-k-first path for top_k <= 256 and an exact sorted threshold otherwise (upstream's cooperative sampling
-kernels hang on gfx1100); conversations evicted from the GPUs are kept in RAM and restored exactly. Image input is
-off by default (`rdna3/serve.sh --vision`): the vision tower runs on rank 0 only and its embeddings are broadcast, with
-no measurable cost on two cards and ~1.5-2 % of decode on one. The tuning is
-switched by environment variables (docs/rdna3/options.md gives each default): most of it is off unless a profile turns
-it on; what is on by default is bit-exact, agent-validated, or (the release's sampler rework, exact by kernel tests,
-and its token broadcast, checked in `check`-mode server runs) new and not agent-validated. Precision rule: a change is either bit-exact (identical greedy answers) or validated on an
-agentic benchmark (the ROCm 10 base with the MTP head scored 12 and 18 of 29 there); an int8 KV cache that passed every short test cut the agentic score from 12-14 to 8-9 and is off in
-every profile (kept as an experimental option). Tested only on RX 7900 XTX + XT; NVIDIA, RDNA4 and TP>2 untested (this
-model cannot run above TP=2 in this build).
+Key facts: the engine keeps every expert in pinned system RAM (~63 GiB for this model in NVFP4, ~43 GiB with the EXL3
+3.05 bpw checkpoint; each rank pins its own share) and caches the most used experts in VRAM; two cards run
+tensor-parallel with an uneven 55/45 split; dense layers are int8 (weights only, lossy but agent-validated); small
+all-reduces go through shared host memory (no GPU peer-to-peer on the reference machine, as usual on consumer boards);
+sampling on ROCm uses a top-k-first path for top_k <= 256 and an exact sorted threshold otherwise (upstream's
+cooperative sampling kernels hang on gfx1100); conversations evicted from the GPUs are kept in RAM and restored exactly.
+Image input is off by default (`rdna3/serve.sh --vision`): the vision tower runs on rank 0 only and its embeddings are
+broadcast, with no measurable cost on two cards and ~1.5-2 % of decode on one. The tuning is switched by environment
+variables (docs/rdna3/options.md gives each default); what is on by default is bit-exact, agent-validated, or (the
+release's sampler rework, exact by kernel tests, and its token broadcast, checked in `check`-mode server runs) new and
+not agent-validated. Precision rule: a change is either bit-exact (identical greedy answers) or validated on an agentic
+benchmark (the ROCm 10 base with the MTP head scored 12 and 18 of 29 there); an int8 KV cache that passed every short
+test cut the agentic score from 12-14 to 8-9 and is off in every profile (kept as an experimental option). Tested only
+on RX 7900 XTX + XT; NVIDIA, RDNA4 and TP>2 untested (this model cannot run above TP=2 in this build).
 
 ## Docs
 

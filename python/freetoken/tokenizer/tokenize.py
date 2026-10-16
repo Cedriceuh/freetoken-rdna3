@@ -24,6 +24,7 @@ from .effort import (
     quantize_effort,
 )
 from .inline_system import has_inline_system, normalize_inline_system, probe_inline_system
+from .prefix_cache import PromptPrefixCache
 
 logger = init_logger(__name__)
 
@@ -62,6 +63,7 @@ class TokenizeManager:
         self._logged_effort_maps: set[tuple[Any, str | int | None]] = set()
         self._inline_system_lock = threading.Lock()
         self._inline_system_modes: dict[str, str] = {}
+        self._prefix_cache = PromptPrefixCache(tokenizer)
 
     def tokenize(self, msgs: List[TokenizeMsg]) -> List[UserMsg]:
         results: List[UserMsg] = []
@@ -74,12 +76,16 @@ class TokenizeManager:
             # the template already rendered one. Raw-string prompts and the dsv4
             # encoder path keep the default.
             templated = isinstance(msg.text, list) and self._dsv4_encoder is None
-            input_ids: torch.Tensor = (  # type: ignore
-                self.tokenizer.encode(
-                    prompt, return_tensors="pt", add_special_tokens=not templated
+            if templated and self._prefix_cache.usable:
+                # the same tokens, the conversation's earlier prompt reused up to its last turn start
+                input_ids = self._prefix_cache.encode(prompt)
+            else:
+                input_ids: torch.Tensor = (  # type: ignore
+                    self.tokenizer.encode(
+                        prompt, return_tensors="pt", add_special_tokens=not templated
+                    )
                 )
-            )
-            input_ids = input_ids.view(-1).to(torch.int32)
+                input_ids = input_ids.view(-1).to(torch.int32)
             if msg.images:
                 if self.mm_processor is None:
                     raise ValueError("image input is not supported for this model")

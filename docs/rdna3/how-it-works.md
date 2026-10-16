@@ -15,7 +15,7 @@ usual on consumer boards): every exchange between them goes through system RAM.
 
 | Where | What |
 |---|---|
-| GPU VRAM | dense weights (int8), the KV cache of the attention layers, the GDN recurrent states, and an **expert cache** filling everything else (on `xtx-xt`: 7.1k of the 24,576 experts, on each card) |
+| GPU VRAM | dense weights (int8), the KV cache of the attention layers, the GDN recurrent states, and an **expert cache** filling everything else (on `xtx-xt`: 7.0k of the 24,576 experts, on each card) |
 | System RAM | **every expert** (~63 GiB, pinned; each rank holds its own share of every expert), conversations moved off the GPUs (the RAM tier), the ranks' exchange buffer |
 | Disk | the n-gram embedding tables, read row by row on demand (the page cache keeps the hot rows) |
 
@@ -69,13 +69,22 @@ cards, changing only tiles that keep the summation order (bit-exact).
 
 A prefill chunk runs every token through every layer, so each chunk streams all 512 experts of every layer over PCIe
 (~700 MB per layer per card). Bigger chunks mean less streaming: in the A/B test, 16k-token chunks read an 8.4k prompt
-in 4.3 s instead of 5.5 s (4.5 s on the swept build, 4.1 s on the release build: [benchmarks.md](benchmarks.md)), and 54-101k-token reads
+in 4.3 s instead of 5.5 s (4.5 s on the swept build; 3.8 s on this release: [benchmarks.md](benchmarks.md)), and 54-101k-token reads
 at depth 2-6 % faster. To fit them, the prefill MoE and the PLE layer run 4096 tokens at a time inside the chunk (the
-NVFP4 MoE blocks are bit-identical; the PLE blocks can round differently, checked to tolerance and validated on the agentic
+NVFP4 MoE blocks are bit-identical, and 8192 tokens long in `xtx-xt` and `xtx-xt-4x262k`: +8 % on cold reads; the PLE blocks can round differently, checked to tolerance and validated on the agentic
 benchmark for one request), and experts already in the GPU cache are gathered on the GPU instead of crossing PCIe
 again (`--moe-prefill-hit-d2d`, with `hipMemcpyBatchAsync` on ROCm, or one copy per entry on older HIP): a third of
 the experts no longer cross PCIe per chunk, an agent turn's first token 1.55 -> 1.18 s. A single card keeps 8k chunks
 (its working memory is smaller).
+
+A short chunk (up to 1280 tokens on Qwen3.8-Flash-Next, an agent's tool result) does not stream the whole layers: it
+routes to only part of the experts, so it reads its routed experts from the slot cache, the next layer's predicted by
+that layer's router and copied while this one computes, and only the missing ones cross PCIe (the same bits, the GEMM
+tiles are those of the expert ids). With the K/V in host RAM it copies to VRAM only the K/V rows its tokens select, and
+the tokenizer reuses the previous prompt's tokens instead of encoding the whole conversation again. An agent turn of
+130-360 tokens takes 0.39-0.47 s to its first token at 25k and 0.46-0.59 s at 224k on `xtx-xt-4x262k` with EXL3 3.05 bpw
+(NVFP4 0.58-0.70 s at 25k)
+([journey.md](journey.md#27-agent-turns-short-prefills-through-the-expert-cache-2026-10-14)).
 
 ## Sampling on ROCm
 
@@ -168,11 +177,11 @@ branch `3.05bpw_h5_ng5` (routed experts at 3 bits per weight, most other linears
   fewer cached experts). Without that, the first 16k-token prefill after a start filled the 7900 XTX; on two cards
   `rdna3/serve.sh` also lowers `--memory-ratio` to 0.77 (0.76 from 4 bpw): see
   [journey.md](journey.md#16-exl3-checkpoints-2026-10-04).
-- Not supported: half-integer bitrates, mixed expert bitrates across layers, the pinned PLE backend, the CPU expert
-  executor, the encoder-only weight reader. FTW conversion is untested. The vision tower reads the checkpoint's bf16
+- Not supported: half-integer bitrates, mixed expert bitrates across layers, the pinned PLE backend, the encoder-only
+  weight reader (the CPU expert executor of `--hybrid` reads EXL3 experts since 2026-10-11: [cpu-experts.md](cpu-experts.md)). FTW conversion is untested. The vision tower reads the checkpoint's bf16
   `qkv` (image input checked with one image per branch).
 
-Measured on 2026-10-12 (image of 35afbb3) with the profiles as shipped, MTP head on, one request (decode: greedy,
+Measured on 2026-10-16 (the image of this release) with the profiles as shipped, MTP head on, one request (decode: greedy,
 from 9k tokens to the profile's maximum context; RAM: locked while serving;
 [benchmarks.md](benchmarks.md#depth-sweep-exl3-checkpoints) has every step, the cold reads and the sampled decode):
 
@@ -180,11 +189,11 @@ from 9k tokens to the profile's maximum context; RAM: locked while serving;
 |---|---:|---:|---:|
 | download | 135 GB | 85 GB | 108 GB |
 | experts in RAM (without the MTP head's) | 63.3 GiB | 42.6 GiB | 56.7 GiB |
-| decode, `xtx-xt` / `xtx` / `xt` | 77-96 / 36-43 / 29-34 tok/s | 98-117 / 52-57 / 41-46 tok/s | 86-94 / 37-47 / 29-36 tok/s |
-| reading a new block, `xtx-xt` | 1780-2080 tok/s | 1870-2190 tok/s | 1850-2200 tok/s |
-| agent turn, first token, `xtx-xt` | 1.3-2.1 s | 0.9-1.7 s | 1.2-2.1 s |
-| RAM locked, `xtx-xt` / one card | 82 / 73 GiB | 60 / 52 GiB | 75 / 66 GiB |
-| expert cache per card, `xtx-xt` | 7.1k | 9.9k | 7.3k |
+| decode, `xtx-xt` / `xtx` / `xt` | 78-96 / 36-44 / 29-34 tok/s | 95-117 / 52-58 / 41-46 tok/s | 86-94 / 37-47 / 29-36 tok/s |
+| reading a new block, `xtx-xt` | 1910-2180 tok/s | 1940-2280 tok/s | 1970-2270 tok/s |
+| agent turn, first token, `xtx-xt` | 0.8-0.9 s | 0.7-0.9 s | 0.8-1.0 s |
+| RAM locked, `xtx-xt` / one card | 82 / 73 GiB | 60 / 51 GiB | 75 / 66 GiB |
+| expert cache per card, `xtx-xt` | 7.0k | 9.8k | 7.2k |
 | agentic benchmark (29 bugs) | 12 and 18 (two runs) | 13 (one run) | 12 (one run) |
 
 The agentic benchmark rows come from runs on earlier builds. The checkpoints answer differently, so the MTP head

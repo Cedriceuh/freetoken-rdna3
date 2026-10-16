@@ -443,3 +443,118 @@ def _prefill_hit_compact_kernel(
     tl.store(dst_ptr + pos, (buffer_base + offs).to(tl.int32), mask=is_hit)
     tl.store(src_ptr + pos, slots, mask=is_hit)
     tl.store(num_ptr, tl.sum(is_hit.to(tl.int64)))
+
+
+def prefill_routed_plan(cache, layer_id: int, topk_ids: torch.Tensor, next_layer: int, predicted_ids: torch.Tensor | None,
+                        slot_of_fix: torch.Tensor, slot_of_pf: torch.Tensor) -> None:
+    """One prefill layer's slot bookkeeping (FREETOKEN_PREFILL_CACHED_MAX), device-side, three launches and a top-k:
+    marks the experts ``topk_ids`` routes to (layer ``layer_id``) and, when ``next_layer`` >= 0, the ones
+    ``predicted_ids`` predicts for ``next_layer``; usage = step for the resident ones (step + 1 first); then gives the
+    absent ones the least recently used slots outside them (by (usage, slot) like ``lru_ensure``), the routed first.
+    Writes the copy plans: decode's (``evict_slots``/``src_indices``/``num_indices``) for the routed misses, the
+    prefetch's (``_prefill_pf_idx``/``_prefill_pf_num``) for the predicted ones, and each placed expert's slot
+    (``slot_of_fix`` / ``slot_of_pf``, -1 elsewhere)."""
+    E, C = cache.num_experts, cache.cache_size
+    masks = cache._prefill_masks  # [2, E] int8, left zeroed by the plan kernel
+    ids = topk_ids.reshape(-1)
+    pred = predicted_ids.reshape(-1) if predicted_ids is not None else ids[:0]
+    n = max(ids.numel(), pred.numel(), 1)
+    _prefill_mark_kernel[(triton.cdiv(n, 1024),)](ids, ids.numel(), pred, pred.numel(), masks, E, BLOCK=1024)
+    slot_bits = max(1, (C - 1).bit_length())
+    _prefill_keys_kernel[(1,)](
+        masks, cache.slot_for_id, cache.usage, cache.step, cache._prefill_keys, cache._prefill_miss,
+        layer_id * E, max(next_layer, 0) * E, next_layer >= 0, E, C, slot_bits,
+        BLOCK_E=triton.next_power_of_2(E), BLOCK_C=1024, num_warps=8,
+    )
+    cand = torch.topk(cache._prefill_keys, min(2 * E, C), largest=False, sorted=True).indices
+    idx = cache._prefill_pf_idx
+    _prefill_claim_kernel[(1,)](
+        cache._prefill_miss, cand, cache.slot_for_id, cache.id_of_slot, cache.usage, cache.step,
+        cache.evict_slots, cache.src_indices, cache.num_indices, idx, idx[E:], cache._prefill_pf_num,
+        slot_of_fix, slot_of_pf, layer_id * E, max(next_layer, 0) * E, E, BLOCK_E=triton.next_power_of_2(E), num_warps=4,
+    )
+
+
+@triton.jit(do_not_specialize=["n_ids", "n_pred"])
+def _prefill_mark_kernel(ids_ptr, n_ids, pred_ptr, n_pred, masks_ptr, E, BLOCK: tl.constexpr):
+    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    e = tl.load(ids_ptr + i, mask=i < n_ids, other=0)
+    tl.store(masks_ptr + e, 1, mask=i < n_ids)
+    p = tl.load(pred_ptr + i, mask=i < n_pred, other=0)
+    tl.store(masks_ptr + E + p, 1, mask=i < n_pred)
+
+
+@triton.jit(do_not_specialize=["base", "base_next", "has_next"])
+def _prefill_keys_kernel(masks_ptr, slot_of_id_ptr, usage_ptr, step_ptr, keys_ptr, miss_ptr, base, base_next, has_next,
+                         E, C, SLOT_BITS: tl.constexpr, BLOCK_E: tl.constexpr, BLOCK_C: tl.constexpr):
+    e = tl.arange(0, BLOCK_E)
+    em = e < E
+    step = tl.load(step_ptr) + 1
+    tl.store(step_ptr, step)
+    r = tl.load(masks_ptr + e, mask=em, other=0) != 0
+    p = (tl.load(masks_ptr + E + e, mask=em, other=0) != 0) & (has_next != 0)
+    s_r = tl.load(slot_of_id_ptr + base + e, mask=em, other=-1)
+    s_p = tl.load(slot_of_id_ptr + base_next + e, mask=em & (has_next != 0), other=-1)
+    tl.store(usage_ptr + s_r, step, mask=em & r & (s_r >= 0))
+    tl.store(usage_ptr + s_p, step, mask=em & p & (s_p >= 0))
+    tl.store(miss_ptr + e, (r & (s_r < 0)).to(tl.int8), mask=em)
+    tl.store(miss_ptr + E + e, (p & (s_p < 0)).to(tl.int8), mask=em)
+    tl.store(masks_ptr + e, 0, mask=em)
+    tl.store(masks_ptr + E + e, 0, mask=em)
+    tl.debug_barrier()  # the bumps visible to the key pass
+    for c0 in range(0, C, BLOCK_C):
+        c = c0 + tl.arange(0, BLOCK_C)
+        cm = c < C
+        u = tl.load(usage_ptr + c, mask=cm, other=0)
+        k = tl.where(u >= step, 0x7FFFFFFFFFFFFFFF, (u << SLOT_BITS) | c.to(tl.int64))
+        tl.store(keys_ptr + c, k, mask=cm)
+
+
+@triton.jit(do_not_specialize=["base", "base_next"])
+def _prefill_claim_kernel(
+    miss_ptr, cand_ptr, slot_of_id_ptr, id_of_slot_ptr, usage_ptr, step_ptr, fix_dst_ptr, fix_src_ptr, fix_num_ptr,
+    pf_dst_ptr, pf_src_ptr, pf_num_ptr, slot_of_fix_ptr, slot_of_pf_ptr, base, base_next, E, BLOCK_E: tl.constexpr,
+):
+    e = tl.arange(0, BLOCK_E)
+    em = e < E
+    mr = (tl.load(miss_ptr + e, mask=em, other=0) != 0) & em
+    mp = (tl.load(miss_ptr + E + e, mask=em, other=0) != 0) & em
+    n_r = tl.sum(mr.to(tl.int32), 0)
+    rank_r = tl.cumsum(mr.to(tl.int32), 0) - 1
+    rank_p = tl.cumsum(mp.to(tl.int32), 0) - 1
+    v_r = tl.load(cand_ptr + rank_r, mask=mr, other=0).to(tl.int32)
+    v_p = tl.load(cand_ptr + n_r + rank_p, mask=mp, other=0).to(tl.int32)
+    old_r = tl.load(id_of_slot_ptr + v_r, mask=mr, other=-1)
+    old_p = tl.load(id_of_slot_ptr + v_p, mask=mp, other=-1)
+    tl.debug_barrier()  # every old owner read before any map is written
+    step = tl.load(step_ptr)
+    tl.store(slot_of_id_ptr + old_r, -1, mask=mr & (old_r >= 0))
+    tl.store(slot_of_id_ptr + old_p, -1, mask=mp & (old_p >= 0))
+    tl.debug_barrier()  # evictions before the new owners (an evicted id may be a new owner's id of another layer)
+    tl.store(id_of_slot_ptr + v_r, base + e, mask=mr)
+    tl.store(slot_of_id_ptr + base + e, v_r, mask=mr)
+    tl.store(id_of_slot_ptr + v_p, base_next + e, mask=mp)
+    tl.store(slot_of_id_ptr + base_next + e, v_p, mask=mp)
+    tl.store(usage_ptr + v_r, step, mask=mr)
+    tl.store(usage_ptr + v_p, step, mask=mp)
+    tl.store(fix_dst_ptr + rank_r, v_r, mask=mr)
+    tl.store(fix_src_ptr + rank_r, e, mask=mr)
+    tl.store(pf_dst_ptr + rank_p, v_p, mask=mp)
+    tl.store(pf_src_ptr + rank_p, e, mask=mp)
+    tl.store(slot_of_fix_ptr + e, tl.where(mr, v_r, -1), mask=em)
+    tl.store(slot_of_pf_ptr + e, tl.where(mp, v_p, -1), mask=em)
+    tl.store(fix_num_ptr, n_r.to(tl.int64))
+    tl.store(pf_num_ptr, tl.sum(mp.to(tl.int32), 0).to(tl.int64))
+
+
+def prefill_demote(cache, slot_ofs: list) -> None:
+    """usage = 0 for the slots in ``slot_ofs`` ([E] int32 arrays, -1 = none): the next victims."""
+    for so in slot_ofs:
+        _prefill_demote_kernel[(1,)](so, cache.usage, so.numel(), BLOCK_E=triton.next_power_of_2(so.numel()))
+
+
+@triton.jit
+def _prefill_demote_kernel(slot_of_ptr, usage_ptr, E, BLOCK_E: tl.constexpr):
+    e = tl.arange(0, BLOCK_E)
+    s = tl.load(slot_of_ptr + e, mask=e < E, other=-1)
+    tl.store(usage_ptr + s, 0, mask=(e < E) & (s >= 0))

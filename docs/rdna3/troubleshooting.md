@@ -73,12 +73,14 @@ Two host settings, both measured on the reference machine on 2026-10-03:
   echo 5 | sudo tee /sys/class/drm/card*/device/pp_power_profile_mode   # 5 = COMPUTE in that file's list
   ```
 
-The first request after the server starts still takes ~11 s (host-side warm-up, once). Undervolting, GFXOFF and the
+The first request after the server starts took ~11 s until 2026-10-14: the JIT modules were rebuilt at every start.
+They now stay in the kernel-cache volume (`TVM_FFI_CACHE_DIR`): 1.3-1.9 s, except the first start of a new image
+(28.1 and 28.4 s for the two images built on 2026-10-14, the kernels compiled once). Undervolting, GFXOFF and the
 display's memory power saving were ruled out on 2026-10-02.
 
 ## A GPU fault or a hung collective with a full card
 
-Seen on `xtx-xt` on 2026-10-05/06, each time while a card was within a few hundred MiB of full and the driver had
+Seen on `xtx-xt` from 2026-10-05 to 07, mostly while a card was within a few hundred MiB of full and the driver had
 just evicted the process's queues (`/sys/class/kfd/kfd/proc/<pid>/stats_<gpu>/evicted_ms` growing outside start-up):
 
 - `CUDA error: an illegal memory access` on rank 0, with `[gfxhub] page fault` for the 7900 XTX in `dmesg`: once in an
@@ -109,6 +111,17 @@ Neither came back in the same runs repeated (hours of agent sessions, the sweep 
 10-minute runs): the eviction has to land at a bad moment. Keep other GPU-heavy programs off the card that drives the
 display while serving, and lower `--memory-ratio` (more headroom, fewer cached experts) if it happens again. Before
 restarting, save the log (`docker logs <container>`): the container is removed when it stops.
+
+## Less VRAM, or a start that never ends, after a server was killed while starting
+
+Seen on 2026-10-16: a server removed with `docker rm -f` while it loaded its weights left an amdgpu kernel worker
+blocked in `svm_range_restore_work` (`journalctl -k`: `task kworker/... blocked for more than ... seconds`, waiting on
+a fence in `svm_range_map_to_gpus`), and the dead process's VRAM held: `/sys/class/kfd/kfd/proc/<pid>/vram_<gpu>`
+listed a pid with no `/proc` entry and 4.4 GiB on the 7900 XTX. The next servers got that much less: NVFP4
+`xtx-xt-4x262k` (3 x 262k) planned 6436 expert slots instead of 8768, decode at four requests fell from 29-30 to
+22 tok/s each, one ran out of memory in a prefill at `--memory-ratio` 0.80, and a later one never came up (stuck while
+building its expert banks, a thread of it in uninterruptible sleep, 3.5 GiB more held on the XT). Only a reboot
+frees it. Stop a server with `docker stop -t 60` (or its service) and let it exit; do not kill one during start-up.
 
 ## Answers stop mid-sentence
 

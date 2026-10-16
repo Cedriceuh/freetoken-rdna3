@@ -53,8 +53,14 @@ a 118k-token prompt (9/9, 61 s) other answers at 81.2 tok/s.
 
 A 118k-token prompt read at the usual speed (83 s on `xtx`, 61 s on `xtx-xt`: prefill streams whole layers to the GPU,
 unchanged) and answered 9/9 planted questions on both. Greedy answers are not bit-identical to offload (the CPU sums in
-fp32 in another order): on `xtx`, 8 of 14 identical, the others diverge after 150-720 characters, all sensible. Every
-change after the first working version kept the greedy answers bit for bit (14/14 on `xtx` and on `xtx-xt`).
+fp32 in another order): on `xtx`, 8 of 14 identical, the others diverge after 150-720 characters, all sensible. They
+are not less precise: against an fp64 reference at the model's sizes, one MoE output computed on the CPU is off by
+2.3e-3 (relative), on the GPU by 3.9e-3 (bf16 between its steps), split between them by 3.3-4.0e-3
+([journey.md](journey.md#27-agent-turns-short-prefills-through-the-expert-cache-2026-10-14)). Every
+change after the first working version kept the greedy answers bit for bit (14/14 on `xtx` and on `xtx-xt`) until
+2026-10-14: since then prefill chunks of up to 1280 tokens (agent turns) read their routed experts through the cache
+here too, which moves the answers as the cache's contents do. Time to the first token of a 132-337-token turn at 25k:
+NVFP4 `xtx-xt` 1.19-1.24 -> 0.78-0.89 s, EXL3 3.05 `xtx` 1.50-1.52 -> 1.05-1.18, NVFP4 `xtx` 2.32-2.34 -> 1.63-1.80.
 
 The CPU pool spins on its cores while a decode runs and parks 50 ms after the last layer: with `--hybrid` on one card,
 31 of the 32 cores are busy during generation (15 + 1 per card on two).
@@ -148,7 +154,7 @@ atomic order, so they compare as means, ~2 % run to run) and two greedy 1024-tok
   expert of rank 0's 384-row slice takes 61 us on 15 threads (54 on 19), against ~42 us to copy it (1.1 MB at the
   26-28 GB/s measured for PCIe, estimated): slower, but it runs alongside the copies; the miss rate is the limit.
 
-## EXL3: +6 % on one card, a loss on two
+## EXL3: +6 % on one card, a loss on two (2026-10-11)
 
 EXL3 3.05 bpw, `FREETOKEN_HYBRID_FETCH_FRACTION` = share of the misses fetched (`ft bench bw` does not bench EXL3):
 
@@ -165,6 +171,17 @@ core busy) where NVFP4 is bound by the RAM (~120 G weights/s on the whole CPU), 
 than an NVFP4 one, so its misses cost less to copy. On two cards, with every miss fetched (the CPU idle) the hybrid
 path is still 2-4 % slower than offload (82.8 / 33.1 tok/s), and giving the CPU 40 % of the misses does not win it
 back (82.5 / 33.3): few experts miss there (the section above).
+
+## NVFP4 with the K/V in RAM, three and four requests (2026-10-16)
+
+`xtx-xt-4x262k` with `--kv-reserve-tokens 787500` (3 x 262k), 20k-token conversations decoding together, the decode step's period over five 300-step windows (`FT_STATS_EVERY` + `FT_MOE_STATS`; MTP head on, no drafts at three or more):
+
+| Requests at once | `offload` | `hybrid` (the CPU takes 1.8-2.8 of 2.7-4.4 misses a layer) |
+|---|---:|---:|
+| 3 | 26.1-28.8 ms (32.1-36.4 tok/s each) | 28.1-29.4 ms (31.9-35.3) |
+| 4 | 31.5-35.4 ms (29.1-29.8) | 32.9-34.4 ms (29.5-30.0) |
+
+Neither better nor worse within the windows' spread (-4 to +8 %): the +15 % of four requests on `xtx-xt` (K/V in VRAM) does not carry over to this profile (why was not measured; the K/V's reads cross the same host memory).
 
 ## Also measured
 

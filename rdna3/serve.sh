@@ -26,6 +26,9 @@
 #                      EXL3: +5 % on xtx, even on xtx-xt; docs/rdna3/cpu-experts.md)
 #   --dry-run          print the docker command instead of running it
 #
+# Requests that send no temperature get 0.6 (`ft serve --default-temperature 0.6`; the checkpoint's generation_config
+# says 1.0): `-- --default-temperature T` changes it.
+#
 # The kernel cache (JIT + autotune results) lives in a docker volume named after the image id, so it is built once
 # per image. See docs/rdna3/getting-started.md and docs/rdna3/profiles.md.
 set -euo pipefail
@@ -133,7 +136,7 @@ if [ -n "$hybrid" ]; then
   ft_args+=(--moe-strategy hybrid)
   if [[ "$cfg" == *'"quant_method":"exl3"'* ]]; then
     envs+=(-e FREETOKEN_HYBRID_FETCH_FRACTION=0.6)
-    [ "$p_gpus" = 1 ] || echo "note: --hybrid with EXL3 experts on two cards measured 2-4 % slower than without (docs/rdna3/cpu-experts.md)" >&2
+    [ "$p_gpus" = 1 ] || echo "note: --hybrid with EXL3 experts on two cards measured even to 2-4 % slower than without (docs/rdna3/cpu-experts.md)" >&2
   elif [ "$p_gpus" = 1 ]; then
     envs+=(-e FREETOKEN_HYBRID_FETCH_FRACTION=0.25)
   else
@@ -178,6 +181,16 @@ video_gid="$(getent group video | cut -d: -f3 || true)" render_gid="$(getent gro
 gpu_flags=(--device=/dev/kfd --device=/dev/dri --group-add "$video_gid" --group-add "$render_gid"
            --security-opt seccomp=unconfined)
 mounts+=(-v "freetoken-rdna3-kcache-$short:/root/.cache/freetoken-rdna3")
+# the JIT modules in that volume too (images before 2026-10-14 build them under ~/.cache/tvm-ffi, lost at each start)
+envs+=(-e TVM_FFI_CACHE_DIR=/root/.cache/freetoken-rdna3/tvm-ffi)
+
+# an image built before --default-temperature (an older one picked with --image) would refuse it: passed when known
+temp_args=(--default-temperature 0.6)
+if ! "$DOCKER" run --rm --entrypoint grep "$image_id" -q -e --default-temperature \
+    /opt/FreeToken/python/freetoken/server/args.py >/dev/null 2>&1; then
+  temp_args=()
+  echo "note: image $image predates --default-temperature: requests without a temperature get the checkpoint's" >&2
+fi
 
 # expandable segments (the engine also sets them when PYTORCH_ALLOC_CONF is unset): without them the allocator's
 # cache filled the VRAM left free and every 14-16k-token prefill chunk past ~26k of context failed once and retried
@@ -187,7 +200,7 @@ cmd=("$DOCKER" run --rm --init --name "$name" --network host --ipc=host "${gpu_f
      -e PYTORCH_ALLOC_CONF=expandable_segments:True -e OMP_WAIT_POLICY=PASSIVE -e "HIP_VISIBLE_DEVICES=$gpus"
      "${envs[@]}" "${mounts[@]}"
      "$image_id" ft serve --model /models/m --host "$host" --port "$port" --served-model-name "$served" "${mm_args[@]}"
-     --max-seq-len-override "$ctx" --kv-reserve-tokens "$kv" "${ft_args[@]}" "${extra[@]}")
+     --max-seq-len-override "$ctx" --kv-reserve-tokens "$kv" "${temp_args[@]}" "${ft_args[@]}" "${extra[@]}")
 if [ -n "$dry" ]; then
   echo "# first: $DOCKER rm -f $name  (a container left behind would hold the GPUs and the port)"
   for a in "${cmd[@]}"; do

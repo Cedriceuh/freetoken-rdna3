@@ -13,7 +13,7 @@ import torch
 
 from freetoken.kernel import moe_sum_reduce_triton
 from freetoken.kernel.triton.exl3 import exl3_gemm_down_out, exl3_gemv, exl3_mid, exl3_moe_gemm, exl3_out, exl3_rotate_in
-from freetoken.moe.fused import moe_align_block_size
+from freetoken.moe.fused import blocks_to_slots, moe_align_block_size
 
 # token block of the prefill path: its rotated inputs are [tokens * top_k, 2, hidden] fp16 and its products fp32,
 # 540 MiB of temporaries at 4096 tokens (top-10, hidden 2560, a 384-wide slice), which the cache planner keeps free
@@ -41,8 +41,10 @@ def fused_experts_exl3(
     codebook: int,
     is_prefill: bool,
     num_experts: int | None = None,
+    slot_map: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """``topk_ids`` index bank rows (cache slots in decode, the full-layer buffer's rows in prefill)."""
+    """``topk_ids`` index bank rows (cache slots in decode, the full-layer buffer's rows in prefill); a prefill with
+    ``slot_map`` keeps expert ids in ``topk_ids`` and reads each expert from its slot of the cache."""
     M, _ = hidden_states.shape
     if is_prefill and M > EXL3_PREFILL_BLOCK > 0:
         out = torch.empty_like(hidden_states)
@@ -51,7 +53,7 @@ def fused_experts_exl3(
             out[start:end] = fused_experts_exl3(
                 hidden_states[start:end], gate_up, gate_up_suh, gate_up_svh, down, down_suh, down_svh,
                 topk_weights[start:end], topk_ids[start:end], codebook=codebook, is_prefill=True,
-                num_experts=num_experts,
+                num_experts=num_experts, slot_map=slot_map,
             )
         return out
     top_k = topk_ids.shape[1]
@@ -61,6 +63,9 @@ def fused_experts_exl3(
     if is_prefill:
         assert num_experts is not None, "the prefill path sorts routes by expert: num_experts is required"
         sorted_ids, expert_ids, ntpp = moe_align_block_size(topk_ids, _PREFILL_BLOCK_M, num_experts)
+        if slot_map is not None:
+            slots = slot_map[slots.long()]
+            expert_ids = blocks_to_slots(expert_ids, slot_map)
         a1 = exl3_rotate_in(hidden_states, gate_up_suh, slots, top_k, dtype=torch.float16)
         c1 = exl3_moe_gemm(a1, gate_up, sorted_ids, expert_ids, ntpp, codebook, block_m=_PREFILL_BLOCK_M)
         del a1

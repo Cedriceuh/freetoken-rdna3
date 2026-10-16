@@ -98,6 +98,9 @@ class ExpertView:
     slots: torch.Tensor | None = None
     n: int | None = None
     alphas: tuple[torch.Tensor, torch.Tensor] | None = None
+    # prefill through the slot cache (FREETOKEN_PREFILL_CACHED_MAX): expert id -> slot of this layer; the routes stay
+    # expert ids (the same tiles as a full-layer prefill), the weights are read from each expert's slot
+    slot_map: torch.Tensor | None = None
 
 
 def fused_piece(pieces: dict[str, torch.Tensor], role: str) -> torch.Tensor:
@@ -157,6 +160,8 @@ class MoEKernel(ABC):
     # Hybrid decode hands the GPU a route split with such holes; kernels without this get the holes
     # pointed at slot 0 with weight 0 (slot storage is zero-filled at allocation, so that is exact).
     supports_inactive_slots: ClassVar[bool] = False
+    # Whether a prefill ``apply`` honours ``ExpertView.slot_map`` (the routed experts read from the slot cache).
+    supports_prefill_slot_map: ClassVar[bool] = False
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
         return None

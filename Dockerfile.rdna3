@@ -51,10 +51,13 @@ RUN set -eux; \
     python3 -m pip install --no-cache-dir --no-build-isolation -e .
 
 # One cache directory per image: AITER / Triton key their caches on the directory, not the image.
+# The JIT C++/HIP modules (tvm-ffi) build under ~/.cache/tvm-ffi by default, outside the volume: every server start
+# rebuilt them on first use (~8 s on the first request, more on the first long prefill).
 ENV XDG_CACHE_HOME=/root/.cache/freetoken-rdna3 \
     TRITON_CACHE_DIR=/root/.cache/freetoken-rdna3/triton \
-    FREETOKEN_KERNEL_CACHE_DIR=/root/.cache/freetoken-rdna3/freetoken/kernels
-RUN mkdir -p /root/.cache/freetoken-rdna3/triton /root/.cache/freetoken-rdna3/freetoken/kernels
+    FREETOKEN_KERNEL_CACHE_DIR=/root/.cache/freetoken-rdna3/freetoken/kernels \
+    TVM_FFI_CACHE_DIR=/root/.cache/freetoken-rdna3/tvm-ffi
+RUN mkdir -p /root/.cache/freetoken-rdna3/triton /root/.cache/freetoken-rdna3/freetoken/kernels /root/.cache/freetoken-rdna3/tvm-ffi
 
 # the ROCm torch and its own Triton (3.8) are the ones in place
 RUN python3 -c 'import importlib.metadata as md, torch, triton; v = md.version("triton"); print("torch", torch.__version__, "| hip", torch.version.hip, "| triton", v); assert torch.version.hip and torch.version.cuda is None; assert "rocm" in v, v; tv = md.version("torchvision"); assert "rocm" in tv, tv'

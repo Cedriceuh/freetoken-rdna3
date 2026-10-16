@@ -97,6 +97,7 @@ See [models.md](models.md#moe-strategies) for what each strategy does.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--sampling-defaults` | model | Fill unspecified sampling params from the checkpoint's `generation_config.json` (`none` = framework defaults) |
+| `--default-temperature` | unset | Temperature for requests that send none, in place of the one `--sampling-defaults` gives (top_k / top_p keep theirs); the startup log names the source |
 | `--tool-call-parser` | auto | Tool-call format; auto-inferred from the model family |
 | `--reasoning-parser` | auto | Splits chain-of-thought into `reasoning_content`; auto-inferred; `off` disables |
 | `--enable-cache-report` | off | Report prefix-cache hits in each response's usage block |

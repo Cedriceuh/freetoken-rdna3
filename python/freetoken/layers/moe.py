@@ -28,6 +28,13 @@ _HYBRID_OVERLAP = os.getenv("FREETOKEN_HYBRID_OVERLAP", "1") != "0"
 # offload path): on two cards one request's few misses cost less than the CPU round trip of each layer. Graphs are
 # captured per batch size, so each size takes one path.
 _HYBRID_MIN_REQS = int(os.getenv("FREETOKEN_HYBRID_MIN_REQS", "1"))
+# FREETOKEN_PREFILL_CACHED_MAX=n: a prefill chunk of at most n tokens reads its routed experts from the slot cache
+# (only the routed misses cross PCIe, the next layer's predicted ones copied while this one computes) instead of
+# streaming every expert the cache lacks; 0 = off. Unset: PREFILL_CACHED_DEFAULT for the layers whose model predicts
+# the next layer's experts (``prefill_cached_default``), off for the others.
+_PREFILL_CACHED_ENV = os.getenv("FREETOKEN_PREFILL_CACHED_MAX")
+_PREFILL_CACHED_SET = int(_PREFILL_CACHED_ENV) if _PREFILL_CACHED_ENV is not None else None  # a bad value fails here
+PREFILL_CACHED_DEFAULT = 1280
 
 
 class MoELayer(BaseOP):
@@ -195,6 +202,11 @@ class OffloadMoELayer(MoELayer):
             prefix=prefix,
         )
         self.offload_cache: OffloadMoeCache | None = None
+        # (layer id, expert ids) the model's MoE block may set before a prefill forward: the experts the next layer is
+        # predicted to route to, prefetched by the slot-cache prefill path (FREETOKEN_PREFILL_CACHED_MAX)
+        self.next_layer_prediction: tuple[int, torch.Tensor] | None = None
+        # set by models that predict the next layer's experts in prefill (the slot-cache path is on for them by default)
+        self.prefill_cached_default = False
 
     def forward(
         self,
@@ -257,6 +269,23 @@ class OffloadMoELayer(MoELayer):
         )
         return self._prefill_routed(hidden_states, topk_weights, topk_ids)
 
+    def prefill_cached(self, num_tokens: int) -> bool:
+        """Whether this forward's prefill reads its routed experts from the slot cache. Decided at the first MoE layer
+        from the chunk length (``num_tokens``) and kept for every later layer of the forward, the MTP head's included:
+        its MoE sees one row a request, and after a full-layer chunk the last layer has already queued its experts
+        into a double buffer the head must wait for. Off unless every layer can take it (a CPU or unpinned layer would
+        break the double-buffer choreography the others follow)."""
+        cache = self.offload_cache
+        if cache is None:
+            return False
+        if self.layer_id == 0:
+            limit = (_PREFILL_CACHED_SET if _PREFILL_CACHED_SET is not None
+                     else PREFILL_CACHED_DEFAULT if self.prefill_cached_default else 0)
+            cache.prefill_chunk_cached = (0 < num_tokens <= limit and self.quant_method is not None
+                                          and self.quant_method.kernel.supports_prefill_slot_map
+                                          and cache.prefill_cached_all_ok())
+        return cache.prefill_chunk_cached
+
     def can_overlap_copy(self) -> bool:
         """Decode on the GPU with the fused miss copy: ``decode_select`` / ``decode_finish`` may split the call."""
         cache = self.offload_cache
@@ -295,7 +324,8 @@ class OffloadMoELayer(MoELayer):
     # ------------------------------------------------------------------
     # Data movement -- one decision tree for every quant format (the banks
     # registry makes the cache machinery bank-count agnostic). Decode loads
-    # on demand; prefill streams whole layers, double-buffered when overlap
+    # on demand; a short prefill chunk loads its routed experts into the slot
+    # cache, a longer one streams whole layers, double-buffered when overlap
     # is enabled. The kernels only ever see bank views plus row indices;
     # which kernel runs is decided afterwards, in ``_expert_gemm``.
     # ------------------------------------------------------------------
@@ -425,12 +455,33 @@ class OffloadMoELayer(MoELayer):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """Prefill movement: stream whole layers -- double-buffered behind the
-        previous layer's GEMMs when ``prefill_overlap`` is on, else a synchronous
-        ``materialize_layer``. In both, position == expert id, so the routing ids
+        """Prefill movement: a short chunk (``prefill_cached``) reads its routed experts from
+        their cache slots (``slot_map``); otherwise stream whole layers -- double-buffered
+        behind the previous layer's GEMMs when ``prefill_overlap`` is on, else a synchronous
+        ``materialize_layer``. In those two, position == expert id, so the routing ids
         pass through unmapped."""
         cache = self.offload_cache
         assert cache is not None
+        if self.prefill_cached(hidden_states.shape[0]):
+            # decided at layer 0 from the chunk length, the same on every rank: every layer takes this path together
+            if self.layer_id == 0:
+                cache.drain_prefill_prefetch()
+            # the next layer's experts as its router sees this layer's input: copied while these GEMMs run
+            slot_map = cache.ensure_prefill_routed(self.layer_id, topk_ids, self.next_layer_prediction)
+            self.next_layer_prediction = None
+            out = self._expert_gemm(
+                cache,
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                views=cache.bank_views(),
+                n=self.num_experts,
+                alphas=None,
+                is_prefill=True,
+                slot_map=slot_map,
+            )
+            cache.demote_prefill_slots()
+            return out
         if cache.prefill_overlap:
             views = self._wait_prefill_overlap(cache)
             out = self._expert_gemm(
@@ -486,13 +537,14 @@ class OffloadMoELayer(MoELayer):
         n: int | None,
         alphas: tuple[torch.Tensor, torch.Tensor] | None,
         is_prefill: bool,
+        slot_map: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.quant_method is not None:
             from freetoken.moe.legacy_format import canonical_role  # legacy_format imports this package
 
             view = ExpertView(
                 {canonical_role(name): t for name, t in zip(cache.bank_schema, views)},
-                slots=None if n is not None else topk_ids, n=n, alphas=alphas,
+                slots=None if n is not None else topk_ids, n=n, alphas=alphas, slot_map=slot_map,
             )
             return self.quant_method.apply(
                 hidden_states, topk_weights, topk_ids, view, layer=self, is_prefill=is_prefill

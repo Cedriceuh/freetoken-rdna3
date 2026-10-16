@@ -84,6 +84,7 @@ class Qwen4ExpMTP(BaseOP):
         experts = make_moe_layer(config, layer_id=config.num_layers, renormalize=config.norm_topk_prob,
                                  quant_config=config.quant, prefix="model.layers.0.mlp.experts")
         experts.defer_all_reduce = mlp.experts.defer_all_reduce
+        experts.prefill_cached_default = getattr(mlp.experts, "prefill_cached_default", False)
         mlp.experts = experts
         self.hyper_connection_mixer = GatedResidual(config, use_combine=False, prefix=f"{prefix}.hyper_connection_mixer")
 

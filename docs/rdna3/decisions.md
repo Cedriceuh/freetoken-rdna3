@@ -10,8 +10,11 @@ every change must be either **bit-exact** (same greedy answers on a fixed set of
 identical outputs) or **validated by the agentic benchmark** (the author's, private: a coding agent fixing 29 planted
 bugs over long sessions). Short fidelity tests (scored benchmarks, needle tests, teacher-forced probes) are used to
 reject changes, never to accept them alone. The changes made after the last agentic run are bit-exact or exact by
-kernel tests, except that prompts prefilled together in one batch (up to 4 requests) can differ at rounding level; the
-docs say which. The ROCm 10 base was run on the agentic
+kernel tests, except these, each described where it is documented: prompts prefilled together in one batch (up to 4
+requests) can differ at rounding level; ROCm 10's own Triton 3.8 rounds differently from the 3.7.1 of that run
+([journey.md](journey.md#18-rocm-10s-own-triton-2026-10-05)); upstream's NVFP4 decode kernel, merged 2026-10-10,
+changed 5 of 15 greedy answers ([options.md](options.md)); the EXL3 dense weights are rebuilt in fp64 since 2026-10-07;
+and `--hybrid` moves its answers with the expert cache's contents. The ROCm 10 base was run on the agentic
 benchmark with the MTP head: 12 and 18 of 29 in two runs.
 
 - **Gives**: speed that did not cost quality on the agentic benchmark.
@@ -23,7 +26,7 @@ benchmark with the MTP head: 12 and 18 of 29 in two runs.
 |---|---|
 | Choice | Split every layer over the XTX and the XT, both working on every token |
 | Alternatives | One card with more experts offloaded; each card serving its own requests |
-| For | Decode 83 tok/s instead of 43 at the model's sampling (66 against 41 without the MTP head; 2026-10-12/13); 250k context instead of 131k; 44 GB of VRAM for one expert cache |
+| For | Decode 88 tok/s instead of 46 at `rdna3/serve.sh`'s sampling (65.5 against 41 without the MTP head; 2026-10-16); 262k context instead of 131k; 44 GB of VRAM for one expert cache |
 | Against | Every layer ends with an all-reduce through system RAM (no GPU peer-to-peer on the reference machine); both cards are busy for every request; more code (uneven split, host all-reduce) |
 | Evidence | Depth sweeps of `xtx-xt` vs `xtx` ([benchmarks.md](benchmarks.md)) |
 
@@ -61,9 +64,9 @@ benchmark with the MTP head: 12 and 18 of 29 in two runs.
 
 | | |
 |---|---|
-| Choice | 16k-token chunks with the PLE layer and the MoE blocked by 4096 tokens inside, memory ratio 0.80 |
+| Choice | 16k-token chunks with the PLE layer and the MoE blocked by 4096 tokens inside (the NVFP4 MoE by 8192 in `xtx-xt` and `xtx-xt-4x262k` since 2026-10-16), memory ratio 0.80 |
 | Alternatives | 4k chunks with ratio 0.85 |
-| For | 8.4k prompt 4.3 s instead of 5.5 s in the A/B test (4.5 s on the swept build, 4.1 s on the release build); 54-101k-token reads at depth 2-6 % faster |
+| For | 8.4k prompt 4.3 s instead of 5.5 s in the A/B test (4.5 s on the swept build; 3.8 s on the 2026-10-16 release); 54-101k-token reads at depth 2-6 % faster |
 | Against | -2 to -3 % decode beyond 100k context (fewer expert-cache slots); a single card cannot hold 16k chunks (8k there) |
 | Evidence | At ratio 0.85, 16k chunks left 50-120 MiB free at 227k and slowed down |
 
@@ -117,9 +120,9 @@ benchmark with the MTP head: 12 and 18 of 29 in two runs.
 
 | | |
 |---|---|
-| Choice | On in the profiles except `gre` (`FREETOKEN_MTP=1 FREETOKEN_SPEC_VERIFY_M=4`; `rdna3/serve.sh --no-mtp` turns it off). The checkpoint's MTP layer drafts up to 3 tokens (chained on its own streams); the next decode step verifies them in the same captured forward, 2-4 rows chosen per request from its measured acceptance and the step costs measured for the card count (mostly 2 on one card; 1 near a request's length limit). Rejected rows are undone by restoring the GDN, conv and PLE states saved after each row; attention KV needs nothing (rejected positions are rewritten before any query sees them). Sampled requests use exact speculative sampling. Only while at most `FREETOKEN_SPEC_BS_MAX` requests decode (2 in `xtx-xt`, 1 in the other profiles): with more, steps run one row each and the head only writes its KV |
+| Choice | On in the profiles except `gre` (`FREETOKEN_MTP=1 FREETOKEN_SPEC_VERIFY_M=4`; `rdna3/serve.sh --no-mtp` turns it off). The checkpoint's MTP layer drafts up to 3 tokens (chained on its own streams); the next decode step verifies them in the same captured forward, 2-4 rows chosen per request from its measured acceptance and the step costs measured for the card count (mostly 2 on one card; 1 near a request's length limit). Rejected rows are undone by restoring the GDN, conv and PLE states saved after each row; attention KV needs nothing (rejected positions are rewritten before any query sees them). Sampled requests use exact speculative sampling. Only while at most `FREETOKEN_SPEC_BS_MAX` requests decode (2 in `xtx-xt` and its K/V-in-RAM variants, 1 in the other profiles): with more, steps run one row each and the head only writes its KV |
 | Alternatives | Plain decode; a fixed draft depth; verifying several requests at once; the head's own forward captured in a graph |
-| For | Agentic benchmark on ROCm 10 with the head: 12 and 18 of 29 (two runs). One request on `xtx-xt` (release, ROCm 10): +34 % decode at the model's sampling, +30-61 % greedy up to 248k of context (earlier runs: +11-39 % on chat, agent turns, a 108k-token context), x1.38 on 60 code and math items; one card +7-8 % (+6-12 % greedy); greedy answers identical to plain decode (bit-exact on every check) |
+| For | Agentic benchmark on ROCm 10 with the head: 12 and 18 of 29 (two runs). One request on `xtx-xt` (2026-10-16): +35 % decode at `rdna3/serve.sh`'s sampling, +35-60 % greedy up to 260k of context (earlier runs: +11-39 % on chat, agent turns, a 108k-token context), x1.38 on 60 code and math items; one card +6-13 % (+9-16 % greedy); greedy answers identical to plain decode (bit-exact on every check) |
 | Against | 3-4 % slower with 3-4 requests at once (the head still writes its KV every step); prompt reading 0-4 % slower (4-5 % on a 108k-token prompt; the head reads it too); the head's 512 experts compete for the expert cache; a CUDA graph per row count (captured up to `FREETOKEN_SPEC_BS_MAX` requests: 2 in `xtx-xt`) |
 | Evidence | Step costs 31 / 53 / 78 / 102 ms at 1-4 rows on one card (the extra rows' missing experts cross PCIe); 1.9-3.9 tokens kept per request step ([benchmarks.md](benchmarks.md#speculative-decoding-mtp-head)) |
 
@@ -129,7 +132,7 @@ benchmark with the MTP head: 12 and 18 of 29 in two runs.
 |---|---|
 | Choice | Keep the routed experts in EXL3 (host banks and GPU cache) behind gfx1100 Triton kernels; decode every other linear to bf16 at load (then int8 like NVFP4's); expert slices cut on whole 128-wide Hadamard blocks (384 / 256 on two cards); the expert kernel declares its prefill temporaries and the cache planner keeps them free |
 | Alternatives | Converting the experts to NVFP4 (loses the 3-bit size); serving every linear in EXL3; cutting the slices inside a Hadamard block (would need re-encoding); a bigger generic VRAM headroom |
-| For | 42.6 GiB of experts instead of 63.3 at 3.05 bpw, 9.9k experts cached per card instead of 7.1k; at 3.05 bpw decode 98-117 tok/s up to 248k on `xtx-xt` (NVFP4 77-96; 2026-10-12), agent turns 0.9-1.7 s (1.3-2.1), 60 GiB of RAM instead of 82; the dense layers keep the tested int8 path |
+| For | 42.6 GiB of experts instead of 63.3 at 3.05 bpw, 9.8k experts cached per card instead of 7.0k; at 3.05 bpw decode 95-117 tok/s up to 260k on `xtx-xt` (NVFP4 78-96; 2026-10-16), agent turns 0.70-0.94 s (0.80-0.93), 60 GiB of RAM instead of 82; the dense layers keep the tested int8 path |
 | Against | One agentic-benchmark run per checkpoint so far (13 and 12 of 29; NVFP4 12 and 18 in two runs); the 60 / 40 split NVFP4 avoids; the even split of two equal cards refused; 0.6 GiB per card of prefill temporaries; more kernels to maintain (rotations per routed expert) |
 | Evidence | [how-it-works.md](how-it-works.md#exl3-checkpoints), [journey.md](journey.md#16-exl3-checkpoints-2026-10-04) (the first agent test crashed on a full 7900 XTX before the temporaries were kept free) |
 
@@ -139,13 +142,13 @@ benchmark with the MTP head: 12 and 18 of 29 in two runs.
 |---|---|
 | Grouping the prefills of several agents | -3 to -6 % total time, but not bit-exact, needs a ~150 ms wait, and agents already overlap naturally |
 | Mixing prefill chunks and decode steps in one batch | estimated at ~3 % |
-| Prefetching experts by prediction | 5 to 31 wasted copies per useful one |
+| Prefetching experts by prediction in decode | 5 to 31 wasted copies per useful one (a short prefill's many tokens let the next layer's router predict 79-84 % of its experts: done there since 2026-10-14) |
 | A smarter expert-cache policy | even the offline optimum only halves the misses; capacity is the lever |
 
 ## Packaging
 
 | Choice | Why | Cost |
 |---|---|---|
-| Build the image locally (`Dockerfile.rdna3`) | the base is ~31 GB of ROCm 10 + PyTorch, pinned by digest; the build itself takes minutes; the image records the commit it came from | a first build downloads the base |
+| Build the image locally (`Dockerfile.rdna3`) | the base is ~25 GB of ROCm 10.1 + PyTorch, pinned by digest; the build itself takes minutes; the image records the commit it came from | a first build downloads the base |
 | One profile per hardware setup | settings that belong together (chunk size, memory ratio, split, concurrency) travel together, and a profile states what was measured | untested setups start from a derived profile (`TESTED=0`) |
-| Settings as environment variables, most of the tuning off by default | the upstream behavior stays one variable away, for comparisons and bug reports; what is on by default is bit-exact, agent-validated, or new and checked otherwise (the release's sampler rework, exact by kernel tests, and its token broadcast, checked in `check`-mode server runs) ([options.md](options.md)) | long command lines, hence the profiles |
+| Settings as environment variables, each switchable | the upstream behavior stays one variable away, for comparisons and bug reports; what is on by default is bit-exact, agent-validated, or new and checked otherwise (the release's sampler rework, exact by kernel tests, and its token broadcast, checked in `check`-mode server runs) ([options.md](options.md)) | long command lines, hence the profiles |

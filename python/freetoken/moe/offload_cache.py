@@ -192,6 +192,7 @@ class OffloadMoeCache:
         # lru_ensure validates these against plan = min(batch * top_k, cache_size), so num_experts elements would under-size them
         plan_slots = max(self.num_experts, self.cache_size)
         self.evict_slots = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
+        self._alloc_prefill_plan()
         self.src_indices = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
         self.num_indices = torch.zeros((1,), dtype=torch.int64, device=self.device)
         # hybrid only: full missing count BEFORE the per-step fetch cap (num_indices holds
@@ -291,6 +292,8 @@ class OffloadMoeCache:
         self._prefill_slot_snapshot: torch.Tensor | None = None
         self._prefill_snapshot_np = None
         self._prefill_hit_d2d_active = False
+        self._prefill_prefetch: dict = {}  # layer -> (ready event, slots) of a predicted prefetch on the copy stream
+        self.prefill_chunk_cached = False  # this forward's choice (layers/moe.py prefill_cached), set at layer 0
         self._hit_d2d_fallback_logged = False
         self._batch_memcpy = None
         self.prefill_hit_rows = 0
@@ -402,6 +405,10 @@ class OffloadMoeCache:
         self._copy_feat_bytes_host: list[int] = []
         self._gather_bank_ids: list[int] = []
         self._gather_dst_ptrs: torch.Tensor | None = None
+        self._gather_src_ptrs: list[torch.Tensor] | None = None
+        self._small_dst_ptrs: torch.Tensor | None = None
+        self._small_src_ptrs: list[torch.Tensor] | None = None
+        self._small_feat_bytes: torch.Tensor | None = None
         self._gather_feat_bytes: torch.Tensor | None = None
         if not _FUSED_COPY or self.device.type != "cuda" or not self.banks:
             return
@@ -440,12 +447,19 @@ class OffloadMoeCache:
         # hit-D2D gather serves only the big banks; small banks are whole-layer
         # H2D entries (see _SMALL_BANK_FEAT_BYTES), so their rows never need D2D.
         self._gather_bank_ids = [i for i, f in enumerate(feats) if f >= _SMALL_BANK_FEAT_BYTES]
+        small = [i for i, f in enumerate(feats) if f < _SMALL_BANK_FEAT_BYTES]
+        if small:
+            self._small_dst_ptrs = self._copy_dst_ptrs[small].contiguous()
+            self._small_feat_bytes = self._copy_feat_bytes[small].contiguous()
+            self._small_src_ptrs = [p[small].contiguous() for p in self._copy_src_ptrs]
         if len(self._gather_bank_ids) == len(feats):
             self._gather_dst_ptrs = self._copy_dst_ptrs
             self._gather_feat_bytes = self._copy_feat_bytes
+            self._gather_src_ptrs = self._copy_src_ptrs
         elif self._gather_bank_ids:
             self._gather_dst_ptrs = self._copy_dst_ptrs[self._gather_bank_ids].contiguous()
             self._gather_feat_bytes = self._copy_feat_bytes[self._gather_bank_ids].contiguous()
+            self._gather_src_ptrs = [p[self._gather_bank_ids].contiguous() for p in self._copy_src_ptrs]
         self._copy_blocks_per_bank = default_blocks_per_bank(self.device)
         self._copy_fused_ok = True
 
@@ -491,6 +505,8 @@ class OffloadMoeCache:
         self._prefill_buffer_layer = [None, None]
         self._prefill_buffer_released = [True, True]
         self._prefill_buffer_has_release_event = [False, False]
+        self._prefill_prefetch = {}  # their slots index the old cache
+        self._prefill_loaded = []
         # 2. Drop old GPU tensors (free-before-alloc).
         self.banks = []
         self.bank_caches = {}
@@ -512,6 +528,7 @@ class OffloadMoeCache:
         self.usage = torch.zeros((cache_size,), dtype=torch.int64, device=self.device)
         plan_slots = max(self.num_experts, cache_size)
         self.evict_slots = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
+        self._alloc_prefill_plan()
         self.src_indices = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
         self.step.zero_()
         self.active_mask.zero_()
@@ -748,7 +765,8 @@ class OffloadMoeCache:
 
                 self._batch_memcpy = load_batch_memcpy()
             except Exception as exc:  # noqa: BLE001 -- any build/runtime gap => legacy path
-                logger.warning(f"MoE prefill hit-D2D disabled ({exc}); using full-layer copies")
+                logger.warning(f"MoE batched expert copies unavailable ({exc}): prefill hit-D2D off (full-layer "
+                               "copies), predicted experts copied by the shader copy")
                 self._batch_memcpy = False
         return self._batch_memcpy is not False
 
@@ -890,6 +908,121 @@ class OffloadMoeCache:
         ensure_experts_hybrid(
             self, layer_id, expert_ids, self.hybrid_max_fetch, self.hybrid_fetch_fraction, out
         )
+
+    def prefill_cached_all_ok(self) -> bool:
+        """``prefill_cached_ok`` for every layer (the MTP head's included): the path is taken by all of them or none."""
+        return all(self.prefill_cached_ok(layer) for layer in range(self.num_layers))
+
+    def prefill_cached_ok(self, layer_id: int) -> bool:
+        """Whether a prefill of this layer can read its routed experts from the slot cache (``ensure_prefill_routed``):
+        a GPU layer with pinned banks and the fused copy, no GPU-resident alphas."""
+        return (self._copy_fused_ok and self.gate_up_alpha is None and not self.is_cpu_layer(layer_id)
+                and layer_id not in self._unpinned_layers)
+
+    def _alloc_prefill_plan(self) -> None:
+        """Scratch of the slot-cache prefill (``ensure_prefill_routed``): marks, misses, LRU keys, the prefetch plan."""
+        E = self.num_experts
+        self._prefill_masks = torch.zeros((2 * E,), dtype=torch.int8, device=self.device)
+        self._prefill_miss = torch.empty((2 * E,), dtype=torch.int8, device=self.device)
+        self._prefill_keys = torch.empty((self.cache_size,), dtype=torch.int64, device=self.device)
+        self._prefill_pf_idx = torch.empty((2 * E,), dtype=torch.int32, device=self.device)
+        self._prefill_pf_num = torch.zeros((1,), dtype=torch.int64, device=self.device)
+
+    def _prefetch_ok(self, layer_id: int) -> bool:
+        return (self.prefill_copy_stream is not None and 0 <= layer_id < self.num_layers and self._copy_fused_ok
+                and not self.is_cpu_layer(layer_id) and layer_id not in self._unpinned_layers)
+
+    def ensure_prefill_routed(self, layer_id: int, topk_ids: torch.Tensor,
+                              predicted: tuple[int, torch.Tensor] | None = None) -> torch.Tensor:
+        """Make this layer's routed experts resident for a prefill chunk and return ``slot_for_id[layer_id]`` (expert
+        id -> slot) for the grouped GEMMs (FREETOKEN_PREFILL_CACHED_MAX).
+
+        A short chunk routes to part of the layer's experts, so only the routed ones that miss cross PCIe, where a
+        full-layer prefill copies every expert not cached into the double buffers and drops their slots. Most of them
+        were already brought in on the copy stream while the layers before ran: ``predicted`` = (next layer, expert
+        ids) is what the next layer's router makes of this layer's input, and its absent experts are copied in while
+        this layer computes. The rest are copied here (decode's copy). Victims are the least recently used slots
+        outside this layer's routed experts and the next layer's predicted ones; once the layer's GEMMs are queued,
+        ``demote_prefill_slots`` makes the experts the prefill brought in the next victims, so a prefill does not push
+        the decode's working set out. A wrong prediction costs a copy, never a result: the GEMMs read only the experts
+        the routing picked, all resident by then. One host sync per layer (the copy engine takes host pointers)."""
+        from freetoken.moe.offload_kernels import prefill_routed_plan
+
+        pending = self._prefill_prefetch.pop(layer_id, None)
+        loaded = []
+        if pending is not None:
+            event, slot_of = pending
+            torch.cuda.current_stream(self.device).wait_event(event)
+            loaded.append(slot_of)
+        nxt, pred_ids = predicted if predicted is not None and self._prefetch_ok(predicted[0]) else (-1, None)
+        slot_of_fix = torch.empty(self.num_experts, dtype=torch.int32, device=self.device)
+        slot_of_pf = torch.empty(self.num_experts, dtype=torch.int32, device=self.device)
+        prefill_routed_plan(self, layer_id, topk_ids, nxt, pred_ids, slot_of_fix, slot_of_pf)
+        self._pending_src_layer = layer_id
+        self._pending_whole_layer = False
+        self.copy_missing()
+        loaded.append(slot_of_fix)
+        self._prefill_loaded = loaded
+        if nxt >= 0:
+            self._launch_prefetch(nxt, slot_of_pf)
+        return self.slot_for_id[layer_id]
+
+    def _launch_prefetch(self, layer_id: int, slot_of: torch.Tensor) -> None:
+        """Copy the planned prefetch (``_prefill_pf_idx``/``_prefill_pf_num``) of ``layer_id`` on the copy stream, after
+        the work queued so far: the small banks by the shader copy (device indices), the big ones by the copy engine
+        (host pointer lists; the shader copy where the batched copy is unavailable)."""
+        from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
+
+        E = self.num_experts
+        idx, num = self._prefill_pf_idx, self._prefill_pf_num
+        big = [b for b, f in enumerate(self._copy_feat_bytes_host) if f >= _SMALL_BANK_FEAT_BYTES]
+        use_dma = bool(big) and self._resolve_batch_memcpy()
+        if use_dma:
+            host = torch.cat((num.to(torch.int32), idx)).cpu()
+            n = int(host[0])
+            if not n:
+                return
+            dst_h, src_h = host[1: 1 + n].tolist(), host[1 + E: 1 + E + n].tolist()
+            dst, src, nbytes = [], [], []
+            for b in big:
+                feat, base, hsrc = self._copy_feat_bytes_host[b], self._copy_dst_ptrs_host[b], self._copy_src_ptrs_host[layer_id][b]
+                dst.extend(base + v * feat for v in dst_h)
+                src.extend(hsrc + e * feat for e in src_h)
+                nbytes.extend([feat] * n)
+        ready = torch.cuda.Event()
+        start = torch.cuda.Event()
+        start.record(torch.cuda.current_stream(self.device))
+        with torch.cuda.stream(self.prefill_copy_stream):
+            self.prefill_copy_stream.wait_event(start)
+            if self._small_dst_ptrs is not None:
+                fast_index_copy_multi_jit(self._small_dst_ptrs, self._small_src_ptrs[layer_id], self._small_feat_bytes,
+                                          idx[:E], idx[E:], num, blocks_per_bank=self._copy_blocks_per_bank)
+            if use_dma:
+                self._batch_memcpy(
+                    torch.tensor(dst, dtype=torch.int64), torch.tensor(src, dtype=torch.int64),
+                    torch.tensor(nbytes, dtype=torch.int64), self.prefill_copy_stream.cuda_stream,
+                )
+            elif big:
+                fast_index_copy_multi_jit(self._gather_dst_ptrs, self._gather_src_ptrs[layer_id], self._gather_feat_bytes,
+                                          idx[:E], idx[E:], num, blocks_per_bank=self._copy_blocks_per_bank)
+            ready.record(self.prefill_copy_stream)
+        self._prefill_prefetch[layer_id] = (ready, slot_of)
+
+    def drain_prefill_prefetch(self) -> None:
+        """Wait on the compute stream for prefetches no layer consumed (a prediction for a layer that did not run)."""
+        cur = torch.cuda.current_stream(self.device)
+        for event, _ in self._prefill_prefetch.values():
+            cur.wait_event(event)
+        self._prefill_prefetch.clear()
+
+    def demote_prefill_slots(self) -> None:
+        """After a layer's prefill GEMMs through the slot cache: the slots the prefill filled for it (predicted and
+        missed) become the least recently used (usage 0), the first ones a later miss takes."""
+        from freetoken.moe.offload_kernels import prefill_demote
+
+        if getattr(self, "_prefill_loaded", None):
+            prefill_demote(self, self._prefill_loaded)
+        self._prefill_loaded = None
 
     def materialize_layer(self, layer_id: int) -> None:
         from freetoken.moe.offload_kernels import materialize_layer

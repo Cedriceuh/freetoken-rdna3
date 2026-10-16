@@ -54,6 +54,11 @@ def kv_int8_enabled() -> bool:
 # FREETOKEN_QSA_KV_HOST=1 (experiment): the K/V slab lives in pinned, device-mapped host memory; the kernels read the
 # selected tokens across PCIe and the VRAM it frees goes to the expert cache (the index tiers stay in VRAM)
 KV_HOST_ENV = "FREETOKEN_QSA_KV_HOST"
+# FREETOKEN_QSA_STAGE_SELECTED (default 1): with the host K/V, a prefill stages only the K/V rows of the tokens it
+# selects (marked per layer from the attention's indices, by the attention kernel's own mapping) instead of every page
+# in use: the attention reads the same rows, so the same bits; a short turn at 224k selects 11-21 % of the history's
+# tokens (40-66 % of its pages). 0: every page in use.
+_STAGE_SELECTED = os.environ.get("FREETOKEN_QSA_STAGE_SELECTED", "1") != "0"
 
 
 def kv_host_enabled() -> bool:
@@ -143,6 +148,7 @@ class QSAKVCache(MHAKVCache):
     def _alloc_staging(self) -> None:
         # host K/V: one layer's K and V staged in VRAM for a prefill's attention, at the physical page ids
         self._staging = None
+        self._stage_mark, self._stage_stamp = None, 0
         if kv_host_enabled():
             _, _, pages, page_size, heads, head_dim = self._kv_buffer.shape
             self._staging = torch.empty((2, pages, page_size, heads, head_dim), dtype=self._kv_buffer.dtype,
@@ -152,13 +158,28 @@ class QSAKVCache(MHAKVCache):
     def kv_on_host(self) -> bool:
         return self._staging is not None
 
-    def staged_kv(self, layer_id: int, pages: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Copy ``pages`` of this layer's host K/V into the VRAM staging buffer; its K and V views (same page ids)."""
-        from freetoken.kernel.triton.qsa.stage import stage_pages
+    def staged_kv(self, layer_id: int, pages: torch.Tensor, indices: torch.Tensor | None = None,
+                  token_to_req: torch.Tensor | None = None,
+                  block_table: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        """Copy ``pages`` of this layer's host K/V into the VRAM staging buffer; its K and V views (same page ids).
+        With the attention's ``indices`` (and its ``token_to_req`` / ``block_table``), only the rows of the tokens it
+        selects (FREETOKEN_QSA_STAGE_SELECTED)."""
+        from freetoken.kernel.triton.qsa.stage import stage_pages, stage_selected_pages
 
         dense = self._dense(layer_id)
-        stage_pages(self._k_buffer[dense], self._staging[0], pages)
-        stage_pages(self._v_buffer[dense], self._staging[1], pages)
+        if indices is not None and _STAGE_SELECTED:
+            if self._stage_mark is None:
+                self._stage_mark = torch.zeros(self._staging.shape[1] * self._staging.shape[2], dtype=torch.int32,
+                                               device=self._device)
+            self._stage_stamp += 1
+            if self._stage_stamp >= 1 << 30:
+                self._stage_mark.zero_()
+                self._stage_stamp = 1
+            stage_selected_pages(self._k_buffer[dense], self._staging[0], self._v_buffer[dense], self._staging[1],
+                                 pages, indices, token_to_req, block_table, self._stage_mark, self._stage_stamp)
+        else:
+            stage_pages(self._k_buffer[dense], self._staging[0], pages)
+            stage_pages(self._v_buffer[dense], self._staging[1], pages)
         return self._staging[0], self._staging[1]
 
     def _new_kv_buffer(self, shape: tuple[int, ...], dtype: torch.dtype, device: torch.device) -> torch.Tensor:

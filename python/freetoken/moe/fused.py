@@ -44,6 +44,13 @@ def fused_topk(
     return fused_topk_softmax(gating_output, topk, renormalize, num_token_non_padded)
 
 
+def blocks_to_slots(expert_ids: torch.Tensor, slot_map: torch.Tensor) -> torch.Tensor:
+    """The block -> expert ids of a ``moe_align_block_size`` call mapped to slot-cache rows (``slot_map``: expert id ->
+    slot). The tiles stay those of the expert ids; only where each block reads its weights changes. Blocks past
+    ``num_tokens_post_padded`` hold unset ids: clamped, then never read by the GEMMs."""
+    return slot_map[expert_ids.clamp(0, slot_map.numel() - 1).long()]
+
+
 def moe_align_block_size(
     topk_ids: torch.Tensor, block_size: int, num_experts: int
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

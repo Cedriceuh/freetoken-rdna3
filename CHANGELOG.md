@@ -2,19 +2,44 @@
 
 ## Unreleased
 
+- Agent turns: a new prompt of up to 1280 tokens on a cached conversation reads only its routed experts, through
+  the GPU expert cache (`FREETOKEN_PREFILL_CACHED_MAX`, 1280 for Qwen3.8-Flash-Next), those the next layer's router
+  predicts from this layer's input copied while this layer computes; the experts it brings in become the next victims,
+  so the decode after the turn keeps its cache. The tokenizer reuses the previous prompt's tokens up to its last turn
+  start (`FREETOKEN_TOKENIZE_PREFIX_CACHE`, the same tokens; ~0.5 s -> 1-3 ms at 224k), and with the K/V in RAM a
+  prefill stages only the K/V rows its tokens select (`FREETOKEN_QSA_STAGE_SELECTED`). The same answers; under
+  `--hybrid` they move with the cache contents, as they always did there. Time to the first token at 25k of context,
+  `main` -> this build (2026-10-16, arms alternated, 9/9 answers identical): 130-340-token turns NVFP4
+  `xtx-xt-4x262k` (3 x 262k pool) 1.22-1.24 -> 0.58-0.70 s and EXL3 3.05 bpw 0.86-0.89 -> 0.40-0.48 s, ~1k-token turns 1.33-1.34 ->
+  0.93-0.98 s and 0.94-0.99 -> 0.69-0.74 s, 3k-token turns -2 to -8 %; decode unchanged (-2 to +4 %). At 173k / 224k
+  on EXL3 3.05 bpw `xtx-xt-4x262k` (2026-10-15): 1.13-1.25 -> 0.43-0.50 s and 1.31-1.43 -> 0.46-0.59 s.
+- Cold reads, the same bits: the GatedDeltaNet prefill conv runs token-major (`FREETOKEN_GDN_CONV_ROWS`) and, on two
+  cards, the NVFP4 prefill MoE 8192 tokens at a time (`FREETOKEN_NVFP4_PREFILL_BLOCK=8192` in `xtx-xt` and
+  `xtx-xt-4x262k`); the EXL3 prefill GEMMs run two pipeline stages. `main` -> this build, the same texts, arms
+  alternated: NVFP4 `xtx-xt-4x262k` (3 x 262k pool) 98k tokens 44.8-44.9 -> 40.2-40.3 s, 116k 52.8 -> 46.8-46.9 s (+11 to +13 %);
+  EXL3 3.05 bpw 98k 40.2 -> 38.2 s, 116k 47.0-47.1 -> 44.3-45.5 s (+3 to +6 %).
+- The two-card profiles (`xtx-xt`; `xtx-xtx`, `xt-xt` untested) keep the model's whole 262,144-token context, as in 0.1.0 and like `xtx-xt-4x262k` (an earlier unreleased change had cut them to 250,000 to give the last 12k tokens' K/V to the expert cache): at 262,144 against 250,000, on `xtx-xt` 134-152 fewer expert slots per card (1.5-1.9 %), the decode of agent turns 0.2-1.7 % slower (turns 1-8 of a 25k conversation, the same answers); a 259,728-token prompt reads in 117-122 s and is answered at 68-76 tok/s; a longer one is refused (`context_length_exceeded`).
+- `--default-temperature T`: the temperature a request that sends none gets, in place of the checkpoint's
+  (`generation_config.json`, 1.0 for Qwen3.8-Flash-Next); requests that send one keep it. `rdna3/serve.sh` passes 0.6
+  (not to an image older than the flag, picked with `--image`).
+- Fixes: the EXL3 prefill's mid step needs 572 B of scratch per lane instead of 2.7 KB (`FREETOKEN_EXL3_MID_COLS`,
+  the same bits, 1.7-3.3x faster): a dispatch of the old kernel was the head of a stopped queue when a rank held an
+  all-reduce until the watchdog stopped the server (seen with a profiler slowing the host, in a short turn after a
+  196k-token read; waiting for its scratch is the likely cause, not proven). The JIT modules stay in the kernel-cache volume (`TVM_FFI_CACHE_DIR`): first request after a start
+  ~10 s -> 1.3-1.9 s; the batched-DMA probe no longer races its own fill (a rank fell back to one copy per expert at
+  random once the modules came from a cache).
 - One card without the MTP head (`--no-mtp`): a decode step's PLE disk rows are filled before its launch
   (`FREETOKEN_PLE_SYNC=auto` takes launch-gating on one GPU when the scheduler overlaps the steps): there the captured
   wait cost ~11 ms a step. NVFP4 `xtx --no-mtp`: 26.6 -> 38.3 tok/s greedy, the same tokens. Two cards, and one card
   with the head, keep the wait-sync, 2-4 % faster there.
 - The README and its banner, `docs/rdna3/benchmarks.md` (summary, depth sweeps, locked RAM, expert caches), the
-  profiles' figures and `llms.txt` re-measured on the image of 35afbb3 (2026-10-12; one card with `--no-mtp` on
-  2026-10-13 with the PLE fill above), one server per profile and checkpoint: greedy decode from 9k tokens to the
-  maximum context on `xtx-xt` 77-96 tok/s with NVFP4 (72-86 before), 98-117 at EXL3 3.05 bpw (83-107), 86-94 at 4.05
-  bpw (76-87); one card 36-57 tok/s across the checkpoints on `xtx` (33-52), 29-46 on `xt` (27-42); without the MTP
-  head 66 tok/s at the model's sampling on `xtx-xt` (58.5), 41 on `xtx` (35.8), 34 on `xt` (29.5). RAM locked, to the
-  nearest GiB, two cards / one: NVFP4 82 / 73 GiB, 3.05 bpw 60 / 52, 4.05 bpw 75 / 66. `--hybrid` again on 2026-10-13:
-  NVFP4 `xtx` 42.7 -> 62.3 tok/s, `xt` 34.6 -> 52.1, `xtx-xt` +2 % alone and +15 % each with four; EXL3 3.05 bpw +5 %
-  on `xtx`, even on `xtx-xt`.
+  profiles' figures and `llms.txt` re-measured on the image of this release (2026-10-16), one server per profile and
+  checkpoint, the 2026-10-12 protocol, two cards to 260k tokens: greedy decode along the context on `xtx-xt` 78-96 tok/s
+  with NVFP4, 95-117 at EXL3 3.05 bpw, 86-94 at 4.05 bpw, on one card about as before; agent turns on `xtx-xt` 0.7-1.0 s
+  at every depth (0.9-2.1 s before), on `xtx` / `xt` 1.0-1.8 s (1.5-2.8 s); cold 8.3k-token reads 3.6-3.8 s on two
+  cards (3.7-3.9 s), 5.0-6.2 s on one (6.3-7.9 s). Sampled decode now runs at the 0.6 that `rdna3/serve.sh` gives
+  (88 tok/s on `xtx-xt` with NVFP4, 83 at 1.0 before). Earlier on 2026-10-13, `--hybrid`: NVFP4 `xtx` 42.7 -> 62.3
+  tok/s, `xt` 34.6 -> 52.1, `xtx-xt` +2 % alone and +15 % each with four; EXL3 3.05 bpw +5 % on `xtx`, even on `xtx-xt`.
 - Decode, bit-exact and on by default (greedy answers identical): the EXL3 output kernel no longer runs Triton's
   constant-1 variant for a single K split, and rank 1's gate|up GEMV takes 4 N tiles a program; the hyper-connection's
   down GEMV applies `hc_silu` as it stores (`FREETOKEN_HC_SILU_EPILOGUE`) and its up GEMV mixes the gates into the
@@ -112,7 +137,6 @@
   driver maps, which stops the GPU queues for 5-22 s (once 140 s, and the server died). The engine now locks its memory
   (`FREETOKEN_MLOCK`) and the host needs `vm.compact_unevictable_allowed=0`; the VRAM clock after a pause needs the
   `COMPUTE` power profile (docs/rdna3/troubleshooting.md).
-- The two-card profiles serve 250,000 tokens of context (262,144 before), the same figure everywhere.
 - `serve.sh` runs PyTorch's allocator with expandable segments: without them, every 14-16k-token prefill chunk past ~26k
   of context hit an out-of-memory retry.
 - `rdna3/bench/depth_sweep.py`; the banner's source, `docs/rdna3/assets/social-preview.html`; `quick_bench.py` warms up

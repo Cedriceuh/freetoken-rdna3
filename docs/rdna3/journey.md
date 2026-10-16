@@ -1,8 +1,8 @@
 # The journey
 
-How this build came about: measured experiments from 2026-09-25 to 2026-10-07 on one machine, an RX 7900
+How this build came about: measured experiments from 2026-09-25 to 2026-10-16 on one machine, an RX 7900
 XTX 24 GB + RX 7900 XT 20 GB (gfx1100, no GPU peer-to-peer), a Threadripper 3970X and 128 GB of DDR4, serving
-Qwen3.8-Flash-Next NVFP4 to the author's coding agent (OpenCode) with a ~250k-token context (262k until 2026-10-03). Every number was measured
+Qwen3.8-Flash-Next NVFP4 to the author's coding agent (OpenCode) with a 262k-token context (250k from 2026-10-03 to 2026-10-16). Every number was measured
 on that machine (changes in interleaved A/B runs), except the few marked as estimates. The choices and their
 trade-offs are summed up in [decisions.md](decisions.md).
 
@@ -124,7 +124,8 @@ eviction fixed it. Result: 4 agents with 82-117k-token conversations, 3 turns ea
 
 ## 11. Tested and not kept: grouping prefills
 
-A prefill pass has a large fixed cost whatever its size, since it streams every expert (in one test at a 20k-token
+A prefill pass has a large fixed cost whatever its size, since it streams every expert (short ones no longer do since
+section 27; in one test at a 20k-token
 context: ~1.35 s, plus ~0.2 ms per new token), so holding a prefill for a moment to batch it with another agent's
 looked attractive. Measured: -3 to -6 % total time and median time
 to first token -37 % with 4 agents, but agents already pair themselves (11 of 46 turns unaided), catching simultaneous
@@ -256,7 +257,7 @@ decode -0.5 % (noise), prefill ~1 % faster. The published image itself was measu
 
 | Idea | Why not |
 |---|---|
-| Predicting the next layer's experts to prefetch them | co-occurrence: 31 wasted copies per useful one; a next-layer router: 65 % recall, still 5 wasted per useful one and an extra router per layer |
+| Predicting the next layer's experts to prefetch them in decode | co-occurrence: 31 wasted copies per useful one; a next-layer router: 65 % recall, still 5 wasted per useful one and an extra router per layer (for a prefill's many tokens the same router predicts 79-84 %: kept there, section 27) |
 | More router warps | upstream's single warp is fastest on RDNA3 |
 | Sampled-LRU expert cache | estimated +0.3 %, not worth an A/B |
 | A gated activation computed inside the GEMV that reads it (hyper-connection up, expert down projections) | exact, but every output tile recomputes it: HC up 7.9 -> 14.2 µs a call on the XTX (8.8 -> 16.4 on the XT), routed NVFP4 down 10.8 -> 12.7 (13.1 -> 19.7), shared-expert int8 down 5.5 -> 4.6 at one row but 5.9 -> 6.3 at two (2026-10-06, graph replay); added to the kept fusions of section 19 on the server: 16.07 against 15.45 ms a step |
@@ -278,6 +279,7 @@ decode -0.5 % (noise), prefill ~1 % faster. The published image itself was measu
 | Moving a verify step's PLE fill off its critical path | the ~2 ms wait seen under the profiler is probably its own doing (~30 ms steps under trace against ~16), and busy-waiting on the token readback changed nothing (70.9-85.5 against 71.0-85.5 tok/s) |
 | A bigger tensor-parallel share for the XTX | in decode the XTX waits ~0.9 ms a step for the XT (the all-reduce wait log), but 0.575 and 0.6 overload it in prefill: 0.55 stays |
 | Pinning the registered host memory from the engine (io_uring buffers) against the stall below | the pages stayed put, but compaction kept retrying around them and moved the runtime's own buffers: worse |
+| The experts a short prefill's prediction missed copied by the copy engine while the GEMMs run the resident experts' blocks (two passes per GEMM, the same bits) | ~50 ms of copies a turn on the XTX in a kernel trace, but measured untraced: +0 to +2 % (2026-10-14) |
 | A larger VRAM margin (`--memory-ratio 0.77`) against the prefill out-of-memory retries | the allocator's cache grew into it: the same retry at the same chunk (expandable segments removed them) |
 
 The stall seen since 2026-09-28 (the GPU stopping for seconds mid-step, in bursts) was found on 2026-10-03: the
@@ -461,12 +463,204 @@ host settings: [troubleshooting.md](troubleshooting.md#long-pauses-in-the-middle
   the XTX bounds it: at 0.83 it came within 56 MiB of full with the light desktop; it keeps 0.77, where the XTX stayed
   531 MiB from full with the desktop at 1.5 GiB (the workload clean, the same answers).
 
-## 22. Still open
+## 22. Four conversations of 262k, or one of 1M: the K/V in host RAM (2026-10-10)
+
+Qwen3.8-Flash-Next is trained to 262,144 positions and Qwen's model card extends it to 1M with YaRN. The attention K/V
+costs 14,144 bytes per token on each card, so 1M tokens is 13.2 GiB per card: the plan refuses it on `xtx-xt`.
+`FREETOKEN_QSA_KV_HOST=1` keeps the K/V in pinned, device-mapped host RAM that torch sees as a GPU tensor: decode and
+verify read their ~2051 selected tokens of each row across PCIe in place, and a prefill first copies one layer's pages
+at a time to a VRAM buffer (reading across PCIe instead ran at 789 tok/s at 118k). The answers are bit-identical to the
+K/V in VRAM. Past 262,144 positions, YaRN now composes with the multi-axis rope (bit-identical to HF transformers'), or
+`FREETOKEN_ROPE_MAX_POSITION` lengthens the plain rope's table. Two profiles, measured with EXL3 3.05 bpw:
+`xtx-xt-1m` read 988k tokens at 1775 tok/s and decodes at 83.6 tok/s there, with ~75 GiB of RAM locked;
+`xtx-xt-4x262k` takes four conversations of 262,144 tokens at once: four cold reads, 1,027,138 tokens in 463 s (2218
+tok/s), then 29.4-30.1 tok/s each with the four decoding at 257-260k, 91.3 alone at 261k. Retrieval of planted values
+100 % from 29k to 988k. Details: [long-context.md](long-context.md).
+
+## 23. Upstream up to ee9789f (2026-10-10)
+
+Upstream's top-k and YaRN replaced this tree's, and `--api-key` and `--hf-overrides` came with the merge
+([changes-from-upstream.md](changes-from-upstream.md)). The NVFP4 decode tiles, swept on the previous kernel, ran with
+layout conversions on upstream's rewritten marlin decode kernel: swept again, the down GEMV takes one trip per tile,
+every entry bit-identical to the tiles shipped before. That kernel itself is not bit-exact with the previous one:
+greedy answers changed on 5 of 15 prompts ([options.md](options.md)).
+
+## 24. Expert misses on the CPU: `--hybrid` (2026-10-11)
+
+`rdna3/serve.sh --hybrid` runs upstream's `--moe-strategy hybrid`: part of each decode step's expert misses is
+computed by the CPU from RAM instead of crossing PCIe. It could not run as shipped on ROCm. The executor now signals
+with HIP's stream memops (it fell back to two host callbacks per layer), sizes its buffers for the MTP verify rows, runs
+under tensor parallelism with NVFP4 (each rank's pool on half the cores) and reads EXL3 experts (AVX2). Opt-in: greedy
+answers differ from the offload path's at rounding level, the CPU summing in fp32 in another order (measured as
+precise as the GPU, section 27). Decode, one request, re-measured on 2026-10-13: NVFP4 `xtx` 42.7 -> 62.3 tok/s
+(+46 %), `xt` 34.6 -> 52.1 (+51 %), `xtx-xt` 82.9 -> 84.5 and 25.2 -> 28.9 each with four at once; EXL3 3.05 bpw `xtx`
+54.8 -> 57.8 (+5 %), `xtx-xt` even. Details and the settings tried without gain: [cpu-experts.md](cpu-experts.md).
+
+## 25. A decode step, kernel by kernel (2026-10-11 and 12)
+
+A `rocprofv3` trace of the decode step on `xtx-xt-4x262k`: 22.9 ms of GPU time a step on the 7900 XTX, and ~1750
+kernels for a 4-row step, ~400 of them small torch ops. Kept, each with the bits of what it replaces (bitwise tests over
+random inputs, greedy answers identical): the EXL3 output kernel's split count left unspecialized (Triton's
+constant-1 variant ran ~2x slower on rank 1's single K split); the hyper-connection's and the shared expert's
+activations in the stores of their GEMVs; and the glue in kernels (the QSA index-write plan, the PLE's 4-row decode
+conv, the MTP head's KV-only pass, a verify step's rollback copies, token-pool writes, draft addressing). The PLE conv
+matched torch only with Triton's FMA contraction off and torch's sum order on gfx1100, (p0 + p1) + (p2 + p3).
+`xtx-xt-4x262k` 85.5 -> 93.9 tok/s at one request (sampled), 33.9 -> 36.0 each at four; NVFP4 `xtx-xt` 77.8 -> 82.5.
+Every profile and checkpoint was re-measured on that image: greedy decode over the whole context on `xtx-xt`, NVFP4
+77-96 tok/s, EXL3 3.05 bpw 98-117, 4.05 bpw 86-94 (2026-10-12; [benchmarks.md](benchmarks.md) has the 2026-10-16 figures). The A/B of each change and what
+was dropped: [long-context.md](long-context.md#a-decode-step-on-xtx-xt-4x262k-kernel-by-kernel-night-of-2026-10-11).
+
+## 26. The PLE fill on one card (2026-10-13)
+
+Without the MTP head the scheduler overlaps its decode steps: the host launched step N+1, then waited for step N's
+readback before filling N+1's PLE rows, while N+1's captured wait held the GPU, ~11 ms more a step on one GPU.
+`FREETOKEN_PLE_SYNC=auto` takes launch-gating there (one GPU, no MTP head): NVFP4 `xtx --no-mtp` 26.6 -> 38.3 tok/s, the
+same tokens. Two cards and the MTP head keep the wait-sync, 1.6-4.3 % faster in their A/B.
+
+## 27. Agent turns: short prefills through the expert cache (2026-10-14)
+
+An agent turn is a short prefill (a tool result of 100-3000 tokens on a cached conversation) and a short answer. On
+`xtx-xt-4x262k` (EXL3 3.05 bpw) a turn of 128-334 new tokens took 0.77-0.82 s to its first token at 25k tokens of
+context and 1.13-1.17 s at 150k, about as long as a turn of 1.2k tokens. In a rocprofv3 trace of those turns the 7900
+XTX computed for 0.17-0.52 s of a ~0.9 s prefill and waited for the rest. Each prefill chunk streams every expert the
+cache lacks into the two full-layer buffers (the 40 % the cache held are gathered device-side; the other ~15k of the 25k
+layer-experts crossed PCIe, ~17 GB on the XTX by the slice sizes), whatever its length: at 128 tokens 62 % of the
+layer-experts are routed to (71 % at 334, 82 % at 1.2k, 90 % at 3.1k). With the copies skipped (a measurement with wrong
+answers) the same turns took 0.39-0.48 s. The bus itself was not the limit: 28.1-28.4 GB/s per card, by DMA or the
+shader copy, alone or both cards at once, and the batched DMA of a layer's misses 26 GB/s; the shader copy instead of
+the DMA gave nothing on short turns and cost 6-15 % from 1k tokens on (it takes compute units from the GEMMs).
+
+What was tried, in order (each against the code without it, same session; answers compared token for token):
+
+- **Only the routed misses, into the slot cache**, by decode's copy, then the prefill GEMMs reading each expert from its
+  slot (the tiles are still built on expert ids, so the same bits): slower (1.2k tokens 0.88 -> 1.44 s). The copy no
+  longer overlapped anything, since a layer's routing is known only when it runs, and the prefill's ~15k experts pushed
+  the decode's working set out of the 11k-slot cache: the answer after the turn decoded slower too.
+- **The experts a prefill brought in demoted** to the next victims once their GEMMs are queued: the decode after a turn
+  became faster than before (the full-layer path also drops the 1024 slots its buffers borrow), short turns -10 to
+  -22 %, 1-3k-token turns still slower.
+- **The next layer's experts predicted and copied while this layer computes.** Layer L+1's router applied to layer L's
+  MoE input, the union of each token's top-10 (its own top-k), recalls 79-84 % of the experts layer L+1 then routes to
+  (88-91 % with the top-14, which predicted 14-27 % more experts, with 53-97 % more of them not routed to; those copies
+  cost more than the misses they saved: short turns up to 6 % slower with the top-14 than with the top-10, 1-3 % slower
+  with the top-8). They
+  cross PCIe on a copy stream during layer L's GEMMs and layer L+1's attention; layer L+1 waits for that copy and
+  fetches only what the prediction missed. A wrong prediction
+  costs a copy, never a result: the GEMMs read only the experts the routing picked, all resident by then.
+- **The slot bookkeeping in three kernels** (marks and hit stamps, LRU keys, the slots of the routed misses and of the
+  predicted experts claimed together, one top-k over the cache per layer) instead of small torch ops (~74 more kernels
+  a layer than a full-layer prefill in a trace) and up to five host syncs a layer: 7-10 % lost at 3k tokens before,
+  2-4 % after. One host sync per layer remains (the DMA takes host pointer lists).
+
+Kept as `FREETOKEN_PREFILL_CACHED_MAX`: on by default up to 1280 tokens for Qwen3.8-Flash-Next (the model that
+predicts). Measured (with the top-14 prediction of the time) against the code without it on the
+same image (greedy answers on 14 prompts and the answers of the agent conversations identical on every profile; time to
+the first token of a turn, seconds; one conversation per profile):
+
+| Profile | Context | 132-148 new tokens | 329-339 | 910-1046 | 2.7-3.2k |
+|---|---|---|---|---|---|
+| EXL3 3.05 `xtx-xt-4x262k` | 25k | 0.76-0.79 -> 0.50 | 0.76-0.78 -> 0.55-0.56 | 0.84-0.88 -> 0.76-0.82 | 1.46-1.54 -> 1.47-1.56 |
+| EXL3 3.05 `xtx-xt-4x262k` | 173k | 1.13-1.23 -> 0.88-0.99 | 1.21-1.25 -> 1.01-1.03 | 1.29-1.33 -> 1.18-1.21 | 1.95-2.02 -> 1.96-2.02 |
+| NVFP4 `xtx-xt` | 25k | 1.19-1.21 -> 0.77-0.80 | 1.20-1.22 -> 0.87-0.88 | 1.29-1.32 -> 1.10-1.15 | 1.75-1.84 -> 1.74-1.85 |
+| EXL3 3.05 `xtx` | 25k | 1.50-1.51 -> 1.06-1.08 | 1.50 -> 1.10-1.19 | 1.54-1.55 -> 1.34-1.39 | 1.95-2.04 -> 1.95-2.04 |
+
+On a 224k-token conversation (`xtx-xt-4x262k`, the same answers): turns of 142-360 tokens 1.31-1.43 -> 1.15-1.27 s,
+1-3k-token turns unchanged, the cold read 95.9 / 96.2 s. Four agents at once on distinct 25k-token conversations (one
+run each; batched answers differ from run to run, the code without it included): the median turn under the threshold
+0.89 -> 0.77 s, the median decode 21.2 -> 23.3 tok/s per agent, the four conversations' summed turn time 447 -> 380 s.
+The answer after the turn decodes faster too (EXL3 `xtx-xt-4x262k` at 25k: +0.5 to +1.9 tok/s over the 88-131 tokens
+answered after the turns under the threshold); the cold read of 173k tokens is unchanged (71.4 / 71.6 s). Past 1.2-1.4k
+tokens the turn is compute-bound and the full-layer path, which overlaps its copy with the previous layer, stays: there
+the cache path was 2-4 % slower.
+
+Under `--moe-strategy hybrid` it is on as well. There the cache contents decide which decode routes the CPU computes, so
+the answers move with them, as they did before. With the cache path off (the answers of main: the same 9 of 9 on a
+25k-token conversation on EXL3 `xtx`), that conversation gave other answers from its second turn on when the 14
+greedy prompts had run before it in the same server. The CPU is not the less precise side. At the
+model's sizes (hidden 2560, expert width 640, top-10, NVFP4 banks, 300 tokens), the relative error of one MoE output
+against an fp64 reference: GPU decode kernel (bf16 between the steps) 3.9e-3, CPU (fp32 inside) 2.3e-3, 8 to 2 of the
+10 routes on the CPU (two bf16 partial sums added) 3.3-4.0e-3; rounding the exact result to bf16 alone is 1.7e-3. The
+CPU and GPU results differ from each other by 4.5e-3, which is what moves a greedy answer. Time to the first token of a
+turn of 132-337 new tokens at 25k, path off -> on: NVFP4 `xtx-xt` 1.19-1.24 -> 0.78-0.89 s, EXL3 `xtx` 1.50-1.52 ->
+1.05-1.18 s, NVFP4 `xtx` 2.32-2.34 -> 1.63-1.80 s.
+
+**Then the tokenizer.** A short turn at 173k of context still took 0.93-1.03 s against 0.49-0.56 s at 25k. The GPU part
+of a turn grows little with the context (the K/V staged from RAM: 0.1-0.2 s of it at 196k, measured with the K/V in VRAM
+instead); the rest was on the host. The tokenizer worker encoded the whole conversation at every request: with the
+model's tokenizer on one core of the 3970X, 41-47 ms at 24k tokens, 0.27-0.40 s at 174k, 0.36-0.51 s at 224k. An
+agent's prompt extends its previous one, and a fast tokenizer encodes the text between two added tokens on its own,
+so the tokens up to an added token depend only on the text up to it. The worker now keeps its last prompts, takes the
+tokens of the longest shared prefix up to the last `<|im_start|>` inside it and encodes only the rest
+(`FREETOKEN_TOKENIZE_PREFIX_CACHE`): 1.0-2.6 ms a turn. The same tokens: compared with the whole encoding on the 8
+turns that reuse a prompt in an agent run (`FREETOKEN_TOKENIZE_PREFIX_CHECK=1`, no difference; prompts under 16k
+characters, such as the greedy prompts, are encoded whole), and in tests on agent
+conversations, edited and branched ones, and prompts cut at random places (inside a word, a multi-byte character, a
+special token's text). That worker also detokenizes the running streams between two encodes, so with several agents
+their streams waited for each encode too. Time to the first token on EXL3 3.05 `xtx-xt-4x262k` (one conversation each,
+the same answers):
+
+| Context | 132-360 new tokens | 910-1118 | 2.7-3.2k |
+|---|---|---|---|
+| 25k | 0.49-0.56 -> 0.42-0.51 | 0.74-0.80 -> 0.69-0.73 | 1.43-1.51 -> 1.36-1.45 |
+| 173k | 0.93-1.03 -> 0.53-0.58 | 1.23-1.29 -> 0.81-0.84 | 1.91-1.98 -> 1.48-1.54 |
+| 224k | 1.17-1.21 -> 0.58-0.70 | 1.45-1.57 -> 0.90-0.98 | 2.23-2.35 -> 1.60-1.73 |
+
+(At 224k the earlier run had the mid step at 16 columns a program instead of 32, the same bits.)
+
+What still grows with the context in a short turn is mostly on the GPU. With the K/V in RAM (`xtx-xt-4x262k`), each
+prefill copied every page of the conversation to VRAM before each of the 12 attention layers: in kernel traces, 1.1 ms
+a layer at 25k, 6.3-6.9 ms in a cold read's chunk at 164-180k (the trace of the 224k read stopped there), for a turn whose ~220 rows read 2048 tokens each. Those rows select 11-21 %
+of the history's tokens but touch 40-66 % of its 64-token pages (21-58 % of the tokens and 73-95 % of the pages for
+600-3200 rows). A prefill now copies only the K/V rows of the selected tokens, marked from the attention's own indices
+with the attention kernel's mapping (`FREETOKEN_QSA_STAGE_SELECTED`): the same rows read, so the same bits (tested with
+NaN in every row left out). At 224k, every page / the selected pages / the selected rows: 142-360-token turns 0.57-0.70
+/ 0.52-0.66 / 0.49-0.62 s, 1.0-1.1k 0.90-0.98 / 0.88-0.94 / 0.84-0.89, 2.8-3.2k 1.61-1.74 / 1.59-1.73 / 1.56-1.70; the
+same answers (greedy and agent conversation), and unchanged at 25k.
+
+Where a short turn's time goes after that, counted per layer during an agent run at 25k with 64-token answers between
+the turns: a turn of 131-232 rows routes ~220-290 distinct experts a layer, 61-73 % of them already cached; the rest
+cross PCIe. For a 131-row turn that is 5275 expert copies, about 5.9 GB on the XTX and 3.9 GB on the XT (estimated
+from the bank sizes), 0.15-0.23 s at 26 GB/s of a 0.34 s turn. Half of the predicted copies were for experts the next
+layer did not route to (2441 of 4693 with each token's top-14): the top-10 is the default now (above). The two EXL3
+prefill GEMMs also run with two pipeline stages (and 16-block groups for gate|up), the same bits: -5 to -8 % on gate|up
+and -2 to -3 % on down in isolation on both cards. Both together, against the image of the previous commit: 132-337-token
+turns 0.42-0.50 -> 0.39-0.47 s at 25k, 0.44-0.52 -> 0.43-0.50 at 173k, and with the launcher's arguments on the two
+images 0.49-0.62 -> 0.46-0.59 at 224k (cold read 94.1 -> 92.2 s); 1-3k-token turns and the other cold reads unchanged;
+the same answers.
+
+Found on the way:
+
+- **A hang, and the kernel behind it.** A rocprofv3 trace of a short turn after a 196k-token cold read hung both
+  ranks: an all-reduce timed out after 60 s (the RCCL watchdog then stops the server). With a profiler or a tracer
+  slowing the host, the cache path hung there in 7 of 8 runs; the code without it in none of 3 runs (24 turns); without
+  instrumentation, 5 runs of that conversation ran clean. `rocgdb` on the two ranks at the hang: rank 1 inside the
+  RCCL kernel; rank 0 with no kernel running, its compute queue stopped at a valid dispatch of the EXL3 mid kernel
+  (between the two expert products) that was never launched, every packet before it complete. That kernel's 64-row
+  tile version spilled 861-866 VGPRs, 2.7 KB of scratch per lane; the dispatch waiting for a scratch grant fits what
+  the queue showed (not proven: the runtime has no symbols). The same kernel ran in every EXL3 prefill before, the
+  full-layer path included. It now takes the Hadamard 32 columns at a time, 32 rows and 4 warps a program
+  (`FREETOKEN_EXL3_MID_COLS`): the same bits (each output is one dot of a row with one column), 572 B of scratch,
+  1.7-3.3x faster alone (7900 XTX: 1394 -> 826 us for a 4096-token block, 416 -> 125 us for 222 tokens); the cold read
+  of 173k tokens 71.4 -> 69.8 s. 6 runs of the same instrumented test with it (with 32 columns, and an earlier 16-column
+  version at 264 B), 24 of 24 turns, no hang. 8 or 16 HIP hardware queues (`GPU_MAX_HW_QUEUES`) also avoided it,
+  which only moves the kernel to another queue.
+- **The JIT modules were rebuilt at every server start.** tvm-ffi builds them under `~/.cache/tvm-ffi`, outside the
+  per-image cache volume: the first request after a start took ~10 s, and the first long prefill 1.5-5.6 s more. The
+  image and `serve.sh` now set `TVM_FFI_CACHE_DIR` in the volume: first request 1.3-1.9 s.
+- **That exposed a race in the batched-DMA probe**: it filled its target on one stream and copied on another without
+  ordering them, and the seconds of compilation used to hide it. With the module loaded from the cache the probe failed
+  at random, and that rank fell back to one copy per expert: full-layer short prefills ~10 % slower. Fixed (the copy
+  waits for the fill), and a failed mode is now logged.
+
+## 28. Still open
 
 - In NVFP4 the model needs ~63 GiB of RAM for its experts alone (the engine keeps every expert in RAM). The EXL3 3.05
   bpw checkpoint needs 42.6 GiB and served under a 56 GiB container limit, but a real 64 GB machine is untested
   ([limits.md](limits.md)).
-- Triton 3.8 is not bit-exact with the 3.7.1 the agentic benchmark last ran on (section 18): not run on it yet.
+- Not run on the agentic benchmark since its last run: Triton 3.8, not bit-exact with that run's 3.7.1 (section 18);
+  upstream's NVFP4 decode kernel (section 23, 5 of 15 greedy answers changed); the fp64 rebuild of EXL3's dense
+  weights (section 20); `--hybrid` (section 24), whose answers also move with the expert cache's contents (section 27);
+  and the two profiles with the K/V in RAM, `xtx-xt-1m` and `xtx-xt-4x262k` (section 22).
 - ROCm 10 / PyTorch 2.13 and ROCm 10.1 / PyTorch 2.14 (rechecked 2026-10-10), the image's bases since 2026-10-02:
   `F.linear` changes its sums with the row count for some shapes ((3072, 256), (6656, 2560)): serving does not use it
   for them (int8 or table GEMVs), but `test_qsa_spec_rows`' toy projections did, which made it fail on 3-4 rows;
@@ -475,13 +669,25 @@ host settings: [troubleshooting.md](troubleshooting.md#long-pauses-in-the-middle
   card within tens of MiB of full (section 21; the torch allocator is now capped 512 MiB short of that). One at start
   on 2026-10-07, ~3 s after the CUDA graphs were captured, with 3.9 GiB free on the XTX (EXL3 3.05 bpw; 1 start in
   ~32 that night, the 16 starts of a series after it were clean): cause not found.
-- Expert misses are 30-35 % of a decode step with the MTP head (section 20): the next lever for decode, not a
-  cache policy (an online one gains ~8 % of the misses at best on a recorded trace). More VRAM for the cache: ~170
+- Expert misses are 30-35 % of a decode step with the MTP head (section 20): the next lever for decode (on one card
+  `--hybrid` computes part of them on the CPU, section 24), not a cache policy (an online one gains ~8 % of the misses at best on a recorded trace). More VRAM for the cache: ~170
   loaded Triton kernel modules at 2 MiB each per card (section 21), and a desktop-aware plan for the card that drives
   the display.
-- EXL3's dense weights are rebuilt at load in fp64 since 2026-10-07 (section 20): the same bits on ROCm 10.0 and 10.1,
-  a one-time change from the fp32 rebuild that the agentic benchmark has not run yet. The EXL3 profiles keep
+- EXL3's dense weights are rebuilt at load in fp64 since 2026-10-07 (section 20): the same bits on ROCm 10.0 and 10.1.
+  The EXL3 profiles keep
   `--memory-ratio` 0.77 / 0.76 on two cards (3.05 bpw at 0.77 measured in section 21; 4.05 bpw not again).
+- Short agent turns (section 27): about half of a 130-row turn at 25k is the routed experts the cache lacks crossing
+  PCIe (4-6 GB a card; estimated from the bank sizes at 26 GB/s, not timed apart), the rest compute and the host. The levers left are a larger expert cache or fewer bytes per
+  expert; a cache policy gains ~8 % of the misses at best (above). The host's ~10,000 kernel launches of a small
+  prefill were not measured apart.
+- Decode at three and four requests (NVFP4 `xtx-xt-4x262k` 3 x 262k, 20k-token conversations decoding together, 2026-10-16, `FT_STATS_EVERY` + `FT_MOE_STATS`): a step takes 26-29 ms at three and 31-35 ms at four, the GPU busy 98-99 % of it; 33-35 experts are active a layer, 2-4.6 of them missing the cache (8-13 %), each copied across PCIe in ~55 us: ~9 ms of a four-request step by that count (misses x 55 us, not timed apart), its largest part. The PLE fill costs 0.9 ms a step (rows read with O_DIRECT, no RAM cache); launch-gating instead of wait-sync -3 %; the side-stream miss copy (`FREETOKEN_MOE_COPY_OVERLAP`) +0.7 %. Prefetching layer L+1's predicted experts on a side stream while layer L computes cut the misses by 42 % but made the step 20 % longer at four requests and 2.2x at one (probably the fork and join edges inside the replayed graphs, not measured apart; a narrower copy grid was slower still): dropped. The sparse attention reads its 2048 selected rows a request from the host K/V each step, 66-81 % of them the same as the step before: a cache that kept them in VRAM per request and layer gave the same bits and steps 0.6-3.5 % shorter at three or four requests, 0.8-1.7 % longer for one (the VRAM it took from the expert cache): not kept, too little for ~440 lines of code. A kernel trace of these steps lost 37 % of its records in whole chunks of dispatches ([testing.md](testing.md#micro-benchmarks-rdna3bench)).
+- Cold reads on NVFP4 `xtx-xt-4x262k` (2026-10-16, a kernel trace of 16k-token chunks on the 7900 XTX, busy 98 % of the time inside the reads): the NVFP4 expert GEMMs 37 % of the GPU time, the RCCL all-reduces 17 % (7.9 ms for 80 MiB when both ranks arrive together, ~10 GB/s: the cards have no peer access and stage through host memory), the sparse attention 11 %, hipBLASLt's dense GEMMs 13 %, the indexer 4.5 %, strided copies of the GatedDeltaNet q / k / v 3.5 % (gone with `FREETOKEN_GDN_CONV_ROWS`). A many-block all-reduce through shared host memory, pipelined in pieces so both PCIe directions work, gave RCCL's bits but took 9.0 ms: dropped. The sparse attention reads each query row's 2048 selected rows apart; sharing them between neighbouring rows would change the sums' order.
+- The NVFP4 prefill MoE ran 4096 tokens at a time since the 16k-token chunks (section 7), when the memory was short at depth. On two cards a 8192-token block reads 8 % faster (NVFP4 `xtx-xt-4x262k`, 2026-10-16: 98k tokens 43.4 -> 40.2 s, 245k 112.6 -> 103.7 s) and 16384 13 % (38.7 and 99.9 s); an expert gets ~160 / ~320 rows a block instead of ~80 on average. Every tile keeps the 32-byte K step, so no bit changes. 16384 took the XT's VRAM peak of a 255k-token read from 19,146 to 19,806 MiB (0.65 GiB left), 8192 to 19,346: `xtx-xt` and `xtx-xt-4x262k` take 8192.
+  In a one-layer kernel benchmark (random routing, the XTX's slice), the gate_up GEMM took 1.53 / 1.51 / 1.15 ms per 1k tokens at 4096 / 8192 / 16384-token blocks and the down GEMM 1.09 / 0.85 / 0.79; gate_up's 128-row tiles are on average 62 % full at 4096 and 8192 tokens (80 or 160 rows an expert) and 83 % at 16384, which fits its times (not measured apart). A 12288-token block, the fastest per token there (gate_up 1.11 ms per 1k), read 98k / 116k tokens in 40.5 / 47.1 s, as 8192 did (a 16k-token chunk also runs a 4096-token block there; its share was not measured apart). Two variants of the GEMM with the same values were slower and dropped: the E2M1 codes decoded by bit arithmetic instead of the 16-entry table (+17 to +23 %), and the activations loaded as one contiguous tile and split into even / odd columns in registers (gate_up up to 2.3x).
+- Cold reads: in a kernel trace of 16k-token chunks on the 7900 XTX (5.2-5.9 s of kernels each), the all-reduce took
+  ~1 s (most of it likely waiting for the slower XT, which was not traced), the EXL3 expert GEMMs ~1.35 s, the sparse
+  attention ~0.66 s (close to the bandwidth its K/V gathers need) and the indexer 0.15-0.55 s, growing with the
+  context.
 - More than two GPUs, other RDNA3 cards, RDNA4 and NVIDIA are untested.
 - Image input (`serve.sh --vision`) is measured on `xtx-xt`, `xtx` and `xt` only. The derived profiles (`xtx-xtx`,
   `xt-xt`, `gre`) are untested with it, as they are without it.

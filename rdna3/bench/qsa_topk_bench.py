@@ -1,5 +1,5 @@
 """QSA block top-k (the indexer's selection, kernel/triton/qsa/topk.py) per call, CUDA-graph replays, on the page
-tables of the profiles: 65,536 block columns (the 250k / 262k contexts) and 250,000 (the 1M profile), full or short
+tables of the profiles: 65,536 block columns (the 262k contexts) and 250,000 (the 1M profile), full or short
 visible rows, 1 / 4 / 8 rows. Checks the winners against torch.topk and prints a checksum that compares across builds
 (same seeds).
 

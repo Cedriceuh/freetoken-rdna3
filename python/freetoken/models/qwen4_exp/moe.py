@@ -23,6 +23,14 @@ _COPY_OVERLAP = os.environ.get("FREETOKEN_MOE_COPY_OVERLAP", "0") == "1"
 # FREETOKEN_FUSED_MOE_EPILOGUE (default 1): the routed sum, the shared-expert gate and the mul-add in one kernel
 # (decode and prefill); the same arithmetic in the same order, so the same bits, two launches fewer per layer
 _FUSED_EPILOGUE = os.environ.get("FREETOKEN_FUSED_MOE_EPILOGUE", "1") == "1"
+# FREETOKEN_PREFILL_PREDICT (default 1): when a prefill chunk reads its experts from the slot cache, layer L+1's router
+# applied to layer L's MoE input predicts the experts layer L+1 routes to (top-k + _PREDICT_EXTRA per token), and the
+# absent ones are copied in while layer L computes (only copies, so the same bits). Each token's own top-k (extra 0)
+# copies about as many experts layer L+1 does not route to as it misses; wider predictions waste more PCIe than the
+# misses they save (short agent turns: extra 0 -4 to -6 % against 4, 8 and 12 slower still, -2 slower)
+_PREDICT = os.environ.get("FREETOKEN_PREFILL_PREDICT", "1") == "1"
+_PREDICT_EXTRA = int(os.environ.get("FREETOKEN_PREFILL_PREDICT_EXTRA", "0"))
+_BLOCKS: dict = {}  # MoE layer id -> block of the main model (the MTP head's is left out)
 
 
 class Qwen4ExpMoE(Qwen3_5MoE):
@@ -41,6 +49,9 @@ class Qwen4ExpMoE(Qwen3_5MoE):
                 config, config.hidden_size, config.shared_expert_intermediate_size,
                 prefix=f"{prefix}.shared_expert", local_intermediate=local,
             )
+        if layer_id is not None and layer_id < config.num_layers:
+            _BLOCKS[self.experts.layer_id] = self
+        self.experts.prefill_cached_default = _PREDICT
         # TP: the routed experts and the shared expert's down_proj each hold a partial sum; the gate is computed
         # from the replicated input, so sum_r(routed_r + g * shared_r) = routed + g * shared and ONE all-reduce of
         # the combined partial replaces two (48 fewer collectives per token on Qwen3.8-Flash-Next).
@@ -56,6 +67,14 @@ class Qwen4ExpMoE(Qwen3_5MoE):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         router_logits = self.gate.forward(hidden_states)
+        cached = getattr(self.experts, "prefill_cached", None)  # offload experts only
+        if cached is not None and get_global_ctx().batch.is_prefill:
+            nxt = _BLOCKS.get(self.experts.layer_id + 1) if _PREDICT else None
+            if nxt is not None and nxt is not self and cached(num_tokens):
+                logits = nxt.gate.forward(hidden_states)
+                width = max(1, min(self.experts.top_k + _PREDICT_EXTRA, logits.shape[-1]))
+                predicted = torch.topk(logits, width, dim=-1).indices
+                self.experts.next_layer_prediction = (nxt.experts.layer_id, predicted)
         split = (_COPY_OVERLAP and not get_global_ctx().batch.is_prefill
                  and getattr(self.experts, "can_overlap_copy", lambda: False)())
         if split:

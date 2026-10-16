@@ -963,6 +963,20 @@ def _serve_and_run_shell(host: str, port: int, api_key: str | None) -> None:
         _reap_backend_workers(_GLOBAL_STATE.backend_processes)
 
 
+def default_sampling(config: ServerArgs) -> tuple[Dict[str, Any], str]:
+    """The sampling values a request that omits them gets, and where they come from: the checkpoint's
+    generation_config.json (--sampling-defaults model) or the framework's, the temperature replaced by
+    --default-temperature when it is set."""
+    sampling: Dict[str, Any] = {}
+    if config.sampling_defaults == "model" and not config.use_dummy_weight:
+        sampling = load_generation_sampling(config.model_path)
+    source = "model" if sampling else "framework"
+    if config.default_temperature is not None:
+        sampling = {**sampling, "temperature": float(config.default_temperature)}
+        source += ", temperature from --default-temperature"
+    return sampling, source
+
+
 def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_shell: bool) -> None:
     """
     Run the frontend API server (FastAPI + uvicorn) and wire it to the tokenizer process via ZMQ.
@@ -976,13 +990,12 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
 
     global _GLOBAL_STATE, _MODEL_SAMPLING
 
-    if config.sampling_defaults == "model" and not config.use_dummy_weight:
-        _MODEL_SAMPLING = load_generation_sampling(config.model_path)
+    _MODEL_SAMPLING, source = default_sampling(config)
     # Always surface the effective default sampling (model-recommended where available,
     # else framework defaults), since unspecified request fields resolve to these.
     logger.info(
         "Default sampling config (source=%s): temperature=%s, top_k=%s, top_p=%s",
-        "model" if _MODEL_SAMPLING else "framework",
+        source,
         _MODEL_SAMPLING.get("temperature", 0.0),
         _MODEL_SAMPLING.get("top_k", -1),
         _MODEL_SAMPLING.get("top_p", 1.0),

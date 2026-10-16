@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """Decode and prompt reading as a conversation grows to the profile's maximum context (docs/rdna3/benchmarks.md).
 
-    python3 rdna3/bench/depth_sweep.py [--url http://127.0.0.1:1919] [--model qwen3.8-flash-next] [--max 248000]
+    python3 rdna3/bench/depth_sweep.py [--url http://127.0.0.1:1919] [--model qwen3.8-flash-next] [--max 260000]
                                        [--passes 2] [--label xtx-xt]
 
 Standard library only. One conversation per pass: a cold ~10.5k-token read, then blocks the server has never seen (like
-large tool results) until the depth reaches --max (ten steps to 248k, seven to 124k). At each step:
+large tool results) until the depth reaches --max (ten steps to 260k, seven to 124k). At each step:
   TG          decode tokens/s over a 256-token answer about the new block, after its first token (greedy)
   PP          speed of reading that block: its new tokens / time to the first token
   agent turn  time to the first token of a following ~1k-token turn on the now-cached conversation
 Prints a Markdown table with the median of the passes. Run it alone on the server: two passes take ~6 min. --max must
-stay ~2k below the server's context (the step's agent turn and answers come on top): 248000 for 250k, 124000 for 131k.
+stay ~2k below the server's context (the step's agent turn and answers come on top): 260000 for 262k, 124000 for 131k.
 """
 from __future__ import annotations
 
@@ -89,7 +89,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--url", default="http://127.0.0.1:1919")
     ap.add_argument("--model", default="qwen3.8-flash-next")
-    ap.add_argument("--max", type=int, default=248_000, help="deepest step, in tokens (124000 for one card)")
+    ap.add_argument("--max", type=int, default=260_000, help="deepest step, in tokens (124000 for one card)")
     ap.add_argument("--passes", type=int, default=2)
     ap.add_argument("--label", default="")
     a = ap.parse_args()

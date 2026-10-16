@@ -87,6 +87,7 @@ class TritonNvfp4MoEKernel(MoEKernel):
 
     name = "triton"
     cpu_format = "nvfp4"
+    supports_prefill_slot_map = True
 
     @property
     def supports_inactive_slots(self) -> bool:  # hybrid decode: CPU routes skipped (FREETOKEN_HYBRID_SKIP_CPU_ROUTES)
@@ -137,7 +138,8 @@ class TritonNvfp4MoEKernel(MoEKernel):
         banks = (t["gate_up"], t["gate_up_scale"], t["gate_up_global"], t["down"], t["down_scale"], t["down_global"])
         alpha, limit = float(layer.alpha), limit_or_inf(layer)
         if is_prefill:
-            return fused_experts_nvfp4(x, *banks, topk_weights, topk_ids, view.n, layer.activation, layer.apply_router_weight_on_input, alpha, limit)
+            return fused_experts_nvfp4(x, *banks, topk_weights, topk_ids, view.n, layer.activation, layer.apply_router_weight_on_input, alpha, limit,
+                                       slot_map=view.slot_map)
         return fused_experts_decode_nvfp4_marlin(x, *banks, topk_weights, topk_ids, layer.activation, layer.apply_router_weight_on_input, alpha, limit)
 
 

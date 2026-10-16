@@ -21,5 +21,6 @@
 Original to this repository: the uneven tensor-parallel split and unequal-card planning, weight-only int8 dense layers
 and their GEMVs, the split-K bf16 GEMVs, the host-memory all-reduce, the top-k-first sampler and the sorted-threshold
 sampling path for ROCm, rank-0 token broadcast, the tuned NVFP4 tiles, the blocked PLE and prefill MoE paths, expert
-reuse in prefill on ROCm, batch-invariant multi-request decoding, the RAM tier for conversations, the EXL3 reader and its
-RDNA3 kernels, the profiles and tooling, and the measurements in these docs.
+reuse in prefill on ROCm, batch-invariant multi-request decoding, the RAM tier for conversations, the MTP-head speculative decoding for
+Qwen3.8-Flash-Next, the attention K/V in host RAM for long contexts, short prefills through the expert cache with the
+next layer's experts predicted, the tokenizer's prompt prefix cache, the EXL3 reader and its RDNA3 kernels, the profiles and tooling, and the measurements in these docs.

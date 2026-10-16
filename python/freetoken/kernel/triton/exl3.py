@@ -18,6 +18,7 @@ rotate-in (``H(x * suh)``), the trellis product, then rotate-out (``H(y) * svh``
 from __future__ import annotations
 
 import functools
+import os
 
 import torch
 import triton
@@ -377,12 +378,14 @@ def exl3_moe_gemm(
     kt: int = 2,
     nt: int = 8,
     num_warps: int = 4,
-    num_stages: int = 1,
-    group_m: int = 8,
+    num_stages: int = 2,
+    group_m: int = 16,
 ) -> torch.Tensor:
     """Prefill counterpart of :func:`exl3_gemv`: ``a`` ``[R, halves, KIN]``, routes sorted by expert with
     ``moe_align_block_size`` at ``block_m``. Returns ``[1, R, N]`` fp32. The tile defaults (with block_m 64) won a sweep
-    on the 7900 XT for Qwen3.8-Flash-Next's per-rank shapes (a one-layer sweep at 2048 tokens: -35..40 % vs 32 / 2 / 4)."""
+    on the 7900 XT for Qwen3.8-Flash-Next's per-rank shapes (a one-layer sweep at 2048 tokens: -35..40 % vs 32 / 2 / 4).
+    Two pipeline stages and 16-block groups (2026-10-14, the same bits: only the launch order and the loads' prefetch
+    change): -5 to -7 % at 4096 tokens, -7 to -8 % at 150, on both cards and expert widths 256, 384 and 640."""
     R, halves, kin = a.shape
     S, A, B, words = trellis_bank.shape
     assert kin == A * 16 and B % halves == 0
@@ -455,8 +458,10 @@ def _exl3_gemm_down_out_kernel(
 
 
 def exl3_gemm_down_out(a, down, down_svh, route_weights, sorted_ids, expert_ids, ntpp, codebook, *, block_m: int,
-                       out_dtype: torch.dtype, kt: int = 2, num_warps: int = 4, group_m: int = 8) -> torch.Tensor:
-    """Fused prefill down product and rotation out: ``[R, H]`` per-route outputs, already weighted by the router."""
+                       out_dtype: torch.dtype, kt: int = 2, num_warps: int = 4, group_m: int = 8,
+                       num_stages: int = 2) -> torch.Tensor:
+    """Fused prefill down product and rotation out: ``[R, H]`` per-route outputs, already weighted by the router.
+    Two pipeline stages: -2 to -3 % against one, the same bits."""
     R, halves, kin = a.shape
     S, A, B, words = down.shape
     assert halves == 1 and kin == A * 16 and B % 8 == 0
@@ -470,7 +475,7 @@ def exl3_gemm_down_out(a, down, down_svh, route_weights, sorted_ids, expert_ids,
         EM, R, B // 8, A,
         a.stride(0), t.stride(0), t.stride(1), t.stride(2), down_svh.stride(0), out.stride(0),
         K=K, CB=codebook, G=group_size(K), KT=kt, DOT4=_dot4(a.device), BLOCK_M=block_m, GROUP_M=group_m,
-        num_warps=num_warps, num_stages=1,
+        num_warps=num_warps, num_stages=num_stages,
     )
     return out
 
@@ -540,6 +545,57 @@ def _exl3_mid_kernel(
         y = _had(act, hm, HOIST, PRECISE)
         tl.store(a_ptr + r[:, None].to(tl.int64) * stride_ar + cols[None, :], y.to(a_ptr.dtype.element_ty),
                  mask=rm[:, None])
+
+
+@triton.jit
+def _had_cols(x, h_ptr, n0, NC: tl.constexpr, PRECISE: tl.constexpr):
+    """Columns ``n0 .. n0 + NC`` of ``_had128(x)``: the same dots on a ``[128, NC]`` slice of the +-1 matrix (each output
+    is one dot of the row with one column, so the slice gives the same values) without holding the whole matrix."""
+    k = tl.arange(0, 128)[:, None]
+    hm = tl.load(h_ptr + k * 128 + (n0 + tl.arange(0, NC))[None, :])
+    hi = x.to(tl.float16)
+    y = tl.dot(hi, hm, out_dtype=tl.float32)
+    if PRECISE:
+        y += tl.dot((x - hi.to(tl.float32)).to(tl.float16), hm, out_dtype=tl.float32)
+    return y * 0.08838834764831845
+
+
+@triton.jit
+def _exl3_mid_cols_kernel(
+    c_ptr, slot_ptr, svh_ptr, suh_ptr, h_ptr, a_ptr,
+    R, INTER, SPLITS,
+    stride_cs, stride_cr, stride_vs, stride_us, stride_ar,
+    BR: tl.constexpr, NC: tl.constexpr, PRECISE: tl.constexpr,
+):
+    """``_exl3_mid_kernel`` with the rotations taken NC columns at a time: the activation is written to ``a`` column
+    slice by column slice, read back whole for the last rotation, then overwritten by it. The same values; far fewer
+    live registers (the tile version spilled ~860 VGPRs: 2.7 KB of scratch per lane)."""
+    r = tl.program_id(0) * BR + tl.arange(0, BR)
+    rm = r < R
+    slot = tl.maximum(tl.load(slot_ptr + r, mask=rm, other=0).to(tl.int64), 0)  # -1: a CPU route, weight 0
+    b = tl.program_id(1)
+    cols = b * 128 + tl.arange(0, 128)
+    g = tl.zeros((BR, 128), tl.float32)
+    u = tl.zeros((BR, 128), tl.float32)
+    for s in range(SPLITS):
+        base = c_ptr + s * stride_cs + r[:, None].to(tl.int64) * stride_cr
+        g += tl.load(base + cols[None, :], mask=rm[:, None], other=0.0)
+        u += tl.load(base + INTER + cols[None, :], mask=rm[:, None], other=0.0)
+    vb = svh_ptr + slot[:, None] * stride_vs
+    arow = a_ptr + r[:, None].to(tl.int64) * stride_ar
+    for n0 in tl.static_range(0, 128, NC):
+        cn = b * 128 + n0 + tl.arange(0, NC)
+        gr = _had_cols(g, h_ptr, n0, NC, PRECISE) * tl.load(vb + cn[None, :], mask=rm[:, None], other=0.0).to(tl.float32)
+        ur = _had_cols(u, h_ptr, n0, NC, PRECISE) * tl.load(vb + INTER + cn[None, :], mask=rm[:, None], other=0.0).to(tl.float32)
+        act = gr / (1.0 + tl.exp(-gr)) * ur
+        act = act * tl.load(suh_ptr + slot[:, None] * stride_us + cn[None, :], mask=rm[:, None], other=0.0).to(tl.float32)
+        tl.store(arow + cn[None, :], act.to(a_ptr.dtype.element_ty), mask=rm[:, None])
+    tl.debug_barrier()  # the program's own activation slices written before it reads the rows back
+    act = tl.load(arow + cols[None, :], mask=rm[:, None], other=0.0).to(tl.float32)
+    tl.debug_barrier()  # every row read before any is overwritten
+    for n0 in tl.static_range(0, 128, NC):
+        cn = b * 128 + n0 + tl.arange(0, NC)
+        tl.store(arow + cn[None, :], _had_cols(act, h_ptr, n0, NC, PRECISE).to(a_ptr.dtype.element_ty), mask=rm[:, None])
 
 
 # SPLITS unspecialized: Triton compiles an argument equal to 1 as a constant, and that variant ran ~2x slower (one
@@ -616,6 +672,13 @@ def _exl3_mid_vec_kernel(
 
 # up to this many rows rotate-in and mid run one program per (row, 128-block) instead of 16-row tl.dot tiles
 _VEC_ROWS = 256
+# FREETOKEN_EXL3_MID_COLS (default 32): above _VEC_ROWS rows with an fp16 output (prefill), the mid step's rotations
+# run 32 columns of the Hadamard at a time (_exl3_mid_cols_kernel, 32 rows and 4 warps a program): the same bits as the
+# 64-row tile kernel, which spilled ~860 VGPRs (2.7 KB of scratch per lane; a dispatch waiting for that scratch once
+# held a rank before an all-reduce until the 60 s watchdog); 572 B now, and 1.7-3.3x faster. 0: the tile kernel.
+_MID_COLS = int(os.environ.get("FREETOKEN_EXL3_MID_COLS", "32"))
+if _MID_COLS not in (0, 16, 32, 64, 128):
+    raise ValueError(f"FREETOKEN_EXL3_MID_COLS must be 0, 16, 32, 64 or 128, got {_MID_COLS}")
 
 
 def exl3_rotate_in(x: torch.Tensor, suh_bank: torch.Tensor, slots: torch.Tensor, top_k: int, *,
@@ -661,8 +724,17 @@ def exl3_mid(c: torch.Tensor, slots: torch.Tensor, gate_up_svh: torch.Tensor, do
             SPLITS=splits, num_warps=4,
         )
         return out
-    BR = 64
     nb = inter // 128
+    if _MID_COLS and dtype == torch.float16:  # fp32 output (PRECISE): its two dots per slice did not keep the bits
+        BR = 32
+        _exl3_mid_cols_kernel[(triton.cdiv(R, BR), nb)](
+            c, slots, gate_up_svh, down_suh, _hadamard_pm1(c.device), out,
+            R, inter, splits,
+            c.stride(0), c.stride(1), gate_up_svh.stride(0), down_suh.stride(0), inter,
+            BR=BR, NC=_MID_COLS, PRECISE=False, num_warps=4, num_stages=1,
+        )
+        return out
+    BR = 64
     _exl3_mid_kernel[(triton.cdiv(R, BR), nb)](  # one block per program: few row tiles, keep them parallel
         c, slots, gate_up_svh, down_suh, _hadamard_pm1(c.device), out,
         R, inter, splits,

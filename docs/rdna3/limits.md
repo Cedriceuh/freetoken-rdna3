@@ -6,7 +6,7 @@
 |---|---:|---:|---:|---|
 | `xtx-xt` | 82 GiB | 60 GiB | 75 GiB | 128 GB |
 | `xtx-xtx`, `xt-xt` *(untested)* | ~82 GiB (estimated) | ~60 GiB (estimated) | ~75 GiB (estimated) | 128 GB |
-| `xtx`, `xt` | 73 GiB | 52 GiB | 66 GiB | 96 GB is tight, 128 GB comfortable |
+| `xtx`, `xt` | 73 GiB | 51 GiB | 66 GiB | 96 GB is tight, 128 GB comfortable |
 | `gre` *(untested)* | ~70 GiB (estimated) | | | 96 GB |
 
 Where it goes, for Qwen3.8-Flash-Next: ~63 GiB of experts (the engine keeps **every** expert in pinned RAM, each rank
@@ -26,7 +26,7 @@ serial`; the parallel loader was killed under a 52 GiB limit). A real 64 GB mach
 
 ## How much VRAM?
 
-20 GB per card runs the full profiles (the XT is the reference small card, 0.8 GiB left at 124k tokens). 16 GB (RX
+20 GB per card runs the full profiles (the XT is the reference small card: its VRAM peaked at 19,367 of 20,464 MiB over a sweep to 124k tokens). 16 GB (RX
 7900 GRE) is expected to work with a shorter context and a small expert cache (`gre`, untested). More VRAM means more
 cached experts, which is where decode speed comes from.
 
@@ -46,12 +46,13 @@ cached experts, which is where decode speed comes from.
 
 Probably, but nothing was run on NVIDIA. The upstream engine targets NVIDIA first, and this build keeps its CUDA paths:
 the ROCm pieces (sampling routes, host-memory all-reduce, RDNA3 GEMVs, ROCm copy engine) are only active on ROCm, and
-most tuning options are off unless set. Some changes are active everywhere: tensor parallelism for Qwen3.8-Flash-Next
-itself (with its one all-reduce per MoE block and blocked PLE and prefill MoE), the TP>1 relay handshake, a GDN
-boundary fix in the prefix cache, CUDA graphs captured for every batch size up to `--cuda-graph-max-bs` (when it is 8
-or less), rank 0's token broadcast on the torch.distributed path (with `--disable-pynccl`), and the Qwen VL vision
-tower never split (Qwen3.8 builds it on rank 0 only), with rank 0's image embeddings broadcast at TP>1. On NVIDIA,
-upstream FreeToken is the better-tested choice.
+the other tuning options are off unless set or bit-exact. Some changes are active everywhere: tensor parallelism for
+Qwen3.8-Flash-Next itself (with its one all-reduce per MoE block and blocked PLE and prefill MoE), the TP>1 relay
+handshake, a GDN boundary fix in the prefix cache, CUDA graphs captured for every batch size up to `--cuda-graph-max-bs`
+(when it is 8 or less), rank 0's token broadcast on the torch.distributed path (with `--disable-pynccl`), the
+tokenizer's prompt prefix cache (the same tokens), short prefills through the expert cache with the Triton NVFP4 / EXL3
+expert kernels (the same bits), and the Qwen VL vision tower never split (Qwen3.8 builds it on rank 0 only), with rank
+0's image embeddings broadcast at TP>1. On NVIDIA, upstream FreeToken is the better-tested choice.
 
 ## More than two GPUs?
 
@@ -96,20 +97,20 @@ On in the profiles except `gre` (`FREETOKEN_MTP=1 FREETOKEN_SPEC_VERIFY_M=4`); `
 ([options.md](options.md#speculative-decoding-with-the-mtp-head-qwen38-flash-next-experimental)). Measured on `xtx-xt`,
 `xtx` and `xt` with Qwen3.8-Flash-Next ([benchmarks.md](benchmarks.md#speculative-decoding-mtp-head)):
 
-- **One request at a time gains (two in `xtx-xt`), more do not.** On `xtx-xt`, a request alone decodes 34 % faster at the model's
-  sampling and 30-61 % faster greedy along a sweep to 248k of context (earlier runs: +11-39 % on chat, agent turns, a
+- **One request at a time gains (two in `xtx-xt` and its K/V-in-RAM variants), more do not.** On `xtx-xt`, a request alone decodes 35 % faster at the
+  sampling `rdna3/serve.sh` gives and 35-60 % faster greedy along a sweep to 260k of context (2026-10-16; earlier runs: +11-39 % on chat, agent turns, a
   108k-token context and a 1500-token answer; x1.38 on 60 code and math items). With more decoding at once than
   `FREETOKEN_SPEC_BS_MAX` (2 in `xtx-xt` and its K/V-in-RAM variants, 1 in the other profiles), steps run one row per request: from the send to the
   last token, 3-4 requests take 3-4 % longer; two agents at ~100k of context decode 8-15 % faster each with `2` than
   with `1`.
-- **One card gains less**: +7-8 % at the model's sampling and +6-12 % greedy on `xtx` or `xt`, -8 % time on code and
-  math; one of six sampled test prompts (a long story) is 3-4 % slower. Its step costs keep the verify steps mostly at 2
+- **One card gains less**: +6-13 % at `rdna3/serve.sh`'s sampling and +9-16 % greedy on `xtx` or `xt` (2026-10-16), -8 %
+  time on code and math (an earlier run). Its step costs keep the verify steps mostly at 2
   rows: the extra rows' missing experts cross PCIe there.
 - **Greedy answers are unchanged**: identical to plain decode on every profile (chat prompts, 60 code and math items,
   108k-token turns, the functional checks), with the default fp32 GDN state (`FREETOKEN_MAMBA_SSM_DTYPE`). Sampled requests use exact speculative sampling: the same
   distribution, not the same draws.
-- **Reading a prompt is 0-4 % slower** (the head reads it too; 4-5 % on a 108k-token prompt), and the head takes room
-  in the expert cache (7,127 experts per card on `xtx-xt` instead of 7,395).
+- **Reading a prompt is up to 5 % slower** (the head reads it too; 4-5 % on a 108k-token prompt in an earlier run), and
+  the head takes room in the expert cache (6,990 experts per card on `xtx-xt` instead of 7,268, 2026-10-16).
 - **Agentic benchmark**: 12 and 18 of 29 in two runs on `xtx-xt` (ROCm 10), in line with the builds before it (12-14).
 - **Not covered**: other cards (`FREETOKEN_SPEC_COSTS` holds the step costs measured on `xtx-xt` and on `xt`), images.
 - **Tool-call snapshots**: the GDN state saved at a tool-call opener for the next turn's prefix reuse is skipped when a

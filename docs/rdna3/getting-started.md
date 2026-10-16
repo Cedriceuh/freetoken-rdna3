@@ -7,7 +7,7 @@ From a fresh Linux machine to an OpenAI-compatible endpoint serving Qwen3.8-Flas
 | | Two cards (`xtx-xt`) | One card (`xtx` or `xt`) |
 |---|---|---|
 | GPUs | RX 7900 XTX 24 GB + RX 7900 XT 20 GB | one RX 7900 XTX 24 GB or RX 7900 XT 20 GB |
-| System RAM (NVFP4; EXL3 3.05 / 4.05 bpw) | 82 GiB used while serving: **128 GB** machine (60 / 75 GiB) | 73 GiB used: **96 GB** is tight, 128 GB comfortable (52 / 66 GiB) |
+| System RAM (NVFP4; EXL3 3.05 / 4.05 bpw) | 82 GiB used while serving: **128 GB** machine (60 / 75 GiB) | 73 GiB used: **96 GB** is tight, 128 GB comfortable (51 / 66 GiB) |
 | Disk | 135 GB for the NVFP4 model (85 / 108 GB in EXL3 3.05 / 4.05 bpw), ~27 GB for the image (its ROCm 10.1 base included), ~29 GB more while building | same |
 | Software | Linux x86_64 with the in-kernel `amdgpu` driver (`/dev/kfd` present), Docker | same |
 | Tested on | Ubuntu 26.04 LTS, kernel 7.0 (older kernels untested) | same |
@@ -67,7 +67,8 @@ a choice, `--dry-run` prints the full `docker run` command instead of running it
 started with `-- --api-key KEY`: [limits.md](limits.md#anything-else-to-know)), `--ctx`, `--served-name`, `--name`,
 `--image`, `--memory`, `--vision` (image input, off by default:
 [limits.md](limits.md#images-vision)), `--no-mtp` (decode without the MTP draft head the profiles turn on:
-[limits.md](limits.md#speculative-decoding-mtp)), and `-- <extra ft serve flags>`.
+[limits.md](limits.md#speculative-decoding-mtp)), `--hybrid` (experimental: the CPU computes part of the expert misses,
+[cpu-experts.md](cpu-experts.md)), and `-- <extra ft serve flags>`.
 
 Loading takes about 2.5 minutes on the reference machine (it reads ~68 GB of experts). The very first start of a new image also compiles and autotunes GPU kernels for a few
 more minutes; the results are kept in a Docker volume (`freetoken-rdna3-kcache-<image id>`), so later starts are fast.
@@ -92,8 +93,8 @@ curl -s http://127.0.0.1:1919/v1/chat/completions -H 'Content-Type: application/
 }'
 ```
 
-- **Sampling defaults** come from the model's `generation_config.json` (temperature 1.0, top_k 20, top_p 0.95) for any
-  field the request leaves out. Keeping `top_k` at 20 (or anything up to 256) uses the fastest sampler.
+- **Sampling defaults** for any field the request leaves out: temperature 0.6 (`rdna3/serve.sh` passes
+  `--default-temperature 0.6`; the checkpoint's `generation_config.json` says 1.0), top_k 20 and top_p 0.95 from that file. Keeping `top_k` at 20 (or anything up to 256) uses the fastest sampler.
 - **Thinking** is on by default (the reasoning goes to `reasoning_content`); the request above turns it off with
   `"chat_template_kwargs": {"enable_thinking": false}`. With thinking on, give `max_tokens` room (several thousand): if
   the budget runs out while the model is still thinking, `content` comes back empty with `finish_reason: "length"`.
@@ -110,7 +111,7 @@ Anthropic-compatible `/v1/messages`. The API key is not checked (use any string)
 - **Anthropic-compatible clients** (Claude Code, Anthropic SDKs) add `/v1/messages` themselves: base URL
   `http://127.0.0.1:1919` (for Claude Code: `ANTHROPIC_BASE_URL=http://127.0.0.1:1919`, any API key).
 
-For a coding agent, set the context window to the profile's context (250000 for the two-card profiles, 262144 for
+For a coding agent, set the context window to the profile's context (262144 for the two-card profiles and
 `xtx-xt-4x262k`, 1000000 for `xtx-xt-1m`, 131072 for `xtx` / `xt`, 65536 for `gre`, or your `--ctx`) so the agent compacts at the right time.
 
 ## 7. Run it as a service (optional)

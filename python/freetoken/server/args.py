@@ -54,6 +54,9 @@ class ServerArgs(SchedulerConfig):
     # "model": fill unspecified request sampling params from generation_config.json
     # (temperature/top_k/top_p), like sglang. "none": use framework defaults only.
     sampling_defaults: str = "model"
+    # Temperature for a request that sends none, in place of the one --sampling-defaults gives (the checkpoint's
+    # generation_config.json, or the framework's 0). None: that one.
+    default_temperature: float | None = None
     # Default max output (decode) tokens for a request that omits one. None falls back to the
     # adapter's built-in default (32k).
     max_output_tokens: int | None = None
@@ -569,6 +572,16 @@ def parse_args(
             "temperature/top_k/top_p from the checkpoint's generation_config.json "
             "(recommended for reasoning models to avoid greedy repetition loops); "
             "'none' uses framework defaults only."
+        ),
+    )
+
+    parser.add_argument(
+        "--default-temperature",
+        type=float,
+        default=ServerArgs.default_temperature,
+        help=(
+            "Temperature for requests that send none, in place of the one --sampling-defaults gives "
+            "(top_k / top_p keep theirs). Unset: the checkpoint's (or the framework's)."
         ),
     )
 

@@ -3,7 +3,7 @@
 ![freetoken-rdna3: Qwen3.8-Flash-Next on RX 7900 XTX / XT, NVFP4 and EXL3 checkpoints](docs/rdna3/assets/social-preview.png)
 
 **Fast local inference of big Mixture-of-Experts models on AMD Radeon RX 7900 XTX / 7900 XT (RDNA3, ROCm), on one or
-two consumer GPUs** (Linux; the server locks 52-82 GiB of system RAM, depending on the checkpoint and the cards). A
+two consumer GPUs** (Linux; the server locks 51-82 GiB of system RAM, depending on the checkpoint and the cards). A
 tuned build of the [FreeToken](https://github.com/FlashML-org/FreeToken) MoE engine: tensor parallelism across two
 unequal cards, a GPU expert cache fed from system RAM, int8 dense layers, exact sampling on ROCm, up to 4 concurrent
 requests (parallel sub-agents), and a RAM tier that keeps conversations pushed off the GPUs instead of recomputing
@@ -23,29 +23,29 @@ the server has never seen, like large tool results ([method](docs/rdna3/benchmar
 
 | Decode (TG) | NVFP4 | EXL3 3.05 bpw | EXL3 4.05 bpw |
 |---|---:|---:|---:|
-| `xtx-xt`: RX 7900 XTX + XT, 9k to 248k tokens | 77-96 tok/s | 98-117 tok/s | 86-94 tok/s |
-| `xtx`: one RX 7900 XTX, 9k to 124k tokens | 36-43 tok/s | 52-57 tok/s | 37-47 tok/s |
+| `xtx-xt`: RX 7900 XTX + XT, 9k to 260k tokens | 78-96 tok/s | 95-117 tok/s | 86-94 tok/s |
+| `xtx`: one RX 7900 XTX, 9k to 124k tokens | 36-44 tok/s | 52-58 tok/s | 37-47 tok/s |
 | `xt`: one RX 7900 XT, 9k to 124k tokens | 29-34 tok/s | 41-46 tok/s | 29-36 tok/s |
 
-| Reading a new 6-41k-token block (PP); agent turn, time to first token | NVFP4 | EXL3 3.05 bpw | EXL3 4.05 bpw |
+| Reading a new 6-52k-token block (PP); agent turn, time to first token | NVFP4 | EXL3 3.05 bpw | EXL3 4.05 bpw |
 |---|---:|---:|---:|
-| `xtx-xt`, 9k to 248k tokens | 1780-2080 tok/s; 1.3-2.1 s | 1870-2190 tok/s; 0.9-1.7 s | 1850-2200 tok/s; 1.2-2.1 s |
-| `xtx`, 9k to 124k tokens | 1440-1650 tok/s; 2.4-2.7 s | 1560-1760 tok/s; 1.5-1.9 s | 1530-1770 tok/s; 2.1-2.4 s |
-| `xt`, 9k to 124k tokens | 1310-1460 tok/s; 2.5-2.8 s | 1420-1560 tok/s; 1.6-2.0 s | 1380-1560 tok/s; 2.2-2.5 s |
+| `xtx-xt`, 9k to 260k tokens | 1910-2180 tok/s; 0.8-0.9 s | 1940-2280 tok/s; 0.7-0.9 s | 1970-2270 tok/s; 0.8-1.0 s |
+| `xtx`, 9k to 124k tokens | 1520-1670 tok/s; 1.5-1.6 s | 1700-1820 tok/s; 1.0-1.2 s | 1640-1820 tok/s; 1.3-1.5 s |
+| `xt`, 9k to 124k tokens | 1350-1480 tok/s; 1.6-1.8 s | 1500-1600 tok/s; 1.2-1.3 s | 1450-1620 tok/s; 1.5-1.6 s |
 
 | Size and memory | NVFP4 | EXL3 3.05 bpw | EXL3 4.05 bpw |
 |---|---:|---:|---:|
 | Download | 135 GB | 85 GB | 108 GB |
-| RAM while serving (locked): two cards; one card | 82 GiB; 73 GiB | 60 GiB; 52 GiB | 75 GiB; 66 GiB |
-| Experts cached per card, `xtx-xt` (of 24,576) | 7.1k | 9.9k | 7.3k |
+| RAM while serving (locked): two cards; one card | 82 GiB; 73 GiB | 60 GiB; 51 GiB | 75 GiB; 66 GiB |
+| Experts cached per card, `xtx-xt` (of 24,576) | 7.0k | 9.8k | 7.2k |
 
-Measured on 2026-10-12 with the image of 35afbb3, one server per cell started by `rdna3/serve.sh`. The 3 bpw experts
-are smaller, so more of them stay in VRAM (9.9k instead of 7.1k per card on `xtx-xt`); the checkpoints also answer
+Measured on 2026-10-16 with the image of this release, one server per cell started by `rdna3/serve.sh`. The 3 bpw
+experts are smaller, so more of them stay in VRAM (9.8k instead of 7.0k per card on `xtx-xt`); the checkpoints also answer
 differently, which changes how many of the MTP head's guesses are kept.
 
 The MTP head (the model's own draft layer) guesses the next tokens and one step checks them; greedy answers are
-identical with and without it. On `xtx-xt` with NVFP4 it takes one request from 66 to 83 tok/s at the model's
-sampling; with 3-4 requests at once it cost 3-4 % (2026-10-06); `rdna3/serve.sh --no-mtp` turns it off. On real
+identical with and without it. On `xtx-xt` with NVFP4 it takes one request from 65.5 to 88 tok/s at the
+sampling `rdna3/serve.sh` gives (temperature 0.6, 2026-10-16); with 3-4 requests at once it cost 3-4 % (2026-10-06); `rdna3/serve.sh --no-mtp` turns it off. On real
 agent turns (~90k-token contexts of code, temperature 0.6, 2026-10-03): 71 tok/s for a request alone, ~34 tok/s each
 when two sub-agents decode at once ([benchmarks](docs/rdna3/benchmarks.md#agent-turns-on-real-code-xtx-xt)).
 
@@ -63,7 +63,7 @@ Full numbers, methods and the cold-read times: [docs/rdna3/benchmarks.md](docs/r
 ## Quick start
 
 You need Linux with the `amdgpu` driver, Docker, an RX 7900 XTX and/or 7900 XT, and enough RAM for the checkpoint: the
-server locks 52-82 GiB (a 128 GB machine for NVFP4; why: [limits](docs/rdna3/limits.md)). Everything runs in the Docker image below; the `install.sh` at the root is
+server locks 51-82 GiB (a 128 GB machine for NVFP4; why: [limits](docs/rdna3/limits.md)). Everything runs in the Docker image below; the `install.sh` at the root is
 upstream's NVIDIA / CUDA installer and is not used here.
 
 ```bash
@@ -92,11 +92,11 @@ One ready-made profile per hardware setup, measured for the tested ones and deri
 
 | Profile | GPUs | Context | Requests at once | Status |
 |---|---|---:|---:|---|
-| `xtx-xt` | RX 7900 XTX 24 GB + RX 7900 XT 20 GB | 250k | 4 | measured (tables above) |
+| `xtx-xt` | RX 7900 XTX 24 GB + RX 7900 XT 20 GB | 262k | 4 | measured (tables above) |
 | `xtx` | one RX 7900 XTX 24 GB | 131k | 1 | measured |
 | `xt` | one RX 7900 XT 20 GB | 131k | 1 | measured |
-| `xtx-xtx` | two RX 7900 XTX 24 GB | 250k | 4 | untested: decode expected >= `xtx-xt`; EXL3 needs `FREETOKEN_TP_SPLIT=0.6` |
-| `xt-xt` | two RX 7900 XT 20 GB | 250k | 4 | untested: decode expected a little below `xtx-xt`; same EXL3 note |
+| `xtx-xtx` | two RX 7900 XTX 24 GB | 262k | 4 | untested: decode expected >= `xtx-xt`; EXL3 needs `FREETOKEN_TP_SPLIT=0.6` |
+| `xt-xt` | two RX 7900 XT 20 GB | 262k | 4 | untested: decode expected a little below `xtx-xt`; same EXL3 note |
 | `gre` | one RX 7900 GRE 16 GB | 65k | 1 | untested: ~20 tok/s at best expected (NVFP4, head off) |
 | `xtx-xt-4x262k` | RX 7900 XTX 24 GB + RX 7900 XT 20 GB | 262k each | 4 | experimental, EXL3 3.05 bpw measured: the K/V in RAM, 4 full contexts at once ([long-context](docs/rdna3/long-context.md)) |
 | `xtx-xt-1m` | RX 7900 XTX 24 GB + RX 7900 XT 20 GB | 1M | 4 (sharing 1M) | experimental, EXL3 3.05 bpw measured: the K/V in RAM, one conversation up to 1M ([long-context](docs/rdna3/long-context.md)) |
