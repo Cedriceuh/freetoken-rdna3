@@ -68,6 +68,16 @@
   siblings and EXL3 column blocks were measured too (off: no gain, or slower in serving). NVFP4: `xtx` 39.4 -> 56.2
   tok/s, `xt` 31.4 -> 46.6, `xtx-xt` one request 78.2 -> 81.2-82.7, 4 requests 24.4 -> 28.2-28.6 each; EXL3: `xtx`
   +6 %, a loss on two cards ([docs/rdna3/cpu-experts.md](docs/rdna3/cpu-experts.md)).
+- Four later upstream commits cherry-picked with their authors (`git cherry-pick -x`): `74a3877` and `9c635a1`
+  (dependency pins: torch 2.14, Triton below 3.9, flashlib 0.4.0, numpy below 3), `7d6490c` (upstream's own QSA LDS
+  clamp, which runs after this tree's and changes no tile) and `9b68e00` (CUDA graphs uploaded at capture; CUDA only,
+  a no-op on ROCm). The image lowers pyproject's new torchvision floor to ROCm's 0.29.0a0, keeps the base's numpy
+  2.5.3 (2.4.6 before) and no longer installs numba or the NVIDIA cutlass-dsl / cuda-bindings packages flashlib 0.3.0
+  pulled in. The same answers through both launcher entries (2026-10-16, NVFP4 `xtx-xt-4x262k` and EXL3 3.05 bpw
+  `xtx-xt-4x262k`, against the previous image: greedy with the MTP head 14/14, a 25k agent conversation 9/9 with the
+  same decode speeds), a 259,728-token prompt served on NVFP4 and a longer one refused; the CPU suite and the GPU tests of
+  the touched paths fail only where they failed before. The other eleven upstream commits are not taken
+  ([maintaining.md](docs/rdna3/maintaining.md#the-stack-on-top-of-upstream-oldest-first)).
 - Upstream FreeToken merged up to `ee9789f` (23 commits, 2026-09-29 to 2026-10-10); the authors' commits are kept.
   On this tree's path: a race in the disk PLE staging fixed (the overlap scheduler could rewrite the pinned rows of a
   batch whose copy was still queued, `d3512b4`); upstream's NVFP4 marlin decode kernel (`7644984`) with the decode

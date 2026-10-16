@@ -1,7 +1,8 @@
 # Changes from upstream
 
 This repository is a modified version of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken) (Apache
-License 2.0), taken at `0d652e7` (2026-09-26) and merged with upstream up to `ee9789f` (2026-10-10). Every file changed
+License 2.0), taken at `0d652e7` (2026-09-26) and merged with upstream up to `ee9789f` (2026-10-10), plus four later
+upstream commits cherry-picked with their authors (`74a3877`, `9c635a1`, `7d6490c`, `9b68e00`). Every file changed
 or added relative to upstream is listed here with the reason. Line counts are `added/removed`, against the upstream
 commit of the time (`0d652e7`, or the commit a section names); `git diff ee9789f` gives today's. Files the merge made
 identical to upstream again are gone from the tables ([maintaining.md](maintaining.md#the-stack-on-top-of-upstream-oldest-first)).
@@ -14,7 +15,7 @@ Who wrote what: [credits.md](credits.md).
 | `python/freetoken/kernel/backend.py` | 2/2 against `ee9789f` | the module docstring (the gating itself is upstream's #134 since `9b585b7`) |
 | `python/freetoken/kernel/csrc/include/freetoken/utils.cuh` | 1/1 against `ee9789f` | on ROCm, `with_attr` refuses `use_pdl=True` (upstream ignores it); the HIP-portable JIT kernels are upstream's since `803a3b4` |
 | `python/freetoken/kernel/pynccl.py` | 7/1 | tensor parallelism routed to RCCL on ROCm |
-| `python/freetoken/kernel/triton/qsa/attend.py` | 51/3 | BLOCK_N clamped to RDNA's 64 KiB LDS; int8 K/V path (experimental) |
+| `python/freetoken/kernel/triton/qsa/attend.py` | 51/3 | BLOCK_N clamped to RDNA's 64 KiB LDS, sized with q's itemsize (upstream's own clamp, `7d6490c`, sized with the K/V cache's, runs after it and changes no tile; alone it would keep 64 with 1-byte K/V); int8 K/V path (experimental) |
 | `tests/engine/test_rocm_communication.py`, `tests/kernels/test_backend.py`, `tests/kernels/test_jit_index_store.py` | new | tests of the above |
 
 ## Qwen3.8-Flash-Next (qwen4_exp) on several GPUs
@@ -118,8 +119,7 @@ Line counts in this section and the next are relative to `d72e5cb` (0.1.0 plus i
 
 | File | Lines | Change |
 |---|---:|---|
-| `Dockerfile.rdna3` | 13/5 | ROCm 10.1 / PyTorch 2.14 base with its own Triton 3.8; pyproject's CUDA ceilings lifted at install |
-| `setup.py` | 3/3 | the C++ extensions build as C++20 (PyTorch 2.14's headers require it) |
+| `Dockerfile.rdna3` | 13/5 | ROCm 10.1 / PyTorch 2.14 base with its own Triton 3.8; pyproject's torchvision floor lowered to ROCm's pre-release (0.29.0a0) at install |
 | `python/freetoken/kernel/triton/moe_align.py`, `tests/kernels/test_moe_align.py` | 13/9, new | no comparison on `tl.histogram` counts: Triton 3.8's AMD range analysis gives them an empty range and folds such comparisons to false, which left the expert ids unwritten (up to 1024 routes) or every count at zero (more), and the expert GEMMs then read wild addresses |
 | `python/freetoken/kernel/gguf.py`, `kernel/csrc/gguf/gguf_kernel.cu`, `dispatch.h`, `gguf_bind.cpp` | 41/8, 249/328, 37/9, new | the GGUF kernels build on ROCm: the torch wrappers in a host-only file (under HIP torch's headers include rocThrust, which the pip SDK lacks), nvcc-only flags for CUDA only, HIP's shuffles for the full-mask ones, the SDK's HIP headers, the shared ROCm link flags |
 | `python/freetoken/kernel/csrc/row_store/row_store_ext.cpp`, `kernel/row_store.py`, `models/qwen4_exp/ple_disk.py` | 32/4, 40/1, 18/1 | HIP stream memops for the PLE wait-sync (the probe used to look for the CUDA driver's only); a captured wait must hold three replays with the PLE copy behind it (`FREETOKEN_PLE_SYNC`); on one GPU without the MTP head (overlapped decode steps) `auto` takes launch-gating, 44 % faster there |

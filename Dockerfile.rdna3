@@ -3,7 +3,7 @@
 #   docker build -f Dockerfile.rdna3 -t freetoken-rdna3:latest .       (from a git clone: the build records the commit)
 #   rdna3/serve.sh <profile> --model DIR                               (docs/rdna3/getting-started.md)
 #
-# Builds THE TREE YOU HAVE CHECKED OUT; nothing is cloned; the install lifts pyproject's CUDA version ceilings. Derived from a community ROCm port's
+# Builds THE TREE YOU HAVE CHECKED OUT; nothing is cloned; the install lowers pyproject's torchvision floor to ROCm's. Derived from a community ROCm port's
 # Dockerfile.gfx1201 (see docs/rdna3/credits.md).
 #
 # Run-time settings the engine does not check for you (rdna3/serve.sh sets them; docs/rdna3/options.md):
@@ -38,15 +38,14 @@ RUN set -eux; \
     printf '%s\n' "commit ${COMMIT}" "tree   ${TREE}" > /opt/FreeToken-BUILD-PROVENANCE.txt
 
 # --no-build-isolation keeps the base image's ROCm torch for the C++/HIP extensions; [accel] is
-# CUDA-only (flashinfer, sgl_kernel) and gated off on ROCm anyway. pyproject's ceilings are the CUDA ones
-# (sglang-kernel links torch 2.11 only); ROCm 10.1 ships torch 2.14 / torchvision 0.29 / Triton 3.8, so the image lifts
-# them where it installs (after the provenance above: the recorded tree is the repository's).
+# CUDA-only (flashinfer, sgl_kernel) and gated off on ROCm anyway. pyproject's torch 2.14 / Triton 3.8 pins accept ROCm
+# 10.1's builds, but its torchvision is a pre-release (0.29.0a0) that ">=0.29" refuses (pip would pull the CUDA wheel),
+# so the image lowers that floor where it installs (after the provenance above: the recorded tree is the repository's).
 RUN set -eux; \
     cd /opt/FreeToken; \
-    sed -i -e 's/"torch>=2.11,<2.12"/"torch>=2.11,<2.15"/g' -e 's/"torchvision>=0.26,<0.27"/"torchvision>=0.26,<0.30"/' \
-        -e 's/"triton>=3.6,<3.8;/"triton>=3.6,<3.9;/' pyproject.toml; \
-    test "$(grep -c '"torch>=2.11,<2.15"' pyproject.toml)" = 2; grep -q '"torchvision>=0.26,<0.30"' pyproject.toml; \
-    grep -q '"triton>=3.6,<3.9;' pyproject.toml; \
+    sed -i -e 's/"torchvision>=0.29,<0.30"/"torchvision>=0.29.0a0,<0.30"/' pyproject.toml; \
+    grep -q '"torchvision>=0.29.0a0,<0.30"' pyproject.toml; \
+    test "$(grep -c '"torch>=2.14,<2.15"' pyproject.toml)" = 2; grep -q '"triton>=3.6,<3.9;' pyproject.toml; \
     python3 -m pip install --no-cache-dir "setuptools>=77" wheel; \
     python3 -m pip install --no-cache-dir --no-build-isolation -e .
 

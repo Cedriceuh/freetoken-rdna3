@@ -9,16 +9,22 @@ git fetch -q upstream
 git remote | grep -qx luka && git fetch -q luka || true
 
 base=$(git merge-base HEAD upstream/main)
+# upstream commits cherry-picked here (`git cherry-pick -x`) are not new
+picked=$(git log --format=%b "$base"..HEAD | sed -n 's/^(cherry picked from commit \([0-9a-f]*\))$/\1/p')
+not_picked() { grep -vxF -f <(printf '%s\n' "$picked") || true; }
 echo "this branch is based on: $(git log -1 --format='%h %cd %s' --date=short "$base")"
 echo "upstream/main:      $(git log -1 --format='%h %cd %s' --date=short upstream/main)"
-echo "new upstream commits: $(git rev-list --count HEAD..upstream/main)"
-git log --date=short --format='  %h %cd %s' HEAD..upstream/main | head -40
+echo "cherry-picked since: $(printf '%s\n' "$picked" | grep -c . || true)"
+new=$(git rev-list HEAD..upstream/main | not_picked)
+echo "new upstream commits: $(printf '%s\n' "$new" | grep -c . || true)"
+[ -z "$new" ] || git log --no-walk=sorted --date=short --format='  %h %cd %s' $new | head -40
 echo
 echo "touching what we serve (qwen4_exp, rocm/hip, moe/nvfp4, sampling, scheduler, engine):"
-git log --date=short --format='  %h %cd %s' HEAD..upstream/main -- \
+serving=$(git rev-list HEAD..upstream/main -- \
   python/freetoken/models/qwen4_exp python/freetoken/kernel/triton/sampling.py python/freetoken/engine \
   python/freetoken/moe python/freetoken/layers/quantization/moe python/freetoken/scheduler \
-  python/freetoken/kernel/backend.py python/freetoken/kernel/csrc | head -30
+  python/freetoken/kernel/backend.py python/freetoken/kernel/csrc | not_picked)
+[ -z "$serving" ] || git log --no-walk=sorted --date=short --format='  %h %cd %s' $serving | head -30
 echo
 if git rev-parse -q --verify luka/rocm-gfx1201 >/dev/null; then
   echo "community ROCm port (luka/rocm-gfx1201), commits not in this tree: $(git rev-list --count HEAD..luka/rocm-gfx1201)"
