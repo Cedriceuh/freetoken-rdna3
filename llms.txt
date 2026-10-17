@@ -16,23 +16,23 @@ sampling on ROCm uses a top-k-first path for top_k <= 256 and an exact sorted th
 cooperative sampling kernels hang on gfx1100); conversations evicted from the GPUs are kept in RAM and restored exactly.
 Image input is off by default (`rdna3/serve.sh --vision`): the vision tower runs on rank 0 only and its embeddings are
 broadcast, with no measurable cost on two cards and ~1.5-2 % of decode on one. The tuning is switched by environment
-variables (docs/rdna3/options.md gives each default); what is on by default is bit-exact, agent-validated, or (the
-release's sampler rework, exact by kernel tests, and its token broadcast, checked in `check`-mode server runs) new and
-not agent-validated. Precision rule: a change is either bit-exact (identical greedy answers) or validated on an agentic
-benchmark (the ROCm 10 base with the MTP head scored 12 and 18 of 29 there); an int8 KV cache that passed every short
+variables (docs/rdna3/options.md gives each default); what is on by default is bit-exact, agent-validated, or checked
+for exactness without the agentic benchmark (the sampler rework, exact by kernel tests; the rank token broadcast,
+checked in `check`-mode server runs). Precision rule: a change is either bit-exact (identical greedy answers) or validated on an agentic
+benchmark (a ROCm 10 build with the MTP head scored 12 and 18 of 29 there); an int8 KV cache that passed every short
 test cut the agentic score from 12-14 to 8-9 and is off in every profile (kept as an option, not recommended).
 Tested only on RX 7900 XTX + XT; NVIDIA, RDNA4 and TP>2 untested (this model cannot run above TP=2 in this build).
 
 ## Docs
 
-- [README](README.md): overview, headline numbers, quick start, profiles
-- [Getting started](docs/rdna3/getting-started.md): requirements, image build, model download, first run, clients, systemd
+- [README](README.md): what it is, what you need, quick start, what you can do, which profile and checkpoint, speed
+- [Getting started](docs/rdna3/getting-started.md): machine check (`serve.sh --check`), host settings, image build, model download (`rdna3/download.sh`), first run, options, clients (OpenCode, Claude Code, Python), systemd, updating
 - [Profiles](docs/rdna3/profiles.md): every setting of each hardware profile, why, and how to adapt to other cards
 - [Options](docs/rdna3/options.md): every environment variable this build adds, default, measured effect, exactness
 - [Benchmarks](docs/rdna3/benchmarks.md): method, depth sweeps per profile, parallel agents, precision, memory
 - [How it works](docs/rdna3/how-it-works.md): memory layout, decode step, split, all-reduce, prefill, sampler, RAM tier, EXL3 checkpoints
 - [Decisions](docs/rdna3/decisions.md): each design choice with alternatives, pros, cons and the deciding measurement
-- [Journey](docs/rdna3/journey.md): chronological record of what was tried, kept and dropped, with numbers
+- [Journey](docs/rdna3/journey.md): dated, chronological record of what was tried, kept and dropped, with numbers (the only dated page)
 - [Limits and FAQ](docs/rdna3/limits.md): RAM (64 GB: only with EXL3, untested), VRAM, other GPUs, NVIDIA, TP>2, other models, security
 - [Troubleshooting](docs/rdna3/troubleshooting.md): symptoms, causes, fixes, what to put in a bug report
 - [Testing](docs/rdna3/testing.md): CPU suite, GPU checks, micro-benchmarks, the release validation procedure
@@ -44,7 +44,8 @@ Tested only on RX 7900 XTX + XT; NVIDIA, RDNA4 and TP>2 untested (this model can
 
 ## Code map
 
-- [rdna3/serve.sh](rdna3/serve.sh): launcher (profile -> docker run + ft serve; GPU choice from the KFD topology)
+- [rdna3/serve.sh](rdna3/serve.sh): launcher (profile -> docker run + ft serve; GPU choice from the KFD topology; `--check` inspects the machine and suggests a profile)
+- [rdna3/download.sh](rdna3/download.sh): checkpoint download with the image's Hugging Face CLI
 - [rdna3/profiles/](rdna3/profiles/): one env file per hardware setup (`TESTED=0` marks derived, unmeasured ones)
 - [Dockerfile.rdna3](Dockerfile.rdna3): the ROCm image (base pinned by digest, records its commit)
 - [distributed/split.py](python/freetoken/distributed/split.py): uneven tensor-parallel split

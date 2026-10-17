@@ -15,6 +15,12 @@ optimization.
 - **Everything new is an environment variable, off by default** unless it is bit-exact or agent-validated, so
   upstream's behavior stays one setting away.
   Document it in [docs/rdna3/options.md](docs/rdna3/options.md) with its measured effect.
+- **Docs describe the current build, undated.** No dates, image ids or "measured on ... with the image of ..." in the
+  docs: state what a feature does, when to use it and its measured effect, replace a number when it is re-measured,
+  and say "earlier build" when a number that helps decide was not re-measured. History (what was tried, older numbers,
+  dates) goes to [journey.md](docs/rdna3/journey.md), the only dated page; [CHANGELOG.md](CHANGELOG.md) dates its
+  releases only. Commit ids stay where a maintainer needs them (upstream bases and authors, the line counts of
+  [changes-from-upstream.md](docs/rdna3/changes-from-upstream.md)).
 - **Report only what was run.** Never state a test or benchmark result that was not produced on real hardware in this
   session; say "untested" otherwise, as the `TESTED=0` profiles do.
 - **Do not push, open pull requests or issues, or publish anything on the user's behalf.** The human owns every line

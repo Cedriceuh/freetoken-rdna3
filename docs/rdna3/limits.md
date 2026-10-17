@@ -2,17 +2,43 @@
 
 ## How much RAM do I need?
 
-| Profile | NVFP4 | EXL3 3.05 bpw | EXL3 4.05 bpw | Machine (NVFP4) |
-|---|---:|---:|---:|---|
-| `xtx-xt` | 82 GiB | 60 GiB | 75 GiB | 128 GB |
-| `xtx-xtx`, `xt-xt` *(untested)* | ~82 GiB (estimated) | ~60 GiB (estimated) | ~75 GiB (estimated) | 128 GB |
-| `xtx`, `xt` | 73 GiB | 51 GiB | 66 GiB | 96 GB is tight, 128 GB comfortable |
-| `gre` *(untested)* | ~70 GiB (estimated) | | | 96 GB |
+The server locks the RAM it uses: nothing of it can be swapped or given back while it runs. The system, the desktop and
+your other programs live in what is left. The rule `rdna3/serve.sh --check` applies, from the reference machine (125.7
+GiB as Linux reports it, a desktop on):
 
-Where it goes, for Qwen3.8-Flash-Next: ~63 GiB of experts (the engine keeps **every** expert in pinned RAM, each rank
-its own share of each one; the GPUs cache the most used ones), the RAM tier for conversations (9.5 GiB on two cards,
-~5 GiB on one; `FREETOKEN_HOST_KV=0` removes it), and a few GiB for the processes. The n-gram tables (51 GB; 33 GB
-in EXL3 3.05 bpw) stay on disk and only use the free page cache.
+**what the server locks + ~3 GiB it grows by in use + ~30 GiB for everything else <= your RAM (`free -g`)**
+
+- With ~31 GiB left beside it after the start (NVFP4, three conversations of 262k in RAM: 94.4 GiB locked), it served
+  751 requests with 16 GB still free; hours later it held ~97 GiB.
+- With ~29 GiB left and 13-15 GiB of other programs beside the desktop, the host ran out of memory
+  ([journey.md](journey.md#29-a-rank-killed-by-the-hosts-oom-killer-2026-10-17)); with ~25 GiB left (four
+  conversations, 100.3 GiB locked) and benchmark tools running beside it, too.
+
+So between 25 and 30 GiB left, a setup only fits with little else running; below 25 it does not. A machine without a
+desktop needs less (untested). `rdna3/serve.sh --check` does this arithmetic for your machine (with `--model DIR`,
+for your checkpoint) and gives the command for what fits; `serve.sh` warns at start when a server would not fit.
+
+What the server locks after its start, measured:
+
+| | NVFP4 | EXL3 3.05 bpw | EXL3 4.05 bpw |
+|---|---:|---:|---:|
+| two cards, the K/V in VRAM (`xtx-xt`) | 82 GiB | 60 GiB | 75 GiB |
+| one card (`xtx`, `xt`) | 73 GiB | 51 GiB | 66 GiB |
+
+Where it goes: the experts first (the engine keeps **every** expert in pinned RAM, each rank its own share of each one,
+and the GPUs cache the most used ones: ~63 GiB in NVFP4, ~43 GiB in EXL3 3.05 bpw), then the RAM tier that keeps
+conversations pushed off the GPUs (9.5 GiB on two cards, ~5 GiB on one; `FREETOKEN_HOST_KV=0` removes it), and a few
+GiB for the processes. The n-gram tables (51 GB; 33 GB in EXL3 3.05 bpw) stay on disk and only use the free page cache.
+The untested two-card profiles (`xtx-xtx`, `xt-xt`) should lock about what `xtx-xt` does, `gre` ~70 GiB (estimates).
+
+**Conversations kept in RAM** (`xtx-xt-4x262k`, `xtx-xt-1m`): the attention K/V moves to RAM in place of the RAM tier,
+14,144 bytes per token on each card, so **6.9 GiB per 262k conversation** on two cards and 26 GiB for 1M tokens
+(estimates within 2 GiB of the measured layouts). On the 125.7 GiB reference machine:
+
+- EXL3 3.05 bpw: 60 - 9.5 + 4 x 6.9 = ~78 GiB for four conversations of 262k (77 measured): ~45 GiB left, fits.
+- NVFP4: two conversations, ~86 GiB: fits. Three, ~93 GiB (94.4 measured, ~97 in use): fits with little else running;
+  `rdna3/serve.sh xtx-xt-4x262k --model DIR -- --kv-reserve-tokens 787500` sizes the pool for three (262,500 tokens
+  each). Four, ~100 GiB: does not.
 
 ## Can it run with 64 GB of RAM?
 
@@ -97,21 +123,21 @@ On in the profiles except `gre` (`FREETOKEN_MTP=1 FREETOKEN_SPEC_VERIFY_M=4`); `
 ([options.md](options.md#speculative-decoding-with-the-mtp-head-qwen38-flash-next)). Measured on `xtx-xt`,
 `xtx` and `xt` with Qwen3.8-Flash-Next ([benchmarks.md](benchmarks.md#speculative-decoding-mtp-head)):
 
-- **One request at a time gains (two in `xtx-xt` and its K/V-in-RAM variants), more do not.** On `xtx-xt`, a request alone decodes 35 % faster at the
-  sampling `rdna3/serve.sh` gives and 35-60 % faster greedy along a sweep to 260k of context (2026-10-16; earlier runs: +11-39 % on chat, agent turns, a
-  108k-token context and a 1500-token answer; x1.38 on 60 code and math items). With more decoding at once than
+- **One request at a time gains (two in `xtx-xt` and its K/V-in-RAM variants), more do not.** On `xtx-xt`, a request
+  alone decodes 35 % faster at the sampling `rdna3/serve.sh` gives and 35-60 % faster greedy along a sweep to 260k of
+  context. With more decoding at once than
   `FREETOKEN_SPEC_BS_MAX` (2 in `xtx-xt` and its K/V-in-RAM variants, 1 in the other profiles), steps run one row per request: from the send to the
   last token, 3-4 requests take 3-4 % longer; two agents at ~100k of context decode 8-15 % faster each with `2` than
   with `1`.
-- **One card gains less**: +6-13 % at `rdna3/serve.sh`'s sampling and +9-16 % greedy on `xtx` or `xt` (2026-10-16), -8 %
-  time on code and math (an earlier run). Its step costs keep the verify steps mostly at 2
-  rows: the extra rows' missing experts cross PCIe there.
+- **One card gains less**: +6-13 % at `rdna3/serve.sh`'s sampling and +9-16 % greedy on `xtx` or `xt`. Its step costs
+  keep the verify steps mostly at 2 rows: the extra rows' missing experts cross PCIe there.
 - **Greedy answers are unchanged**: identical to plain decode on every profile (chat prompts, 60 code and math items,
   108k-token turns, the functional checks), with the default fp32 GDN state (`FREETOKEN_MAMBA_SSM_DTYPE`). Sampled requests use exact speculative sampling: the same
   distribution, not the same draws.
-- **Reading a prompt is up to 5 % slower** (the head reads it too; 4-5 % on a 108k-token prompt in an earlier run), and
-  the head takes room in the expert cache (6,990 experts per card on `xtx-xt` instead of 7,268, 2026-10-16).
-- **Agentic benchmark**: 12 and 18 of 29 in two runs on `xtx-xt` (ROCm 10), in line with the builds before it (12-14).
+- **Reading a prompt is up to 5 % slower** (the head reads it too), and the head takes room in the expert cache (6,990
+  experts per card on `xtx-xt` instead of 7,268).
+- **Agentic benchmark** (an earlier build): 12 and 18 of 29 in two runs on `xtx-xt`, in line with the builds before
+  it (without the head: 12-14).
 - **Not covered**: other cards (`FREETOKEN_SPEC_COSTS` holds the step costs measured on `xtx-xt` and on `xt`), images.
 - **Tool-call snapshots**: the GDN state saved at a tool-call opener for the next turn's prefix reuse is skipped when a
   verify step jumps over that token; the next turn then reuses less of its prefix. Likewise the state at the end of an

@@ -2,24 +2,112 @@
 
 ![freetoken-rdna3: Qwen3.8-Flash-Next on RX 7900 XTX / XT, NVFP4 and EXL3 checkpoints](docs/rdna3/assets/social-preview.png)
 
-**Fast local inference of big Mixture-of-Experts models on AMD Radeon RX 7900 XTX / 7900 XT (RDNA3, ROCm), on one or
-two consumer GPUs** (Linux; the server locks 51-82 GiB of system RAM, depending on the checkpoint and the cards). A
-tuned build of the [FreeToken](https://github.com/FlashML-org/FreeToken) MoE engine: tensor parallelism across two
-unequal cards, a GPU expert cache fed from system RAM, int8 dense layers, exact sampling on ROCm, up to 4 concurrent
-requests (parallel sub-agents), and a RAM tier that keeps conversations pushed off the GPUs instead of recomputing
-them.
+**Run Qwen3.8-Flash-Next, a 125B-parameter Mixture-of-Experts model, on your own PC with one or two AMD Radeon RX 7900
+XTX / XT cards.** You get a local server with an OpenAI- and Anthropic-compatible API: chat apps, coding agents
+(OpenCode, Claude Code) and your own scripts use it like a cloud API, with 262k tokens of context per conversation (up
+to 1M with `xtx-xt-1m`), while the model runs on your hardware.
 
-Built for, and measured with, **Qwen3.8-Flash-Next** (125B-parameter MoE, ~6B active per token) behind a coding agent
-(OpenCode), with an OpenAI- and Anthropic-compatible API, from three checkpoints: NVFP4
-([RadixArk](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4)) and EXL3 at 3.05 or 4.05 bits per weight
-([turboderp](https://huggingface.co/turboderp/Qwen3.8-Flash-Next-exl3), smaller, read directly by this build). Image
-input is optional (`rdna3/serve.sh --vision`): no measurable cost on two cards, ~1.5-2 % of decode on one
-([limits](docs/rdna3/limits.md#images-vision)).
+It is a tuned build of the [FreeToken](https://github.com/FlashML-org/FreeToken) MoE engine for RDNA3 (ROCm). The model
+does not fit in VRAM: every expert lives in system RAM and the GPUs keep the most used ones; two unequal cards share
+the work.
 
-### Speed over the whole context
+## What you need
 
-One request, MTP head on, greedy: one conversation grown from 9k tokens to the profile's maximum context with blocks
-the server has never seen, like large tool results ([method](docs/rdna3/benchmarks.md#how-the-numbers-are-taken)).
+| | |
+|---|---|
+| GPUs | one or two RX 7900 XTX (24 GB) / RX 7900 XT (20 GB); other cards: [which GPUs](docs/rdna3/limits.md#which-gpus) |
+| RAM | 128 GB recommended: the server locks 51 to 82 GiB, depending on the checkpoint and the number of cards ([table](#which-checkpoint)), more with conversations kept in RAM, and the system and your programs need ~30 GiB beside it ([how to count](docs/rdna3/limits.md#how-much-ram-do-i-need)) |
+| Disk | 85 to 135 GB for the model, ~27 GB for the image (~29 GB more while it builds) |
+| System | Linux x86_64 with the in-kernel `amdgpu` driver, and Docker. ROCm, PyTorch and the rest come inside the image |
+
+`rdna3/serve.sh --check` looks at your machine, says what is missing, which profile fits your GPUs and what fits in your
+RAM. It changes nothing.
+
+## Quick start
+
+```bash
+git clone https://github.com/Cedriceuh/freetoken-rdna3 && cd freetoken-rdna3
+rdna3/serve.sh --check                                   # what this machine has, which profile fits (no image yet: expected)
+docker build -f Dockerfile.rdna3 -t freetoken-rdna3:latest .    # once; pulls a 25 GB ROCm base image
+rdna3/download.sh nvfp4                                  # 135 GB into ~/models (or exl3-3.05, exl3-4.05: see below)
+rdna3/serve.sh xtx-xt --model ~/models/Qwen3.8-Flash-Next-NVFP4  # use the profile --check suggests
+```
+
+The server loads in ~2.5 minutes on the reference machine (the first start of a new image also compiles GPU kernels for
+a few minutes). It is
+ready when `curl -s http://127.0.0.1:1919/health` answers `"ok"`. Then, from another terminal:
+
+```bash
+curl -s http://127.0.0.1:1919/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model": "qwen3.8-flash-next", "messages": [{"role": "user", "content": "Hello! Who are you?"}],
+  "chat_template_kwargs": {"enable_thinking": false}}'
+```
+
+Every step explained, with client set-ups and running it as a service:
+[docs/rdna3/getting-started.md](docs/rdna3/getting-started.md).
+
+## What you can do with it
+
+- **Chat** from any app that speaks the OpenAI API: base URL `http://127.0.0.1:1919/v1`, model `qwen3.8-flash-next`,
+  any API key.
+- **Run coding agents**: OpenCode through the OpenAI API (the client every agent measurement here used), or a client
+  of the Anthropic API such as Claude Code (`ANTHROPIC_BASE_URL=http://127.0.0.1:1919`; not measured here). Tool calls
+  and thinking are supported. On two cards up to four
+  requests run at once, so sub-agents work in parallel. Set-ups:
+  [connect a client](docs/rdna3/getting-started.md#7-connect-a-client).
+- **Work on long inputs**: 262,144 tokens per conversation on two cards, 131,072 on one. `xtx-xt-4x262k` keeps four
+  full-length conversations at once, `xtx-xt-1m` one of up to 1M tokens, as many as your RAM holds: each 262k
+  conversation takes 6.9 GiB of it ([long-context](docs/rdna3/long-context.md), `rdna3/serve.sh --check`).
+- **Switch between conversations**: one pushed off the GPUs is kept in system RAM and resumes in ~2 s instead of being
+  read again.
+- **Send images** with `rdna3/serve.sh ... --vision` ([images](docs/rdna3/limits.md#images-vision)).
+- **Script it** with any OpenAI or Anthropic SDK, or serve your network (`--host 0.0.0.0`, add an API key:
+  [security](docs/rdna3/limits.md#anything-else-to-know)).
+
+## Which profile?
+
+A profile holds every setting for one GPU setup; `rdna3/serve.sh <profile>` picks the cards by itself.
+
+| Your GPUs | Profile | Context | Requests at once | Status |
+|---|---|---:|---:|---|
+| RX 7900 XTX + RX 7900 XT | `xtx-xt` | 262k, shared by the requests | 4 | measured |
+| the same, several long agent conversations | `xtx-xt-4x262k` | 262k each | up to 4, as your RAM allows | measured |
+| the same, one very long document | `xtx-xt-1m` | 1M | 4, sharing 1M | measured with EXL3 3.05 bpw |
+| two RX 7900 XTX | `xtx-xtx` | 262k | 4 | untested; EXL3 needs `FREETOKEN_TP_SPLIT=0.6` |
+| two RX 7900 XT | `xt-xt` | 262k | 4 | untested; EXL3 needs `FREETOKEN_TP_SPLIT=0.6` |
+| one RX 7900 XTX | `xtx` | 131k | 1 | measured |
+| one RX 7900 XT | `xt` | 131k | 1 | measured |
+| one RX 7900 GRE | `gre` | 65k | 1 | untested |
+
+Untested profiles are derived from the measured ones; the script says so when you start one. Measured one? Please open
+an issue with your numbers. Details and adapting a profile to other cards: [profiles](docs/rdna3/profiles.md).
+
+## Which checkpoint?
+
+All three run on `xtx-xt`, `xtx` and `xt` with nothing to change: download one and point `--model` at its directory.
+`xtx-xt-1m` is measured with EXL3 3.05 bpw only, `xtx-xt-4x262k` with EXL3 3.05 bpw (four conversations) and NVFP4
+(three) ([profiles](docs/rdna3/profiles.md#xtx-xt-4x262k-and-xtx-xt-1m-the-kv-in-host-ram)). "bpw" is bits per weight;
+the other terms: [glossary](docs/rdna3/README.md#terms-used-in-these-pages).
+
+| | NVFP4 | EXL3 3.05 bpw | EXL3 4.05 bpw |
+|---|---:|---:|---:|
+| `rdna3/download.sh` | `nvfp4` | `exl3-3.05` | `exl3-4.05` |
+| Hugging Face | [RadixArk/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4) | [turboderp/Qwen3.8-Flash-Next-exl3](https://huggingface.co/turboderp/Qwen3.8-Flash-Next-exl3) | [turboderp/Qwen3.8-Flash-Next-exl3](https://huggingface.co/turboderp/Qwen3.8-Flash-Next-exl3) |
+| Download | 135 GB | 85 GB | 108 GB |
+| RAM locked: two cards; one card | 82 GiB; 73 GiB | 60 GiB; 51 GiB | 75 GiB; 66 GiB |
+| Decode, `xtx-xt` | 78-96 tok/s | 95-117 tok/s | 86-94 tok/s |
+| Decode, `xtx` | 36-44 tok/s | 52-58 tok/s | 37-47 tok/s |
+
+EXL3 3.05 bpw is the smallest and decodes the fastest on every measured profile: its experts are smaller, so more of
+them stay in VRAM (the checkpoints also differ in how many of the MTP head's drafts are kept). On the
+maintainers' agentic benchmark (29 planted bugs to fix in long agent sessions, on an earlier build) NVFP4 fixed 12 and
+18 in two runs, EXL3 3.05 bpw 13 and 4.05 bpw 12 in one run each: too few runs to rank them.
+
+## Speed
+
+One request, greedy, the model's MTP draft head on (as the profiles ship): one conversation grown from 9k tokens to the
+profile's maximum context with blocks the server has never seen, like large tool results
+([method](docs/rdna3/benchmarks.md#how-the-numbers-are-taken)).
 
 | Decode (TG) | NVFP4 | EXL3 3.05 bpw | EXL3 4.05 bpw |
 |---|---:|---:|---:|
@@ -33,93 +121,24 @@ the server has never seen, like large tool results ([method](docs/rdna3/benchmar
 | `xtx`, 9k to 124k tokens | 1520-1670 tok/s; 1.5-1.6 s | 1700-1820 tok/s; 1.0-1.2 s | 1640-1820 tok/s; 1.3-1.5 s |
 | `xt`, 9k to 124k tokens | 1350-1480 tok/s; 1.6-1.8 s | 1500-1600 tok/s; 1.2-1.3 s | 1450-1620 tok/s; 1.5-1.6 s |
 
-| Size and memory | NVFP4 | EXL3 3.05 bpw | EXL3 4.05 bpw |
-|---|---:|---:|---:|
-| Download | 135 GB | 85 GB | 108 GB |
-| RAM while serving (locked): two cards; one card | 82 GiB; 73 GiB | 60 GiB; 51 GiB | 75 GiB; 66 GiB |
-| Experts cached per card, `xtx-xt` (of 24,576) | 7.0k | 9.8k | 7.2k |
-
-Measured on 2026-10-16 with the image of 8899710 (the merge of upstream `9b68e00` after it measured -0.8 to +0.9 %
-against it on `xtx-xt-4x262k`, [CHANGELOG](CHANGELOG.md)), one server per cell started by `rdna3/serve.sh`. The 3 bpw
-experts are smaller, so more of them stay in VRAM (9.8k instead of 7.0k per card on `xtx-xt`); the checkpoints also
-answer differently, which changes how many of the MTP head's guesses are kept.
-
-The MTP head (the model's own draft layer) guesses the next tokens and one step checks them; greedy answers are
-identical with and without it. On `xtx-xt` with NVFP4 it takes one request from 65.5 to 88 tok/s at the
-sampling `rdna3/serve.sh` gives (temperature 0.6, 2026-10-16); with 3-4 requests at once it cost 3-4 % (2026-10-06); `rdna3/serve.sh --no-mtp` turns it off. On real
-agent turns (~90k-token contexts of code, temperature 0.6, 2026-10-03): 71 tok/s for a request alone, ~34 tok/s each
-when two sub-agents decode at once ([benchmarks](docs/rdna3/benchmarks.md#agent-turns-on-real-code-xtx-xt)).
-
-Off by default: `rdna3/serve.sh <profile> --hybrid` has the CPU compute part of each decode step's missing experts
-straight from RAM instead of copying them to the GPU. With NVFP4 (2026-10-13): one request on `xtx` from 42.7 to
-62.3 tok/s (`xt`: 34.6 to 52.1), on `xtx-xt` 82.9 to 84.5 for one request and 25.2 to 28.9 tok/s each for four at
-once; EXL3 3.05 bpw: +5 % on `xtx`, even on `xtx-xt` ([docs/rdna3/cpu-experts.md](docs/rdna3/cpu-experts.md)).
-
-Four agents with 82-117k-token conversations, 3 turns each: after the first reads, the three rounds of turns take
-**35 s instead of 599 s** without the RAM tier, because a conversation pushed off the GPUs is kept in system RAM and
-resumes in ~2 s instead of being re-read.
-
-Full numbers, methods and the cold-read times: [docs/rdna3/benchmarks.md](docs/rdna3/benchmarks.md).
-
-## Quick start
-
-You need Linux with the `amdgpu` driver, Docker, an RX 7900 XTX and/or 7900 XT, and enough RAM for the checkpoint: the
-server locks 51-82 GiB (a 128 GB machine for NVFP4; why: [limits](docs/rdna3/limits.md)). Everything runs in the Docker image below; the `install.sh` at the root is
-upstream's NVIDIA / CUDA installer and is not used here.
-
-```bash
-git clone https://github.com/Cedriceuh/freetoken-rdna3 && cd freetoken-rdna3
-docker build -f Dockerfile.rdna3 -t freetoken-rdna3:latest .          # pulls the ROCm 10.1 PyTorch base, 25 GB
-mkdir -p ~/models      # model download (~135 GB), with the image's own `hf`
-docker run --rm --user "$(id -u):$(id -g)" -e HF_HOME=/models/.cache/huggingface -v ~/models:/models \
-  --entrypoint hf freetoken-rdna3:latest download RadixArk/Qwen3.8-Flash-Next-NVFP4 \
-  --local-dir /models/Qwen3.8-Flash-Next-NVFP4
-rdna3/serve.sh xtx-xt --model ~/models/Qwen3.8-Flash-Next-NVFP4       # or: xtx, xt (one card); stays in the foreground
-```
-
-For an EXL3 checkpoint, download `turboderp/Qwen3.8-Flash-Next-exl3` with `--revision 3.05bpw_h5_ng5` (85 GB) or
-`--revision 4.05bpw_h6_ng6` (108 GB) and point `--model` at it: nothing else changes
-([details](docs/rdna3/how-it-works.md#exl3-checkpoints)).
-
-Loading takes ~2.5 minutes on the reference machine (the first start of a new image also compiles GPU kernels for a few minutes); the server
-is ready when `curl -s http://127.0.0.1:1919/health` (from another terminal) reports `"ok"`. Then point any
-OpenAI-compatible client at `http://127.0.0.1:1919/v1` (model `qwen3.8-flash-next`), or an Anthropic-compatible one at
-`http://127.0.0.1:1919`. Step by step, with a client example and a systemd unit: [docs/rdna3/getting-started.md](docs/rdna3/getting-started.md).
-
-## Profiles
-
-One ready-made profile per hardware setup, measured for the tested ones and derived for those marked untested
-([details](docs/rdna3/profiles.md)):
-
-| Profile | GPUs | Context | Requests at once | Status |
-|---|---|---:|---:|---|
-| `xtx-xt` | RX 7900 XTX 24 GB + RX 7900 XT 20 GB | 262k | 4 | measured (tables above) |
-| `xtx` | one RX 7900 XTX 24 GB | 131k | 1 | measured |
-| `xt` | one RX 7900 XT 20 GB | 131k | 1 | measured |
-| `xtx-xtx` | two RX 7900 XTX 24 GB | 262k | 4 | untested: decode expected >= `xtx-xt`; EXL3 needs `FREETOKEN_TP_SPLIT=0.6` |
-| `xt-xt` | two RX 7900 XT 20 GB | 262k | 4 | untested: decode expected a little below `xtx-xt`; same EXL3 note |
-| `gre` | one RX 7900 GRE 16 GB | 65k | 1 | untested: ~20 tok/s at best expected (NVFP4, head off) |
-| `xtx-xt-4x262k` | RX 7900 XTX 24 GB + RX 7900 XT 20 GB | 262k each | 4 | EXL3 3.05 bpw (4 contexts) and NVFP4 (3) measured: the K/V in RAM, full contexts at once ([long-context](docs/rdna3/long-context.md)) |
-| `xtx-xt-1m` | RX 7900 XTX 24 GB + RX 7900 XT 20 GB | 1M | 4 (sharing 1M) | EXL3 3.05 bpw measured: the K/V in RAM, one conversation up to 1M ([long-context](docs/rdna3/long-context.md)) |
-
-Untested profiles are derived from the measured ones and the engine's memory plans; the script says so when you start
-one. Measured something? Please open an issue with your numbers.
-
-`rdna3/serve.sh --list` prints this table from the profile files; `rdna3/serve.sh` picks the right cards by itself;
-`--dry-run` shows the exact `docker run` it would start.
+An "agent turn" is ~1k new tokens (a tool result) added to a conversation the server already holds. Requests running
+at once share the GPUs: on `xtx-xt-4x262k`, four agents at 257-260k tokens decode at 29.6-31.6 tok/s each, one alone at
+95.1 (EXL3 3.05 bpw, one pass on an earlier build than the tables above).
+All the numbers: [benchmarks](docs/rdna3/benchmarks.md).
 
 ## Documentation
 
-- [Getting started](docs/rdna3/getting-started.md): install, first run, clients, running it as a service
-- [Profiles](docs/rdna3/profiles.md): what each profile sets and how to adapt one to other cards
-- [Options](docs/rdna3/options.md): every setting this build adds, with its measured effect
-- [Benchmarks](docs/rdna3/benchmarks.md): speed at every context depth, several requests and agents, precision
-- [How it works](docs/rdna3/how-it-works.md): what was changed in the engine and why
-- [Decisions](docs/rdna3/decisions.md): each design choice, its alternatives and trade-offs
-- [Limits and FAQ](docs/rdna3/limits.md): RAM, other GPUs (RDNA4, NVIDIA), other models
-- [Troubleshooting](docs/rdna3/troubleshooting.md)
-- [The journey](docs/rdna3/journey.md): what was tried, measured, kept and dropped
-- [Testing](docs/rdna3/testing.md) and [maintaining](docs/rdna3/maintaining.md): checking a change, following upstream
+| I want to | Read |
+|---|---|
+| install it and connect my tools | [getting started](docs/rdna3/getting-started.md) |
+| fix something that goes wrong | [troubleshooting](docs/rdna3/troubleshooting.md) |
+| know if my RAM, GPUs or model will work | [limits and FAQ](docs/rdna3/limits.md) |
+| change or adapt a profile | [profiles](docs/rdna3/profiles.md), [options](docs/rdna3/options.md) (every setting this build adds) |
+| serve very long contexts | [long context](docs/rdna3/long-context.md) |
+| use the CPU for part of the experts (`--hybrid`) | [CPU experts](docs/rdna3/cpu-experts.md) |
+| see every measurement | [benchmarks](docs/rdna3/benchmarks.md) |
+| understand the engine | [how it works](docs/rdna3/how-it-works.md), [decisions](docs/rdna3/decisions.md), [the journey](docs/rdna3/journey.md) (what was tried, kept and dropped) |
+| contribute | [CONTRIBUTING](CONTRIBUTING.md), [testing](docs/rdna3/testing.md), [maintaining](docs/rdna3/maintaining.md) |
 
 For LLM agents: [`llms.txt`](llms.txt) indexes everything, [`AGENTS.md`](AGENTS.md) explains how to work on the code.
 

@@ -4,10 +4,10 @@ How this repository relates to upstream FreeToken and how to keep it current. Fo
 
 ## What this tree is
 
-Upstream [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken) at `9b68e00` (2026-10-15, "fix(engine):
-upload cuda graphs at capture so a stream wait cannot block the first launch (#697)"), plus the changes listed file by
-file in [changes-from-upstream.md](changes-from-upstream.md). The history is upstream's own up to `0d652e7`
-(2026-09-26), then this project's commits on top (the first one holds everything up to 0.1.0), a merge of upstream up
+Upstream [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken) at `9b68e00` ("fix(engine): upload cuda
+graphs at capture so a stream wait cannot block the first launch (#697)"), plus the changes listed file by file in
+[changes-from-upstream.md](changes-from-upstream.md). The history is upstream's own up to `0d652e7`, then this
+project's commits on top (the first one holds everything up to 0.1.0), a merge of upstream up
 to `ee9789f`, five upstream commits cherry-picked (`74a3877`, `9c635a1`, `7d6490c`, `9b68e00`, `b6193e8`, authors
 kept) and a merge of the rest up to `9b68e00`. Once the `upstream` remote is set up (below),
 `git diff $(git merge-base HEAD upstream/main)` shows every change against the upstream version this tree is based on.
@@ -34,12 +34,13 @@ carries #133's HIP-portable JIT kernels since `803a3b4` (#133 itself was closed)
 ROCm, `LaunchKernel::with_attr` refuses `use_pdl=True` where upstream ignores it. The YaRN rope table and the split
 top-k past 16 chunks, written here first, are upstream's own since `235e201` and `5031e3d`.
 
-At the merge of `9b68e00` (2026-10-16): upstream's vendored ggml-cuda kernels (`e5d3bd3`, they build for gfx1100)
+At the merge of `9b68e00`: upstream's vendored ggml-cuda kernels (`e5d3bd3`, they build for gfx1100)
 replaced this tree's ROCm build of the old GGUF kernels; upstream's hybrid ensure kernel splits the routes (`f02fbb1`),
 which this tree's split kernel did, and its executor speaks HIP's memops (`2010271`), which this tree added: both left
 the stack. Kept over upstream: `kernel/triton/moe_align.py` on ROCm instead of the staged align of `0bca88f` (the same
 Triton 3.8 bug, fixed in the kernel here); the hybrid publish / merge kernels instead of upstream's copies around the
 doorbell, which it keeps on ROCm. The prefill through the slot cache needs one slot pool (`b416f85`'s default here).
+
 ## Keeping current
 
 ```bash
@@ -85,6 +86,6 @@ decode GEMV table (`_GEMV_TUNED` in `kernel/triton/exl3.py`) came from `rdna3/be
 to this model's 384 / 256 shapes; there the N tiles per program keep the sums, the K tile and split change them, and
 some warp counts do too (check the outputs bit for bit). The int8 GEMV configs (`_CONFIGS` in
 `kernel/triton/int8_gemv.py`): only BLOCK_N keeps the sums; the K block, split and warps change them (checked on the
-uneven split's shapes, 2026-10-11). Sweep cold (48 distinct matrices or 48 layers' own slots, as a decode step reads
+uneven split's shapes). Sweep cold (48 distinct matrices or 48 layers' own slots, as a decode step reads
 them) with a warm-up pass, and time the current config first and last: a warm microbenchmark keeps the weights in the
 Infinity Cache and promises gains that serving does not see.

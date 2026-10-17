@@ -53,7 +53,7 @@ routers are replicated; with `--ple-backend disk` (every profile) each rank read
 ## Talking between the cards: host-memory all-reduce (+2.5-4.8 %)
 
 Without peer-to-peer, RCCL stages each small decode all-reduce (5 KB) through host memory with its proxy threads:
-~12 µs inside a CUDA graph, ~97 times per token. Both ranks now map one shared host-memory region and a one-block
+~12 µs inside a CUDA graph, ~97 times per token. Here both ranks map one shared host-memory region and a one-block
 kernel copies, signals, waits and adds (fp32, rounded to bf16 exactly as RCCL does): 6 µs, same bits. Separately, the
 two MoE all-reduces of a layer (routed and shared experts) are merged into one (+2.7 % decode): that change reorders
 sums and was validated on the agentic benchmark.
@@ -69,12 +69,12 @@ cards, changing only tiles that keep the summation order (bit-exact).
 
 A prefill chunk runs every token through every layer, so each chunk streams all 512 experts of every layer over PCIe
 (~700 MB per layer per card). Bigger chunks mean less streaming: in the A/B test, 16k-token chunks read an 8.4k prompt
-in 4.3 s instead of 5.5 s (4.5 s on the swept build; 3.8 s on this release: [benchmarks.md](benchmarks.md)), and 54-101k-token reads
-at depth 2-6 % faster. To fit them, the prefill MoE and the PLE layer run 4096 tokens at a time inside the chunk (the
+in 4.3 s instead of 5.5 s, and 54-101k-token reads at depth 2-6 % faster ([benchmarks.md](benchmarks.md) has the
+current speeds). To fit them, the prefill MoE and the PLE layer run 4096 tokens at a time inside the chunk (the
 NVFP4 MoE blocks are bit-identical, and 8192 tokens long in `xtx-xt` and `xtx-xt-4x262k`: +8 % on cold reads; the PLE blocks can round differently, checked to tolerance and validated on the agentic
 benchmark for one request), and experts already in the GPU cache are gathered on the GPU instead of crossing PCIe
 again (`--moe-prefill-hit-d2d`, with `hipMemcpyBatchAsync` on ROCm, or one copy per entry on older HIP): a third of
-the experts no longer cross PCIe per chunk, an agent turn's first token 1.55 -> 1.18 s. A single card keeps 8k chunks
+the experts stay off PCIe per chunk, an agent turn's first token 1.55 -> 1.18 s. A single card keeps 8k chunks
 (its working memory is smaller).
 
 A short chunk (up to 1280 tokens on Qwen3.8-Flash-Next, an agent's tool result) does not stream the whole layers: it
@@ -82,8 +82,8 @@ routes to only part of the experts, so it reads its routed experts from the slot
 that layer's router and copied while this one computes, and only the missing ones cross PCIe (the same bits, the GEMM
 tiles are those of the expert ids). With the K/V in host RAM it copies to VRAM only the K/V rows its tokens select, and
 the tokenizer reuses the previous prompt's tokens instead of encoding the whole conversation again. An agent turn of
-130-340 tokens takes 0.40-0.48 s to its first token at 25k and 0.46-0.59 s at 224k on `xtx-xt-4x262k` with EXL3 3.05 bpw
-(NVFP4 0.58-0.70 s at 25k)
+130-340 tokens takes 0.40-0.48 s to its first token at 25k, one of 142-360 tokens 0.46-0.59 s at 224k, on
+`xtx-xt-4x262k` with EXL3 3.05 bpw (NVFP4 0.58-0.70 s at 25k)
 ([journey.md](journey.md#27-agent-turns-short-prefills-through-the-expert-cache-2026-10-14)).
 
 ## Sampling on ROCm
@@ -101,20 +101,18 @@ Here:
 - every rank samples its own copy of the logits, and rank 0's tokens are broadcast after each sampled step, so two
   different GPUs can never drift onto different tokens.
 
-The sorted path and the broadcast are new in the release build: the sorted path checked by kernel tests (same kept
-sets as the float64 definition, seeded draws identical to upstream's kernels), the broadcast by
-`FREETOKEN_TP_SYNC_TOKENS=check` server runs (0 disagreements over ~8k sampled tokens); neither was run on the agentic
-benchmark. The vendored sampling
-module from before upstream PR #329, used earlier, was removed: its top-k could keep the whole row (measured: 89 % of
-the draws outside the top-20 on one distribution) and its top-p was approximate.
+The sorted path is checked by kernel tests (same kept sets as the float64 definition, seeded draws identical to
+upstream's kernels), the broadcast by `FREETOKEN_TP_SYNC_TOKENS=check` server runs (0 disagreements over ~8k sampled
+tokens); neither was run on the agentic benchmark. Why not the older vendored sampling module:
+[decisions.md](decisions.md#sampling-on-rocm).
 
 ## Several requests at once
 
 Up to 4 requests decode together (`--max-running-requests 4`), with CUDA graphs captured for every batch size up to 4.
 The decode GEMVs run their unchanged per-row body once per request (the weight tile loaded once when the reduction fits
 one tile), so batching changes the speed of a request's decode, not its tokens. Prompts prefilled in the same forward can differ at rounding level (the dense GEMMs run at
-another size), as prefix caching already makes them. Added after the agentic benchmark runs: a request alone on this
-build gives the same answers as before (120 prompts), batched runs were not scored. Prefills are not mixed with
+another size), as prefix caching already makes them. A request alone gives the same answers as with one request at a
+time (120 prompts); batched runs were not run on the agentic benchmark. Prefills are not mixed with
 decode steps in one batch (estimated at ~3 %, not done); agents naturally overlap their prefills.
 
 ## Conversations kept in RAM
@@ -126,8 +124,9 @@ tokens). With `FREETOKEN_HOST_KV=1` an evicted node is **demoted** instead: its 
 pinned RAM and the node stays in the tree; a later match **promotes** it back (fresh GPU pages and state slot,
 host-to-device copies, ~20 GB/s). The copies are exact. Eviction splits a node when only part of it has to leave (an
 agent turn is one node), capacities are counted in pages and snapshots so both ranks take identical decisions, and
-nodes being promoted are pinned against eviction. Four agents with 82-117k-token conversations, 3 turns each: after
-the first reads, the rounds of turns take 35 s instead of 599 s.
+nodes being promoted are pinned against eviction. It pays when conversations together outgrow the GPU pool, as
+parallel sub-agents do; a single conversation that fits the GPUs gains nothing, and the tier's RAM stays locked for
+the whole run ([options.md](options.md#conversations-kept-in-ram)).
 
 ## Images (`--vision`, off by default)
 
@@ -178,11 +177,11 @@ branch `3.05bpw_h5_ng5` (routed experts at 3 bits per weight, most other linears
   `rdna3/serve.sh` also lowers `--memory-ratio` to 0.77 (0.76 from 4 bpw): see
   [journey.md](journey.md#16-exl3-checkpoints-2026-10-04).
 - Not supported: half-integer bitrates, mixed expert bitrates across layers, the pinned PLE backend, the encoder-only
-  weight reader (the CPU expert executor of `--hybrid` reads EXL3 experts since 2026-10-11: [cpu-experts.md](cpu-experts.md)). FTW conversion is untested. The vision tower reads the checkpoint's bf16
+  weight reader (the CPU expert executor of `--hybrid` does read EXL3 experts: [cpu-experts.md](cpu-experts.md)). FTW conversion is untested. The vision tower reads the checkpoint's bf16
   `qkv` (image input checked with one image per branch).
 
-Measured on 2026-10-16 (the image of 8899710) with the profiles as shipped, MTP head on, one request (decode: greedy,
-from 9k tokens to the profile's maximum context; RAM: locked while serving;
+With the profiles' settings, MTP head on, one request (decode: greedy, from 9k tokens to the profile's maximum context;
+RAM: locked while serving;
 [benchmarks.md](benchmarks.md#depth-sweep-exl3-checkpoints) has every step, the cold reads and the sampled decode):
 
 | | NVFP4 | EXL3 3.05 bpw | EXL3 4.05 bpw |
@@ -196,7 +195,7 @@ from 9k tokens to the profile's maximum context; RAM: locked while serving;
 | expert cache per card, `xtx-xt` | 7.0k | 9.8k | 7.2k |
 | agentic benchmark (29 bugs) | 12 and 18 (two runs) | 13 (one run) | 12 (one run) |
 
-The agentic benchmark rows come from runs on earlier builds. The checkpoints answer differently, so the MTP head
+The agentic benchmark scores come from earlier builds than the other rows. The checkpoints answer differently, so the MTP head
 keeps a different share of its guesses: compare decode rates as an order of magnitude. Greedy answers are identical
 with and without the head. With the RAM tier off and `--expert-load serial`, the 3.05 bpw server started and served under a
 56 GiB container limit at 52.3 GiB used (`quick_bench.py` then: 70.1 tok/s decode at the model's sampling, 8.3k-token

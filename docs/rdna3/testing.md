@@ -13,9 +13,9 @@ python3 rdna3/bench/quick_bench.py --label "2x RX 7900 XT, xt-xt"
 
 About a minute; it measures decode speed, a cold ~8.3k-token read, an agent turn on the cached conversation and a
 tool call, on text the server has never seen, and prints a Markdown table for an issue. For comparison, `xtx-xt` with
-the NVFP4 checkpoint on the image of 2026-10-15 gave 70.7 and 73.5 tok/s with the MTP head in two runs (a sampled
-answer, so it varies), 3.86-3.88 s for the cold read and 0.86-0.88 s for the agent turn, tool call parsed. On a fresh image the first run can be
-slower (one-time kernel preparation): run it twice.
+the NVFP4 checkpoint, on an earlier build than the [benchmarks.md](benchmarks.md#summary) summary, gave 70.7 and 73.5 tok/s with the MTP head in two runs (a sampled answer, so it varies),
+3.86-3.88 s for the cold read and 0.86-0.88 s for the agent turn, tool call parsed. On a fresh image the first run can
+be slower (one-time kernel preparation): run it twice.
 
 ## CPU test suite
 
@@ -30,7 +30,7 @@ NVIDIA-only package:
 `test_cache_budget.py::test_adjust_config_resolves_num_tokens_generic`,
 `test_offload.py::test_adjust_config_converts_moe_cache_rate_to_cache_size`), and
 `qwen4_exp/test_weight.py::test_every_registry_architecture_is_claimed_by_an_aot_entry` finds two of upstream's GGUF
-architectures without an AOT entry (upstream `9b68e00`).
+architectures without an AOT entry.
 
 To test source changes without rebuilding, mount your tree instead (`-v "$PWD":/src:ro -w /src -e
 PYTHONPATH=/src/python`); `test_swiglu_clamp.py::test_cpu_extension_supports_swiglu_clamp` then fails too, because the
@@ -80,7 +80,7 @@ docker run --rm --device=/dev/kfd --device=/dev/dri --security-opt seccomp=uncon
 Microbenchmarks only locate a cost: the weights stay hot in the 80-96 MB Infinity Cache and the kernel mix is not a
 real step's. Decide on the whole model.
 
-A `rocprofv3 --kernel-trace` of graph-replayed decode can lose records: on 2026-10-16 (ROCm 10.1, four requests) 37 %
+A `rocprofv3 --kernel-trace` of graph-replayed decode can lose records: in one trace (ROCm 10.1, four requests) 37 %
 of the dispatches were missing, in whole chunks of 256, 321 or 720 (`Dispatch_Id` jumps), which looked like
 milliseconds of idle GPU. Count gaps only between consecutive `Dispatch_Id`s.
 
@@ -95,8 +95,8 @@ milliseconds of idle GPU. Count gaps only between consecutive `Dispatch_Id`s.
 4. **Several requests and sampling**: four concurrent agents with sampling, one request per sampler path (greedy,
    top-p only, large and small top-k) alone and batched, with `FREETOKEN_TP_SYNC_TOKENS=check` (no disagreement lines
    expected), and a smoke test with a tool call. Answers under load are no bit-exactness test: four agents at
-   temperature 0 on one build gave the same answers on only 4 and 11 of 44 turns from one run to the next (measured
-   2026-10-15; which requests share a batch and where a prompt is chunked follow arrival times). Under load, check a
+   temperature 0 on one build gave the same answers on only 4 and 11 of 44 turns from one run to the next (which
+   requests share a batch and where a prompt is chunked follow arrival times). Under load, check a
    new path from inside instead (what it reads against the old path's bytes), and expect an agentic score to move
    between two runs of one build (6 of 29 tasks measured with sampling).
 5. **Anything not bit-exact**: a scored benchmark to reject it early, then an agentic, multi-turn benchmark to accept
