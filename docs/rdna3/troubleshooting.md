@@ -112,6 +112,18 @@ Neither came back in the same runs repeated (hours of agent sessions, the sweep 
 display while serving, and lower `--memory-ratio` (more headroom, fewer cached experts) if it happens again. Before
 restarting, save the log (`docker logs <container>`): the container is removed when it stops.
 
+## The server stops answering and one card's VRAM empties
+
+The host ran out of RAM and the kernel's OOM killer stopped one rank: `journalctl -k | grep -i "killed process"` names a
+`python3`. The engine locks its experts and its K/V pool in RAM (~95 GiB for the two ranks with NVFP4 and a pool of
+787,500 tokens), so the desktop and every other program share what is left. `serve.sh` starts the container with
+`--oom-score-adj -999` (not with rootless Docker, which cannot lower it): the kernel kills other processes first, and
+the engine only when nothing else is left (the container's own `--memory` limit, for instance). When a rank dies, the
+API server stops the surviving ranks (SIGKILL after 5 s) and exits with code 1, streams still open included, so a
+service with `Restart=on-failure` starts it again: with a rank 0 killed under a stream on `xtx-xt-4x262k`, the container
+had exited 37 s later and both cards were free. Close what holds the RAM (`ps -eo rss,comm --sort=-rss | head`) or lower
+the K/V kept in RAM (`--kv-reserve-tokens`).
+
 ## Less VRAM, or a start that never ends, after a server was killed while starting
 
 Seen on 2026-10-16: a server removed with `docker rm -f` while it loaded its weights left an amdgpu kernel worker

@@ -83,6 +83,7 @@ Who wrote what: [credits.md](credits.md).
 | `python/freetoken/scheduler/scheduler.py` | 16/5 | optional decode interleaving between prefill chunks (`FREETOKEN_DECODE_INTERLEAVE`, off); RAM-tier hooks |
 | `python/freetoken/scheduler/prefill.py`, `scheduler/cache.py` | 19/1, 93/3 | the GDN boundary carried across prefill chunk seams; RAM-tier matching and promotion |
 | `tests/scheduler/test_gdn_boundary_carry.py` | new | |
+| `python/freetoken/server/api_server.py`, `tests/server/test_backend_death_exit.py` | 12/4, new | a worker dead after start ends the API server with exit code 1 after a 10 s grace, streams still open included: it stops the surviving workers itself (SIGKILL after 5 s); upstream's SIGTERM to itself went through uvicorn's graceful stop, which waits for open streams without a timeout, and a stream to a dead backend never ends |
 
 ## Conversations kept in RAM
 

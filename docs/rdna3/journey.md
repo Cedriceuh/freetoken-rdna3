@@ -1,6 +1,6 @@
 # The journey
 
-How this build came about: measured experiments from 2026-09-25 to 2026-10-16 on one machine, an RX 7900
+How this build came about: measured experiments from 2026-09-25 to 2026-10-17 on one machine, an RX 7900
 XTX 24 GB + RX 7900 XT 20 GB (gfx1100, no GPU peer-to-peer), a Threadripper 3970X and 128 GB of DDR4, serving
 Qwen3.8-Flash-Next NVFP4 to the author's coding agent (OpenCode) with a 262k-token context (250k from 2026-10-03 to 2026-10-16). Every number was measured
 on that machine (changes in interleaved A/B runs), except the few marked as estimates. The choices and their
@@ -667,7 +667,20 @@ Upstream's fix of the Triton 3.8 histogram bug (a staged align, `0bca88f`) was l
 compare. On `xtx-xt-4x262k` with NVFP4 and EXL3 3.05 bpw the answers stayed the same, bit for bit
 ([CHANGELOG](../../CHANGELOG.md)).
 
-## 29. Still open
+## 29. A rank killed by the host's OOM killer (2026-10-17)
+
+Twice in a morning the host's 125.6 GiB filled up (no swap) and the kernel's OOM killer took a rank, the largest process
+(the second time rank 0: 52 GiB of RSS, rank 1 43 GiB), while ~90 `MainThread` processes (Node.js) held 13-14 GiB beside
+the desktop. Rank 1 kept its 18.7 GiB on the 7900 XT and looped on `TCPStore ... Broken pipe`; the port no longer
+answered, but the container stayed up, its service stayed active, and stopping it ran into the 30 s timeout. The logs
+went with the container; the cause found in the code and reproduced on the CPU: on a worker's death the API server sent
+itself a SIGTERM, and uvicorn's graceful stop (0.54, `timeout_graceful_shutdown=None`) waits for open connections first.
+A stream to a dead backend only sends keepalives, so the lifespan shutdown that terminates the workers never ran. The
+server now stops the workers itself and exits with code 1 (a test with an open stream and a worker ignoring SIGTERM: no
+exit in 60 s before, exit 1 after; live, rank 0 killed under a stream: the container exited 37 s later, both cards
+freed, `llm.service` restarted it 5 s after), and `serve.sh` gives the container `--oom-score-adj -999`.
+
+## 30. Still open
 
 - In NVFP4 the model needs ~63 GiB of RAM for its experts alone (the engine keeps every expert in RAM). The EXL3 3.05
   bpw checkpoint needs 42.6 GiB and served under a 56 GiB container limit, but a real 64 GB machine is untested

@@ -163,7 +163,7 @@ if [ -z "$gpus" ]; then
   echo "GPUs: $(printf '%s\n' "${pick[@]}" | LC_ALL=C awk '{printf "%sHIP %s (PCI %s, %.0f GiB)", (NR > 1 ? ", " : ""), $1, $3, $2 / 1073741824}')" >&2
 fi
 mounts=(-v "$model:/models/m:ro")
-if [ -z "$dry" ] && ! "$DOCKER" info >/dev/null 2>&1; then
+if [ -z "$dry" ] && ! security="$("$DOCKER" info --format '{{json .SecurityOptions}}' 2>/dev/null)"; then
   echo "cannot reach the Docker daemon: is it running, and is your user in the 'docker' group (log in again after adding it)?" >&2
   exit 2
 fi
@@ -195,8 +195,13 @@ fi
 # expandable segments (the engine also sets them when PYTORCH_ALLOC_CONF is unset): without them the allocator's
 # cache filled the VRAM left free and every 14-16k-token prefill chunk past ~26k of context failed once and retried
 # (xtx-xt, 2026-10-03; none with them, same speed)
+# --oom-score-adj: the engine is the host's largest process by far, so when the desktop fills the rest of the RAM the
+# kernel's OOM killer took one TP rank and left the other holding its GPU; -999 makes it pick the other processes first.
+# Left out with rootless Docker, which cannot lower a score (that takes CAP_SYS_RESOURCE)
+oom_args=(--oom-score-adj -999)
+[[ "${security:-}" == *rootless* ]] && oom_args=()
 cmd=("$DOCKER" run --rm --init --name "$name" --network host --ipc=host "${gpu_flags[@]}"
-     --ulimit memlock=-1 --memory "$memory"
+     --ulimit memlock=-1 --memory "$memory" "${oom_args[@]}"
      -e PYTORCH_ALLOC_CONF=expandable_segments:True -e OMP_WAIT_POLICY=PASSIVE -e "HIP_VISIBLE_DEVICES=$gpus"
      "${envs[@]}" "${mounts[@]}"
      "$image_id" ft serve --model /models/m --host "$host" --port "$port" --served-model-name "$served" "${mm_args[@]}"

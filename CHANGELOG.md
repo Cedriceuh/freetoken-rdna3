@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- A rank killed by the host's OOM killer no longer leaves a half server: the API server exits with code 1 even while
+  streams are open (it used to wait for them forever, the other rank holding its GPU; with a rank 0 killed under a
+  stream on `xtx-xt-4x262k`, the container exited 37 s later, both cards free, and the service restarted), and
+  `rdna3/serve.sh` starts the container with `--oom-score-adj -999` (not with rootless Docker), so the kernel picks
+  other processes first.
 - Agent turns: a new prompt of up to 1280 tokens on a cached conversation reads only its routed experts, through
   the GPU expert cache (`FREETOKEN_PREFILL_CACHED_MAX`, 1280 for Qwen3.8-Flash-Next), those the next layer's router
   predicts from this layer's input copied while this layer computes; the experts it brings in become the next victims,

@@ -92,7 +92,15 @@ def _exit_after_backend_death(grace_s: float) -> threading.Timer:
         if _SHUTTING_DOWN.is_set():
             return  # an external stop got here first
         logger.error("Backend worker is gone and cannot be restarted; stopping the API server")
-        os.kill(os.getpid(), signal.SIGTERM)
+        # Not a SIGTERM to ourselves: uvicorn's graceful stop waits, with no timeout, for the open
+        # streams the dead backend will never finish, so its lifespan never tore the surviving
+        # workers down and the process kept their GPUs. Exit 1 so a supervisor (systemd
+        # Restart=on-failure) sees the crash.
+        _SHUTTING_DOWN.set()
+        processes = getattr(_GLOBAL_STATE, "backend_processes", None) or []
+        _terminate_backend_workers(processes)
+        _reap_backend_workers(processes)
+        os._exit(1)
 
     timer = threading.Timer(grace_s, _stop)
     timer.daemon = True
@@ -102,9 +110,9 @@ def _exit_after_backend_death(grace_s: float) -> threading.Timer:
 
 def _reap_backend_workers(processes: List[Any], timeout: float = 5.0) -> None:
     """Wait out a preceding ``_terminate_backend_workers`` and SIGKILL whatever is still
-    standing. Only the shell path needs this: it owns the process lifetime end to end (no
-    outer signal takes the process down for it), and a worker that ignored SIGTERM would keep
-    the GPU and the IPC sockets after the shell has already returned to the user's terminal."""
+    standing. The shell path and the backend-death exit need this: they own the process
+    lifetime end to end (no outer signal takes the process down for them), and a worker that
+    ignored SIGTERM would keep the GPU and the IPC sockets after they have returned/exited."""
     for p in processes or []:
         try:
             p.join(timeout=timeout)
