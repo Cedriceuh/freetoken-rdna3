@@ -18,7 +18,9 @@ names another (all three checkpoints: [README](../../README.md#which-checkpoint)
 
 "Decode" is one request's 512-token answers at the sampling `rdna3/serve.sh` gives (temperature 0.6; median of 12);
 "deep decode" is greedy decode at every context step from 9k to 260k on two cards and 124k on one; "agent turn" is the
-time to the first token when ~1k new tokens are added to a cached conversation, over the same steps. The profiles turn
+time to the first token when ~1k new tokens are added to a cached conversation, over the same steps (an earlier
+build: since the short-prefill changes, 200-250-token turns take 11-13 % less time to their first token on another
+workload; not re-measured this way). The profiles turn
 the MTP head on; `rdna3/serve.sh <profile> --no-mtp` turns it off (numbers in brackets). All numbers:
 [benchmarks.md](benchmarks.md). `--hybrid` (off by default) has the CPU compute part of the expert misses: NVFP4 decode +46 % on
 `xtx`, +51 % on `xt`, +2 % on `xtx-xt`, measured on an earlier build than this table ([cpu-experts.md](cpu-experts.md)).

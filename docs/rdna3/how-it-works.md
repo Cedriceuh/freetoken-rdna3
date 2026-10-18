@@ -82,9 +82,12 @@ routes to only part of the experts, so it reads its routed experts from the slot
 that layer's router and copied while this one computes, and only the missing ones cross PCIe (the same bits, the GEMM
 tiles are those of the expert ids). With the K/V in host RAM it copies to VRAM only the K/V rows its tokens select, and
 the tokenizer reuses the previous prompt's tokens instead of encoding the whole conversation again. An agent turn of
-130-340 tokens takes 0.40-0.48 s to its first token at 25k, one of 142-360 tokens 0.46-0.59 s at 224k, on
-`xtx-xt-4x262k` with EXL3 3.05 bpw (NVFP4 0.58-0.70 s at 25k)
-([journey.md](journey.md#27-agent-turns-short-prefills-through-the-expert-cache-2026-10-14)).
+130-340 tokens took 0.40-0.48 s to its first token at 25k, one of 142-360 tokens 0.46-0.59 s at 224k, on
+`xtx-xt-4x262k` with EXL3 3.05 bpw (NVFP4 0.58-0.70 s at 25k), on an earlier build
+([journey.md](journey.md#27-agent-turns-short-prefills-through-the-expert-cache-2026-10-14)). Short prefills now take
+expert tiles sized for a few rows an expert and no longer wait on the GPU in every GatedDeltaNet layer: the time to
+the first token of 200-250-token turns at 34k 11-13 % shorter, of one-word turns 42 % on NVFP4 and 5 % on EXL3
+([journey.md](journey.md#31-short-agent-turns-2026-10-17-and-18)).
 
 ## Sampling on ROCm
 

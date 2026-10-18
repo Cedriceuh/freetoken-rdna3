@@ -290,6 +290,42 @@ class OffloadMoELayer(MoELayer):
         cache = self.offload_cache
         return cache is not None and cache.can_copy_async(self.layer_id)
 
+    def prefill_select(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+        """First half of a short prefill that reads its experts from the slot cache (FREETOKEN_PREFILL_COPY_OVERLAP):
+        route, plan the slots, copy the missing experts on the prefill copy stream; work issued before
+        ``prefill_finish`` (the shared expert) overlaps the copy. The same plan, copies and GEMMs as ``forward``."""
+        topk_weights, topk_ids = fused_topk(
+            hidden_states=hidden_states,
+            gating_output=router_logits,
+            topk=self.top_k,
+            renormalize=self.renormalize,
+        )
+        cache = self.offload_cache
+        if self.layer_id == 0:
+            cache.drain_prefill_prefetch()
+        slot_map = cache.ensure_prefill_routed(self.layer_id, topk_ids, self.next_layer_prediction, async_copy=True)
+        self.next_layer_prediction = None
+        return topk_weights, topk_ids, slot_map
+
+    def prefill_finish(self, hidden_states: torch.Tensor, topk_weights: torch.Tensor, topk_ids: torch.Tensor,
+                       slot_map: torch.Tensor):
+        """Second half: wait for the copy, then the expert GEMMs and the demotion, as ``_prefill_routed``."""
+        cache = self.offload_cache
+        cache.wait_prefill_fix()
+        out = self._expert_gemm(
+            cache,
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            views=cache.pool_bank_views(self.layer_id),
+            n=self.num_experts,
+            alphas=None,
+            is_prefill=True,
+            slot_map=slot_map,
+        )
+        cache.demote_prefill_slots()
+        return self._maybe_all_reduce(out)
+
     def decode_select(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
         """First half of a decode call (FREETOKEN_MOE_COPY_OVERLAP): route, map to cache slots and start copying
         the missing experts on a side stream. Work issued before ``decode_finish`` overlaps the copy."""

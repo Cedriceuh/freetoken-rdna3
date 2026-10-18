@@ -37,15 +37,18 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DOCKER="$(command -v docker || echo docker)"
+# where the machine is read from; tests/rdna3/test_serve_sh.py points these at a fake one
+MEMINFO="${SERVE_SH_MEMINFO:-/proc/meminfo}" KFD_NODES="${SERVE_SH_KFD_NODES:-/sys/class/kfd/kfd/topology/nodes}"
 image="freetoken-rdna3:latest" name="freetoken-rdna3" served="qwen3.8-flash-next" host=127.0.0.1 port=1919
 model="" ctx="" gpus="" memory="" dry="" no_mtp="" hybrid="" profile="" check="" extra=() mm_args=(--text-model-only)
 
 list_gpus() {  # "hip_index vram_bytes pci_address gfx_arch simd_count" per GPU, from the kernel's KFD topology (no GPU
   # context opened): HIP numbers the GPU nodes in topology order
   local i=0 n p loc dom mem s b simd gv
-  [ -d /sys/class/kfd/kfd/topology/nodes ] || return 0
-  for n in $(ls -d /sys/class/kfd/kfd/topology/nodes/* | sort -t/ -k8,8n); do
-    p="$n/properties"
+  [ -d "$KFD_NODES" ] || return 0
+  for n in $(ls "$KFD_NODES" | sort -n); do
+    case "$n" in *[!0-9]*) continue ;; esac
+    n="$KFD_NODES/$n" p="$n/properties"
     simd=$(awk '/^simd_count/{print $2}' "$p")
     [ "$simd" = 0 ] && continue
     loc=$(awk '/^location_id/{print $2}' "$p"); dom=$(awk '/^domain/{print $2}' "$p"); mem=0
@@ -107,24 +110,26 @@ ram_core() {
   esac
 }
 ram_locked() {  # $1 GPUs, $2 checkpoint, $3 K/V pool in host RAM in tokens (0: K/V in VRAM), $4 the RAM tier's
-  # tokens (FREETOKEN_HOST_KV_TOKENS, 131072 by default; 0 when the tier is off)
+  # tokens (FREETOKEN_HOST_KV_TOKENS, 262144 by default; 0 when the tier is off). Unrounded: the verdicts judge this
+  # value and ram_pool_max solves for it, so a pool --check offers is judged the same when asked for
   local c
   c="$(ram_core "$1" "$2")"
   [ -n "$c" ] || return 0
-  LC_ALL=C awk -v c="$c" -v g="$1" -v p="$3" -v h="${4:-131072}" 'BEGIN {
+  LC_ALL=C awk -v c="$c" -v g="$1" -v p="$3" -v h="${4:-262144}" 'BEGIN {
     t = (h == 0 ? 0 : (g == 2 ? 9.5 : 5 * h / 131072))
-    printf "%.0f", c + (p > 0 ? p * 14144 * g / 1073741824 : t) }'
+    printf "%.3f", c + (p > 0 ? p * 14144 * g / 1073741824 : t) }'
 }
+gib() { LC_ALL=C awk -v x="$1" 'BEGIN { printf "%.0f", x }'; }  # a ram_locked value as the messages show it
 # What the machine needs beside the server, measured on the 126 GiB reference machine (journey.md, sections 22 and
-# 29): a server grows by a few GiB in use (NVFP4 with 3 x 262k in RAM: 94.4 GiB locked after its start, ~97 GiB hours
+# 30): a server grows by a few GiB in use (NVFP4 with 3 x 262k in RAM: 94.4 GiB locked after its start, ~97 GiB hours
 # later); with ~31 GiB left it served for hours, with ~29 GiB left and 13-15 GiB of other programs beside the desktop
 # the host ran out of memory, and with ~25 GiB left (and benchmark tools) it did too. So: GiB left after the server's
 # use >= RAM_KEEP fits, >= RAM_KEEP_MIN only with little else running, below that does not.
 RAM_GROWTH=3 RAM_KEEP=30 RAM_KEEP_MIN=25
-ram_total() { LC_ALL=C awk '/^MemTotal/ { printf "%.1f", $2 / 1048576 }' /proc/meminfo; }
+ram_total() { LC_ALL=C awk '/^MemTotal/ { printf "%.1f", $2 / 1048576 }' "$MEMINFO"; }
 ram_verdict() {  # $1 GiB locked after start: ok, tight or over
   LC_ALL=C awk -v t="$(ram_total)" -v l="$1" -v g="$RAM_GROWTH" -v k="$RAM_KEEP" -v m="$RAM_KEEP_MIN" \
-    'BEGIN { left = t - l - g; print (left >= k ? "ok" : (left >= m ? "tight" : "over")) }'
+    'BEGIN { left = t - l - g + 0.001; print (left >= k ? "ok" : (left >= m ? "tight" : "over")) }'
 }
 ram_pool_max() {  # $1 GPUs, $2 checkpoint, $3 GiB to leave beside the server: the largest K/V pool in host RAM, in tokens
   local c
@@ -148,7 +153,7 @@ extra_pool() {  # the --kv-reserve-tokens passed after -- (the last one, as ft s
 conv_line() {  # --check: $2 conversations of 262k with the K/V in RAM for checkpoint $1, $3 a condition
   printf '        K/V in RAM: %s, ~%s GiB%s%s: xtx-xt-4x262k%s\n' \
     "$( [ "$2" = 1 ] && echo "1 conversation of 262k" || echo "$2 conversations of 262k at once")" \
-    "$(ram_locked 2 "$1" $(($2 * 262500)))" \
+    "$(gib "$(ram_locked 2 "$1" $(($2 * 262500)))")" \
     "$( case "$1:$2" in exl3-3.05:*|nvfp4:[123]) ;; *) echo " (untested)" ;; esac)" "$3" \
     "$( [ "$2" = 4 ] || echo " -- --kv-reserve-tokens $(($2 * 262500))")"
 }
@@ -194,7 +199,7 @@ next_command() {  # the command --check suggests: the arguments given, without -
 }
 
 check_machine() {  # --check: what this machine has, what is missing, which profile fits; exit status 1 if a start would fail
-  local bad=0 v f n best="" commit head arch total g kind running fits=0 base hk kvhost pool locked
+  local bad=0 v f n best="" prov commit tree head htree dirty arch total g kind running fits=0 base hk kvhost pool locked
   local p c m t ct mt want next_ctx="" next_pool=""
   ok() { printf '  ok    %s\n' "$*"; }
   warn() { printf '  warn  %s\n' "$*"; }
@@ -208,15 +213,22 @@ check_machine() {  # --check: what this machine has, what is missing, which prof
   else
     ok "Docker reachable"
     if "$DOCKER" image inspect "$image" >/dev/null 2>&1; then
-      # the build records the commit it was made from (Dockerfile.rdna3)
-      commit="$("$DOCKER" run --rm --entrypoint cat "$image" /opt/FreeToken-BUILD-PROVENANCE.txt 2>/dev/null |
-                awk '$1 == "commit" { print $2 }' || true)"
+      # the build records the commit it was made from and the tree of the files it copied (Dockerfile.rdna3)
+      prov="$("$DOCKER" run --rm --entrypoint cat "$image" /opt/FreeToken-BUILD-PROVENANCE.txt 2>/dev/null || true)"
+      commit="$(awk '$1 == "commit" { print $2 }' <<< "$prov")" tree="$(awk '$1 == "tree" { print $2 }' <<< "$prov")"
       head="$(git -C "$HERE/.." rev-parse HEAD 2>/dev/null || true)"
+      htree="$(git -C "$HERE/.." rev-parse 'HEAD^{tree}' 2>/dev/null || true)"
+      dirty="$(git -C "$HERE/.." status --porcelain 2>/dev/null | head -1)"
       if [ -z "$commit" ] || [ -z "$head" ]; then ok "image $image"
-      elif [ "$commit" = "$head" ]; then
+      elif [ "$commit" = "$head" ] && { [ -n "$dirty" ] || [ -z "$tree" ] || [ "$tree" = "$htree" ]; }; then
+        # a dirty checkout's files have no tree to compare without writing one into .git: only say they differ
         ok "image $image, built from this checkout's commit (${head:0:7})"
-        [ -z "$(git -C "$HERE/.." status --porcelain 2>/dev/null)" ] ||
-          printf '        the checkout has local changes: an image built before them does not run them\n'
+        [ -z "$dirty" ] || printf '        the checkout has local changes: an image built before them does not run them\n'
+      elif [ "$commit" = "$head" ]; then
+        warn "image $image was built from commit ${head:0:7} with changes not in it: rebuild to run the commit"
+        printf '        docker build -f Dockerfile.rdna3 -t %s .\n' "$image"
+      elif [ -n "$tree" ] && [ "$tree" = "$htree" ] && [ -z "$dirty" ]; then
+        ok "image $image, built from the files of this checkout's commit (${head:0:7})"
       else
         warn "image $image was built from commit ${commit:0:7}, this checkout is at ${head:0:7}: rebuild to run it"
         printf '        docker build -f Dockerfile.rdna3 -t %s .\n' "$image"
@@ -276,8 +288,9 @@ check_machine() {  # --check: what this machine has, what is missing, which prof
   if [ -z "$profile" ] && [ -n "$kind" ] && [ -n "$(ram_core 2 "$kind")" ] && [ "${#fit[@]}" -gt 0 ]; then
     for n in "${fit[@]}"; do
       case "$n" in *-4x262k|*-1m) continue ;; esac
+      [ "$n" = "$best" ] || [ "$(pval "$HERE/profiles/$n.env" TESTED 1)" = 1 ] || continue
       locked="$(ram_locked "$(pval "$HERE/profiles/$n.env" GPUS 1)" "$kind" 0 \
-                "$(pval "$HERE/profiles/$n.env" FREETOKEN_HOST_KV_TOKENS 131072)")"
+                "$(pval "$HERE/profiles/$n.env" FREETOKEN_HOST_KV_TOKENS 262144)")"
       if [ "$(ram_verdict "$locked")" != over ]; then
         [ "$n" = "$best" ] || printf '        for this RAM with %s: %s\n' "$(ckpt_label "$kind")" "$n"
         best="$n"; break
@@ -286,7 +299,7 @@ check_machine() {  # --check: what this machine has, what is missing, which prof
   fi
   base="${best:-xtx-xt}"
   case "$base" in *-4x262k|*-1m) base=xtx-xt ;; esac   # the same cards with the K/V in VRAM
-  g="$(pval "$HERE/profiles/$base.env" GPUS 1)" hk="$(pval "$HERE/profiles/$base.env" FREETOKEN_HOST_KV_TOKENS 131072)"
+  g="$(pval "$HERE/profiles/$base.env" GPUS 1)" hk="$(pval "$HERE/profiles/$base.env" FREETOKEN_HOST_KV_TOKENS 262144)"
   kvhost=""
   profile_fits "$HERE/profiles/xtx-xt-4x262k.env" && kvhost=1
   pool="$(extra_pool)"
@@ -295,11 +308,11 @@ check_machine() {  # --check: what this machine has, what is missing, which prof
     locked="$(ram_locked "$g" "$v" 0 "$hk")" n=""
     [ "$(pval "$HERE/profiles/$base.env" TESTED 1)" = 1 ] || n=" (estimated)"
     case "$(ram_verdict "$locked")" in
-      ok) ok "$(ckpt_label "$v"), $base (K/V in VRAM): locks ~$locked GiB$n"; fits=1 ;;
-      tight) warn "$(ckpt_label "$v"), $base (K/V in VRAM): locks ~$locked GiB$n: fits with little else running"; fits=1 ;;
+      ok) ok "$(ckpt_label "$v"), $base (K/V in VRAM): locks ~$(gib "$locked") GiB$n"; fits=1 ;;
+      tight) warn "$(ckpt_label "$v"), $base (K/V in VRAM): locks ~$(gib "$locked") GiB$n: fits with little else running"; fits=1 ;;
       *) if [ "$best" = "$base" ] && [ -n "$kind" ]; then
-           fail "$(ckpt_label "$v"), $base: locks ~$locked GiB$n, more than this machine can hold"
-         else warn "$(ckpt_label "$v"), $base (K/V in VRAM): locks ~$locked GiB$n, more than this machine can hold"; fi ;;
+           fail "$(ckpt_label "$v"), $base: locks ~$(gib "$locked") GiB$n, more than this machine can hold"
+         else warn "$(ckpt_label "$v"), $base (K/V in VRAM): locks ~$(gib "$locked") GiB$n, more than this machine can hold"; fi ;;
     esac
     [ -n "$kvhost" ] && [ "$g" = 2 ] || continue
     # the K/V in host RAM: as many 262k conversations (262,500 tokens of pool each, at most 4) as leave RAM_KEEP GiB,
@@ -316,7 +329,7 @@ check_machine() {  # --check: what this machine has, what is missing, which prof
     if [ "$mt" -gt 262144 ] && profile_fits "$HERE/profiles/xtx-xt-1m.env"; then
       t="$m"; [ "$m" -gt 262144 ] || t="$mt"
       printf '        or one conversation of up to %s tokens, ~%s GiB%s%s: xtx-xt-1m%s\n' \
-        "$( [ "$t" = 1000000 ] && echo 1M || echo "$((t / 1000))k")" "$(ram_locked 2 "$v" "$t")" \
+        "$( [ "$t" = 1000000 ] && echo 1M || echo "$((t / 1000))k")" "$(gib "$(ram_locked 2 "$v" "$t")")" \
         "$( [ "$v" = exl3-3.05 ] || echo " (untested)")" "$( [ "$t" = "$m" ] || echo ", with little else running")" \
         "$( [ "$t" = 1000000 ] || echo " --ctx $t")"
     fi
@@ -326,20 +339,20 @@ check_machine() {  # --check: what this machine has, what is missing, which prof
       *-4x262k)
         want="${pool:-$(pval "$HERE/profiles/$best.env" KV_TOKENS 1050000)}" locked="$(ram_locked 2 "$v" "$want")"
         case "$(ram_verdict "$locked")" in
-          tight) warn "$best with $(ckpt_label "$v"): its $want-token K/V pool locks ~$locked GiB: fits with little else running" ;;
+          tight) warn "$best with $(ckpt_label "$v"): its $want-token K/V pool locks ~$(gib "$locked") GiB: fits with little else running" ;;
           over)
             if [ "$ct" -ge 1 ]; then
-              warn "$best with $(ckpt_label "$v"): its $want-token K/V pool locks ~$locked GiB, more than this machine can hold"
+              warn "$best with $(ckpt_label "$v"): its $want-token K/V pool locks ~$(gib "$locked") GiB, more than this machine can hold"
               next_pool=$(( (c >= 1 ? c : ct) * 262500 ))
             else fail "$best with $(ckpt_label "$v"): not one 262k conversation fits in RAM"; fi ;;
         esac ;;
       *-1m)
         want="${pool:-${ctx:-$(pval "$HERE/profiles/$best.env" CTX 1000000)}}" locked="$(ram_locked 2 "$v" "$want")"
         case "$(ram_verdict "$locked")" in
-          tight) warn "$best with $(ckpt_label "$v"): a $want-token context locks ~$locked GiB: fits with little else running" ;;
+          tight) warn "$best with $(ckpt_label "$v"): a $want-token context locks ~$(gib "$locked") GiB: fits with little else running" ;;
           over)
             if [ "$mt" -gt 262144 ]; then
-              warn "$best with $(ckpt_label "$v"): a $want-token context locks ~$locked GiB, more than this machine can hold"
+              warn "$best with $(ckpt_label "$v"): a $want-token context locks ~$(gib "$locked") GiB, more than this machine can hold"
               next_ctx=$(( m > 262144 ? m : mt ))
             else fail "$best with $(ckpt_label "$v"): no context past 262k fits in RAM"; fi ;;
         esac ;;
@@ -348,13 +361,16 @@ check_machine() {  # --check: what this machine has, what is missing, which prof
   if [ -z "$kind" ] && [ "$fits" = 0 ]; then
     fail "no checkpoint fits this machine's RAM (docs/rdna3/limits.md#how-much-ram-do-i-need)"
   fi
+  # the running containers with /dev/kfd: a server of any image (an older one after a rebuild) holds the GPUs
   running=""
   "$DOCKER" info >/dev/null 2>&1 &&
-    running="$("$DOCKER" ps --filter "ancestor=$image" --format '{{.Names}}' 2>/dev/null | paste -sd, || true)"
+    running="$("$DOCKER" ps -q 2>/dev/null |
+               xargs -r "$DOCKER" inspect --format '{{.Name}} {{range .HostConfig.Devices}}{{.PathOnHost}} {{end}}' 2>/dev/null |
+               awk '/ \/dev\/kfd / { sub(/^\//, "", $1); print $1 }' | paste -sd, || true)"
   if [ -n "$running" ]; then
-    warn "a container of $image is running ($running): a server holds the GPUs and its RAM until it stops"
+    warn "a container with the GPUs is running ($running): a server holds the GPUs and its RAM until it stops"
   else
-    n="$(awk '/^MemAvailable/ { printf "%d", $2 / 1048576 }' /proc/meminfo)"
+    n="$(awk '/^MemAvailable/ { printf "%d", $2 / 1048576 }' "$MEMINFO")"
     [ "$(LC_ALL=C awk -v t="$total" -v a="$n" 'BEGIN { printf "%d", t - a }')" -le 15 ] ||
       warn "only $n GiB available now: other programs hold $(LC_ALL=C awk -v t="$total" -v a="$n" 'BEGIN { printf "%d", t - a }') GiB (the desktop and system took ~15 on the reference machine)"
   fi
@@ -479,7 +495,7 @@ while IFS= read -r line || [ -n "$line" ]; do
     *) envs+=(-e "$key=$val") ;;
   esac
 done < "$pfile"
-ctx="${ctx:-$p_ctx}" memory="${memory:-$p_memory}"
+user_ctx="$ctx" ctx="${ctx:-$p_ctx}" memory="${memory:-$p_memory}"
 # the K/V pool the requests share: the profile's KV_TOKENS, never less than one request's context
 kv="${p_kv:-$ctx}"
 [ "$kv" -ge "$ctx" ] || kv="$ctx"
@@ -513,7 +529,7 @@ if [ -n "$hybrid" ]; then
 fi
 
 # the RAM this server will lock (ram_locked) against what the machine can spare: a warning, `--check` says what fits
-kind="$(ckpt_kind "$model")" kvpool=0 tier_tokens=131072
+kind="$(ckpt_kind "$model")" kvpool=0 tier_tokens=262144
 for e in "${envs[@]}"; do
   case "$e" in
     FREETOKEN_QSA_KV_HOST=1) kvpool="$(extra_pool)"; kvpool="${kvpool:-$kv}" ;;
@@ -523,11 +539,16 @@ for e in "${envs[@]}"; do
 done
 locked="$(ram_locked "$p_gpus" "$kind" "$kvpool" "$tier_tokens")"
 if [ -n "$locked" ]; then
+  chk=(rdna3/serve.sh --check --model "$model")  # the check of this very server: its --ctx and K/V pool
+  [ -z "$user_ctx" ] || chk+=(--ctx "$user_ctx")
+  chk+=("$profile")
+  [ -z "$(extra_pool)" ] || chk+=(-- --kv-reserve-tokens "$(extra_pool)")
+  chk="$(printf '%q ' "${chk[@]}")" chk="${chk% }"
   case "$(ram_verdict "$locked")" in
-    over) echo "warning: this server will lock ~$locked GiB of RAM, more than this $(ram_total) GiB machine can hold beside" \
-               "the system: it may run out of memory; 'rdna3/serve.sh --check --model $model $profile' shows what fits" >&2 ;;
-    tight) echo "note: this server will lock ~$locked GiB of RAM: on this $(ram_total) GiB machine that fits with little" \
-                "else running ('rdna3/serve.sh --check --model $model $profile')" >&2 ;;
+    over) echo "warning: this server will lock ~$(gib "$locked") GiB of RAM, more than this $(ram_total) GiB machine can hold" \
+               "beside the system: it may run out of memory; '$chk' shows what fits" >&2 ;;
+    tight) echo "note: this server will lock ~$(gib "$locked") GiB of RAM: on this $(ram_total) GiB machine that fits with" \
+                "little else running ('$chk')" >&2 ;;
   esac
 fi
 
@@ -550,12 +571,15 @@ if [ -z "$gpus" ]; then
   echo "GPUs: $(printf '%s\n' "${pick[@]}" | LC_ALL=C awk '{printf "%sHIP %s (PCI %s, %.0f GiB)", (NR > 1 ? ", " : ""), $1, $3, $2 / 1073741824}')" >&2
 fi
 mounts=(-v "$model:/models/m:ro")
-if [ -z "$dry" ] && ! security="$("$DOCKER" info --format '{{json .SecurityOptions}}' 2>/dev/null)"; then
+if [ -z "$dry" ] && ! "$DOCKER" info >/dev/null 2>&1; then
   echo "cannot reach the Docker daemon: is it running, and is your user in the 'docker' group (log in again after adding it)?" >&2
   exit 2
 fi
+# rootless or not (a Docker-compatible CLI without SecurityOptions counts as not), for --dry-run too
+security="$("$DOCKER" info --format '{{json .SecurityOptions}}' 2>/dev/null || true)"
+have_image=""
 if image_id="$("$DOCKER" image inspect "$image" --format '{{.Id}}' 2>/dev/null)"; then
-  short="${image_id#sha256:}" short="${short:0:12}"
+  short="${image_id#sha256:}" short="${short:0:12}" have_image=1
 elif [ -n "$dry" ]; then
   image_id="$image" short="IMAGE-ID"
   echo "note: no image $image yet; once built, its id replaces the tag and names the kernel-cache volume" >&2
@@ -572,8 +596,9 @@ mounts+=(-v "freetoken-rdna3-kcache-$short:/root/.cache/freetoken-rdna3")
 envs+=(-e TVM_FFI_CACHE_DIR=/root/.cache/freetoken-rdna3/tvm-ffi)
 
 # an image built before --default-temperature (an older one picked with --image) would refuse it: passed when known
+# (no image yet, under --dry-run: docker would try to pull the tag)
 temp_args=(--default-temperature 0.6)
-if ! "$DOCKER" run --rm --entrypoint grep "$image_id" -q -e --default-temperature \
+if [ -n "$have_image" ] && ! "$DOCKER" run --rm --entrypoint grep "$image_id" -q -e --default-temperature \
     /opt/FreeToken/python/freetoken/server/args.py >/dev/null 2>&1; then
   temp_args=()
   echo "note: image $image predates --default-temperature: requests without a temperature get the checkpoint's" >&2

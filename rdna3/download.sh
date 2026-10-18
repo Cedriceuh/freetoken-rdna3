@@ -59,4 +59,4 @@ args=(download "$repo" --local-dir /out)
 envs=(-e HF_HOME=/out/.cache/huggingface)
 [ -z "${HF_TOKEN:-}" ] || envs+=(-e HF_TOKEN)
 "$DOCKER" run --rm --user "$(id -u):$(id -g)" "${envs[@]}" -v "$dir:/out" --entrypoint hf "$image" "${args[@]}" "${extra[@]}"
-echo "done: rdna3/serve.sh --check --model $dir" >&2
+printf 'done: rdna3/serve.sh --check --model %q\n' "$dir" >&2  # pasteable with spaces in DIR

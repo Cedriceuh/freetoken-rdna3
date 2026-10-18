@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Short agent turns, the same bits: the GatedDeltaNet prefill no longer reads the longest request back from the GPU in
+  every GDN layer (36 host syncs a forward), NVFP4 prefill blocks of up to 1536 tokens take 4-warp expert tiles
+  (`FREETOKEN_NVFP4_PREFILL_TUNED`, set in the profiles) and EXL3 blocks of up to 512 tokens 16-row tiles. On
+  `xtx-xt-4x262k` with the reference machine's launcher settings, time to the first token, the previous build -> this
+  one: NVFP4 (3 x 262k pool) 200-250-token turns of an agent conversation at 34k 0.448 -> 0.398-0.399 s, one-word turns
+  at 26k 0.394 -> 0.227 s; EXL3 3.05 bpw 0.328 -> 0.287 s and 0.230 -> 0.218 s. The same answers (15 greedy prompts, the
+  agent conversation, the one-word turns); decode, four requests and a 133k-token cold read unchanged.
+- NVFP4 short turns, the same bits: the routed experts a short prefill's prediction missed are copied on the prefill
+  copy stream while the shared expert runs (`FREETOKEN_PREFILL_COPY_OVERLAP`, default `auto`: NVFP4 experts decoded on
+  the GPU, not `--hybrid`). On `xtx-xt-4x262k` with the launcher's settings: one-word turns 0.239 -> 0.225-0.228 s,
+  agent turns 0.407 -> 0.398-0.399 s, the decode unchanged. Off with EXL3, where the turns gained 3-4 % but the decode
+  after them ran 1-2 % slower.
 - A rank killed by the host's OOM killer no longer leaves a half server: the API server exits with code 1 even while
   streams are open (it used to wait for them forever, the other rank holding its GPU; with a rank 0 killed under a
   stream on `xtx-xt-4x262k`, the container exited 37 s later, both cards free, and the service restarted), and

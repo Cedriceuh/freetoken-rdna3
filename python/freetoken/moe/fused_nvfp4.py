@@ -278,13 +278,29 @@ NVFP4_PREFILL_TUNED = os.environ.get("FREETOKEN_NVFP4_PREFILL_TUNED", "0") == "1
 _TUNED_MID = dict(BLOCK_SIZE_M=64, BLOCK_SIZE_N=64, BLOCK_SIZE_KB=32, GROUP_SIZE_M=8, num_warps=8, num_stages=1)
 _TUNED_BIG_GATE_UP = dict(BLOCK_SIZE_M=128, BLOCK_SIZE_N=128, BLOCK_SIZE_KB=32, GROUP_SIZE_M=8, num_warps=8,
                           num_stages=2)
+# Short prefills (agent turns: ~5-25 rows an expert) run 4-warp tiles: per GEMM, bit-identical to the tiles they
+# replace, 7900 XTX / XT, random routing over 512 experts: 32-64 tokens 5-13x faster than the shipped 8-warp 4-stage
+# tile, 128-512 tokens 1.7-2.5x and 768-1536 1.4-1.8x faster than _TUNED_MID; past ~2048 tokens within 9 %, kept.
+_TUNED_TINY_GATE_UP = dict(BLOCK_SIZE_M=16, BLOCK_SIZE_N=64, BLOCK_SIZE_KB=32, GROUP_SIZE_M=1, num_warps=4,
+                           num_stages=2)
+_TUNED_TINY_DOWN = dict(BLOCK_SIZE_M=16, BLOCK_SIZE_N=128, BLOCK_SIZE_KB=32, GROUP_SIZE_M=1, num_warps=4, num_stages=1)
+_TUNED_SMALL = dict(BLOCK_SIZE_M=16, BLOCK_SIZE_N=64, BLOCK_SIZE_KB=32, GROUP_SIZE_M=1, num_warps=4, num_stages=1)
+_TUNED_SHORT_GATE_UP = dict(BLOCK_SIZE_M=32, BLOCK_SIZE_N=64, BLOCK_SIZE_KB=32, GROUP_SIZE_M=8, num_warps=4,
+                            num_stages=2)
+_TUNED_SHORT_DOWN = dict(BLOCK_SIZE_M=32, BLOCK_SIZE_N=64, BLOCK_SIZE_KB=32, GROUP_SIZE_M=8, num_warps=4, num_stages=1)
 
 
 def _prefill_configs(M: int) -> tuple[Dict[str, int], Dict[str, int]]:
     """(gate_up config, down config) for an M-token prefill block."""
-    if not NVFP4_PREFILL_TUNED or M <= 64:
+    if not NVFP4_PREFILL_TUNED:
         cfg = _prefill_config(M)
         return cfg, cfg
+    if M <= 64:
+        return _TUNED_TINY_GATE_UP, _TUNED_TINY_DOWN
+    if M <= 640:
+        return _TUNED_SMALL, _TUNED_SMALL
+    if M <= 1536:
+        return _TUNED_SHORT_GATE_UP, _TUNED_SHORT_DOWN
     if M >= 3072:
         return _TUNED_BIG_GATE_UP, _TUNED_MID
     return _TUNED_MID, _TUNED_MID

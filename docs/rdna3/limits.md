@@ -11,7 +11,7 @@ GiB as Linux reports it, a desktop on):
 - With ~31 GiB left beside it after the start (NVFP4, three conversations of 262k in RAM: 94.4 GiB locked), it served
   751 requests with 16 GB still free; hours later it held ~97 GiB.
 - With ~29 GiB left and 13-15 GiB of other programs beside the desktop, the host ran out of memory
-  ([journey.md](journey.md#29-a-rank-killed-by-the-hosts-oom-killer-2026-10-17)); with ~25 GiB left (four
+  ([journey.md](journey.md#30-a-rank-killed-by-the-hosts-oom-killer-2026-10-17)); with ~25 GiB left (four
   conversations, 100.3 GiB locked) and benchmark tools running beside it, too.
 
 So between 25 and 30 GiB left, a setup only fits with little else running; below 25 it does not. A machine without a
@@ -42,13 +42,15 @@ The untested two-card profiles (`xtx-xtx`, `xt-xt`) should lock about what `xtx-
 
 ## Can it run with 64 GB of RAM?
 
-Not with the NVFP4 checkpoint: its experts alone need ~63 GiB of RAM, and the engine has no mode that reads experts
-from disk. An **EXL3 checkpoint at 3 bits per weight** ([how-it-works.md](how-it-works.md#exl3-checkpoints))
-needs 42.6 GiB for its experts (63.3 in NVFP4; 43.5 and ~64.6 with the MTP head's experts, which an NVFP4 checkpoint stores in bf16, 4.7 GiB,
-and the engine quantizes to NVFP4 at load): on `xtx-xt`, with the RAM
-tier off and the experts loaded one file at a time, the server ran under a 56 GiB container limit at 52.3 GiB used
-(`FREETOKEN_HOST_KV=0` in the profile file, then `rdna3/serve.sh xtx-xt --model DIR --memory 56g -- --expert-load
-serial`; the parallel loader was killed under a 52 GiB limit). A real 64 GB machine is untested. On the agentic benchmark the 3.05 bpw checkpoint fixed 13 of 29 bugs (one run; NVFP4: 12 and 18 in two runs).
+Not with the NVFP4 checkpoint: its experts alone need ~63 GiB of RAM, and the engine has no mode that reads experts from
+disk. An **EXL3 checkpoint at 3 bits per weight** ([how-it-works.md](how-it-works.md#exl3-checkpoints)) needs 42.6 GiB
+for its experts (63.3 in NVFP4; 43.5 and ~64.6 with the MTP head's experts, which an NVFP4 checkpoint stores in bf16,
+4.7 GiB, and the engine quantizes to NVFP4 at load): on `xtx-xt`, with the RAM tier off and the experts loaded one file
+at a time, the server ran under a 56 GiB container limit at 52.3 GiB used (`FREETOKEN_HOST_KV=0` in the profile file,
+then `rdna3/serve.sh xtx-xt --model DIR --memory 56g -- --expert-load serial`; the parallel loader was killed under a 52
+GiB limit). A real 64 GB machine is untested. `serve.sh --check` keeps 25-30 GiB beside a server for a desktop and its
+programs, so it says no on 64 GB: this path is for a machine that runs little else, and `serve.sh` then starts with a
+warning. On the agentic benchmark the 3.05 bpw checkpoint fixed 13 of 29 bugs (one run; NVFP4: 12 and 18 in two runs).
 
 ## How much VRAM?
 

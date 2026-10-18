@@ -183,10 +183,12 @@ def test_prefill_split_copy_matches_sources():
 
 
 @cuda
-def test_predicted_prefetch_then_fixup_keeps_every_routed_expert():
+@pytest.mark.parametrize("async_copy", [False, True])
+def test_predicted_prefetch_then_fixup_keeps_every_routed_expert(async_copy):
     """A layer's routed experts are resident with their bytes after the predicted prefetch (copy stream) and the
-    fixup copy of what the prediction missed; the prefetch never takes a slot of the layer still computing; the
-    prefill's own slots end demoted, and the maps stay each other's inverse."""
+    fixup copy of what the prediction missed (in stream, or on the copy stream with ``async_copy`` until
+    ``wait_prefill_fix``: FREETOKEN_PREFILL_COPY_OVERLAP); the prefetch never takes a slot of the layer still
+    computing; the prefill's own slots end demoted, and the maps stay each other's inverse."""
     from freetoken.moe import offload_cache as oc
 
     dev = torch.device("cuda")
@@ -225,7 +227,9 @@ def test_predicted_prefetch_then_fixup_keeps_every_routed_expert():
 
     routed0 = [0, 1, 2, 3, 5, 8, 13]
     predicted = torch.tensor([[1, 2, 4, 6, 7], [9, 10, 11, 12, 14]], dtype=torch.int64, device=dev)
-    row0 = cache.ensure_prefill_routed(0, ids(routed0), (1, predicted))
+    row0 = cache.ensure_prefill_routed(0, ids(routed0), (1, predicted), async_copy=async_copy)
+    if async_copy:
+        cache.wait_prefill_fix()  # the checks below read on the current stream
     slots0 = {int(row0[e]) for e in routed0}
     pf_slots = {int(s) for s in cache._prefill_prefetch[1][1] if int(s) >= 0}
     assert len(pf_slots) == 10  # none of layer 1's experts was resident
@@ -233,9 +237,12 @@ def test_predicted_prefetch_then_fixup_keeps_every_routed_expert():
     check(0, routed0)
     cache.demote_prefill_slots()
     routed1 = [1, 2, 3, 4, 7, 15]  # 3 and 15 were not predicted
-    cache.ensure_prefill_routed(1, ids(routed1))
+    cache.ensure_prefill_routed(1, ids(routed1), async_copy=async_copy)
+    if async_copy:
+        cache.wait_prefill_fix()
     assert int(cache.num_indices) == 2
-    torch.cuda.synchronize()
+    if not async_copy:
+        torch.cuda.synchronize()
     check(1, routed1)
     cache.demote_prefill_slots()
     assert all(int(cache.usage[int(cache.slot_for_id[1, e])]) == 0 for e in routed1)  # all brought in by this prefill

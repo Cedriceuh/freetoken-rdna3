@@ -1119,7 +1119,8 @@ class OffloadMoeCache:
                 and not self.is_cpu_layer(layer_id) and layer_id not in self._unpinned_layers)
 
     def ensure_prefill_routed(self, layer_id: int, topk_ids: torch.Tensor,
-                              predicted: tuple[int, torch.Tensor] | None = None) -> torch.Tensor:
+                              predicted: tuple[int, torch.Tensor] | None = None,
+                              async_copy: bool = False) -> torch.Tensor:
         """Make this layer's routed experts resident for a prefill chunk and return ``slot_for_id[layer_id]`` (expert
         id -> slot) for the grouped GEMMs (FREETOKEN_PREFILL_CACHED_MAX).
 
@@ -1146,7 +1147,15 @@ class OffloadMoeCache:
         prefill_routed_plan(self, layer_id, topk_ids, nxt, pred_ids, slot_of_fix, slot_of_pf)
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
-        self.copy_missing()
+        if async_copy:  # FREETOKEN_PREFILL_COPY_OVERLAP: the caller runs the shared expert, then wait_prefill_fix()
+            cur = torch.cuda.current_stream(self.device)
+            self.prefill_copy_stream.wait_stream(cur)
+            with torch.cuda.stream(self.prefill_copy_stream):
+                self.copy_missing()
+            self._prefill_fix_event = torch.cuda.Event()
+            self._prefill_fix_event.record(self.prefill_copy_stream)
+        else:
+            self.copy_missing()
         loaded.append(slot_of_fix)
         self._prefill_loaded = loaded
         if nxt >= 0:
@@ -1354,6 +1363,13 @@ class OffloadMoeCache:
         return (self.decode_target == "gpu" and self._copy_fused_ok and not self.is_cpu_layer(layer_id)
                 and layer_id not in self._unpinned_layers)
 
+    def can_copy_async_prefill(self, layer_id: int) -> bool:
+        """Whether a short prefill's fix-up copy may run on the prefill copy stream (fused copy, GPU, pinned layer).
+        That stream and not a third one: with ``_copy_side_stream`` the decode after a few dozen such prefills ran
+        about a third slower at four requests (two cards; cause not found), on the copy stream it did not."""
+        return (self.prefill_copy_stream is not None and self._copy_fused_ok and not self.is_cpu_layer(layer_id)
+                and layer_id not in self._unpinned_layers)
+
     def copy_missing_async(self) -> None:
         """``copy_missing`` on a side stream that forks from the current one (FREETOKEN_MOE_COPY_OVERLAP): the
         caller issues independent work (the shared expert) and then ``wait_copy`` before the expert GEMM reads
@@ -1364,6 +1380,11 @@ class OffloadMoeCache:
         self._copy_side_stream.wait_stream(cur)
         with torch.cuda.stream(self._copy_side_stream):
             self.copy_missing()
+
+    def wait_prefill_fix(self) -> None:
+        """The current stream waits for ``ensure_prefill_routed(async_copy=True)``'s copy (not for the prefetch queued
+        after it on the same stream)."""
+        torch.cuda.current_stream(self.device).wait_event(self._prefill_fix_event)
 
     def wait_copy(self) -> None:
         torch.cuda.current_stream(self.device).wait_stream(self._copy_side_stream)

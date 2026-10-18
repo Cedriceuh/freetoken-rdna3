@@ -175,14 +175,17 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
                                    cu_seqlens, cache_indices, has_initial_state)
         return out.transpose(0, 1)  # [total, conv_dim]
 
-    def _conv_prefill_rows(self, conv_in, pool, cu_seqlens, cache_indices, has_initial_state):
+    def _conv_prefill_rows(self, conv_in, pool, cu_seqlens, cache_indices, has_initial_state, seq_bounds=None):
         """``_conv_prefill`` split into q / k / v, each [total, dim] contiguous (FREETOKEN_GDN_CONV_ROWS)."""
         from freetoken.kernel.triton.causal_conv1d_triton import causal_conv1d_varlen_rows
 
         li = pool.local_index(self.layer_id)
         weight, states = self._conv_weight(), pool.conv_states[li]
         total = conv_in.shape[0]
-        max_len = int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())
+        # the longest request from the host bounds (cu_seqlens is their device copy): a .item() here was a host sync in
+        # every GDN layer of a prefill, 36 a forward
+        max_len = (max(b - a for a, b in seq_bounds) if seq_bounds
+                   else int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item()))
         outs, start = [], 0
         for dim in (self.key_dim, self.key_dim, self.value_dim):
             out = torch.empty((total, dim), dtype=conv_in.dtype, device=conv_in.device)
@@ -287,7 +290,7 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
             # channel-major path, which keeps int64 feature offsets (a forward of ~175k+ tokens; chunks are 16k)
             if _CONV_ROWS and not _sgl_conv() and (total + 1) * conv_in.stride(0) < 2**31:
                 qf, kf, vf = self._conv_prefill_rows(
-                    conv_in, pool, fla.cu_seqlens, fla.cache_indices, fla.has_initial_state)
+                    conv_in, pool, fla.cu_seqlens, fla.cache_indices, fla.has_initial_state, fla.seq_bounds)
             else:
                 mixed = self._conv_prefill(
                     conv_in, pool, fla.cu_seqlens, fla.cache_indices, fla.has_initial_state)

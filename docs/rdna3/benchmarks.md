@@ -25,8 +25,10 @@ give orders of magnitude; a section that mixes the two says so.
   The first step is a cold ~8.8k-token read; each later step adds a 6-52k-token block the cache has not seen, like a
   large tool result (ten steps to 260k on two cards, seven to 124k on one). At each step: **TG** = greedy decode over
   256 tokens, **PP** = speed of reading that block, **agent turn** = time to the first token of a following ~1k-token
-  turn. Median of two passes, each with its own text. With the MTP head, TG follows how many of its guesses the text
-  lets it keep (1.6-3.5 tokens per step): the spread between steps is the text, not noise.
+  turn (an earlier build for this column: since the short-prefill changes, 200-250-token turns take 11-13 % less time to
+  their first token on another workload, [journey.md](journey.md#31-short-agent-turns-2026-10-17-and-18)). Median of two
+  passes, each with its own text. With the MTP head, TG follows how many of its guesses the text lets it keep (1.6-3.5
+  tokens per step): the spread between steps is the text, not noise.
 
 ## Summary
 

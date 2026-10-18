@@ -127,7 +127,11 @@ the engine only when nothing else is left (the container's own `--memory` limit,
 API server stops the surviving ranks (SIGKILL after 5 s) and exits with code 1, streams still open included, so a
 service with `Restart=on-failure` starts it again: with a rank 0 killed under a stream on `xtx-xt-4x262k`, the container
 had exited 37 s later and both cards were free. Close what holds the RAM (`ps -eo rss,comm --sort=-rss | head`) or lower
-the K/V kept in RAM (`--kv-reserve-tokens`).
+the K/V kept in RAM (`--kv-reserve-tokens`). The kernel's report (`journalctl -k`, the table after "Tasks state") lists
+every process at that moment: on the reference machine each out-of-memory event came right after 63-66 Node.js
+workers started at once (12-17 GiB, within seconds, so a memory monitor never shows them), one of them under
+`npm exec jest`, whose default pool is one worker per core but one; cap such pools (Jest: `maxWorkers`) on a machine
+that serves, or run the tool that starts them under a memory limit (`systemd-run --user --scope -p MemoryMax=16G ...`).
 
 ## Less VRAM, or a start that never ends, after a server was killed while starting
 

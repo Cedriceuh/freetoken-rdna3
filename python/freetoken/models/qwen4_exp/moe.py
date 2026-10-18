@@ -20,6 +20,12 @@ if TYPE_CHECKING:
 # FREETOKEN_MOE_COPY_OVERLAP=1: in decode, the missing experts are copied on a side stream while the shared expert and
 # its gate run (offload backend, GPU decode); same kernels and inputs, so the same bits
 _COPY_OVERLAP = os.environ.get("FREETOKEN_MOE_COPY_OVERLAP", "0") == "1"
+# FREETOKEN_PREFILL_COPY_OVERLAP: a short prefill that reads its experts from the slot cache copies the missing ones on
+# the prefill copy stream while the shared expert runs; the same copies and GEMMs, so the same bits. "auto" (default):
+# NVFP4 experts decoded on the GPU (offload) only, where one-word agent turns took 5 % less and agent turns 2 % less
+# with the decode unchanged; with EXL3 the turns took 3-4 % less but the decode after them ran 1-2 % slower (cause not
+# found); --hybrid was not measured. "1" / "0": always / never
+_PREFILL_COPY_OVERLAP = os.environ.get("FREETOKEN_PREFILL_COPY_OVERLAP", "auto")
 # FREETOKEN_FUSED_MOE_EPILOGUE (default 1): the routed sum, the shared-expert gate and the mul-add in one kernel
 # (decode and prefill); the same arithmetic in the same order, so the same bits, two launches fewer per layer
 _FUSED_EPILOGUE = os.environ.get("FREETOKEN_FUSED_MOE_EPILOGUE", "1") == "1"
@@ -31,6 +37,12 @@ _FUSED_EPILOGUE = os.environ.get("FREETOKEN_FUSED_MOE_EPILOGUE", "1") == "1"
 _PREDICT = os.environ.get("FREETOKEN_PREFILL_PREDICT", "1") == "1"
 _PREDICT_EXTRA = int(os.environ.get("FREETOKEN_PREFILL_PREDICT_EXTRA", "0"))
 _BLOCKS: dict = {}  # MoE layer id -> block of the main model (the MTP head's is left out)
+
+
+def _prefill_copy_overlap(cache) -> bool:
+    """FREETOKEN_PREFILL_COPY_OVERLAP for this model's expert cache."""
+    return _PREFILL_COPY_OVERLAP == "1" or (_PREFILL_COPY_OVERLAP == "auto" and cache.quant_format == "nvfp4"
+                                            and cache.decode_target == "gpu")
 
 
 class Qwen4ExpMoE(Qwen3_5MoE):
@@ -79,11 +91,17 @@ class Qwen4ExpMoE(Qwen3_5MoE):
                  and getattr(self.experts, "can_overlap_copy", lambda: False)())
         if split:
             topk_weights, topk_ids = self.experts.decode_select(hidden_states, router_logits)
+        split_pf = (cached is not None and get_global_ctx().batch.is_prefill and cached(num_tokens)
+                    and _prefill_copy_overlap(self.experts.offload_cache)
+                    and self.experts.offload_cache.can_copy_async_prefill(self.experts.layer_id))
+        if split_pf:
+            routing = self.experts.prefill_select(hidden_states, router_logits)
         shared = self.shared_expert.forward(hidden_states)
         if _FUSED_EPILOGUE and not split and self._epilogue_fusable():
             fused_nvfp4.PER_EXPERT_OUTPUT[0] = True
             try:
-                routed = self.experts.forward(hidden_states=hidden_states, router_logits=router_logits)
+                routed = (self.experts.prefill_finish(hidden_states, *routing) if split_pf
+                          else self.experts.forward(hidden_states=hidden_states, router_logits=router_logits))
             finally:
                 fused_nvfp4.PER_EXPERT_OUTPUT[0] = False
             routed = routed if routed.dim() == 3 else routed.view(num_tokens, 1, hidden_dim)
@@ -92,6 +110,8 @@ class Qwen4ExpMoE(Qwen3_5MoE):
             gate = shared_gate_sigmoid(hidden_states, self.shared_expert_gate.weight.view(-1))
             if split:
                 routed = self.experts.decode_finish(hidden_states, topk_weights, topk_ids)
+            elif split_pf:
+                routed = self.experts.prefill_finish(hidden_states, *routing)
             else:
                 routed = self.experts.forward(hidden_states=hidden_states, router_logits=router_logits)
             out = shared_gate_mul_add(routed, shared, gate)

@@ -244,6 +244,8 @@ Line counts here are on top of the lines listed in the sections above.
 | `python/freetoken/tokenizer/prefix_cache.py`, `tokenizer/tokenize.py`, `tests/tokenizer/test_prefix_cache.py` | 167/0, 11/5, 133/0 | `PromptPrefixCache`: a templated prompt reuses an earlier prompt's tokens up to the last `<\|im_start\|>` of their shared prefix and encodes the rest, the same tokens (`FREETOKEN_TOKENIZE_PREFIX_CACHE`) |
 | `tests/README.md` | 1/0 | `FREETOKEN_TOKENIZE_CACHE_MODEL`, the checkpoint the prefix-cache test tokenizes with |
 | `tests/moe/test_prefill_cached.py` | 273/0 | prefill from slots bit-identical to the full-layer buffers (EXL3, NVFP4), the LRU claims and demotion, the predicted prefetch then the fix-up copy, the split prefetch by DMA or shader copy (GPU) |
+| `python/freetoken/models/qwen4_exp/gdn.py`, `moe/fused_nvfp4.py`, `moe/fused_exl3.py`, `tests/models/qwen4_exp/test_gdn_host_bounds.py`, `tests/moe/test_nvfp4_prefill_tiles.py`, `tests/moe/test_short_prefill_tiles.py` | 6/3, 17/1, 7/3, new, new, new | short prefills (agent turns): the GDN prefill conv takes its longest request from the host bounds (a host sync in every GDN layer before); NVFP4 prefills of up to 1536 tokens take 4-warp tiles (`FREETOKEN_NVFP4_PREFILL_TUNED`), EXL3 ones of up to 512 tokens 16-row tiles (the same K order, the same bits) |
+| `python/freetoken/layers/moe.py`, `moe/offload_cache.py`, `models/qwen4_exp/moe.py`, `tests/moe/test_prefill_cached.py` | 36/0, 23/2, 21/1, 13/6 | a short prefill's fix-up copy (the routed experts the prediction missed) on the prefill copy stream while the shared expert runs (`FREETOKEN_PREFILL_COPY_OVERLAP`, the same copies and GEMMs); the test runs the predicted prefetch then the fix-up copy both ways |
 
 ## Tooling and documentation
 
@@ -252,6 +254,7 @@ Line counts here are on top of the lines listed in the sections above.
 | `python/freetoken/engine/ftprof.py` (106/0) | env-gated decode profiling (`FT_STATS_EVERY`, `FT_PROF_*`) |
 | `python/freetoken/server/args.py` (3/1) | `--cuda-graph-max-bs` help |
 | `Dockerfile.rdna3`, `.dockerignore` | the ROCm image |
-| `rdna3/` | profiles (the MTP head on), `serve.sh` (`--no-mtp`; `--hybrid`; a lower `--memory-ratio` for EXL3 on two cards), GPU checks, micro-benchmarks and `bench/depth_sweep.py`, maintenance tools |
+| `rdna3/` | profiles (the MTP head on), `serve.sh` (`--no-mtp`; `--hybrid`; a lower `--memory-ratio` for EXL3 on two cards; `--check` and the RAM warning at start; `--oom-score-adj -999`), `download.sh` (the checkpoints), GPU checks, micro-benchmarks and `bench/depth_sweep.py`, maintenance tools |
+| `tests/rdna3/test_serve_sh.py` (new) | `serve.sh` on a fake machine (topology, RAM, docker stub): the RAM arithmetic and the commands it suggests or prints |
 | `README.md`, `NOTICE`, `CHANGELOG.md`, `llms.txt`, `llms-full.txt`, `AGENTS.md`, `CONTRIBUTING.md`, `SECURITY.md`, `docs/rdna3/` | this repository's documentation (the banner rendered from `docs/rdna3/assets/social-preview.html`); upstream's README moved to `docs/FREETOKEN_UPSTREAM_README.md` |
 | `.github/` | upstream's release workflows and issue templates replaced by this repository's |

@@ -121,10 +121,11 @@ profile's maximum context with blocks the server has never seen, like large tool
 | `xtx`, 9k to 124k tokens | 1520-1670 tok/s; 1.5-1.6 s | 1700-1820 tok/s; 1.0-1.2 s | 1640-1820 tok/s; 1.3-1.5 s |
 | `xt`, 9k to 124k tokens | 1350-1480 tok/s; 1.6-1.8 s | 1500-1600 tok/s; 1.2-1.3 s | 1450-1620 tok/s; 1.5-1.6 s |
 
-An "agent turn" is ~1k new tokens (a tool result) added to a conversation the server already holds. Requests running
-at once share the GPUs: on `xtx-xt-4x262k`, four agents at 257-260k tokens decode at 29.6-31.6 tok/s each, one alone at
-95.1 (EXL3 3.05 bpw, one pass on an earlier build than the tables above).
-All the numbers: [benchmarks](docs/rdna3/benchmarks.md).
+An "agent turn" is ~1k new tokens (a tool result) added to a conversation the server already holds (an earlier build:
+since the short-prefill changes, 200-250-token turns take 11-13 % less time to their first token on another workload).
+Requests running at once share the GPUs: on `xtx-xt-4x262k`, four agents at 257-260k tokens decode at 29.6-31.6 tok/s
+each, one alone at 95.1 (EXL3 3.05 bpw, one pass on an earlier build than the tables above). All the numbers:
+[benchmarks](docs/rdna3/benchmarks.md).
 
 ## Documentation
 

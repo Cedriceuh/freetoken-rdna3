@@ -22,6 +22,9 @@ from freetoken.moe.fused import blocks_to_slots, moe_align_block_size
 # the memory. With 32-row tiles, a 4096-token block still feeds every expert ~80 routes on average.
 EXL3_PREFILL_BLOCK = int(os.environ.get("FREETOKEN_EXL3_PREFILL_BLOCK", "4096"))
 _PREFILL_BLOCK_M = 32
+# short prefills (agent turns: ~5-10 routes an expert) take 16-row tiles: the same K order, so the same bits; the whole
+# MoE block 11-19 % faster at 32-512 tokens on both cards, slower from ~1024 (I = 384 / 256, random routing)
+_SHORT_PREFILL_BLOCK_M, _SHORT_PREFILL_TOKENS = 16, 512
 # FREETOKEN_HYBRID_SKIP_CPU_ROUTES=0: under --moe-strategy hybrid the decode GEMVs still decode the routes the CPU
 # computes (on slot 0, weight 0) instead of writing zeros for them without a read
 SKIP_CPU_ROUTES = os.environ.get("FREETOKEN_HYBRID_SKIP_CPU_ROUTES", "1") != "0"
@@ -62,18 +65,19 @@ def fused_experts_exl3(
     out = torch.empty_like(hidden_states)
     if is_prefill:
         assert num_experts is not None, "the prefill path sorts routes by expert: num_experts is required"
-        sorted_ids, expert_ids, ntpp = moe_align_block_size(topk_ids, _PREFILL_BLOCK_M, num_experts)
+        block_m = _SHORT_PREFILL_BLOCK_M if M <= _SHORT_PREFILL_TOKENS else _PREFILL_BLOCK_M
+        sorted_ids, expert_ids, ntpp = moe_align_block_size(topk_ids, block_m, num_experts)
         if slot_map is not None:
             slots = slot_map[slots.long()]
             expert_ids = blocks_to_slots(expert_ids, slot_map)
         a1 = exl3_rotate_in(hidden_states, gate_up_suh, slots, top_k, dtype=torch.float16)
-        c1 = exl3_moe_gemm(a1, gate_up, sorted_ids, expert_ids, ntpp, codebook, block_m=_PREFILL_BLOCK_M)
+        c1 = exl3_moe_gemm(a1, gate_up, sorted_ids, expert_ids, ntpp, codebook, block_m=block_m)
         del a1
         a2 = exl3_mid(c1, slots, gate_up_svh, down_suh, dtype=torch.float16)
         del c1
         # the rotation out runs as the down GEMM's epilogue (a program owns a 128-column block), then a plain sum
         y = exl3_gemm_down_out(a2, down, down_svh, weights.reshape(-1), sorted_ids, expert_ids, ntpp, codebook,
-                               block_m=_PREFILL_BLOCK_M, out_dtype=hidden_states.dtype)
+                               block_m=block_m, out_dtype=hidden_states.dtype)
         moe_sum_reduce_triton(y.view(M, top_k, -1), out)
         return out
     a1 = exl3_rotate_in(hidden_states, gate_up_suh, slots, top_k)
