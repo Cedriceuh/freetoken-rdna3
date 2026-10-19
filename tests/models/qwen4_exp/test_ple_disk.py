@@ -377,3 +377,39 @@ def test_auto_sync_gates_one_gpu_with_overlapped_steps(monkeypatch):
     for mode in ("wait", "gate"):
         monkeypatch.setenv("FREETOKEN_PLE_SYNC", mode)
         assert _sync_mode() == mode
+
+
+@requires_cuda
+def test_prefill_reads_on_a_thread_and_ahead(tmp_path, monkeypatch):
+    """FREETOKEN_PLE_PREFILL_PREFETCH: a prefill's rows are read on a thread (the lookup waits for them), and a chunk
+    of a longer prompt also reads the next chunk's rows, which that chunk takes without a read of its own when its
+    tokens are those; another length, or an eager fill in between (a decode step), reads again. The oracle's rows every
+    time."""
+    from freetoken.models.qwen4_exp import ple_disk
+
+    monkeypatch.setattr(ple_disk, "_PREFILL_PREFETCH", True)
+    disk, oracle, args = _make_table(tmp_path)
+    emb = _embedding()
+    reads = []
+    real = disk._read_on_thread
+    monkeypatch.setattr(disk, "_read_on_thread",
+                        lambda runs, ahead: (reads.append("read" if runs is not None else "adopt"), real(runs, ahead)))
+    prompt = torch.tensor([3, 4, EOS, 5, 6, 8, 2, 11, 12, 13, 14, 9, 7, 21, 22, 23, 24], dtype=torch.int32)
+
+    def chunk(start, end, whole=prompt):
+        req = SimpleNamespace(input_ids=whole[:end], device_len=end, cached_len=start, prompt_ids=whole)
+        disk.host_fill_batch(SimpleNamespace(is_decode=False, padded_reqs=[req]), use_graph=False)
+        window = [int(whole[start - 2]) if start >= 2 else EOS, int(whole[start - 1]) if start >= 1 else EOS]
+        ids = emb.row_ids(_meta([whole[start:end].tolist()], [window])).cuda()
+        assert _bitwise_equal(disk.lookup(ids), oracle.lookup(ids)), f"chunk [{start}, {end})"
+
+    chunk(0, 6)    # read on the thread, then [6, 12) ahead
+    chunk(6, 12)   # taken: then [12, 17) ahead
+    chunk(12, 17)  # taken, the end of the prompt: no thread
+    assert reads == ["read", "adopt"]
+    chunk(0, 5)    # read, then [5, 10) ahead
+    chunk(5, 8)    # another length: read again
+    assert reads == ["read", "adopt", "read", "read"]
+    disk.fill([torch.tensor([prompt[6], prompt[7], 2])], graph=False)  # an eager decode fill drops [8, 11) read ahead
+    chunk(8, 11)
+    assert reads == ["read", "adopt", "read", "read", "read"]

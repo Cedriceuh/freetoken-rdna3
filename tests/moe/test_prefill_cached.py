@@ -183,13 +183,17 @@ def test_prefill_split_copy_matches_sources():
 
 
 @cuda
+@pytest.mark.parametrize("defer", [False, True])
 @pytest.mark.parametrize("async_copy", [False, True])
-def test_predicted_prefetch_then_fixup_keeps_every_routed_expert(async_copy):
+def test_predicted_prefetch_then_fixup_keeps_every_routed_expert(async_copy, defer, monkeypatch):
     """A layer's routed experts are resident with their bytes after the predicted prefetch (copy stream) and the
     fixup copy of what the prediction missed (in stream, or on the copy stream with ``async_copy`` until
     ``wait_prefill_fix``: FREETOKEN_PREFILL_COPY_OVERLAP); the prefetch never takes a slot of the layer still
-    computing; the prefill's own slots end demoted, and the maps stay each other's inverse."""
+    computing; the prefill's own slots end demoted, and the maps stay each other's inverse. ``defer``
+    (FREETOKEN_PREFILL_PREFETCH_DEFER): the copy engine's part is queued once the layer's GEMMs are."""
     from freetoken.moe import offload_cache as oc
+
+    monkeypatch.setattr(oc, "_PREFETCH_DEFER", defer)
 
     dev = torch.device("cuda")
     L, E, S = 3, 16, 40
@@ -230,6 +234,9 @@ def test_predicted_prefetch_then_fixup_keeps_every_routed_expert(async_copy):
     row0 = cache.ensure_prefill_routed(0, ids(routed0), (1, predicted), async_copy=async_copy)
     if async_copy:
         cache.wait_prefill_fix()  # the checks below read on the current stream
+    if defer:
+        assert cache._prefetch_deferred is not None and 1 not in cache._prefill_prefetch
+        cache._flush_prefetch()  # what demote_prefill_slots does once the layer's GEMMs are queued
     slots0 = {int(row0[e]) for e in routed0}
     pf_slots = {int(s) for s in cache._prefill_prefetch[1][1] if int(s) >= 0}
     assert len(pf_slots) == 10  # none of layer 1's experts was resident

@@ -75,7 +75,12 @@ NVFP4 MoE blocks are bit-identical, and 8192 tokens long in `xtx-xt` and `xtx-xt
 benchmark for one request), and experts already in the GPU cache are gathered on the GPU instead of crossing PCIe
 again (`--moe-prefill-hit-d2d`, with `hipMemcpyBatchAsync` on ROCm, or one copy per entry on older HIP): a third of
 the experts stay off PCIe per chunk, an agent turn's first token 1.55 -> 1.18 s. A single card keeps 8k chunks
-(its working memory is smaller).
+(its working memory is smaller). The per-layer-embedding rows of a prefill are read from disk on a thread by rank 0
+only, which broadcasts them, and a long prompt's next chunk's rows are read while a chunk computes (they took ~1.1 s
+per 16k-token chunk, the GPUs idle); on two cards each block of a chunk's routed experts and of its GatedDeltaNet
+output starts its all-reduce while the next block computes, and the QSA indexer scores 16 query rows a program (the
+same bits): fully cold reads ~25 % shorter
+([journey.md](journey.md#33-short-turns-the-host-waiting-at-every-layer-2026-10-18-and-19)).
 
 A short chunk (up to 1280 tokens on Qwen3.8-Flash-Next, an agent's tool result) does not stream the whole layers: it
 routes to only part of the experts, so it reads its routed experts from the slot cache, the next layer's predicted by
@@ -87,7 +92,13 @@ the tokenizer reuses the previous prompt's tokens instead of encoding the whole 
 ([journey.md](journey.md#27-agent-turns-short-prefills-through-the-expert-cache-2026-10-14)). Short prefills now take
 expert tiles sized for a few rows an expert and no longer wait on the GPU in every GatedDeltaNet layer: the time to
 the first token of 200-250-token turns at 34k 11-13 % shorter, of one-word turns 42 % on NVFP4 and 5 % on EXL3
-([journey.md](journey.md#31-short-agent-turns-2026-10-17-and-18)).
+([journey.md](journey.md#31-short-agent-turns-2026-10-17-and-18)). The predicted experts' copy plan, which the copy
+engine needs on the host, is read once the layer's GEMMs are queued rather than in a sync that emptied the GPU's queue
+at every layer, Triton kernels launch through a shorter host path, the int8 weights are dequantized in one pass, the
+PLE rows are read as above, with EXL3 too the missing experts' copy overlaps the shared expert, and with NVFP4, whose
+short turns keep PCIe saturated, only the experts at least two tokens predict are copied ahead: one-word turns at 34k a
+further ~20 % shorter on EXL3 and 12 % on NVFP4, agent turns of 500-750 tokens 15 % and 13 %
+([journey.md](journey.md#33-short-turns-the-host-waiting-at-every-layer-2026-10-18-and-19)).
 
 ## Sampling on ROCm
 

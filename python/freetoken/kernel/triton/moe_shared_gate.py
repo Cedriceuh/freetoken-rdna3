@@ -168,16 +168,19 @@ def _gate_sum_mul_add_kernel(
 
 
 def shared_gate_sum_mul_add(
-    routed: torch.Tensor, shared: torch.Tensor, hidden_states: torch.Tensor, gate_weight: torch.Tensor
+    routed: torch.Tensor, shared: torch.Tensor, hidden_states: torch.Tensor, gate_weight: torch.Tensor,
+    out: torch.Tensor | None = None, warps_tokens: int | None = None,
 ) -> torch.Tensor:
     """``sum_k routed[:, k] + sigmoid(hidden_states @ gate_weight)[:, None] * shared`` in one launch, bit for bit what
     ``moe_sum_reduce`` + :func:`shared_gate_sigmoid` + :func:`shared_gate_mul_add` give; ``routed`` is ``[T, K, H]``
-    (per-expert outputs, or ``[T, 1, H]`` when the experts already summed them)."""
+    (per-expert outputs, or ``[T, 1, H]`` when the experts already summed them). ``warps_tokens``: the row count the
+    gate's warps (hence its sum) follow, for rows of a larger call computed apart."""
     num_tokens, topk, hidden_dim = routed.shape
     assert shared.shape == (num_tokens, hidden_dim) and hidden_states.shape == (num_tokens, hidden_dim)
     assert routed.stride(2) == 1 and shared.stride(1) == 1 and hidden_states.stride(1) == 1
     assert gate_weight.shape == (hidden_dim,) and gate_weight.is_contiguous()
-    out = torch.empty_like(shared)
+    if out is None:
+        out = torch.empty_like(shared)
     _gate_sum_mul_add_kernel[(num_tokens,)](
         routed,
         shared,
@@ -192,7 +195,7 @@ def shared_gate_sum_mul_add(
         topk,
         HIDDEN=hidden_dim,
         BLOCK_SIZE=triton.next_power_of_2(hidden_dim),
-        num_warps=_reduction_warps(hidden_dim, num_tokens),
+        num_warps=_reduction_warps(hidden_dim, num_tokens if warps_tokens is None else warps_tokens),
     )
     return out
 

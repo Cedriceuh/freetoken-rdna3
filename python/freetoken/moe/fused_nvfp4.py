@@ -25,6 +25,7 @@ from freetoken.kernel.triton.nvfp4_fused_moe import (
 )
 from freetoken.layers import gated_act_and_mul
 from freetoken.moe.fused import blocks_to_slots, moe_align_block_size
+from freetoken.moe.prefill_hooks import BLOCK_DONE
 from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
@@ -388,6 +389,7 @@ def fused_experts_nvfp4(
     M, H = hidden_states.shape
     if M > NVFP4_PREFILL_BLOCK > 0:
         out = torch.empty_like(hidden_states)
+        done = BLOCK_DONE[0]
         for start in range(0, M, NVFP4_PREFILL_BLOCK):
             end = min(start + NVFP4_PREFILL_BLOCK, M)
             out[start:end] = fused_experts_nvfp4(
@@ -395,6 +397,8 @@ def fused_experts_nvfp4(
                 down_global, topk_weights[start:end], topk_ids[start:end], num_experts, activation,
                 apply_router_weight_on_input, act_alpha, act_limit, slot_map,
             )
+            if done is not None:
+                done(start, end, out)
         return out
     top_k = topk_ids.shape[1]
     two_i = gate_up_packed.shape[1]

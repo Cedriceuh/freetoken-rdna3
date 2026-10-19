@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -49,6 +50,17 @@ from .weight import (
 )
 
 _IO_URING_ENV = "FREETOKEN_PLE_IO_URING"
+# FREETOKEN_PLE_PREFILL_PREFETCH (default 1): a prefill's PLE rows are read on a thread while the forward's layers
+# before the PLE layer launch (its lookup waits for them), and while a prefill chunk of one request computes, the
+# thread reads the rows of the chunk that request most likely prefills next (the same length, or the rest of its
+# prompt) into the other eager slot, which the next chunk uses when its tokens are exactly those: they were read before
+# each forward (~1.1 s for 16k tokens on the reference machine's NVMe, ~50 ms for a 600-token turn, the GPUs idle
+# meanwhile). The same rows, so the same bits
+_PREFILL_PREFETCH = os.environ.get("FREETOKEN_PLE_PREFILL_PREFETCH", "1") == "1"
+# FREETOKEN_PLE_PREFILL_RANK0 (default 1): at TP>1 only rank 0 reads a prefill's PLE rows from disk and broadcasts
+# their bytes to the other ranks at the lookup (every rank stages every head, so the bytes are the same): half the
+# disk reads, and rank 0's no longer compete with another rank's for the same rows
+_PREFILL_RANK0 = os.environ.get("FREETOKEN_PLE_PREFILL_RANK0", "1") == "1"
 _SYNC_ENV = "FREETOKEN_PLE_SYNC"  # auto | wait | gate
 
 logger = init_logger(__name__)
@@ -251,19 +263,34 @@ class DiskRowTable:
             raise ValueError(
                 f"PLE row source holds {source.total_rows} rows but the hash addresses {need}; incomplete checkpoint?"
             )
-        self._store = PleStore(
-            paths=list(source.paths),
-            extent_file=list(source.extent_file),
-            extent_base=list(source.extent_base),
-            rows_per_extent=source.rows_per_extent,
-            row_bytes=source.row_bytes,
-            row_stride=source.row_stride,
-            multipliers=[int(x) for x in hash_constants["layer_multipliers"]],
-            head_vocab_sizes=sizes,
-            head_offsets=offsets,
-            eos_token_id=self.eos_token_id,
-            use_io_uring=os.getenv(_IO_URING_ENV, "1") != "0",
-        )
+        def store() -> PleStore:
+            return PleStore(
+                paths=list(source.paths),
+                extent_file=list(source.extent_file),
+                extent_base=list(source.extent_base),
+                rows_per_extent=source.rows_per_extent,
+                row_bytes=source.row_bytes,
+                row_stride=source.row_stride,
+                multipliers=[int(x) for x in hash_constants["layer_multipliers"]],
+                head_vocab_sizes=sizes,
+                head_offsets=offsets,
+                eos_token_id=self.eos_token_id,
+                use_io_uring=os.getenv(_IO_URING_ENV, "1") != "0",
+            )
+
+        from freetoken.distributed import try_get_tp_info
+
+        tp = try_get_tp_info()
+        self._rank0_reads = (_PREFILL_RANK0 and tp is not None and tp.size > 1 and torch.distributed.is_available()
+                             and torch.distributed.is_initialized())
+        self._is_rank0 = tp is None or tp.rank == 0
+        self._store = store()
+        # FREETOKEN_PLE_PREFILL_PREFETCH: a store of its own (its own io_uring ring) for the next chunk's rows, on the
+        # ranks that read prefill rows
+        self._prefetch_store = store() if _PREFILL_PREFETCH and (self._is_rank0 or not self._rank0_reads) else None
+        self._share = False  # this prefill's lookup broadcasts rank 0's rows (FREETOKEN_PLE_PREFILL_RANK0)
+        self._next = None  # (slot, run, thread, state) of the read thread (slot / run None: no read ahead)
+        self._pending_fill = None  # (ready event, state) of this prefill's rows being read on the thread
         self._device = torch.device("cuda", torch.cuda.current_device())
         self._token_bytes = self.heads * self._row_bytes
         self._head_bias = None if source.head_bias is None else source.head_bias.to(self._device)
@@ -299,7 +326,8 @@ class DiskRowTable:
         self._token_readback = alloc_pinned_tensor(max_graph_rows, dtype=torch.int32)
         self._readback_event = torch.cuda.Event()
         sync = "wait-sync" if self._wait_sync else "launch-gating"
-        logger.info_rank0(f"PLE disk backend: {self._store.io_backend()}, {sync}")
+        reads = ", prefill rows read by rank 0" if self._rank0_reads else ""
+        logger.info_rank0(f"PLE disk backend: {self._store.io_backend()}, {sync}{reads}")
 
     # ---------------- host side (engine thread, before the forward launches) ----------------
 
@@ -309,6 +337,12 @@ class DiskRowTable:
             self._graph_consumed.synchronize()
             pinned = self._graph_pinned
         else:
+            if self._next is not None:  # the read thread may be writing the other slot: let it finish, drop its read
+                _, _, thread, state = self._next
+                self._next = None
+                thread.join()
+                if state["error"] is not None:
+                    raise state["error"]
             self._eager_slot ^= 1
             self._eager_read[self._eager_slot].synchronize()
             pinned = self._eager_pinned[self._eager_slot]
@@ -377,8 +411,90 @@ class DiskRowTable:
             ))
             for req in batch.padded_reqs
         ]
-        self.fill(runs, graph=False)
+        if self._rank0_reads:
+            self._share = True
+            if not self._is_rank0:
+                return None  # the rows arrive from rank 0 at the lookup
+        adopted = self._adopt_prefetch(runs)
+        reqs = batch.padded_reqs
+        prompt = getattr(reqs[0], "prompt_ids", None) if len(reqs) == 1 else None  # set on a chunk of a longer prompt
+        ahead = None
+        if self._prefetch_store is not None and prompt is not None and reqs[0].device_len < len(prompt):
+            req = reqs[0]
+            end = min(req.device_len + (req.device_len - req.cached_len), len(prompt))
+            ahead = torch.cat((
+                torch.tensor(self._ple_context(prompt, req.device_len), dtype=torch.int64),
+                self._ple_ids(prompt[req.device_len : end]).to(torch.int64),
+            ))
+        if adopted and ahead is None:
+            return None
+        if self._prefetch_store is None:
+            self.fill(runs, graph=False)
+            return None
+        self._read_on_thread(None if adopted else runs, ahead)
         return None
+
+    def _read_on_thread(self, runs: Sequence[torch.Tensor] | None, ahead: torch.Tensor | None) -> None:
+        """FREETOKEN_PLE_PREFILL_PREFETCH, on a thread with a store of its own (its calls release the GIL): this
+        prefill's rows (``runs``, unless they were read ahead) into the next eager slot, which ``lookup`` waits for, so
+        the forward's layers before the PLE layer launch meanwhile; then the rows of the chunk the request most likely
+        prefills next (``ahead``) into the other slot, which the next fill adopts if its tokens are those."""
+        store = self._prefetch_store
+        cur = None
+        if runs is not None:
+            self._eager_slot ^= 1
+            cur = self._eager_slot
+            self._eager_read[cur].synchronize()  # the H2D copy that last read the slot
+        nxt = self._eager_slot ^ 1
+        state = {"error": None}
+        ready = threading.Event()
+
+        def work() -> None:
+            try:
+                if runs is not None:
+                    offset = 0
+                    for run in runs:
+                        store.stage(run.data_ptr(), run.numel() - 2,
+                                    self._eager_pinned[cur].data_ptr() + offset * self._token_bytes)
+                        offset += run.numel() - 2
+                    store.flush(0)
+                ready.set()
+                if ahead is not None:
+                    self._eager_read[nxt].synchronize()
+                    store.stage(ahead.data_ptr(), ahead.numel() - 2, self._eager_pinned[nxt].data_ptr())
+                    store.flush(0)
+            except BaseException as exc:  # surfaced by lookup or _adopt_prefetch
+                state["error"] = exc
+                ready.set()
+
+        thread = threading.Thread(target=work, name="ple-read", daemon=True)
+        thread.start()
+        self._pending_fill = (ready, state) if runs is not None else None
+        self._next = (nxt, ahead, thread, state) if ahead is not None else (None, None, thread, state)
+
+    def _wait_fill(self) -> None:
+        """The thread's read of this prefill's rows, before the H2D copy of them."""
+        pending, self._pending_fill = self._pending_fill, None
+        if pending is not None:
+            ready, state = pending
+            ready.wait()
+            if state["error"] is not None:
+                raise state["error"]
+
+    def _adopt_prefetch(self, runs: Sequence[torch.Tensor]) -> bool:
+        """Wait for a pending prefetch; use its slot when it staged exactly ``runs`` (one request), else let the fill
+        overwrite it."""
+        pending, self._next = self._next, None
+        if pending is None:
+            return False
+        slot, run, thread, state = pending
+        thread.join()
+        if state["error"] is not None:
+            raise state["error"]
+        if run is None or len(runs) != 1 or not torch.equal(runs[0], run):
+            return False
+        self._eager_slot = slot
+        return True
 
     @contextmanager
     def forward_host_ctx(self, batch: Batch, use_graph: bool):
@@ -402,13 +518,19 @@ class DiskRowTable:
             from freetoken.kernel.row_store import wait_reset
 
             wait_reset(stream, self._flag)
+        share, self._share = self._share and not capturing, False
+        if not capturing and (self._is_rank0 or not share):
+            self._wait_fill()
         pinned, dev = (
             (self._graph_pinned, self._graph_dev) if capturing else (self._eager_pinned[self._eager_slot], self._eager_dev)
         )
         nbytes = rows * self._token_bytes
-        dev[:nbytes].copy_(pinned[:nbytes], non_blocking=True)
-        if not capturing:
-            self._eager_read[self._eager_slot].record(stream)
+        if self._is_rank0 or not share:
+            dev[:nbytes].copy_(pinned[:nbytes], non_blocking=True)
+            if not capturing:
+                self._eager_read[self._eager_slot].record(stream)
+        if share:
+            torch.distributed.broadcast(dev[:nbytes], src=0)
         if self._exl3_bits:
             from freetoken.kernel.triton.exl3 import exl3_ngram_dequant
 

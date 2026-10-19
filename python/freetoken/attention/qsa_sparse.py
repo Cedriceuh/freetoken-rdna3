@@ -466,6 +466,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
                 self.ratio,
                 logits,
                 visible,
+                one_request=md.block_table.shape[0] == 1,
             )
             blocks = self._scratch("blocks", end - start, self.block_topk, dtype=torch.int32)
             self._top_blocks(logits, visible, blocks)

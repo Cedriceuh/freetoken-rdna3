@@ -24,6 +24,11 @@ _FUSED_COPY = os.getenv("FREETOKEN_FUSED_COPY", "1").strip().lower() not in {"0"
 # whole layer is tiny) and are excluded from the hit gather, so every per-run
 # entry the batch sees is >= this size.
 _SMALL_BANK_FEAT_BYTES = 256 * 1024
+# FREETOKEN_PREFILL_PREFETCH_DEFER (default 1): the copy engine's host pointer lists for a slot-cache prefill's
+# predicted experts are read once the layer's GEMMs are queued (an async copy of the plan to pinned memory, then its
+# event) instead of right after the plan (a sync that drained the GPU queue at every layer); the same copies into the
+# same slots
+_PREFETCH_DEFER = os.environ.get("FREETOKEN_PREFILL_PREFETCH_DEFER", "1") == "1"
 
 # FREETOKEN_PREFILL_HIT_LOG=1: log each prefill chunk's hit-D2D share (expert rows gathered
 # from the cache instead of crossing PCIe).
@@ -324,6 +329,8 @@ class OffloadMoeCache:
         self._prefill_snapshot_np = None
         self._prefill_hit_d2d_active = False
         self._prefill_prefetch: dict = {}  # layer -> (ready event, slots) of a predicted prefetch on the copy stream
+        self._prefetch_deferred = None  # FREETOKEN_PREFILL_PREFETCH_DEFER: the plan copy not yet read (_flush_prefetch)
+        self._prefetch_plan_host: torch.Tensor | None = None
         self.prefill_chunk_cached = False  # this forward's choice (layers/moe.py prefill_cached), set at layer 0
         self._hit_d2d_fallback_logged = False
         self._batch_memcpy = None
@@ -683,6 +690,7 @@ class OffloadMoeCache:
         self._prefill_buffer_released = [True, True]
         self._prefill_buffer_has_release_event = [False, False]
         self._prefill_prefetch = {}  # their slots index the old cache
+        self._prefetch_deferred = None
         self._prefill_loaded = []
         # 2. Drop old GPU tensors (free-before-alloc).
         self.banks = []
@@ -1135,6 +1143,7 @@ class OffloadMoeCache:
         the routing picked, all resident by then. One host sync per layer (the copy engine takes host pointers)."""
         from freetoken.moe.offload_kernels import prefill_routed_plan
 
+        self._flush_prefetch()
         pending = self._prefill_prefetch.pop(layer_id, None)
         loaded = []
         if pending is not None:
@@ -1186,23 +1195,19 @@ class OffloadMoeCache:
 
         E = self.num_experts
         idx, num = self._prefill_pf_idx, self._prefill_pf_num
-        p, feats = self.pool_of_layer[layer_id], self._row_bytes[self.layer_layout[layer_id]]
+        feats = self._row_bytes[self.layer_layout[layer_id]]
         big = tuple(k for k, f in enumerate(feats) if f >= _SMALL_BANK_FEAT_BYTES)
         small = tuple(k for k, f in enumerate(feats) if f < _SMALL_BANK_FEAT_BYTES)
         use_dma = bool(big) and self._resolve_batch_memcpy()
+        if use_dma and _PREFETCH_DEFER:
+            self._defer_prefetch(layer_id, slot_of, small, big)
+            return
         if use_dma:
             host = torch.cat((num.to(torch.int32), idx)).cpu()
             n = int(host[0])
             if not n:
                 return
-            dst_h, src_h = host[1: 1 + n].tolist(), host[1 + E: 1 + E + n].tolist()
-            dst, src, nbytes = [], [], []
-            for k in big:
-                feat = feats[k]
-                base, hsrc = self._copy_dst_ptrs_host[k] + self._pool_offsets[k][p], self._copy_src_ptrs_host[layer_id][k]
-                dst.extend(base + v * feat for v in dst_h)
-                src.extend(hsrc + e * feat for e in src_h)
-                nbytes.extend([feat] * n)
+            dst, src, nbytes = self._dma_lists(layer_id, host, n, big)
         ready = torch.cuda.Event()
         start = torch.cuda.Event()
         start.record(torch.cuda.current_stream(self.device))
@@ -1222,8 +1227,74 @@ class OffloadMoeCache:
             ready.record(self.prefill_copy_stream)
         self._prefill_prefetch[layer_id] = (ready, slot_of)
 
+    def _dma_lists(self, layer_id: int, host: torch.Tensor, n: int, big: tuple[int, ...]):
+        """The copy engine's (destination, source, bytes) lists of the planned prefetch, from its host copy
+        ([n, slots..., experts...])."""
+        E = self.num_experts
+        p, feats = self.pool_of_layer[layer_id], self._row_bytes[self.layer_layout[layer_id]]
+        dst_h, src_h = host[1: 1 + n].tolist(), host[1 + E: 1 + E + n].tolist()
+        dst, src, nbytes = [], [], []
+        for k in big:
+            feat = feats[k]
+            base, hsrc = self._copy_dst_ptrs_host[k] + self._pool_offsets[k][p], self._copy_src_ptrs_host[layer_id][k]
+            dst.extend(base + v * feat for v in dst_h)
+            src.extend(hsrc + e * feat for e in src_h)
+            nbytes.extend([feat] * n)
+        return dst, src, nbytes
+
+    def _defer_prefetch(self, layer_id: int, slot_of: torch.Tensor, small: tuple[int, ...],
+                        big: tuple[int, ...]) -> None:
+        """FREETOKEN_PREFILL_PREFETCH_DEFER: queue the plan's copy to pinned memory and the small banks' shader copy
+        now; ``_flush_prefetch`` reads the plan and queues the copy engine's part once the layer's GEMMs are queued."""
+        from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
+
+        self._flush_prefetch()
+        E = self.num_experts
+        idx, num = self._prefill_pf_idx, self._prefill_pf_num
+        if self._prefetch_plan_host is None:
+            self._prefetch_plan_host = torch.empty(1 + 2 * E, dtype=torch.int32, pin_memory=True)
+        cur = torch.cuda.current_stream(self.device)
+        self._prefetch_plan_host.copy_(torch.cat((num.to(torch.int32), idx)), non_blocking=True)
+        plan = torch.cuda.Event()
+        plan.record(cur)
+        if small:
+            with torch.cuda.stream(self.prefill_copy_stream):
+                self.prefill_copy_stream.wait_event(plan)
+                fast_index_copy_multi_jit(*self._subset_copy_plan(layer_id, small), idx[:E], idx[E:], num,
+                                          blocks_per_bank=self._copy_blocks_per_bank)
+        self._prefetch_deferred = (layer_id, slot_of, plan, big, bool(small))
+
+    def _flush_prefetch(self) -> None:
+        """Queue a deferred prefetch's copy-engine part (waits for its plan, not for the GPU queue to drain)."""
+        deferred = self._prefetch_deferred
+        if deferred is None:
+            return
+        self._prefetch_deferred = None
+        layer_id, slot_of, plan, big, had_small = deferred
+        plan.synchronize()
+        host = self._prefetch_plan_host
+        n = int(host[0])
+        if not n:
+            if had_small:  # the small banks' copy read the shared plan buffers: the next plan must wait for it
+                ready = torch.cuda.Event()
+                ready.record(self.prefill_copy_stream)
+                self._prefill_prefetch[layer_id] = (ready, slot_of)
+            return
+        dst, src, nbytes = self._dma_lists(layer_id, host, n, big)
+        ready = torch.cuda.Event()
+        with torch.cuda.stream(self.prefill_copy_stream):
+            if not had_small:
+                self.prefill_copy_stream.wait_event(plan)
+            self._batch_memcpy(
+                torch.tensor(dst, dtype=torch.int64), torch.tensor(src, dtype=torch.int64),
+                torch.tensor(nbytes, dtype=torch.int64), self.prefill_copy_stream.cuda_stream,
+            )
+            ready.record(self.prefill_copy_stream)
+        self._prefill_prefetch[layer_id] = (ready, slot_of)
+
     def drain_prefill_prefetch(self) -> None:
         """Wait on the compute stream for prefetches no layer consumed (a prediction for a layer that did not run)."""
+        self._flush_prefetch()
         cur = torch.cuda.current_stream(self.device)
         for event, _ in self._prefill_prefetch.values():
             cur.wait_event(event)
@@ -1237,6 +1308,7 @@ class OffloadMoeCache:
         if getattr(self, "_prefill_loaded", None):
             prefill_demote(self, self._prefill_loaded)
         self._prefill_loaded = None
+        self._flush_prefetch()
 
     def materialize_layer(self, layer_id: int) -> None:
         from freetoken.moe.offload_kernels import materialize_layer

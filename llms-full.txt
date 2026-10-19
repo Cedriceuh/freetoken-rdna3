@@ -726,6 +726,8 @@ For every `ft serve` flag, see upstream's [CLI reference](../cli.md); the flags 
 | `FREETOKEN_HOST_ALLREDUCE_WAITLOG` | unset | Debug, `1`: each call stores how long its rank waited for the other one (100 MHz ticks, `[rank][seq % 65536]` after the four slots), and the shared region stays in `/dev/shm` (`freetoken-hostar-*-waitlog`) for a reader inside the container until a clean shutdown (a killed container leaves it: `--ipc=host` puts it in the host's `/dev/shm`, owned by root). Same speed. On `xtx-xt` it showed the XTX waiting ~0.9 ms a decode step for the XT, at every all-reduce. |
 | `FREETOKEN_TP_SYNC_TOKENS` | `1` | `1` broadcasts rank 0's sampled tokens to the other ranks after each sampled step (~15 µs per step). `0` = off; `check` also compares the ranks' draws and logs each disagreement (one sync per step). |
 | `FREETOKEN_FUSE_MOE_ALLREDUCE` | `1` | qwen4_exp at TP>1: one all-reduce per MoE block (routed + shared experts) instead of two. +2.7 % decode, -4.5 % prefill time. Reorders sums, *agent-validated*. |
+| `FREETOKEN_PREFILL_AR_OVERLAP` | `1` | qwen4_exp at two ranks (the sum of two values is the same however the rows are split), with `FREETOKEN_FUSE_MOE_ALLREDUCE` and the fused MoE epilogue (offloaded NVFP4 or EXL3 experts decoded on the GPU: not with `--hybrid`, not on CPU layers): a prefill chunk whose routed experts run in token blocks (`FREETOKEN_NVFP4_PREFILL_BLOCK`, `FREETOKEN_EXL3_PREFILL_BLOCK`) finishes each block's rows (the epilogue with the whole chunk's warps) and starts their all-reduce while the next block computes, instead of one all-reduce after the last block. Each element is still the same epilogue, then the sum of the two ranks' values: **bit-exact** (`tests/moe/test_prefill_block_hook.py`; greedy prompts and 164k / 96k-token cold reads identical). The compute stream then waits for RCCL's on the GPU, after which the decode graphs ran a third slower at four requests (NVFP4: 22.7 tok/s each against 33.9) until the host synchronized: the engine synchronizes the device once before the next decode step (34.0). `xtx-xt-4x262k`, cold reads, two runs each: NVFP4 (8192-token blocks) 164k 70.1-70.2 -> 67.0-67.1 s, 96k 39.4-39.5 -> 37.6 s; EXL3 3.05 bpw (4096-token blocks) 66.6-66.7 -> 62.7-62.9 s and 37.4 -> 35.0-35.1 s. `0`: one all-reduce after the experts. |
+| `FREETOKEN_GDN_AR_OVERLAP` | `1` | qwen4_exp at two ranks, the output projection bf16 or int8 weight-only (what the check runs): a prefill chunk of one request made of whole `FREETOKEN_GDN_PREFILL_BLOCK` blocks (4096 tokens: every 16k-token chunk of a long read, not its last) runs each GatedDeltaNet block's gated norm and output projection as the block's delta rule finishes and starts that block's all-reduce while the next block's delta rule runs. The norm keeps the whole chunk's rows per program; hipBLASLt keeps the rows' bits for some shapes and block sizes, not all (on gfx1100 the output projections' shapes at 4096-row blocks, not at 2048), so the first chunk of each length runs a check of block against whole call on random data and the ranks keep the overlap for that length only if all of them pass: **bit-exact** (`tests/models/qwen4_exp/test_gdn_ar_overlap.py`; greedy prompts and two cold reads identical). `xtx-xt-4x262k`, with `FREETOKEN_PREFILL_AR_OVERLAP`, cold reads, two runs each: NVFP4 164k 66.9-67.0 -> 65.8-65.9 s, 96k 37.5 -> 37.0 s; EXL3 3.05 bpw 96k 35.0-35.1 -> 34.7 s (164k 62.7 -> 62.1 s in one run, the other slow). The check takes ~0.2 GiB for a moment at the layer's entry, once per chunk length. `0`: the output projection after the last block. |
 | `FREETOKEN_RELAY_HANDSHAKE_MAX_HELLOS` | `2400` | TP>1: how many 50 ms hellos the rank-0 relay sends while the other ranks subscribe (2 minutes). |
 
 **`FREETOKEN_TP_SPLIT`** splits the experts' intermediate dimension (routed experts on the NVFP4 Triton expert kernels,
@@ -748,6 +750,7 @@ disagreements over ~8k sampled tokens in `check` mode). It is on the torch.distr
 |---|---|---|
 | `FREETOKEN_INT8_DENSE` | unset | `1`: every dense (non-expert) linear layer in int8, weights only, one scale per output channel and rank; routers and the vision tower stay bf16. Converted at load. **+28 % decode**, frees ~2.4 GiB per card for the expert cache. Lossy, not bit-exact; no measurable loss on the scored benchmark, *agent-validated*. |
 | `FREETOKEN_INT8_DENSE_SKIP` | empty | Comma-separated module names to keep in bf16. |
+| `FREETOKEN_INT8_PREFILL_DEQUANT` | `triton` | With `FREETOKEN_INT8_DENSE=1`, a prefill dequantizes each int8 weight for its GEMM in one Triton pass (int8 times the row's fp32 scale, rounded once to bf16) instead of `torch.mul`'s mixed-dtype kernel: the same arithmetic, **bit-exact** (`tests/kernels/test_int8_dequant.py`). On the 7900 XT, GDN in_proj (9270 x 2560) 456 -> 58 us, 2560 x 4096 157 -> 24 us, the small ones ~2x. EXL3 3.05 `xtx-xt-4x262k`: agent turns 0.495 -> 0.487 s; NVFP4 0.718 -> 0.713 s. `torch`: `torch.mul`. |
 | `FREETOKEN_INT8_COMPACT` | `1` | Compact the device allocator after the conversion; without it the freed VRAM stays fragmented and is lost to the expert cache. |
 | `FREETOKEN_INT8_ROWS_MAX` | `8` | Decode batches up to this many rows (concurrent requests) use the row-looped GEMVs (the int8 one and the bf16 Triton one), each row bit-identical to a batch of one; bigger batches dequantize the int8 weight per call (bf16 layers use `F.linear`). |
 | `FREETOKEN_INT8_ROW_GROUPS` | `1` | With several rows (a speculative verify step, or requests decoding together), the int8 GEMVs whose input is longer than one tile (hyper-connection down projections, shared expert gate/up, index projection, LM head) read each weight tile once for up to 4 rows instead of once per row; same arithmetic per row, bit-exact. At 4 rows on the XT: HC down 17.7 -> 12.1 µs, LM head 704 -> 499 µs. `0`: each program runs the rows one after the other, reloading the tile for each. |
@@ -786,11 +789,15 @@ disagreements over ~8k sampled tokens in `check` mode). It is on the torch.distr
 | Variable | Default | Effect |
 |---|---|---|
 | `FREETOKEN_PLE_SYNC` | `auto` | How a captured decode step gets its PLE disk rows. `auto` probes the stream memops once at start: `wait-sync` (the step waits inside the graph for the host fill) where a captured wait holds three replays in a row (ROCm 10 on these cards); else `launch-gating` (the host fills before each launch). On one GPU without the MTP head (the scheduler then overlaps its decode steps) `auto` takes `launch-gating`: wait-sync costs ~11 ms a step there (NVFP4 `xtx --no-mtp`, greedy: 26.6 tok/s against 38.3, the same tokens). The log says which. `wait`: require memops, `gate`: never use them. Wait-sync elsewhere: +1.6-4.3 % decode against launch-gating (NVFP4 `xtx-xt` 95.2 against 92.0 tok/s, `xtx-xt --no-mtp` 67.2 against 64.4, `xtx-xt-4x262k` with 4 requests 35.9 against 34.9 each; `xtx` with the head 43.5 against 42.8), bit-exact. |
+| `FREETOKEN_PLE_PREFILL_PREFETCH` | `1` | With `--ple-backend disk` (every profile): a prefill read its tokens' PLE rows from the checkpoint on the host before its forward started, the GPUs idle meanwhile: ~1.1 s for a 16k-token chunk on the reference machine's NVMe, ~50 ms for a 600-token agent turn (each rank reads every head; ~250k random reads a second). Now a thread reads them with a store of its own while the layers before the PLE layer launch (the lookup waits for them), and while a chunk of a longer prompt computes, it also reads the next chunk's rows (the same length, or the rest of the prompt) into the other pinned buffer, which the next chunk takes when its tokens are exactly those (an eager fill in between drops them). The same rows: **bit-exact** (`tests/models/qwen4_exp/test_ple_disk.py`). `xtx-xt-4x262k`, two runs each: EXL3 3.05 bpw one-word turns 0.199-0.202 -> 0.194 s, agent turns 0.477 -> 0.465-0.466 s, a 45k-token document 15.8 -> 14.1 s, a 96k-token read 34.6-34.7 -> 29.9 s, 164k 62.1 -> 53.4 s (the read ahead alone); NVFP4 (one run) 0.253 -> 0.243 s, 0.714 -> 0.694 s, 17.0 -> 15.1 s, 37.0 -> 31.8 s, 164k 65.9-66.0 -> 56.7 s. Decode unchanged. `0`: the read before each forward. |
+| `FREETOKEN_PLE_PREFILL_RANK0` | `1` | With `--ple-backend disk` at TP>1: only rank 0 reads a prefill's PLE rows from disk and broadcasts their bytes to the other ranks at the lookup (every rank stages every head, so the bytes are the same: **bit-exact**), instead of every rank reading the same rows at once from the same disk. `xtx-xt-4x262k`, with `FREETOKEN_PLE_PREFILL_PREFETCH`: EXL3 3.05 bpw agent turns 0.466 -> 0.435 s, one-word turns 0.192 -> 0.188 s; NVFP4 0.693 -> 0.662 s, 0.243 s either way; the 45k-token document 14.1 -> 13.8 s and 15.1 -> 14.7 s; decode and four requests unchanged. `0`: each rank reads its own. |
 | `FREETOKEN_QSA_PLAN_KERNEL` | `1` | The QSA layers' per-forward index-write plan (compressed-slab rows, ring rows, the mrope rows of the indexer) in two kernels instead of ~30 torch ops, in the graph and in each eager MTP pass (four times a 4-row step). Same values. With `FREETOKEN_PLE_CONV_KERNEL` and `FREETOKEN_MTP_KV_ONLY_STOP`: `xtx-xt-4x262k` +1.8 % at one request, +1.9 % at four; NVFP4 `xtx-xt` +1.6 % / +1.0 % ([journey.md](journey.md#25-a-decode-step-kernel-by-kernel-2026-10-11-and-12)). `0`: torch ops. |
 | `FREETOKEN_PLE_CONV_KERNEL` | `1` | The PLE's decode conv over a verify step's rows in one kernel instead of ~6 torch ops a row, on gfx11 (other GPUs keep the torch ops). Same bits (fp32 products rounded on their own, summed in the order torch takes there). `0`: torch ops. |
 | `FREETOKEN_PLE_CONV_BLOCK` | `4096` | The per-layer-embedding (PLE) convolution runs 4096 tokens at a time, for one or several requests. Keeps big prefill chunks and batched prefills within memory (3 requests prefilled together, 16k tokens: 0.7 GiB of temporaries, 2.6 GiB unblocked). Reorders sums; *agent-validated* for one request, identical to the unblocked path in a GPU check with several. |
 | `FREETOKEN_PREFILL_PREDICT` | `1` | With `FREETOKEN_PREFILL_CACHED_MAX`: layer L+1's router applied to layer L's MoE input predicts the experts layer L+1 routes to (each token's top-k + `FREETOKEN_PREFILL_PREDICT_EXTRA`, default 0: 79-84 % of them, and about as many experts it does not route to; +4 caught 88-91 % but predicted 14-27 % more experts, with 53-97 % more of them not routed to, and those copies cost more than the misses: short turns up to 6 % slower on EXL3 `xtx-xt-4x262k`; not measured on NVFP4), and the ones not cached are copied on a copy stream while layer L computes; layer L+1 copies only what the prediction missed. Only copies, so the same bits. `0`: no prediction (and the cache path off by default: without the prediction it gained only below ~300 tokens and lost from ~1k on). |
-| `FREETOKEN_PREFILL_COPY_OVERLAP` | `auto` | With `FREETOKEN_PREFILL_CACHED_MAX`: the routed experts a short prefill's prediction missed are copied on the prefill copy stream while the shared expert runs, instead of before it on the compute stream. The same copies and GEMMs: **bit-exact**. `auto`: with NVFP4 experts decoded on the GPU (not with `--hybrid`, not measured there). NVFP4 `xtx-xt-4x262k` (two runs against one): one-word turns 0.239 -> 0.225-0.228 s, agent turns 0.407 -> 0.398-0.399 s, the decode unchanged. EXL3 3.05 bpw (four runs against two): agent turns 0.286 -> 0.274 s, one-word turns 0.225 -> 0.218 s, but the decode after them 1-2 % slower (one request 93.4 -> 91.7 tok/s, four 37.25 -> 36.8 each), a net loss on an agent turn of a few hundred tokens; the cause was not found, as for the third stream of its own on which the copy first ran, where the decode after many turns ran a third slower ([journey.md](journey.md#32-streams-queues-and-the-gdn-chain-2026-10-18)). `1` / `0`: on / off whatever the experts. |
+| `FREETOKEN_PREFILL_PREDICT_MIN_VOTES` | `auto` | With `FREETOKEN_PREFILL_PREDICT`: copy ahead only the experts at least this many of the chunk's tokens predict; the others, when layer L+1 routes to them, go through the fix-up copy. Only copies: **bit-exact** (`tests/models/qwen4_exp/test_predict_votes.py`). An NVFP4 agent turn of 500-750 tokens copied ~10,000 predicted and ~1,600 missed experts on rank 0 (~16 GiB, PCIe saturated), many of the predicted ones named by a single token and not routed. `auto`: 2 with NVFP4 experts, 1 (every prediction) otherwise. `xtx-xt-4x262k`, two runs each: NVFP4 agent turns 0.663 -> 0.624-0.625 s at 2 (0.616 at 3), one-word turns 0.244-0.245 -> 0.228-0.229 s (0.235-0.236 at 3); EXL3 3.05 bpw at 2 one-word turns 0.191-0.193 -> 0.199-0.205 s, agent turns 0.435-0.436 -> 0.440-0.441 s (its turns lean on the copies overlapping the compute). |
+| `FREETOKEN_PREFILL_PREFETCH_DEFER` | `1` | With `FREETOKEN_PREFILL_PREDICT`: the copy engine needs host addresses for the predicted experts, so their copy plan has to reach the host. That read used to come right after the plan, a sync at every layer (~47 a short turn) that emptied the GPU's queue, which then refilled at the host's launch pace; the host spent most of a short turn waiting there. Now the plan is copied to pinned memory with an event, and the host reads it once the layer's expert GEMMs are queued (the GPU still has them to run). The same copies into the same slots: **bit-exact** (`tests/moe/test_prefill_cached.py` runs both ways). `xtx-xt-4x262k`, launcher settings: EXL3 one-word turns 0.246 -> 0.220 s and agent turns 0.508 -> 0.494 s alone, 0.188-0.195 s with `FREETOKEN_TRITON_FAST_LAUNCH`; NVFP4 0.263 -> 0.258 s, agent turns unchanged. `0`: the read right after the plan. |
+| `FREETOKEN_PREFILL_COPY_OVERLAP` | `auto` | With `FREETOKEN_PREFILL_CACHED_MAX`: the routed experts a short prefill's prediction missed are copied on the prefill copy stream while the shared expert runs, instead of before it on the compute stream. The same copies and GEMMs: **bit-exact**. `auto`: with the experts decoded on the GPU (not with `--hybrid`, not measured there), EXL3 ones only with `FREETOKEN_PREFILL_PREFETCH_DEFER`. NVFP4 `xtx-xt-4x262k` (two runs against one): one-word turns 0.239 -> 0.225-0.228 s, agent turns 0.407 -> 0.398-0.399 s, the decode unchanged. EXL3 3.05 bpw with `FREETOKEN_PREFILL_PREFETCH_DEFER` (two runs each): agent turns 0.487-0.488 -> 0.475-0.476 s, one-word turns 0.197-0.201 -> 0.191-0.192 s, the decode unchanged (one request 91.9-92.1 against 92.0 tok/s, four 36.1-36.2 each); with the plan read right after it, the EXL3 decode after the turns ran 1-2 % slower ([journey.md](journey.md#33-short-turns-the-host-waiting-at-every-layer-2026-10-18-and-19)). `1` / `0`: on / off whatever the experts. |
 | `FREETOKEN_FUSED_MOE_EPILOGUE` | `1` | The routed experts' sum, the shared expert's gate (a dot product and a sigmoid) and the mul-add of each MoE block in one kernel instead of three; the NVFP4 decode hands over its per-expert outputs. Same arithmetic in the same order on the same tiles: **bit-exact**. Only Triton NVFP4 / EXL3 experts on the GPU decode path, at TP=1 or with `FREETOKEN_FUSE_MOE_ALLREDUCE=1` (the bf16 kernel overwrites its input; hybrid and CPU layers add partial sums; without the block's single all-reduce the experts would reduce each expert's output): others keep the three kernels. NVFP4 `xtx-xt`, greedy decode without the MTP head: 57.8 -> 59.2 tok/s alone, with the MTP head 82.9 -> 83.8. `0`: three kernels. |
 | `FREETOKEN_FUSED_HC_NORM` | `1` | Each hyper-connection combine and the grouped RMSNorm that reads the streams next (the MLP block's, the next layer's, the final mixer's; not into a PLE layer) in one kernel, the normed streams freed as soon as read. **Bit-exact**, two launches fewer per layer. With the epilogue above, `xtx-xt` greedy decode: NVFP4 57.8 -> 59.8-60.0 tok/s (82.9 -> 85.6 with the MTP head), EXL3 3.05 bpw 58.4 -> 59.7 (86.4 -> 89.2), 4.05 bpw 55.3 -> 56.5 (81.6 -> 83.3); prompt reading and VRAM peaks unchanged ([journey.md](journey.md#19-fewer-decode-kernels-2026-10-06)). `0`: separate kernels. |
 | `FREETOKEN_FEWER_COPIES` | `1` on ROCm, `0` elsewhere | Decode and prefill read the attention's q / k, its output gate, the GDN gate z and the QSA indexer's q / k where the projections wrote them, instead of copying each to a contiguous tensor first: the norms and the indexer kernels take the row / head strides, and the gate is applied in one kernel (`o * sigmoid(gate)`, the sigmoid rounded to bf16 as torch does: identical on all 65280 finite bf16 inputs). **Bit-exact** (GPU tests on both cards, `tests/kernels/test_fewer_copies.py`); up to ~110 launches fewer per verify step of the MTP head, fewer prefill temporaries. With `FREETOKEN_GEMV_LAST_REDUCES`, `xtx-xt` greedy with the MTP head (sessions interleaved, 12 prompts identical): NVFP4 83.2 -> 85.1-85.2 tok/s (GPU time per step -2.6 to -2.8 %), EXL3 3.05 bpw 99.1 -> 101.9-102.0 (-2.9 to -3.3 %); prompt reading unchanged; VRAM peak ~100 MiB lower on each card (NVFP4). Off by default on NVIDIA: flashinfer's `gemma_rmsnorm` takes 2D inputs only, and the bits were checked on ROCm's Triton only. `0`: the copies. |
@@ -800,6 +807,7 @@ disagreements over ~8k sampled tokens in `check` mode). It is on the torch.distr
 | `FREETOKEN_GDN_PREFILL_BLOCK` | `4096` | The GatedDeltaNet delta rule of a prefill runs 4096 tokens of each request at a time, the recurrent state carried through the request's pool slot (a multiple of 64; `0`: the whole chunk in one call). The same bits (the kernels work per 64-token chunk with an fp32 state); a quarter of the temporaries at a 16k-token chunk. |
 | `FREETOKEN_GDN_PREFILL_WARPS` | `8` on ROCm | Warps of two GatedDeltaNet prefill kernels (the state recurrence of `chunk_delta_h`, upstream 4; `recompute_w_u`, upstream 4 warps and 3 stages, here 1 stage). At upstream's they spill 484 and 796 B per lane to scratch on RDNA3. The same bits; a 16k-token GDN prefill 37 % faster on a 7900 XT (8.56 -> 5.43 ms), and less of the scratch the HIP runtime takes outside the torch allocator (101 -> 48 MiB). `0`: upstream's launches. `SGLANG_GDN_CHUNK_H_NUM_WARPS` still overrides the first. |
 | `FREETOKEN_QSA_MIN_WARPS` | `4` on ROCm | The fewest warps of the QSA sparse attention kernel. Its prefill profile (tuned on GB300) runs 2 warps, which on RDNA3 at head_dim 256 spill ~2.2 KB per lane to scratch; at 4 none. The same bits (bf16 cache; 8 prefill shapes of 128-16k rows checked); the kernel 39-45 % faster at 1k-16k rows, and no ~60 MiB of scratch per GPU queue outside the torch allocator. Decode already runs 4. `0`: the profile's own. |
+| `FREETOKEN_QSA_SCORE_ROWS` | `1` | The QSA indexer's block scoring of a prefill of one request (64 rows or more) runs 16 query rows a program instead of one: each tile of compressed keys is loaded once for the 16 rows and multiplied with their 4 heads together, where the one-row kernel padded the 4 heads to 16 and reloaded the keys for every row. The same K order in the dot and the heads summed as the padded reduction sums them, (h0 + h2) + (h1 + h3): **bit-exact** (`tests/kernels/test_qsa_score_rows.py`, both cards). A 16k-token chunk 150k deep: 47.3 -> 11.1 ms a layer on the 7900 XTX (12 attention layers a chunk). `xtx-xt-4x262k`, cold reads: NVFP4 164k tokens 56.0-56.2 -> 52.7-53.7 s, 96k 31.5-31.6 -> 30.5 s (two runs each); EXL3 3.05 bpw 52.6 -> 49.7 s and 29.5 -> 28.5 s (one). `0`: one row a program. |
 | `FREETOKEN_QSA_KV_INT8` | unset | **Not recommended.** `1`: int8 KV cache for the attention (QSA) layers, 3.19 -> 1.71 GiB per card. Short benchmarks and 227k-token needle tests looked fine, but the agentic benchmark fell from 12-14 to 8-9 bugs fixed and the agent stopped exploring early. |
 | `FREETOKEN_QSA_STAGE_SELECTED` | `1` | With `FREETOKEN_QSA_KV_HOST=1`, a prefill copies to VRAM only the K/V rows of the tokens it selects (marked per layer from the attention's indices by the attention kernel's own mapping) instead of every page in use: the attention reads the same rows, so the same bits (`tests/kernels/test_qsa_kv_host.py`). A 220-row turn at 224k selects 11-21 % of the history's tokens. EXL3 3.05 `xtx-xt-4x262k` at 224k of context: turns of 142-360 tokens 0.57-0.70 -> 0.49-0.62 s, 1.0-1.1k 0.90-0.98 -> 0.84-0.89, 2.8-3.2k -0.04 to -0.05 s, the same answers; unchanged at 25k. `0`: every page in use. |
 | `FREETOKEN_QSA_KV_HOST` | unset | `1` in `xtx-xt-1m` and `xtx-xt-4x262k`. `1`: the attention K/V slab in pinned, device-mapped host memory instead of VRAM; decode and verify read the selected tokens across PCIe, a prefill copies the K/V rows its tokens select to a VRAM buffer first (`FREETOKEN_QSA_STAGE_SELECTED`). Bit-identical answers. On ROCm the memory is allocated non-coherent, so L2 keeps what the verify rows share. At 1M tokens of context on `xtx-xt` with EXL3 3.05 bpw: 11,261 expert slots (the K/V would need 13.2 GiB per card), prompt reading 2376 tok/s at 118k and 1780 at 988k, decode 84.2 tok/s at 118k (90.6 with the K/V in VRAM at 250k), 93.0 at 498k and 84.7 at 988k; ~75 GiB of host RAM locked ([long-context.md](long-context.md)). The pool stays at `--kv-reserve-tokens` (a page past it would pin ~0.9 MB of RAM for ~0.1 MB of VRAM); `FREETOKEN_HOST_KV=1` is ignored with it (a warning) and `FREETOKEN_QSA_KV_INT8=1` refused. |
@@ -866,6 +874,7 @@ Beyond the GPU pool + the RAM tier, the least recently used conversations are dr
 | `FREETOKEN_VRAM_MARGIN_MIB` | `512` on ROCm, `0` elsewhere | Once the engine is built, cap the torch allocator at the card's VRAM minus what lives outside torch then (HIP runtime, RCCL, loaded kernel modules, scratch, a desktop's buffers: the card's used VRAM is read from sysfs, since the free memory HIP reports leaves the graphics stack out) minus this margin. A prefill that reaches the cap makes the allocator release its cached blocks, or fail with a plain out-of-memory error, before the card is full: within tens of MiB of full the driver's evictions ended in GPU page faults and a hung collective ([troubleshooting.md](troubleshooting.md#a-gpu-fault-or-a-hung-collective-with-a-full-card)). The cap and the VRAM outside torch are logged at start. `0`: no cap. |
 | `FREETOKEN_TOKENIZE_PREFIX_CACHE` | `8` | The tokenizer keeps the last N prompts it encoded. A prompt that shares a prefix with one of them takes that prompt's tokens up to the last turn start (`<\|im_start\|>`) inside the shared part and encodes only the rest: the same tokens (a fast tokenizer encodes the text between two added tokens on its own; the split is checked on probe strings at start, else off; `tests/tokenizer/test_prefix_cache.py`). An agent turn's encode at 173k of context ~0.4 s -> 2 ms: time to the first token of a short turn 0.93-1.03 -> 0.53-0.58 s (EXL3 `xtx-xt-4x262k`; at 25k -0.05 to -0.08 s), the same answers ([journey.md](journey.md#27-agent-turns-short-prefills-through-the-expert-cache-2026-10-14)). `0` = off. |
 | `FREETOKEN_TOKENIZE_PREFIX_CHECK` | `0` | `1`: also encode every prompt whole, log a mismatch and keep the whole encoding (validation). |
+| `FREETOKEN_TRITON_FAST_LAUNCH` | `1` | A Triton launch skips Triton's per-launch Python (the binder specializing every argument, on ROCm with a Python call per tensor for the buffer ops, the cache key, the launch metadata and two empty launch hooks): the kernel compiled for a launch is kept under a key computed from what that specialization reads (each tensor's dtype, 16-byte alignment and storage under 2 GiB; each integer's 1 / multiple of 16 / width; the constexprs and options), and later launches with the same key call its launcher directly. The same compiled kernel with the same arguments: **bit-exact** by construction (`tests/kernels/test_triton_fast_launch.py`: equal keys specialize alike, misaligned pointers key apart). A short agent turn launches ~1,550 Triton kernels; a launch took ~18 us of host time in isolation (~10 us through this path) and ~50 us in the server. Measured on `xtx-xt-4x262k` with the launcher's settings: EXL3 one-word turns 0.235 -> 0.214 s (agent turns unchanged); NVFP4, whose short turns wait on PCIe, 0.260 -> 0.255 s. A launch hook (a profiler), a pre-run hook or an argument type the key does not cover takes Triton's path; the direct call repeats Triton 3.8.0's launcher, so another Triton version keeps Triton's path everywhere (no `Triton launches: fast path` line in the log). `check`: also runs Triton's binder at every launch and raises if it would pick another kernel (validation). `0`: Triton's path. |
 | `FREETOKEN_MLOCK` | `1` | Lock the process's memory once the model is loaded (`mlockall`, current and future pages, on fault), so that with `vm.compact_unevictable_allowed=0` the kernel's memory compaction leaves the pages the GPU driver maps alone; each move stopped the GPU queues for seconds ([troubleshooting.md](troubleshooting.md#long-pauses-in-the-middle-of-a-run)). Skipped, with a log line, under a finite `RLIMIT_MEMLOCK`. `0`: off. |
 
 ## Diagnostics (off by default)
@@ -1335,7 +1344,12 @@ NVFP4 MoE blocks are bit-identical, and 8192 tokens long in `xtx-xt` and `xtx-xt
 benchmark for one request), and experts already in the GPU cache are gathered on the GPU instead of crossing PCIe
 again (`--moe-prefill-hit-d2d`, with `hipMemcpyBatchAsync` on ROCm, or one copy per entry on older HIP): a third of
 the experts stay off PCIe per chunk, an agent turn's first token 1.55 -> 1.18 s. A single card keeps 8k chunks
-(its working memory is smaller).
+(its working memory is smaller). The per-layer-embedding rows of a prefill are read from disk on a thread by rank 0
+only, which broadcasts them, and a long prompt's next chunk's rows are read while a chunk computes (they took ~1.1 s
+per 16k-token chunk, the GPUs idle); on two cards each block of a chunk's routed experts and of its GatedDeltaNet
+output starts its all-reduce while the next block computes, and the QSA indexer scores 16 query rows a program (the
+same bits): fully cold reads ~25 % shorter
+([journey.md](journey.md#33-short-turns-the-host-waiting-at-every-layer-2026-10-18-and-19)).
 
 A short chunk (up to 1280 tokens on Qwen3.8-Flash-Next, an agent's tool result) does not stream the whole layers: it
 routes to only part of the experts, so it reads its routed experts from the slot cache, the next layer's predicted by
@@ -1347,7 +1361,13 @@ the tokenizer reuses the previous prompt's tokens instead of encoding the whole 
 ([journey.md](journey.md#27-agent-turns-short-prefills-through-the-expert-cache-2026-10-14)). Short prefills now take
 expert tiles sized for a few rows an expert and no longer wait on the GPU in every GatedDeltaNet layer: the time to
 the first token of 200-250-token turns at 34k 11-13 % shorter, of one-word turns 42 % on NVFP4 and 5 % on EXL3
-([journey.md](journey.md#31-short-agent-turns-2026-10-17-and-18)).
+([journey.md](journey.md#31-short-agent-turns-2026-10-17-and-18)). The predicted experts' copy plan, which the copy
+engine needs on the host, is read once the layer's GEMMs are queued rather than in a sync that emptied the GPU's queue
+at every layer, Triton kernels launch through a shorter host path, the int8 weights are dequantized in one pass, the
+PLE rows are read as above, with EXL3 too the missing experts' copy overlaps the shared expert, and with NVFP4, whose
+short turns keep PCIe saturated, only the experts at least two tokens predict are copied ahead: one-word turns at 34k a
+further ~20 % shorter on EXL3 and 12 % on NVFP4, agent turns of 500-750 tokens 15 % and 13 %
+([journey.md](journey.md#33-short-turns-the-host-waiting-at-every-layer-2026-10-18-and-19)).
 
 ## Sampling on ROCm
 
@@ -1637,7 +1657,7 @@ run on the agentic benchmark with the MTP head: 12 and 18 of 29 in two runs.
 
 # The journey
 
-How this build came about: measured experiments from 2026-09-25 to 2026-10-17 on one machine, an RX 7900
+How this build came about: measured experiments from 2026-09-25 to 2026-10-19 on one machine, an RX 7900
 XTX 24 GB + RX 7900 XT 20 GB (gfx1100, no GPU peer-to-peer), a Threadripper 3970X and 128 GB of DDR4, serving
 Qwen3.8-Flash-Next NVFP4 to the author's coding agent (OpenCode) with a 262k-token context (250k from 2026-10-03 to 2026-10-16). Every number was measured
 on that machine (changes in interleaved A/B runs), except the few marked as estimates. The choices and their
@@ -2716,7 +2736,174 @@ the other stride gives other bits, why was not looked into). The first version o
 bitwise test (which checked the conv's outputs) and changed 7 of 15 greedy answers. A fused kernel's test has to run
 the kernel after it on the layout it hands over.
 
-## 33. Still open
+## 33. Short turns: the host waiting at every layer (2026-10-18 and 19)
+
+Measured on `xtx-xt-4x262k` with the launcher's arguments, each arm a fresh server, the changed files mounted over the
+image of section 32, arms alternated. The workloads: 15 greedy prompts; one-word turns (9 turns on a 34k-token
+conversation, 40-90 tokens to read each); an agent conversation (a 45k-token document, then 9 turns of 500-750 tokens to
+read, each after a 200-token greedy answer); one request decoding 512 tokens; four requests of ~8k tokens each decoding
+together (the window where all four decode); cold reads of 164k and 214k tokens. Every arm gave the answers of the build
+without its change (the greedy prompts, both conversations and the cold reads).
+
+**Where a short turn's host time goes.** A wrapper around Triton's launch counted ~1,550 Triton launches a one-word turn
+and ~78 ms of host time inside them (~50 us a launch; ~18 us for a small kernel in isolation). Launching faster (below)
+gained little on NVFP4, so the host was not the bound: under cProfile, then py-spy (native stacks), the main thread of
+rank 0 spent ~74 % of its samples (EXL3) waiting in the `.cpu()` of the predicted experts' copy plan, ~47 a turn, ~3 ms
+each, and `torch.topk`, which cProfile showed at ~1 ms a call, took 50 us in isolation and was barely sampled (a
+cProfile artefact). Each of those syncs emptied the GPU's queue, which the host then refilled at its launch pace.
+
+**Kept, the same bits:**
+- The copy plan read once the layer's expert GEMMs are queued (`FREETOKEN_PREFILL_PREFETCH_DEFER`): the plan goes to
+  pinned memory with an event; the host waits on that event, by then usually passed, while the GPU still has the layer's
+  GEMMs to run. EXL3 one-word turns 0.246 -> 0.220 s, agent turns 0.508 -> 0.494 s; NVFP4 0.263 -> 0.258 s, agent turns
+  unchanged.
+- A shorter launch path for every Triton kernel (`FREETOKEN_TRITON_FAST_LAUNCH`): the compiled kernel is kept under a
+  key computed from what Triton's specialization reads, and later launches call its C launcher with the same arguments
+  (empty launch hooks passed as none). A small kernel 17.4 -> 9.7 us of host time; a check mode runs Triton's binder at
+  every launch and compares the kernels (clean through every NVFP4 workload, the two long reads included). EXL3 one-word
+  turns 0.235 -> 0.214 s alone, 0.188-0.195 s with the deferred plan read; NVFP4 0.260 -> 0.255 s.
+- The prefill's int8 dequantization in one Triton pass (`FREETOKEN_INT8_PREFILL_DEQUANT`), bit for bit `torch.mul`'s:
+  EXL3 agent turns 0.495 -> 0.487 s, NVFP4 0.718 -> 0.713 s.
+- With the deferred plan read, the EXL3 fix-up copy on the prefill copy stream (`FREETOKEN_PREFILL_COPY_OVERLAP`,
+  section 32) no longer slows the decode after it (two runs each: one request 92.0 against 91.9-92.1 tok/s, four
+  36.1-36.2 each): agent turns 0.487-0.488 -> 0.475-0.476 s, one-word turns 0.197-0.201 -> 0.191-0.192 s. `auto` now
+  takes it with EXL3 too.
+
+All four, the image of section 32 against its tree (one run each, the answers identical):
+
+| | NVFP4 3 x 262k | EXL3 3.05 bpw |
+|---|---|---|
+| one-word turns | 0.261 -> 0.251 s | 0.243 -> 0.192 s |
+| agent turns | 0.718 -> 0.717 s | 0.507 -> 0.477 s |
+| one request, decode | 92.9 -> 93.2 tok/s | 91.9 -> 91.9 tok/s |
+| four requests, each | 33.8 -> 34.0 tok/s | 36.1 -> 36.2 tok/s |
+
+NVFP4's agent turns wait on the routed experts crossing PCIe (section 31), which none of this changes. Fully cold reads
+(on a fresh server after the greedy prompts, two starts each): EXL3 164k tokens 66.8 s on the image, 66.7 s with these
+four, 96k 37.5 and 37.4 s. The same 164k-token read after the four-request workload, one of whose prompts is its
+beginning (9,856 tokens found in the cache): NVFP4 65.7-66.1 s in three runs (the image, these four, these four in the
+check mode), EXL3 62.6 s with these four but 67.2 s on the image, a slow run without a cause found (with the NVFP4 read
+of 23.4 s below, two slow reads among the night's ~40).
+
+**Cold reads: the GatedDeltaNet output's all-reduce behind the next block (kept, `FREETOKEN_GDN_AR_OVERLAP`).** The
+delta rule of a 16k-token chunk already runs in 4096-token blocks. A one-request chunk of whole blocks now runs each
+block's gated norm (with the whole chunk's rows per program) and output projection as the block finishes, and starts its
+all-reduce while the next block's delta rule runs. hipBLASLt keeps a row's bits across row counts for some shapes only:
+the output projections (2560 x 3456 / 2688 on the two ranks with GDN, 2560 x 3328 / 2816 for attention) gave the whole
+call's rows in 4096-row blocks of 8k-16k-row calls on both cards, but 2560 x 2688 and 2560 x 2816 not in 2048-row
+blocks, and the shared expert's 704 x 2560 not even in 8192-row ones. So the first chunk of each size checks a block
+against the whole call on random data, and the ranks keep the overlap only if all pass (one all-reduce of the verdict).
+The same bits (greedy prompts and both cold reads identical). Two runs each, with the MoE overlap above: NVFP4 164k
+tokens 66.9-67.0 -> 65.8-65.9 s, 96k 37.5 -> 37.0 s; EXL3 96k 35.0-35.1 -> 34.7 s, 164k 62.7 -> 62.1 s in one run (the
+other took 67.5 s, two of its 16k-token chunks 10 and 8 s instead of 6, the slowdown seen twice before).
+
+**The decode after the overlapped all-reduces.** A validation of the whole tree with the decode measured after the cold
+reads (the overlap series had measured only reads) found four NVFP4 requests decoding at 22.7 tok/s each against 33.9:
+the compute stream waits for RCCL's on the GPU, the mechanism of the next paragraph. A device synchronize at the end of
+every prefill forward that ran such an all-reduce restored them (34.2) but lengthened the 164k-token read by 1.4 s (67.3
+against 65.9 s: the host prepares each chunk while the GPU sits idle); one before the next decode step instead restored
+them (34.0) and left the reads unchanged (65.9 s). EXL3's four requests had not slowed (36.5).
+
+**Cold reads: the PLE rows read ahead (kept, `FREETOKEN_PLE_PREFILL_PREFETCH`).** The GPUs' busy percentage sampled at
+20 Hz during a 164k-token read showed both cards idle for 0.9-1.4 s at the start of every 16k-token chunk, ~16 % of the
+read. A prefill reads its tokens' per-layer-embedding rows from the checkpoint on the host, before the forward starts:
+1.09-1.21 s per 16,384 tokens on each rank (each reads every head). While a chunk of a longer prompt computes, a thread
+now reads the next chunk's rows (assumed of the same length, or the rest of the prompt) into the other pinned buffer
+through a store of its own (the store's calls release the GIL); the next chunk takes them when its tokens are exactly
+those, and every chunk of a long read did. The scheduler hands the whole prompt to each chunk for it. The same rows, the
+same bits. Fully cold reads, two runs each: NVFP4 164k tokens 65.9-66.0 -> 56.7 s, 96k 37.0 -> 32.0 s, the 45k-token
+document of the agent conversation 17.0 -> 15.3 s; EXL3 3.05 bpw 62.1 -> 53.4 s, 34.7 -> 30.1 s, 15.9 -> 14.3 s; short
+turns and decode unchanged. Against the image of section 32, with the two all-reduce overlaps: NVFP4 reads 70.2 -> 56.7
+s and 39.5 -> 32.0 s, EXL3 66.9 -> 53.4 s and 37.6 -> 30.1 s (-19 to -20 %). The slow reads above (two 16k-token chunks
+taking 10 and 8 s instead of 6) fit a slower disk read for a while, which the read-ahead now hides; not verified.
+
+**Short prefills: the PLE rows read on the thread too.** The same read takes 46-66 ms for an agent turn of 500-740
+tokens (EXL3, both ranks reading at once) and 4-10 ms for a one-word turn of 40-94 tokens, before the forward. A
+micro-benchmark of the row store on the checkpoint's table (9,600 random rows of 160 bytes, one process) took 36-44 ms
+with io_uring at a queue depth of 64, no less at 128-1024, and the same with 64 threads of `pread`: ~250k random reads a
+second, the disk's limit for this pattern here (a container without `seccomp=unconfined` falls back to 16 `pread`
+threads, 53 ms). So the thread now also reads the current prefill's rows, while the host launches the layers before
+the PLE layer (layer 2), and the lookup waits for them; an eager fill on the host thread (a decode step without a graph)
+waits for the thread and drops what it read ahead. Two runs each, the same answers: EXL3 one-word turns 0.199-0.202 ->
+0.194 s, agent turns 0.477 -> 0.465-0.466 s, the 45k-token document 15.8 -> 14.1 s; NVFP4 (one run) 0.253 -> 0.243 s,
+0.714 -> 0.694 s, 17.0 -> 15.1 s; decode unchanged.
+
+**One rank reads the PLE rows (kept, `FREETOKEN_PLE_PREFILL_RANK0`).** Each rank read every head, the same rows,
+from the same disk at the same time. Now only rank 0 reads a prefill's rows and broadcasts their bytes (~1.5 MB for a
+600-token turn) at the lookup; the same bytes, the same answers, and the four requests after it did not slow (EXL3
+36.2, NVFP4 34.1 tok/s each). One run each: EXL3 agent turns 0.466 -> 0.435 s, one-word turns 0.192 -> 0.188 s, the
+45k-token document 14.1 -> 13.8 s; NVFP4 0.693 -> 0.662 s, 0.243 s either way, 15.1 -> 14.7 s.
+
+**NVFP4: copy ahead only the experts several tokens predict (kept, `FREETOKEN_PREFILL_PREDICT_MIN_VOTES`).** Counted
+in the plans, an NVFP4 agent turn of 500-750 tokens copies 8,400-10,000 predicted and ~1,600 missed experts on rank 0,
+14.5-17 GiB at 1.46 MiB each over the turn's 0.65-0.70 s: PCIe is busy throughout, so an expert copied ahead that the
+next layer does not route to costs the turn its transfer time. Keeping only the experts that at least 2 tokens predict
+(the others go through the fix-up copy if routed; only copies, the same answers), two runs each: NVFP4 agent turns
+0.663 -> 0.624-0.625 s, one-word turns 0.244-0.245 -> 0.228-0.229 s; at 3, 0.616 and 0.235-0.236 s. EXL3, whose turns
+lean on the copies overlapping the compute, lost at 2 (0.435-0.436 -> 0.440-0.441 s, 0.191-0.193 -> 0.199-0.205 s): the
+default takes 2 for NVFP4 only.
+
+**The decode slowed by copies on another stream (cause narrowed, section 32).** The fix-up copy put back on a third
+stream of its own (NVFP4): one request decoded at 88.4 tok/s after the turns against 92.9-93.0, the four requests after
+long prefills unchanged (33.9). With a device synchronize after every prefill: 92.7. With a host synchronize of that
+stream alone after every prefill: 92.9 and 33.9. With the compute stream waiting on it on the GPU (`wait_stream`) after
+every prefill instead: 92.9 for one request but 22.3 tok/s each for four, the slowdown of section 32. So a cross-stream
+wait on the GPU leaves the decode graph replayed after it slow until the host synchronizes the other stream; what in the
+HIP runtime keeps that state was not found (its stream wait inserts a marker that depends on the other queue's command).
+
+The NVFP4 read of 23.4 s: an arm read the agent conversation's 45k-token document in 23.4 s instead of ~18, two
+16k-token chunks taking 10 and 7 s instead of 6 and 5, and decoded the answer at 87 tok/s instead of 93, around
+midnight; the system journal shows nothing.
+
+**Cold reads: the MoE all-reduce block by block (kept, `FREETOKEN_PREFILL_AR_OVERLAP`).** A 16k-token chunk's routed
+experts already run in token blocks (8192 tokens with NVFP4, 4096 with EXL3) whose rows are independent. Each block now
+finishes its rows (the fused epilogue, with the warps the whole chunk would take, since the gate's sum follows them) and
+starts their all-reduce on RCCL's stream while the next block computes; the layer waits for all of them at its end.
+Every element is the same epilogue, then the sum of the two ranks' values: the same bits (greedy prompts and both cold
+reads identical). Two runs each, on a fresh server after the greedy prompts, nothing of either text cached: NVFP4 164k
+tokens 70.1-70.2 -> 67.0-67.1 s, 96k 39.4-39.5 -> 37.6 s (-4.5 %); EXL3 66.6-66.7 -> 62.7-62.9 s and 37.4 -> 35.0-35.1 s
+(-6 %).
+
+**Cold reads: the indexer's scoring 16 rows at a time (kept, `FREETOKEN_QSA_SCORE_ROWS`).** The QSA indexer scores
+every query row against every visible compressed key (a quarter of the tokens) in a program of its own: a [64 x 128]
+x [128 x 16] dot a tile, its 4 heads padded to 16, the keys reloaded for every row; 47.3 ms a layer for a 16k-token
+chunk 150k deep on the 7900 XTX, 12 ms at 30k (12 attention layers a chunk). A kernel for a prefill of one request
+scores 16 rows a program, one [64 x 128] x [128 x 64] dot a tile for their 64 (row, head) pairs: 11.1 ms. A score
+keeps its bits: the dot's K order is the same, and of three explicit orders for the sum of the 4 heads, (h0 + h2) + (h1
++ h3) is the one the padded reduction gives (the two others differed in ~14k and ~12k of ~1M scores). Bit for bit
+against the one-row kernel from 70 to 16,384 rows and 0 to 150k deep on both cards; the same answers. Cold reads: NVFP4
+164k tokens 56.0-56.2 -> 52.7-53.7 s, 96k 31.5-31.6 -> 30.5 s (two runs each); EXL3 52.6 -> 49.7 s and 29.5 -> 28.5 s
+(one); short turns unchanged.
+
+**Long agent turns.** Turns of ~2k tokens (beyond `FREETOKEN_PREFILL_CACHED_MAX`, they stream whole layers) took 1.19
+s (NVFP4) and 0.89 s (EXL3); with the slot cache up to 4096 tokens, 1.17 and 0.90 s, the same answers: the threshold
+stays.
+
+**Dropped:** the row store's reads through the page cache instead of O_DIRECT (a micro-benchmark on the table: on text
+not read before, 600-token turns 31-55 ms against 23-40 and 16k-token chunks 650-780 ms against 510-710; faster only on
+rows already read, for RAM the experts and the K/V need); a deeper io_uring queue (above).
+
+**The night's build against the image of section 32**, `xtx-xt-4x262k` with the launcher's arguments, two fresh
+servers each, alternated, every answer identical (the greedy prompts, both conversations, the 164k and 96k-token
+prompts, and with NVFP4 the four requests at once; with EXL3 two of those four differ between two starts of the image
+itself as well, batching, so they are not compared):
+
+| | NVFP4 3 x 262k | EXL3 3.05 bpw |
+|---|---|---|
+| one-word turns at 34k (40-90 tokens to read) | 0.256-0.261 -> 0.227-0.228 s | 0.237-0.243 -> 0.185-0.197 s |
+| agent turns at 45k (500-750 tokens to read) | 0.718 -> 0.621-0.622 s | 0.509-0.512 -> 0.432-0.434 s |
+| a 45k-token document, cold | 18.2 -> 14.5 s | 17.2 -> 13.6 s |
+| a 96k-token prompt, cold | 39.5-39.6 -> 30.3-30.4 s | 37.5-37.6 -> 28.4-28.7 s |
+| a 164k-token prompt, cold | 70.2-70.3 -> 52.7-52.8 s | 66.8-67.0 -> 49.5-49.9 s |
+| one request, decode | 92.8-92.9 -> 93.3 tok/s | 91.2-91.7 -> 91.7-92.1 tok/s |
+| four requests, each | 33.8-33.9 -> 33.8-34.0 tok/s | 35.9-36.2 -> 36.0 tok/s |
+
+One card (`xtx`, EXL3 3.05 bpw, 131k, one request at a time; the launcher's third entry), two starts each, the same
+answers: one-word turns 0.408-0.411 -> 0.388 s, agent turns 1.070-1.074 -> 1.009-1.010 s, the 45k-token document 24.6
+-> 23.4 s, the 96k-token prompt 53.4 -> 50.6-50.7 s, decode 51.3-51.6 -> 52.2-52.4 tok/s (there the all-reduce and
+rank-0 changes do not apply; measured before the indexer's 16-row scoring, not run on one card).
+
+## 34. Still open
 
 - In NVFP4 the model needs ~63 GiB of RAM for its experts alone (the engine keeps every expert in RAM). The EXL3 3.05
   bpw checkpoint needs 42.6 GiB and served under a 56 GiB container limit, but a real 64 GB machine is untested
@@ -2740,22 +2927,28 @@ the kernel after it on the layout it hands over.
 - On two cards `serve.sh` lowers `--memory-ratio` to 0.77 / 0.76 for EXL3 (3.05 bpw at 0.77 measured in section 21; 4.05
   bpw at 0.76 not measured again).
 - Short agent turns (section 27): about half of a 130-row turn at 25k is the routed experts the cache lacks crossing
-  PCIe (4-6 GB a card; estimated from the bank sizes at 26 GB/s, not timed apart), the rest compute and the host. The
-  levers left are a larger expert cache or fewer bytes per expert; a cache policy gains ~8 % of the misses at best
-  (above). The host paces short prefills (section 31): ~1,500 Triton launches at ~25 us of host time each, the copy
-  engine's host sync per layer for the predicted experts (removing it alone gained nothing), `torch.topk` and
-  hipBLASLt's host time.
+  PCIe (4-6 GB a card; estimated from the bank sizes at 26 GB/s, not timed apart), the rest compute and the host. An
+  NVFP4 agent turn of 500-750 tokens at 45k copies 8,400-10,000 predicted and ~1,600 missed experts on rank 0 (counted
+  in the plans: 14.5-17 GiB at 1.46 MiB each, ~24-28 GB/s over the turn's 0.65-0.70 s): PCIe is saturated throughout.
+  The levers left are a larger expert cache or fewer bytes per expert; a cache policy gains ~8 % of the misses at best
+  (above). The host's part (section 33): the per-layer sync of the predicted experts' copy plan is gone, Triton launches
+  cost ~10 us instead of ~50 and the PLE rows are read by one rank on a thread, but the GPUs still wait for them past
+  the first two layers (~250k random reads a second from the disk, ~30-40 ms for a 600-token turn); `F.linear`
+  (hipBLASLt) takes ~44 us of host time a call (~500 a turn).
 - Decode at three and four requests: the expert misses are ~9 ms of a four-request step (estimated), its largest part,
   and prefetching them on a side stream inside the replayed graphs made the step longer (section 29): a copy kernel
   beside the compute holds CUs for the whole PCIe transfer, and the copy engine would need host-known addresses
   (section 32). At four requests the host spends 23.7-25.0 ms of a 26.3-27.7 ms forward inside it
   (`FREETOKEN_SPEC_TIMING`, one run), then 1.4-1.5 ms launching the MTP head's KV pass (0.33 ms of GPU time); what
   holds the host inside the forward was not looked into.
-- A short prefill's copies slow the decode after them when they run on a stream of their own (a third slower, in
-  the runs without a periodic device synchronize) and, with EXL3 experts, a little on the prefill copy stream too
-  (section 32): cause not found.
+- A cross-stream wait on the GPU leaves the decode graph replayed after it slow until the host synchronizes the other
+  stream (section 33: the fix-up copy on a stream of its own, one request -5 %; joined on the GPU after each prefill,
+  four requests a third slower); what in the HIP runtime keeps that state was not found. The shipped copies on the
+  prefill copy stream do not show it.
 - Cold reads on two cards: the RCCL all-reduces take 17 % of the GPU time, staged through host memory (the cards have no
-  peer access); a host all-reduce of the same bits was slower (section 29).
+  peer access); a host all-reduce of the same bits was slower (section 29). The MoE's and the GatedDeltaNet output's
+  now run block by block behind the next block's work (section 33); the attention layers' output (12 of 48) and the
+  last, partial chunk of a read still all-reduce in one piece.
 - Cold reads: in a kernel trace of 16k-token chunks on the 7900 XTX (5.2-5.9 s of kernels each), the all-reduce took
   ~1 s (most of it likely waiting for the slower XT, which was not traced), the EXL3 expert GEMMs ~1.35 s, the sparse
   attention ~0.66 s (close to the bandwidth its K/V gathers need) and the indexer 0.15-0.55 s, growing with the
@@ -3589,6 +3782,15 @@ Line counts here are on top of the lines listed in the sections above.
 | `tests/moe/test_prefill_cached.py` | 273/0 | prefill from slots bit-identical to the full-layer buffers (EXL3, NVFP4), the LRU claims and demotion, the predicted prefetch then the fix-up copy, the split prefetch by DMA or shader copy (GPU) |
 | `python/freetoken/models/qwen4_exp/gdn.py`, `moe/fused_nvfp4.py`, `moe/fused_exl3.py`, `tests/models/qwen4_exp/test_gdn_host_bounds.py`, `tests/moe/test_nvfp4_prefill_tiles.py`, `tests/moe/test_short_prefill_tiles.py` | 6/3, 17/1, 7/3, new, new, new | short prefills (agent turns): the GDN prefill conv takes its longest request from the host bounds (a host sync in every GDN layer before); NVFP4 prefills of up to 1536 tokens take 4-warp tiles (`FREETOKEN_NVFP4_PREFILL_TUNED`), EXL3 ones of up to 512 tokens 16-row tiles (the same K order, the same bits) |
 | `python/freetoken/layers/moe.py`, `moe/offload_cache.py`, `models/qwen4_exp/moe.py`, `tests/moe/test_prefill_cached.py` | 36/0, 23/2, 21/1, 13/6 | a short prefill's fix-up copy (the routed experts the prediction missed) on the prefill copy stream while the shared expert runs (`FREETOKEN_PREFILL_COPY_OVERLAP`, the same copies and GEMMs); the test runs the predicted prefetch then the fix-up copy both ways |
+| `python/freetoken/kernel/triton/fast_launch.py`, `server/launch.py`, `tests/kernels/test_triton_fast_launch.py` | new, 4/0, new | Triton launches through a shorter host path (`FREETOKEN_TRITON_FAST_LAUNCH`): the compiled kernel kept under a key computed from what Triton's specialization reads, its C launcher called with the same arguments; the test checks that equal keys specialize alike and that launches through it run the kernel Triton would |
+| `python/freetoken/moe/offload_cache.py`, `tests/moe/test_prefill_cached.py` | 81/9, 9/2 | a slot-cache prefill reads its predicted experts' copy plan (the copy engine's host addresses) once the layer's GEMMs are queued, from pinned memory behind an event, instead of a sync right after the plan (`FREETOKEN_PREFILL_PREFETCH_DEFER`); the prefetch test runs both ways |
+| `python/freetoken/kernel/triton/int8_dequant.py`, `layers/quantization/int8_weight_only.py`, `tests/kernels/test_int8_dequant.py` | new, 9/1, new | a prefill's int8 dense weights dequantized in one Triton pass with `torch.mul`'s bits (`FREETOKEN_INT8_PREFILL_DEQUANT`) |
+| `python/freetoken/models/qwen4_exp/moe.py`, `moe/prefill_hooks.py`, `moe/fused_nvfp4.py`, `moe/fused_exl3.py`, `kernel/triton/moe_shared_gate.py`, `distributed/impl.py`, `tests/moe/test_prefill_block_hook.py` | 91/7, new, 4/0, 4/0, 7/4, 20/0, new | each prefill block of routed experts finishes its rows and starts their all-reduce while the next block computes (`FREETOKEN_PREFILL_AR_OVERLAP`, two ranks, the layer's path agreed across them once; the epilogue keeps the whole chunk's warps, an async all-reduce on the torch.distributed path); `FREETOKEN_PREFILL_COPY_OVERLAP=auto` with EXL3 experts too |
+| `python/freetoken/models/qwen4_exp/gdn.py`, `tests/models/qwen4_exp/test_gdn_ar_overlap.py` | 82/2, new | a one-request prefill chunk of whole GDN blocks: each block's gated norm, output projection and all-reduce started as its delta rule finishes (`FREETOKEN_GDN_AR_OVERLAP`), after a check, agreed across the ranks, that hipBLASLt's block rows equal the whole call's |
+| `python/freetoken/kernel/triton/qsa/score.py`, `attention/qsa_sparse.py`, `tests/kernels/test_qsa_score_rows.py` | 128/1, 1/0, new | the QSA indexer's scoring of a one-request prefill 16 query rows a program, the heads unpadded and summed in the padded reduction's order (`FREETOKEN_QSA_SCORE_ROWS`) |
+| `tests/models/qwen4_exp/test_predict_votes.py` | new | with NVFP4 experts (`auto`), a short prefill copies ahead only the experts at least two tokens predict (`FREETOKEN_PREFILL_PREDICT_MIN_VOTES`, in `models/qwen4_exp/moe.py`) |
+| `python/freetoken/models/qwen4_exp/ple_disk.py`, `scheduler/prefill.py`, `tests/models/qwen4_exp/test_ple_disk.py` | 140/18, 1/0, 36/0 | a prefill's PLE rows read on a thread with a store of its own (the lookup waits for them), and the next chunk's rows read ahead while a chunk of a longer prompt computes, taken when its tokens match (`FREETOKEN_PLE_PREFILL_PREFETCH`; a chunked request carries the whole prompt); at TP>1 only rank 0 reads them and broadcasts the bytes at the lookup (`FREETOKEN_PLE_PREFILL_RANK0`) |
+| `python/freetoken/engine/engine.py` | 6/1 | one device synchronize before the decode step that follows a prefill whose compute stream waited for RCCL's on the GPU (`moe/prefill_hooks.py`'s flag): the decode graphs replayed after such a wait ran a third slower at four requests |
 
 ## Tooling and documentation
 

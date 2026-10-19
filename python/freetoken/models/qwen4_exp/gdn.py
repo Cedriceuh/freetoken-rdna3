@@ -12,6 +12,7 @@ from freetoken.distributed.split import gdn_head_partition
 from freetoken.layers import BaseOP, GatedRMSNorm, LinearColParallelMerged, LinearRowParallel
 from freetoken.layers.quantization import QuantConfig
 from freetoken.models.qwen3_5_moe.gdn_kernels import gdn_decode_fla, gdn_prefill_chunk_fla
+from freetoken.moe import prefill_hooks
 from freetoken.spec_decode import SPEC_M, RollbackTarget, block_contiguous, register, rows_of
 
 
@@ -27,6 +28,15 @@ _GDN_PREFILL_BLOCK = int(os.environ.get("FREETOKEN_GDN_PREFILL_BLOCK", "4096"))
 # kernel and taps, so the same values, without the channel-major transpose of the input and the strided copies of every
 # 4096-token block's q / k / v (~0.2 s of each 16k-token chunk on NVFP4 xtx-xt-4x262k). Triton conv path only.
 _CONV_ROWS = os.environ.get("FREETOKEN_GDN_CONV_ROWS", "1") != "0"
+# FREETOKEN_GDN_AR_OVERLAP (default 1): at TP>1, a one-request prefill chunk of whole FREETOKEN_GDN_PREFILL_BLOCK
+# blocks runs the gated norm and the output projection of each block as its delta rule finishes, and starts that
+# block's all-reduce while the next block's delta rule runs. The same per-row arithmetic (the norm with the whole
+# chunk's rows per program; the projection only where a check at first use finds hipBLASLt's rows of a block equal to
+# those of the whole call, on every rank)
+_AR_OVERLAP = os.environ.get("FREETOKEN_GDN_AR_OVERLAP", "1") == "1"
+_SPLIT_OK: dict = {}  # (rows, out, in) -> whether F.linear's rows by blocks equal the whole call's
+# the check runs a bf16 F.linear: what these methods run at a prefill's row counts (int8: dequantize, then F.linear)
+_CHECKED_METHODS = ("UnquantizedLinearMethod", "Int8WeightOnlyLinearMethod")
 assert _GDN_PREFILL_BLOCK % 64 == 0, "FREETOKEN_GDN_PREFILL_BLOCK must be a multiple of the 64-token chunk"
 _SPEC_BUFS: list = []  # [(recurrent [layers, reqs, m-1, ...], conv [layers, m-1, reqs, ...])] once allocated
 _SPEC_ROWS: list = []
@@ -253,6 +263,10 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
             fla = build_fla_metadata(batch, hidden_states.device)
             batch.fla_metadata = fla
 
+        if (_AR_OVERLAP and not batch.is_decode and self.out_proj._tp_size == 2 and total > _GDN_PREFILL_BLOCK > 0
+                and total % _GDN_PREFILL_BLOCK == 0
+                and type(self.out_proj.quant_method).__name__ in _CHECKED_METHODS):
+            self._check_split(total)
         if self._split_in_proj:
             qkvz = self.in_proj_qkvz.forward(hidden_states)
             conv_in, z = torch.split(qkvz, [self.conv_dim, self.value_dim], dim=-1)
@@ -307,6 +321,8 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
             if fla.fresh_state_indices is not None:
                 pool.recurrent_states[li].index_fill_(0, fla.fresh_state_indices, 0.0)
             track = fla.track_dst is not None
+            if self._overlap_out(total, fla, dtype):
+                return self._prefill_overlapped(q, k, v, g, beta, pool, li, fla, conv_in, z, track)
             if _GDN_PREFILL_BLOCK > 0 and fla.seq_bounds is not None and total > _GDN_PREFILL_BLOCK:
                 core_out, h_rows = _gdn_prefill_blocked(q, k, v, g, beta, pool.recurrent_states[li], fla,
                                                         self.head_k_dim ** -0.5, track)
@@ -337,6 +353,66 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         return self.out_proj.forward(out)
 
 
+    def _overlap_out(self, total: int, fla, dtype: torch.dtype) -> bool:
+        """FREETOKEN_GDN_AR_OVERLAP applies to this prefill chunk."""
+        out_proj = self.out_proj
+        if not (_AR_OVERLAP and _GDN_PREFILL_BLOCK > 0 and out_proj._tp_size == 2 and not out_proj.defer_all_reduce
+                and type(out_proj.quant_method).__name__ in _CHECKED_METHODS
+                and not self._out_heads_tiled and fla.seq_bounds is not None and len(fla.seq_bounds) == 1
+                and total > _GDN_PREFILL_BLOCK and total % _GDN_PREFILL_BLOCK == 0 and dtype is torch.bfloat16):
+            return False
+        return _SPLIT_OK.get((total, *out_proj.weight.shape), False)
+
+    def _check_split(self, total: int) -> None:
+        """Run the projection's block check once per chunk size, at the layer's entry (before its temporaries), and
+        agree on it across the ranks: they must all-reduce the same blocks."""
+        key = (total, *self.out_proj.weight.shape)
+        if key in _SPLIT_OK:
+            return
+        ok = torch.tensor([int(_rows_split_equal(total, *key[1:], self.out_proj.weight.device))],
+                          dtype=torch.int32, device=self.out_proj.weight.device)
+        torch.distributed.all_reduce(ok, op=torch.distributed.ReduceOp.MIN)
+        _SPLIT_OK[key] = bool(ok.item())
+
+    def _prefill_overlapped(self, q, k, v, g, beta, pool, li, fla, conv_in, z, track) -> torch.Tensor:
+        """The blocked delta rule with each block's gated norm, output projection and all-reduce started as the block
+        finishes (FREETOKEN_GDN_AR_OVERLAP); returns the all-reduced projection."""
+        from freetoken.kernel.fla.layernorm_gated import calc_rows_per_block
+
+        total, vd = q.shape[1], self.head_v_dim
+        rpb = calc_rows_per_block(total * self.num_v_heads, q.device)  # what the whole chunk's norm would take
+        out = torch.empty((total, self.out_proj.weight.shape[0]), dtype=q.dtype, device=q.device)
+        works = []
+        comm = self.out_proj._comm
+
+        def block_done(a: int, b: int, res: torch.Tensor) -> None:
+            zb = z[a:b] if _FEWER_COPIES else z[a:b].reshape(-1, vd)
+            o = self.norm.forward(res.reshape(-1, vd), zb, rows_per_block=rpb).reshape(b - a, -1)
+            out[a:b] = self.out_proj.quant_method.apply(self.out_proj, o)
+            works.append(comm.all_reduce_async(out[a:b]))
+
+        _, h_rows = _gdn_prefill_blocked(q, k, v, g, beta, pool.recurrent_states[li], fla, self.head_k_dim ** -0.5,
+                                         track, block_done=block_done)
+        if track:
+            self._write_track_snapshot(pool, li, conv_in, None, fla, h_rows=h_rows)
+        for work in works:
+            if work is not None:
+                work.wait()
+                prefill_hooks.ASYNC_AR[0] = True
+        return out
+
+
+def _rows_split_equal(rows: int, n: int, k: int, device: torch.device) -> bool:
+    """Whether F.linear over ``rows`` rows gives, block by block (FREETOKEN_GDN_PREFILL_BLOCK rows), the bits of the
+    whole call for an [n, k] bf16 weight (hipBLASLt picks its kernel by shape; some keep each row's sum, some not)."""
+    g = torch.Generator(device=device).manual_seed(rows + n + k)
+    x = torch.randn(rows, k, device=device, dtype=torch.bfloat16, generator=g)
+    w = (torch.randn(n, k, device=device, generator=g) * 0.02).to(torch.bfloat16)
+    whole = F.linear(x, w)
+    return all(torch.equal(F.linear(x[a:a + _GDN_PREFILL_BLOCK], w), whole[a:a + _GDN_PREFILL_BLOCK])
+               for a in range(0, rows, _GDN_PREFILL_BLOCK))
+
+
 def _sgl_conv() -> bool:
     from freetoken.kernel.backend import is_sgl_kernel_installed
 
@@ -356,9 +432,10 @@ def _gdn_blocks(fla, device: torch.device) -> list:
     return blocks
 
 
-def _gdn_prefill_blocked(q, k, v, g, beta, state: torch.Tensor, fla, scale: float, track: bool):
+def _gdn_prefill_blocked(q, k, v, g, beta, state: torch.Tensor, fla, scale: float, track: bool, block_done=None):
     """``gdn_prefill_chunk_fla`` over the whole prefill, a block of one request at a time (the state chained through its
-    slot); returns (o, the h rows of the track entries or None)."""
+    slot); returns (o, the h rows of the track entries or None). ``block_done(start, end, o_block)``: called as each
+    block's output is queued (then o is not assembled: None)."""
     blocks = _gdn_blocks(fla, q.device)
     want: dict[int, list] = {}
     if track:
@@ -378,6 +455,9 @@ def _gdn_prefill_blocked(q, k, v, g, beta, state: torch.Tensor, fla, scale: floa
                 rows = h.new_empty((len(fla.track_seq_chunk), *h.shape[2:]))
             for e, local in want[j]:
                 rows[e] = h[0, local]
+        if block_done is not None:
+            block_done(a, b, res)
+            continue
         if o is None:
             o = res.new_empty((q.shape[1], *res.shape[1:]))
         o[a:b] = res

@@ -14,6 +14,7 @@ import torch
 from freetoken.kernel import moe_sum_reduce_triton
 from freetoken.kernel.triton.exl3 import exl3_gemm_down_out, exl3_gemv, exl3_mid, exl3_moe_gemm, exl3_out, exl3_rotate_in
 from freetoken.moe.fused import blocks_to_slots, moe_align_block_size
+from freetoken.moe.prefill_hooks import BLOCK_DONE
 
 # token block of the prefill path: its rotated inputs are [tokens * top_k, 2, hidden] fp16 and its products fp32,
 # 540 MiB of temporaries at 4096 tokens (top-10, hidden 2560, a 384-wide slice), which the cache planner keeps free
@@ -51,6 +52,7 @@ def fused_experts_exl3(
     M, _ = hidden_states.shape
     if is_prefill and M > EXL3_PREFILL_BLOCK > 0:
         out = torch.empty_like(hidden_states)
+        done = BLOCK_DONE[0]
         for start in range(0, M, EXL3_PREFILL_BLOCK):
             end = min(start + EXL3_PREFILL_BLOCK, M)
             out[start:end] = fused_experts_exl3(
@@ -58,6 +60,8 @@ def fused_experts_exl3(
                 topk_weights[start:end], topk_ids[start:end], codebook=codebook, is_prefill=True,
                 num_experts=num_experts, slot_map=slot_map,
             )
+            if done is not None:
+                done(start, end, out)
         return out
     top_k = topk_ids.shape[1]
     slots = topk_ids.reshape(-1)

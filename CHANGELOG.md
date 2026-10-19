@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- Short agent turns and cold reads, the same bits. A prefill's per-layer-embedding rows are read from the checkpoint
+  on a thread, by rank 0 only, which broadcasts them (`FREETOKEN_PLE_PREFILL_PREFETCH`, `FREETOKEN_PLE_PREFILL_RANK0`:
+  the GPUs idled ~50 ms an agent turn and ~1.1 s a 16k-token chunk while every rank read them), and the next chunk's
+  rows of a long prompt are read while a chunk computes; a slot-cache prefill reads its predicted experts' copy plan
+  once the layer's GEMMs are queued instead of in a sync at every layer (`FREETOKEN_PREFILL_PREFETCH_DEFER`); Triton
+  kernels launch through a shorter host path that calls the same compiled kernel (`FREETOKEN_TRITON_FAST_LAUNCH`); a
+  prefill dequantizes its int8 dense weights in one Triton pass with `torch.mul`'s bits
+  (`FREETOKEN_INT8_PREFILL_DEQUANT`); `FREETOKEN_PREFILL_COPY_OVERLAP=auto` now covers EXL3 (with the deferred plan);
+  with NVFP4 experts a short prefill copies ahead only the experts at least two tokens predict, PCIe being saturated
+  (`FREETOKEN_PREFILL_PREDICT_MIN_VOTES`); and on two cards each block of a chunk's routed experts and of its
+  GatedDeltaNet output all-reduces while the next block computes (`FREETOKEN_PREFILL_AR_OVERLAP`,
+  `FREETOKEN_GDN_AR_OVERLAP`, the latter after a check, at the first chunk of each length, that hipBLASLt gives a
+  block's rows the bits of the whole call), the engine synchronizing once before the next decode step (without it,
+  four NVFP4 requests decoded a third slower after such a read). The QSA indexer scores 16 query rows a program for a
+  prefill of one request (`FREETOKEN_QSA_SCORE_ROWS`, the padded heads' sum order kept). On `xtx-xt-4x262k` with the
+  reference machine's launcher settings, the previous build -> this one, two runs each: EXL3 3.05 bpw one-word turns
+  at 34k (40-90 tokens to read) 0.237-0.243 -> 0.185-0.197 s, agent turns at 45k (500-750 tokens) 0.509-0.512 ->
+  0.432-0.434 s, a 45k-token document 17.2 -> 13.6 s, a 164k-token prompt 66.8-67.0 -> 49.5-49.9 s; NVFP4 (3 x 262k
+  pool) 0.256-0.261 -> 0.227-0.228 s, 0.718 -> 0.621-0.622 s, 18.2 -> 14.5 s, 70.2-70.3 -> 52.7-52.8 s. The same
+  answers (15 greedy prompts, an agent conversation, one-word turns, 164k and 96k-token prompts); decode and four
+  requests unchanged.
 - Short agent turns, the same bits: the GatedDeltaNet prefill no longer reads the longest request back from the GPU in
   every GDN layer (36 host syncs a forward), NVFP4 prefill blocks of up to 1536 tokens take 4-warp expert tiles
   (`FREETOKEN_NVFP4_PREFILL_TUNED`, set in the profiles) and EXL3 blocks of up to 512 tokens 16-row tiles. On

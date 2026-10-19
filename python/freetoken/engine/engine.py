@@ -23,7 +23,7 @@ from freetoken.mm.config import ENCODER_SECTIONS
 from freetoken.models.config import VISION_KEY_PREFIXES
 from freetoken.models import create_model, load_weight
 from freetoken.models.weight import ftw_lacks_vision
-from freetoken.moe import is_offload_moe_strategy
+from freetoken.moe import is_offload_moe_strategy, prefill_hooks
 from freetoken.moe.expert_banks import attach_resident_banks, load_expert_banks
 from freetoken.moe.host_banks import PinFailed
 from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache, bank_layouts
@@ -1347,6 +1347,11 @@ class Engine:
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
+        if batch.is_decode and prefill_hooks.ASYNC_AR[0]:
+            # a prefill made the compute stream wait for RCCL's on the GPU: the decode graphs replayed after it ran a
+            # third slower at four requests until the host synchronized (journey.md section 33)
+            prefill_hooks.ASYNC_AR[0] = False
+            torch.cuda.synchronize()
         if batch.mm_gather_plan:
             self._run_mm_encoder(batch)
         use_graph = self.graph_runner.can_use_cuda_graph(batch)

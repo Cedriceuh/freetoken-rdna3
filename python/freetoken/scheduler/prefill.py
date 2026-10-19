@@ -227,6 +227,7 @@ class PrefillAdder:
         req.mm_items = pending_req.mm_items
         if is_chunked:  # the prompt token after this chunk (the MTP head reads it at the chunk's last row)
             req.mtp_next_token = int(pending_req.input_ids[cached_len + chunk_size])
+            req.prompt_ids = pending_req.input_ids  # the whole prompt (FREETOKEN_PLE_PREFILL_PREFETCH reads ahead)
         req.mrope_positions_full = pending_req.mrope_positions_full
         req.mrope_delta = pending_req.mrope_delta
         # Hybrid GDN per-request state slots (None for non-hybrid). On a fresh admit these are

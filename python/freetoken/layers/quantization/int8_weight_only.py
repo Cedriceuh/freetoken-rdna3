@@ -33,6 +33,9 @@ from freetoken.utils import init_logger
 logger = init_logger(__name__)
 
 _ALWAYS_SKIP = (".mlp.gate", ".mlp.shared_expert_gate", ".visual")
+# FREETOKEN_INT8_PREFILL_DEQUANT (default triton): a prefill's weight dequantization in one Triton pass, the same bits
+# as torch.mul's; "torch": torch.mul
+_TRITON_DEQUANT = os.environ.get("FREETOKEN_INT8_PREFILL_DEQUANT", "triton") == "triton"
 
 
 def enabled() -> bool:
@@ -57,7 +60,12 @@ class Int8WeightOnlyLinearMethod:
         # int8 * fp32 computes in fp32 and rounds once into the activation dtype: the bits of
         # (weight.float() * scale).to(dtype), without the full-size fp32 temporary
         w = torch.empty(layer.weight.shape, dtype=x.dtype, device=layer.weight.device)
-        torch.mul(layer.weight, layer.weight_scale[:, None], out=w)
+        if _TRITON_DEQUANT and x.dtype is torch.bfloat16 and layer.weight.is_cuda and layer.weight.is_contiguous():
+            from freetoken.kernel.triton.int8_dequant import dequant_int8_rows
+
+            dequant_int8_rows(layer.weight, layer.weight_scale, w)
+        else:
+            torch.mul(layer.weight, layer.weight_scale[:, None], out=w)
         return F.linear(x, w, layer.bias.to(x.dtype) if layer.bias is not None else None)
 
     def finalize(self, layer: Any) -> None:

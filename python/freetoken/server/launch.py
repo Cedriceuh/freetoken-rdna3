@@ -67,7 +67,11 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
     set_assigned_gpu(targets[args.tp_info.rank])
 
     import torch
+    from freetoken.kernel.triton.fast_launch import install as install_triton_fast_launch
     from freetoken.scheduler import Scheduler
+
+    if install_triton_fast_launch() and args.tp_info.is_primary():
+        init_logger(__name__).info("Triton launches: fast path (FREETOKEN_TRITON_FAST_LAUNCH)")
 
     if args.tp_info.is_primary():
         from freetoken.utils.progress import set_progress_sink

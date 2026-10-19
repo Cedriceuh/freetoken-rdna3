@@ -17,6 +17,12 @@ class DistributedImpl(ABC):
     @abstractmethod
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor: ...
 
+    def all_reduce_async(self, x: torch.Tensor):
+        """Start an in-place all-reduce of ``x``; returns a handle whose ``wait()`` makes the current stream wait for
+        it, or None when it already ran on the current stream."""
+        self.all_reduce(x)
+        return None
+
     @abstractmethod
     def all_gather(self, x: torch.Tensor) -> torch.Tensor: ...
 
@@ -29,6 +35,11 @@ class TorchDistributedImpl(DistributedImpl):
             return x
         dist.all_reduce(x, op=dist.ReduceOp.SUM)
         return x
+
+    def all_reduce_async(self, x: torch.Tensor):
+        if dist.get_world_size() == 1:
+            return None
+        return dist.all_reduce(x, op=dist.ReduceOp.SUM, async_op=True)
 
     def all_gather(self, x: torch.Tensor) -> torch.Tensor:
         tp_size = dist.get_world_size()
@@ -73,6 +84,12 @@ class HostStagedDistributedImpl(DistributedImpl):
             return self.ar(x)
         return self.fallback.all_reduce(x)
 
+    def all_reduce_async(self, x: torch.Tensor):
+        if self.ar.supports(x):
+            self.ar(x)
+            return None
+        return self.fallback.all_reduce_async(x)
+
     def all_gather(self, x: torch.Tensor) -> torch.Tensor:
         return self.fallback.all_gather(x)
 
@@ -82,6 +99,9 @@ class DistributedCommunicator:
 
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
         return self.plugins[-1].all_reduce(x)
+
+    def all_reduce_async(self, x: torch.Tensor):
+        return self.plugins[-1].all_reduce_async(x)
 
     def all_gather(self, x: torch.Tensor) -> torch.Tensor:
         return self.plugins[-1].all_gather(x)
