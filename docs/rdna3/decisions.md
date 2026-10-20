@@ -5,17 +5,19 @@ in [journey.md](journey.md); the options themselves in [options.md](options.md).
 
 ## Rule 0: precision before speed
 
-After a faster build lost a third of its score on an agentic benchmark (see "bf16 attention KV, not int8" below),
-every change must be either **bit-exact** (same greedy answers on a fixed set of 120 prompts, or a kernel check with
-identical outputs) or **validated by the agentic benchmark** (the author's, private: a coding agent fixing 29 planted
-bugs over long sessions). Short fidelity tests (scored benchmarks, needle tests, teacher-forced probes) are used to
-reject changes, never to accept them alone. The changes made after the last agentic run are bit-exact or exact by
-kernel tests, except these, each described where it is documented: prompts prefilled together in one batch (up to 4
-requests) can differ at rounding level; ROCm 10's own Triton 3.8 rounds differently from the 3.7.1 of that run
+After a faster build lost a third of its score on an agentic benchmark (see "bf16 attention KV, not int8" below), every
+change must be either **bit-exact** (same greedy answers on a fixed set of 120 prompts, or a kernel check with identical
+outputs) or **validated by the agentic benchmark** (the author's, private: a coding agent fixing 29 planted bugs over
+long sessions). Short fidelity tests (scored benchmarks, needle tests, teacher-forced probes) are used to reject
+changes, never to accept them alone. The changes made after the last agentic run are bit-exact or exact by kernel tests,
+except these, each described where it is documented: prompts prefilled together in one batch (up to 4 requests) can
+differ at rounding level; ROCm 10's own Triton 3.8 rounds differently from the 3.7.1 of that run
 ([journey.md](journey.md#18-rocm-10s-own-triton-2026-10-05)); upstream's NVFP4 decode kernel changed 5 of 15 greedy
 answers ([journey.md](journey.md#23-upstream-up-to-ee9789f-2026-10-10)); the EXL3 dense weights are rebuilt in fp64
-([options.md](options.md)); and `--hybrid` moves its answers with the expert cache's contents. The ROCm 10 base was
-run on the agentic benchmark with the MTP head: 12 and 18 of 29 in two runs.
+([options.md](options.md)); upstream's fp32 NVFP4 global scales and rewritten NVFP4 prefill GEMM changed 25 of 42 greedy
+outputs, EXL3 none ([journey.md](journey.md#35-upstream-up-to-cc56b6b-2026-10-20)); and `--hybrid` moves its answers
+with the expert cache's contents. The ROCm 10 base was run on the agentic benchmark with the MTP head: 12 and 18 of 29
+in two runs.
 
 - **Gives**: speed that did not cost quality on the agentic benchmark.
 - **Costs**: slower progress; some real speedups were dropped (int8 KV, grouped prefills).

@@ -185,8 +185,8 @@ class ParallelLMHead(VocabParallelEmbedding):
         ids, lps = [], []
         for a in range(0, x.shape[0], rows):
             part = x[a: a + rows].contiguous()
-            local = F.linear(part, self.tied_embedding.weight, self.bias) if self.tied_embedding is not None \
-                else self.quant_method.apply(self, part)
+            local = self.tied_embedding.quant_method.logits(self.tied_embedding, part, self.bias) \
+                if self.tied_embedding is not None else self.quant_method.apply(self, part)
             if self.tp_size > 1:
                 shape = local.shape
                 full = self._comm.all_gather(local).view((self.tp_size,) + shape).permute(1, 0, 2)

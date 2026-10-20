@@ -4,12 +4,12 @@ How this repository relates to upstream FreeToken and how to keep it current. Fo
 
 ## What this tree is
 
-Upstream [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken) at `9b68e00` ("fix(engine): upload cuda
-graphs at capture so a stream wait cannot block the first launch (#697)"), plus the changes listed file by file in
+Upstream [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken) at `cc56b6b` ("feat(gguf): serve
+GLM-5.3-Flash GGUF checkpoints on glm5-next (#721)"), plus the changes listed file by file in
 [changes-from-upstream.md](changes-from-upstream.md). The history is upstream's own up to `0d652e7`, then this
 project's commits on top (the first one holds everything up to 0.1.0), a merge of upstream up
 to `ee9789f`, five upstream commits cherry-picked (`74a3877`, `9c635a1`, `7d6490c`, `9b68e00`, `b6193e8`, authors
-kept) and a merge of the rest up to `9b68e00`. Once the `upstream` remote is set up (below),
+kept), a merge of the rest up to `9b68e00` and a merge up to `cc56b6b`. Once the `upstream` remote is set up (below),
 `git diff $(git merge-base HEAD upstream/main)` shows every change against the upstream version this tree is based on.
 
 ## The stack on top of upstream (oldest first)
@@ -40,6 +40,17 @@ which this tree's split kernel did, and its executor speaks HIP's memops (`20102
 the stack. Kept over upstream: `kernel/triton/moe_align.py` on ROCm instead of the staged align of `0bca88f` (the same
 Triton 3.8 bug, fixed in the kernel here); the hybrid publish / merge kernels instead of upstream's copies around the
 doorbell, which it keeps on ROCm. The prefill through the slot cache needs one slot pool (`b416f85`'s default here).
+
+At the merge of `cc56b6b`: upstream's CPU MoE executor serves a format per MoE layer (`e8c6bf1`) and computes GGUF
+experts with ggml-cpu instead of its Q4_0 kernels (`c8559fd`); this tree's EXL3 experts (with their own fp16 decode,
+which upstream dropped from the shared header in `0db5023`), route grouping and hybrid flag words sit on it, and
+`FREETOKEN_HYBRID_FETCH_FRACTION` fills its per-layer fractions. Upstream moved the NVFP4 launches to
+`kernel/nvfp4_moe.py` (`ac6a15d`) and rewrote the Triton prefill GEMM (`03c2c9c`): the RDNA3 decode tiles and the skip
+of the CPU's routes moved with the launches, the RDNA3 prefill tiles were swept again on the new GEMM. NVFP4 global
+scales are fp32 (`0db5023`); with the rewritten GEMM, NVFP4 answers differ from the build before, EXL3 ones do not. The
+qwen4_exp dense reader is upstream's scheme-driven one (`163d1de`), with this tree's tensor-parallel sharding, EXL3
+reconstruction and MTP head on top; the expert-piece hook takes upstream's `layers` argument, and the TP slicing keeps
+the experts' static activation scales (`e4f69d9`) whole on every rank.
 
 ## Keeping current
 

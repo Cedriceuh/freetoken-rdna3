@@ -147,10 +147,10 @@ def test_prefill_split_copy_matches_sources():
     sources = {  # the native NVFP4 banks: the packed rows are big (256 KiB, gathered and copied by rows), the rest small
         "gate_up_packed": [rand(E, 1024, 256) for _ in range(L)],
         "gate_up_scale": [rand(E, 1024, 32) for _ in range(L)],
-        "gate_up_global": [rand(E, 1024, dtype=torch.float16) for _ in range(L)],
+        "gate_up_global": [rand(E, 1024, dtype=torch.float32) for _ in range(L)],
         "down_packed": [rand(E, 512, 512) for _ in range(L)],
         "down_scale": [rand(E, 512, 64) for _ in range(L)],
-        "down_global": [rand(E, 512, dtype=torch.float16) for _ in range(L)],
+        "down_global": [rand(E, 512, dtype=torch.float32) for _ in range(L)],
     }
     sources = {n: [t.pin_memory() for t in v] for n, v in sources.items()}
     cache = oc.OffloadMoeCache(num_layers=L, num_experts=E, cache_size=S, device=dev, quant_format="nvfp4",
@@ -206,10 +206,10 @@ def test_predicted_prefetch_then_fixup_keeps_every_routed_expert(async_copy, def
     sources = {
         "gate_up_packed": [rand(E, 1024, 256) for _ in range(L)],
         "gate_up_scale": [rand(E, 1024, 32) for _ in range(L)],
-        "gate_up_global": [rand(E, 1024, dtype=torch.float16) for _ in range(L)],
+        "gate_up_global": [rand(E, 1024, dtype=torch.float32) for _ in range(L)],
         "down_packed": [rand(E, 512, 512) for _ in range(L)],
         "down_scale": [rand(E, 512, 64) for _ in range(L)],
-        "down_global": [rand(E, 512, dtype=torch.float16) for _ in range(L)],
+        "down_global": [rand(E, 512, dtype=torch.float32) for _ in range(L)],
     }
     sources = {n: [t.pin_memory() for t in v] for n, v in sources.items()}
     cache = oc.OffloadMoeCache(num_layers=L, num_experts=E, cache_size=S, device=dev, quant_format="nvfp4",

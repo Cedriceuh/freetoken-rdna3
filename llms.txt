@@ -55,7 +55,7 @@ Tested only on RX 7900 XTX + XT; NVIDIA, RDNA4 and TP>2 untested (this model can
 - [layers/quantization/int8_weight_only.py](python/freetoken/layers/quantization/int8_weight_only.py): int8 dense layers (+ `kernel/triton/int8_gemv.py`)
 - [kernel/triton/sampling_topk.py](python/freetoken/kernel/triton/sampling_topk.py): top-k-first sampler; [kernel/triton/sampling.py](python/freetoken/kernel/triton/sampling.py) `_sorted_threshold`: ROCm exact path
 - [kvcache/host_kv_pool.py](python/freetoken/kvcache/host_kv_pool.py) + [kvcache/hybrid_radix_cache.py](python/freetoken/kvcache/hybrid_radix_cache.py): conversations kept in RAM
-- [moe/fused_nvfp4.py](python/freetoken/moe/fused_nvfp4.py): NVFP4 expert kernels, tuned tiles, blocked prefill
+- [moe/fused_nvfp4.py](python/freetoken/moe/fused_nvfp4.py): the NVFP4 expert path, tuned prefill tiles, blocked prefill; [kernel/nvfp4_moe.py](python/freetoken/kernel/nvfp4_moe.py): its launches and the tuned decode tiles
 - [kernel/triton/exl3.py](python/freetoken/kernel/triton/exl3.py) + [layers/quantization/exl3_codec.py](python/freetoken/layers/quantization/exl3_codec.py): EXL3 checkpoints: trellis kernels for gfx1100 and the torch reference; [models/exl3_weights.py](python/freetoken/models/exl3_weights.py) loads them
 - [models/qwen4_exp/](python/freetoken/models/qwen4_exp/): Qwen3.8-Flash-Next (tensor-parallel port, PLE)
 - [engine/engine.py](python/freetoken/engine/engine.py): memory planning, rank token broadcast, int8 conversion

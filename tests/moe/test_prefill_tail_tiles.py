@@ -1,4 +1,4 @@
-"""Prefill tail tiles: a >= 3072-token NVFP4 block runs each expert's full 128-row tiles in one launch and its remaining
+"""Prefill tail tiles: a > 6144-token NVFP4 block runs each expert's full 128-row tiles in one launch and its remaining
 rows in 32-row tiles in a second one (FREETOKEN_NVFP4_PREFILL_TAIL_TILES), EXL3's gate|up GEMM full 64-row tiles and
 32-row ones (FREETOKEN_EXL3_PREFILL_TAIL_TILES); ``moe_align_split`` places every routed row exactly once, and the
 outputs keep the bits of the one-launch tiles (the same K order)."""
@@ -45,7 +45,7 @@ def test_split_alignment_places_every_row_once(skew):
     assert torch.equal(per_expert_rest, counts % 128)
 
 
-@pytest.mark.parametrize("M,skew", [(3072, 0.0), (5000, 3.0), (8192, 1.0)])
+@pytest.mark.parametrize("M,skew", [(6400, 0.0), (7000, 3.0), (8192, 1.0)])
 @pytest.mark.parametrize("slots", [False, True])
 def test_tail_tiles_keep_the_bits(monkeypatch, M, skew, slots):
     from freetoken.moe import fused_nvfp4 as fm
@@ -74,7 +74,7 @@ def test_tail_tiles_keep_the_bits(monkeypatch, M, skew, slots):
         monkeypatch.setattr(fm, "_TAIL_TILES", True)
         assert torch.equal(new, fm.fused_experts_nvfp4(x, *by_id, w, ids, NV_E, "silu", False))
     # and the old path is the one-launch 128 / 64-row tiles
-    assert fm._prefill_configs(M) == (fm._TUNED_BIG_GATE_UP, fm._TUNED_MID)
+    assert fm._prefill_configs(M, ids.shape[1], NV_E, 0) == (fm._TUNED_BIG_GATE_UP, fm._TUNED_MID)
 
 
 @pytest.mark.parametrize("skew", [0.0, 3.0])

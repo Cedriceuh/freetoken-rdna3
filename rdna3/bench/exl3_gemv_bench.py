@@ -41,7 +41,7 @@ for name, kin, n, halves in [x for x in SHAPES if not only or x[0].split(" i=")[
     # NVFP4 reference: [S, N, K/2] codes, [S, N, K/16] e4m3 scales, [S, N] globals
     packed = torch.randint(0, 255, (S, n, kin // 2), device=dev, dtype=torch.uint8)
     scale = torch.rand(S, n, kin // 16, device=dev).to(torch.float8_e4m3fn)
-    glob = torch.rand(S, n, device=dev, dtype=torch.float16)
+    glob = torch.rand(S, n, device=dev, dtype=torch.float32)
     a = torch.randn(1 if halves == 2 else TOP_K, kin, device=dev, dtype=torch.bfloat16)
     c = torch.empty(1, TOP_K, n, device=dev, dtype=torch.bfloat16)
     tw = torch.rand(1, TOP_K, device=dev)

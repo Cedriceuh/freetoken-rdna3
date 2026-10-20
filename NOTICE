@@ -3,8 +3,8 @@ Copyright 2026 TheGreenery
 
 This product is a modified version of FreeToken (https://github.com/FlashML-org/FreeToken), licensed under the Apache
 License, Version 2.0 (see LICENSE). It was taken from upstream commit 0d652e7 (2026-09-26) and merged with upstream up
-to commit ee9789f (2026-10-10), then up to 9b68e00 (2026-10-15); every file changed or added relative to upstream is
-listed, with the reason, in docs/rdna3/changes-from-upstream.md.
+to commit ee9789f (2026-10-10), then up to 9b68e00 (2026-10-15), then up to cc56b6b (2026-10-19); every file changed or
+added relative to upstream is listed, with the reason, in docs/rdna3/changes-from-upstream.md.
 
 It includes ROCm support contributed to FreeToken by zihaomu (upstream pull requests #133, #134, #135) and pieces of a
 community ROCm port of FreeToken by lukascechovic; see docs/rdna3/credits.md.

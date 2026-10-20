@@ -86,6 +86,17 @@ def test_nvfp4_expert_shards_reassemble_every_bank(tp):
         assert torch.equal(s["down_global"], ref["down_global"])  # not on the intermediate axis
 
 
+def test_nvfp4_expert_shards_take_the_activation_scales_whole():
+    """Checkpoints with static activation scales give their pieces ``*_input`` (one fp32 per expert): every rank keeps
+    them, and the banks are those of the pieces without them."""
+    pieces = _full_pieces()
+    g = torch.Generator().manual_seed(1)
+    scaled = {**pieces, **{f"{p}_input": torch.rand(2, 1, generator=g) for p in ("gate", "up", "down")}}
+    for rank in (0, 1):
+        got, want = _pack(scaled, rank, 2), _pack(pieces, rank, 2)
+        assert all(torch.equal(_u8(got[role]), _u8(want[role])) for role in want)
+
+
 def test_nvfp4_expert_shard_is_not_a_flat_chunk_of_the_fused_rows():
     """Guards the per-half cut: a flat row chunk of [gate | up] has the right shape and is wrong."""
     pieces = _full_pieces()

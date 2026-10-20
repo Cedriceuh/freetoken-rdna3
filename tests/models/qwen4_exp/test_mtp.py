@@ -45,7 +45,7 @@ def test_matches_the_dequant_kernel():
     torch.manual_seed(1)
     w = (torch.randn(128, 512) * 0.05).cuda()
     packed, scale, g = quantize_nvfp4(w)
-    glob = g.to(torch.float16).expand(128).contiguous()
+    glob = g.to(torch.float32).expand(128).contiguous()
     got = dequant_nvfp4(packed.unsqueeze(0), scale.unsqueeze(0), glob.unsqueeze(0),
                         torch.zeros(1, dtype=torch.int32, device="cuda"), dtype=torch.float32)[0]
     want = _torch_dequant(packed, scale, g.to(torch.float16))

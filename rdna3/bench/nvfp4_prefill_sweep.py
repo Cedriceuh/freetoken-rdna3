@@ -1,6 +1,6 @@
 """Tile sweep of the NVFP4 prefill MoE GEMMs (moe/fused_nvfp4.py) on RDNA3, Qwen3.8-Flash shapes.
 
-The shipped _prefill_config was picked by an offline sweep for MiniMax-M2 shapes (upstream, NVIDIA). This times the
+The shipped config (kernel/nvfp4_moe.py prefill_config) comes from upstream's NVIDIA sweeps; ROCm takes its H100 tiles. This times the
 two GEMMs of one prefill MoE block separately (gate_up: N = 2 * inter, K = hidden; down: N = hidden, K = inter) for
 each (BLOCK_M, BLOCK_N, BLOCK_KB, num_warps, num_stages), on 512 experts / top-10 / hidden 2560 banks that are larger
 than the Infinity Cache, and checks each result against the shipped config. A different BLOCK_KB reorders the fp32
@@ -18,6 +18,7 @@ import time
 
 import torch
 
+from freetoken.kernel import nvfp4_moe
 from freetoken.kernel.triton.moe_align import moe_align_block_size
 from freetoken.moe import fused_nvfp4 as fm
 
@@ -56,7 +57,7 @@ def main() -> None:
     def bank(n: int, k: int):
         packed = torch.randint(0, 256, (E, n, k // 2), dtype=torch.uint8, device=dev, generator=g)
         scale = torch.randint(0x30, 0x40, (E, n, k // 16), dtype=torch.uint8, device=dev, generator=g).view(fp8)
-        glob = torch.full((E, n), 0.01, dtype=torch.float16, device=dev)
+        glob = torch.full((E, n), 0.01, dtype=torch.float32, device=dev)
         return packed, scale, glob
 
     gu = bank(2 * I, H)
@@ -79,7 +80,7 @@ def main() -> None:
             fm._prefill_gemm(act, *dn, out, tw, sorted_ids, expert_ids, ntpp, M * K, 1, True, cfg)
         return out
 
-    base = fm._prefill_config(M)
+    base = {k: v for k, v in nvfp4_moe.prefill_config(M, K, E, dev.index).items() if k != "FAST_DECODE"}
     aligns = {}
     for bm in (16, 32, 64, 128):
         aligns[bm] = moe_align_block_size(topk_ids, bm, E)

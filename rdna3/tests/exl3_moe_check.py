@@ -2,6 +2,8 @@
 from exl3_codec.reconstruct, on one GPU: decode (GEMV) and prefill (grouped GEMM), the banks packed by the MoE kernel
 for a whole intermediate and for a 384/256 two-rank split (the slices' outputs must add up), prefill token blocks
 (1024-token blocks bit-identical to the whole 3000-token chunk), and a CUDA-graph replay."""
+import os
+
 import torch
 import torch.nn.functional as F
 
@@ -11,6 +13,21 @@ from freetoken.layers.quantization.moe.exl3 import TritonExl3MoEKernel
 from freetoken.layers.quantization.scheme import exl3_scheme
 from freetoken.moe.fused_exl3 import fused_experts_exl3
 
+
+def _cpu_quota() -> int:
+    """CPUs this process may run on: a container's --cpus quota, else its affinity."""
+    try:
+        quota, period = open("/sys/fs/cgroup/cpu.max").read().split()
+        if quota != "max":
+            return max(1, int(quota) // int(period))
+    except (OSError, ValueError):
+        pass
+    return len(os.sched_getaffinity(0))
+
+
+# the reference decodes the trellises on the CPU: with torch's default thread count oversubscribing a --cpus quota (64
+# threads on 8 CPUs), a decode of the same tiles came out different now and then, and the check failed on the reference
+torch.set_num_threads(min(torch.get_num_threads(), _cpu_quota()))
 torch.manual_seed(0)
 dev = "cuda"
 E, H, I, K, TOP_K = 12, 2560, 640, 3, 10

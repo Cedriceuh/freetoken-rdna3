@@ -572,8 +572,8 @@ A comment may follow a value on the same line. Copy a file to make your own prof
 | `FREETOKEN_TP_ALLOW_IMBALANCE` | `1` | plan memory on the smaller card (upstream refuses ranks whose free memory differs by more than 2 GiB) |
 | `FREETOKEN_INT8_DENSE` | `1` | dense layers in int8 (weights only, routers stay bf16): +28 % decode, frees ~2.4 GiB per card for the expert cache; lossy, agent-validated |
 | `FREETOKEN_HOST_ALLREDUCE` | `1` | small all-reduces through shared host memory instead of RCCL's proxies (no GPU peer-to-peer here): +2.5-4.8 % decode, bit-exact |
-| `FREETOKEN_NVFP4_PREFILL_TUNED` / `_DECODE_TUNED` | `1` | expert GEMM tiles swept on these cards for this model (the decode ones for this split's shapes): long prompts -11 %, the down decode GEMV x1.06-1.19 in the kernel sweep, bit-exact against the default tiles |
-| `FREETOKEN_NVFP4_PREFILL_BLOCK` | `8192` | the NVFP4 prefill MoE 8192 tokens at a time instead of 4096: cold reads +7.9 % (arms alternated), the same bits; 16384 left the XT 0.65 GiB of VRAM at the peak of a 255k-token read ([options.md](options.md)) |
+| `FREETOKEN_NVFP4_PREFILL_TUNED` / `_DECODE_TUNED` | `1` | expert GEMM tiles swept on these cards for this model (the decode ones for this split's shapes): one prefill MoE block of 1600-2560 tokens 2.8-3.0x faster than the tiles before, long prompts -11 % on an earlier build, the down decode GEMV x1.06-1.19 in the kernel sweep, bit-exact against the default tiles |
+| `FREETOKEN_NVFP4_PREFILL_BLOCK` | `8192` | the NVFP4 prefill MoE 8192 tokens at a time instead of 4096: cold reads +7.9 % (arms alternated, an earlier build), the same bits; 16384 left the XT 0.65 GiB of VRAM at the peak of a 255k-token read ([options.md](options.md)) |
 | `FREETOKEN_HOST_KV` | `1` | conversations evicted from the GPUs go to RAM (9.5 GiB locked) and come back in ~2 s; exact |
 | `FREETOKEN_MTP` / `FREETOKEN_SPEC_VERIFY_M` | `1` / `4` | the checkpoint's MTP head drafts up to 3 tokens a step for a request decoding alone (two at once in `xtx-xt`, `FREETOKEN_SPEC_BS_MAX=2`: +8-15 % each): +35 % decode at `rdna3/serve.sh`'s sampling (+6-13 % on one card), greedy answers unchanged; `rdna3/serve.sh --no-mtp` turns it off ([limits.md](limits.md#speculative-decoding-mtp)) |
 | `--moe-strategy offload --moe-cache-auto` | | experts live in RAM; every byte of VRAM left after the dense weights and the KV is an expert cache (7.5k of the 24,576 experts, on each card) |
@@ -752,7 +752,7 @@ disagreements over ~8k sampled tokens in `check` mode). It is on the torch.distr
 | `FREETOKEN_INT8_DENSE_SKIP` | empty | Comma-separated module names to keep in bf16. |
 | `FREETOKEN_INT8_PREFILL_DEQUANT` | `triton` | With `FREETOKEN_INT8_DENSE=1`, a prefill dequantizes each int8 weight for its GEMM in one Triton pass (int8 times the row's fp32 scale, rounded once to bf16) instead of `torch.mul`'s mixed-dtype kernel: the same arithmetic, **bit-exact** (`tests/kernels/test_int8_dequant.py`). On the 7900 XT, GDN in_proj (9270 x 2560) 456 -> 58 us, 2560 x 4096 157 -> 24 us, the small ones ~2x. EXL3 3.05 `xtx-xt-4x262k`: agent turns 0.495 -> 0.487 s; NVFP4 0.718 -> 0.713 s. `torch`: `torch.mul`. |
 | `FREETOKEN_INT8_COMPACT` | `1` | Compact the device allocator after the conversion; without it the freed VRAM stays fragmented and is lost to the expert cache. |
-| `FREETOKEN_EMBED_HOST` | `1` on ROCm, `0` elsewhere | The input embedding, when it is not tied to the LM head (Qwen3.8-Flash-Next's is not), stays in pinned, device-mapped host memory instead of VRAM: the same lookup kernel reads the same rows across PCIe, a 5 KiB row per token. Its VRAM goes to the pools sized after the weights, 606 MiB a rank at TP=2 and 1.18 GiB on one card: on `xtx-xt-4x262k` with a 3 x 262k pool the expert cache grows from 8,768 to 9,255 slots with NVFP4 and from 11,554 to 12,095 with EXL3 3.05 bpw. The same bits (`tests/layers/test_embed_host.py`; greedy answers identical). `xtx-xt-4x262k` with a 3 x 262k pool, two runs each: NVFP4 agent turns (~520 tokens at 45k) 0.728-0.729 -> 0.707-0.711 s, ~2,600-token turns 1.162-1.165 -> 1.142-1.148 s, decode 89.7-89.9 -> 91.2-91.7 tok/s, four requests 29.0-29.3 -> 30.5 tok/s each; EXL3 3.05 bpw agent turns 0.485-0.487 -> 0.472 s, decode 93.5-93.6 -> 94.3-94.5 tok/s, four requests 36.2 -> 36.8-37.1; cold reads unchanged. One card (`xtx`, EXL3 3.05 bpw, 131k), two runs each: 4,783-4,793 -> 5,459-5,468 slots, one-word turns 0.432-0.433 -> 0.410-0.413 s, agent turns 1.120-1.126 -> 1.083-1.086 s, decode 52.3-52.7 -> 55.4 tok/s, cold reads unchanged. The server locks 1.2 GiB more RAM (the table). `0`: the table in VRAM. |
+| `FREETOKEN_EMBED_HOST` | `1` on ROCm, `0` elsewhere | The input embedding, when it is not tied to the LM head (Qwen3.8-Flash-Next's is not), stays in pinned, device-mapped host memory instead of VRAM: the same lookup kernel reads the same rows across PCIe, a 5 KiB row per token. Its VRAM goes to the pools sized after the weights, 606 MiB a rank at TP=2 and 1.18 GiB on one card: on `xtx-xt-4x262k` with a 3 x 262k pool the expert cache grew from 8,768 to 9,255 slots with NVFP4 (9,209 since the NVFP4 global scales take 4 bytes) and from 11,554 to 12,095 with EXL3 3.05 bpw. The same bits (`tests/layers/test_embed_host.py`; greedy answers identical). `xtx-xt-4x262k` with a 3 x 262k pool, two runs each: NVFP4 agent turns (~520 tokens at 45k) 0.728-0.729 -> 0.707-0.711 s, ~2,600-token turns 1.162-1.165 -> 1.142-1.148 s, decode 89.7-89.9 -> 91.2-91.7 tok/s, four requests 29.0-29.3 -> 30.5 tok/s each; EXL3 3.05 bpw agent turns 0.485-0.487 -> 0.472 s, decode 93.5-93.6 -> 94.3-94.5 tok/s, four requests 36.2 -> 36.8-37.1; cold reads unchanged. One card (`xtx`, EXL3 3.05 bpw, 131k), two runs each: 4,783-4,793 -> 5,459-5,468 slots, one-word turns 0.432-0.433 -> 0.410-0.413 s, agent turns 1.120-1.126 -> 1.083-1.086 s, decode 52.3-52.7 -> 55.4 tok/s, cold reads unchanged. The server locks 1.2 GiB more RAM (the table). `0`: the table in VRAM. |
 | `FREETOKEN_INT8_ROWS_MAX` | `8` | Decode batches up to this many rows (concurrent requests) use the row-looped GEMVs (the int8 one and the bf16 Triton one), each row bit-identical to a batch of one; bigger batches dequantize the int8 weight per call (bf16 layers use `F.linear`). |
 | `FREETOKEN_INT8_ROW_GROUPS` | `1` | With several rows (a speculative verify step, or requests decoding together), the int8 GEMVs whose input is longer than one tile (hyper-connection down projections, shared expert gate/up, index projection, LM head) read each weight tile once for up to 4 rows instead of once per row; same arithmetic per row, bit-exact. At 4 rows on the XT: HC down 17.7 -> 12.1 µs, LM head 704 -> 499 µs. `0`: each program runs the rows one after the other, reloading the tile for each. |
 | `FREETOKEN_INT8_TP_TILES` | unset | `1` (opt-in, **not bit-exact**): K blocks of 512 for three int8 shapes of the uneven split (GDN in_proj 9270 / 7210 x 2560, attention qkv), which then run 2-4 verify rows through the row-group kernel, and an 8-wide tile for the HC up projection (still one pass; it then keeps its separate gate mix): forward pass -1.5 / -2.6 / -2.9 % at 2 / 3 / 4 rows, -2.3 % at four requests on `xtx-xt-4x262k`. Each row is summed in another order, so greedy answers change at rounding level (6 of 14 prompts); not run on the agentic benchmark. Configs that keep the bits (another BLOCK_N) took 3-11 % less per call cold and nothing in serving. |
@@ -767,17 +767,17 @@ disagreements over ~8k sampled tokens in `check` mode). It is on the torch.distr
 
 | Variable | Default | Effect |
 |---|---|---|
-| `FREETOKEN_NVFP4_PREFILL_TUNED` | unset | `1`: NVFP4 expert GEMM tiles for prefill swept on RX 7900 XTX / XT for this model, chosen by token count (any split, one or two cards). Only the M / N tiles, warps and stages change (a different K tile would reorder the sums): **bit-exact**, long prompts -11 %. Prefills of up to 1536 tokens (agent turns, a few rows an expert) take 4-warp tiles: one layer's two GEMMs 5-13x faster at 32-64 tokens, 1.7-2.5x at 128-512, 1.4-1.8x at 768-1536 (both cards); on NVFP4 `xtx-xt-4x262k` (3 x 262k pool) one-word turns at 26k 0.350 -> 0.227 s and 200-250-token turns at 34k 0.415 -> 0.398-0.399 s (time to the first token, the same answers). |
+| `FREETOKEN_NVFP4_PREFILL_TUNED` | unset | `1`: NVFP4 expert GEMM tiles for prefill swept on RX 7900 XTX / XT for this model, chosen by token count (any split, one or two cards). Only the M / N tiles, warps and stages change (a different K tile would reorder the sums): **bit-exact**. They give the bits of upstream's default tiles too (16 to 8192 tokens, checked on one card). Swept on upstream's rewritten prefill GEMM (4 warps and 2 stages on both GEMMs from 1537 to 6144 tokens, 2 stages on the down GEMM up to 64 and from 641 to 1536), one MoE block with this model's shapes and random routing, each card on its own slice, interleaved against the tiles before (the same bits): 1600-2560 tokens 2.8-3.0x faster (7900 XTX 9.7-10.3 -> 3.3-3.6 ms, XT 9.6-10.2 -> 3.3-3.7 ms), 1280 tokens 1.4-1.5x, 32 tokens 1.3-1.4x; a 64-row tile up to 6144 tokens (4096: 7.1 -> 6.4-6.5 ms, 6144: 9.1-9.2 -> 7.6 ms on both cards, against the 128-row tile with tail tiles), the 128-row one above. On an earlier build (the prefill GEMM before upstream's rewrite): long prompts -11 %; prefills of up to 1536 tokens (agent turns, a few rows an expert) on 4-warp tiles, NVFP4 `xtx-xt-4x262k` (3 x 262k pool) one-word turns at 26k 0.350 -> 0.227 s and 200-250-token turns at 34k 0.415 -> 0.398-0.399 s (time to the first token, the same answers). |
 | `FREETOKEN_NVFP4_DECODE_TUNED` | unset | `1`: the same for decode (upstream's marlin decode kernel), per (N, K) and batch size, for the two-card shapes at a 0.55 split; other shapes (one card, other splits) keep the default tiles, logged once per shape. gate_up keeps the default tiles, the best of the sweep; the down GEMV runs one loop trip per tile, x1.06-1.11 at 1 request and x1.10-1.19 at 2-4 (kernel sweep). **Bit-exact** against the default tiles. |
-| `FREETOKEN_NVFP4_PREFILL_BLOCK` | `4096`; `8192` in the `xtx-xt` and `xtx-xt-4x262k` profiles | The prefill MoE runs the chunk this many tokens at a time on the same expert banks (`0` = the whole chunk). Every tile steps through K 32 bytes at a time, so the block size changes no bit (`rdna3/tests/moe_block_check.py`: 4096-, 8192-, 12288- and 16384-token blocks against the one-shot call, with the tuned and the shipped tiles, both cards; greedy 14/14 with the MTP head and a 25k agent conversation 9/9 on NVFP4 at 8192 and 16384). Its temporaries grow with it, ~75 KiB a token on the 7900 XTX's slice (~600 MiB at 8192), and the cache planner does not set them aside. Cold reads of the same texts, NVFP4 `xtx-xt-4x262k` (3 x 262k pool), 4096 against 8192 in alternated runs: 98k tokens 43.6-43.8 -> 40.4-40.5 s, 116k 51.0-51.1 -> 47.1-47.4 s (+7.9 %); in single runs 4096 / 8192 / 16384: 98k 43.4 / 40.2 / 38.7 s, 245k 112.6 / 103.7 / 99.9 s; NVFP4 `xtx-xt` (K/V in VRAM, 4096 / 8192): 245k 127.1 / 115.9 s, 255k 129.9 / 121.8 s. VRAM peaks of the 245k and 255k reads (4096 / 8192 / 16384): XTX 23,136 / 23,124 / 23,544 MiB, XT 19,146 / 19,346 / 19,806 MiB of 20,464: 16384 left the XT 0.65 GiB, hence 8192. One card keeps 4096 (8k chunks, less working memory). |
-| `FREETOKEN_NVFP4_PREFILL_TAIL_TILES` | `1` | With `FREETOKEN_NVFP4_PREFILL_TUNED=1`, a prefill block of 3072 tokens or more: each expert's rows past its last full 128-row tile run in 32-row tiles of a second launch, in both GEMMs (the down GEMM's full tiles become 128 rows too), instead of a 128-row tile mostly padding (an expert gets ~160 rows of an 8192-token block on average). Only the M / N tiles, warps and stages change: **bit-exact** (`tests/moe/test_prefill_tail_tiles.py`). One 8192-token MoE block (alignment, both GEMMs, activation, sum), this model's shapes, random routing: 20.3 -> 16.5 ms on the 7900 XTX's slice, 19.8 -> 16.6 ms on the XT's; with this model's own routing (96 blocks dumped from serving) 1921 -> 1696 ms and 1892 -> 1682 ms for the 96. `xtx-xt-4x262k` (3 x 262k pool), an earlier build -> this one (with `FREETOKEN_ROW_STORE_RINGS` too, which alone moves such reads by 1 % at most), two runs each, the same answers: cold reads of 113k tokens 36.2-36.3 -> 34.1-34.2 s, 159k 51.5-51.6 -> 48.6-48.8 s, 210k 68.7 -> 64.9-65.0 s. `0`: one launch of 128-row tiles (64 for the down GEMM). |
+| `FREETOKEN_NVFP4_PREFILL_BLOCK` | `4096`; `8192` in the `xtx-xt` and `xtx-xt-4x262k` profiles | The prefill MoE runs the chunk this many tokens at a time on the same expert banks (`0` = the whole chunk). The block size changes no bit (`rdna3/tests/moe_block_check.py`: 4096-, 8192-, 12288- and 16384-token blocks against the one-shot call, with the tuned and the shipped tiles, both cards; greedy 14/14 with the MTP head and a 25k agent conversation 9/9 on NVFP4 at 8192 and 16384). Its temporaries grow with it, ~75 KiB a token on the 7900 XTX's slice (~600 MiB at 8192), and the cache planner does not set them aside. Cold reads of the same texts, NVFP4 `xtx-xt-4x262k` (3 x 262k pool), an earlier build (the prefill GEMM before upstream's rewrite), 4096 against 8192 in alternated runs: 98k tokens 43.6-43.8 -> 40.4-40.5 s, 116k 51.0-51.1 -> 47.1-47.4 s (+7.9 %); in single runs 4096 / 8192 / 16384: 98k 43.4 / 40.2 / 38.7 s, 245k 112.6 / 103.7 / 99.9 s; NVFP4 `xtx-xt` (K/V in VRAM, 4096 / 8192): 245k 127.1 / 115.9 s, 255k 129.9 / 121.8 s. VRAM peaks of the 245k and 255k reads (4096 / 8192 / 16384): XTX 23,136 / 23,124 / 23,544 MiB, XT 19,146 / 19,346 / 19,806 MiB of 20,464: 16384 left the XT 0.65 GiB, hence 8192. One card keeps 4096 (8k chunks, less working memory). |
+| `FREETOKEN_NVFP4_PREFILL_TAIL_TILES` | `1` | With `FREETOKEN_NVFP4_PREFILL_TUNED=1`, a prefill block of more than 6144 tokens: each expert's rows past its last full 128-row tile run in 32-row tiles of a second launch, in both GEMMs (the down GEMM's full tiles become 128 rows too), instead of a 128-row tile mostly padding (an expert gets ~160 rows of an 8192-token block on average). Only the M / N tiles, warps and stages change: **bit-exact** (`tests/moe/test_prefill_tail_tiles.py`). On an earlier build (the prefill GEMM before upstream's rewrite), one 8192-token MoE block (alignment, both GEMMs, activation, sum), this model's shapes, random routing: 20.3 -> 16.5 ms on the 7900 XTX's slice, 19.8 -> 16.6 ms on the XT's; with this model's own routing (96 blocks dumped from serving) 1921 -> 1696 ms and 1892 -> 1682 ms for the 96. `xtx-xt-4x262k` (3 x 262k pool), between two earlier builds (with `FREETOKEN_ROW_STORE_RINGS` too, which alone moves such reads by 1 % at most), two runs each, the same answers: cold reads of 113k tokens 36.2-36.3 -> 34.1-34.2 s, 159k 51.5-51.6 -> 48.6-48.8 s, 210k 68.7 -> 64.9-65.0 s. `0`: one launch of 128-row tiles (64 for the down GEMM). |
 | `FREETOKEN_EXL3_MID_COLS` | `32` | EXL3: in prefill (more than 256 routes, fp16), the step between the two expert products rotates 32 columns of the Hadamard at a time, 32 rows and 4 warps a program, instead of 64-row tiles. **Bit-exact** (`tests/kernels/test_exl3_mid_cols.py`); 572 B of scratch per lane, and 1.7-3.3x faster than the tile kernel (cold read of 173k tokens on `xtx-xt-4x262k` 71.4 -> 69.8 s). `0`: the tile kernel, which spills ~860 VGPRs (2.7 KB of scratch per lane); a dispatch of it waiting for that scratch held a rank before an all-reduce until the 60 s watchdog ([journey.md](journey.md#27-agent-turns-short-prefills-through-the-expert-cache-2026-10-14)). |
 | `FREETOKEN_EXL3_PREFILL_BLOCK` | `4096` | EXL3 checkpoints ([how-it-works.md](how-it-works.md#exl3-checkpoints)): the prefill MoE runs 4096 tokens at a time (`0` = the whole chunk): 540 MiB of temporaries on the 384-wide expert slice, 620 MiB with a 16k chunk's output (measured; 500 / 580 MiB on the 256-wide slice, by the same formula), which the cache planner keeps free at start. A block of 12 tokens or fewer (the last one included) takes the decode kernels for both rotations, one of 13-25 for the step between the products (at top-10), and rounds differently; otherwise the block size changes no result (`rdna3/tests/exl3_moe_check.py`: 1024-token blocks against the whole 3000-token chunk, bit-identical). Larger blocks on EXL3 3.05 bpw `xtx-xt-4x262k` (cold reads of the same texts): 8192 read 98k and 116k tokens 2-2.5 % faster (38.2-38.3 -> 37.6 s, 44.4-44.6 -> 43.5 s) but left 504 fewer expert slots (11,117 -> 10,613), 16384 1,437 fewer and its first read slower (43.5 s): hence 4096. Blocks of up to 512 tokens (agent turns) run 16-row tiles instead of 32 (always on) (the same K order, the same bits): the MoE block 11-19 % faster at 32-512 tokens. |
 | `FREETOKEN_EXL3_PREFILL_TAIL_TILES` | `1` | EXL3 checkpoints, a prefill block of 3072 tokens or more: the gate-up GEMM runs each expert's full 64-row tiles in one launch and its remaining rows in 32-row tiles in a second one (the down GEMM keeps its 32-row tiles: no gain there). The same K order: **bit-exact** (`tests/moe/test_prefill_tail_tiles.py`). One 4096-token block's gate-up GEMM, random routing: 4.27 -> 3.74 ms on the 7900 XTX's 384-wide slice, 4.03 -> 3.67 ms on the XT's 256-wide one; the whole MoE block with this model's own routing (96 blocks dumped from serving) 919 -> 884 ms and 790 -> 762 ms for the 96. `xtx-xt-4x262k` (3 x 262k pool), two runs each, the same answers: cold reads of 113k / 159k / 210k tokens 33.8 / 48.1 / 64.2 -> 33.2-33.3 / 47.4-47.5 / 63.1-63.2 s (-1.4 to -1.6 %). `0`: one launch of 32-row tiles. |
-| `FREETOKEN_HYBRID_FETCH_FRACTION` | unset | With `--moe-strategy hybrid` ([cpu-experts.md](cpu-experts.md)): the share of each decode step's expert misses fetched over PCIe (strictly between 0 and 1), the rest computed on the CPU (`rdna3/serve.sh --hybrid` sets `0.25` on one card and `0.4` on two with NVFP4, `0.6` with EXL3). Unset: the split `ft bench bw` measured for the expert format, or a fixed cap of one fetch per layer without a profile (EXL3 is not benched). |
+| `FREETOKEN_HYBRID_FETCH_FRACTION` | unset | With `--moe-strategy hybrid` ([cpu-experts.md](cpu-experts.md)): the share of each decode step's expert misses fetched over PCIe (strictly between 0 and 1), the rest computed on the CPU, the same share on every MoE layer (`rdna3/serve.sh --hybrid` sets `0.25` on one card and `0.4` on two with NVFP4, `0.6` with EXL3). Unset: the split `ft bench bw --model <checkpoint>` measured for each layer's kind, or a fixed cap of one fetch per layer without one (EXL3 is not benched). |
 | `FREETOKEN_HYBRID_MIN_REQS` | `1` | With `--moe-strategy hybrid`: decode steps of fewer requests fetch every miss (the offload path). CUDA graphs are captured per batch size, so each size takes one path. `rdna3/serve.sh --hybrid` does not set it. |
 | `FREETOKEN_HYBRID_FLAG_IN_KERNEL` | `1` | With `--moe-strategy hybrid`: the CPU's inputs written into its pinned IO rows by one kernel that also rings the coordinator, its partial added back by another that waits for it, over two pinned flag words (`0`: upstream's copies around the doorbell's stream memops, ~3.2 us a node). The routing split itself runs in upstream's hybrid ensure kernel. Bit-identical to an earlier step-number handshake, with which the speed was measured, together with other hybrid changes: one request on NVFP4 `xtx-xt` 74.3 -> 78.3 tok/s ([cpu-experts.md](cpu-experts.md)); the current handshake was not measured again. Replaces `FREETOKEN_HYBRID_SPLIT_KERNEL`. |
-| `FREETOKEN_CPU_MOE_GROUP` | `1` | CPU expert executor, NVFP4 / bf16 / Q4_0: one task per (expert, row block) for the routes of rows that share an expert, so its rows are read from RAM once (`0`: one task per route). Bit-identical. |
+| `FREETOKEN_CPU_MOE_GROUP` | `1` | CPU expert executor, NVFP4 / bf16: one task per (expert, row block) for the routes of rows that share an expert, so its rows are read from RAM once (`0`: one task per route). Bit-identical. |
 | `FREETOKEN_CPU_MOE_ROUTE_STATS` | unset | Measurement: every `n` CPU expert tasks, print how many of the CPU's routes repeat an expert of another row of the same step (8-13 % in the `--hybrid` runs). |
 | `FREETOKEN_HYBRID_SKIP_CPU_ROUTES` | `1` | With `--moe-strategy hybrid`, NVFP4 and EXL3: the GPU decode kernels write zeros for the routes the CPU computes (slot -1) instead of computing them on slot 0 at weight 0. Bit-identical; +1-3 % decode ([cpu-experts.md](cpu-experts.md)). |
 | `FREETOKEN_CPU_MOE_CORES_BY_SLICE` | `0` | `1`: under tensor parallelism each rank's CPU expert pool takes a share of the cores proportional to its expert slice (an uneven `FREETOKEN_TP_SPLIT`) instead of half. Measured without gain. |
@@ -1135,15 +1135,15 @@ With three or four requests a step runs one row each and the head only writes it
 - **Agentic benchmark** (the author's, private: a coding agent in OpenCode fixing 29 bugs planted in a ~50k-line
   codebase, long sessions, single runs): builds with the int8 attention KV cache fixed 8-9 bugs, builds with the bf16 KV
   12-14. The int8 KV is out of every profile ([options.md](options.md)).
-- **What the agentic benchmark covered**: the two-card builds that scored 12-13 had the uneven split, int8 dense
-  layers, one MoE all-reduce per block, the split-K GEMVs, the top-k-first sampler, 16k chunks with blocked PLE,
-  expert reuse in prefill, the host-memory all-reduce and the tuned prefill tiles. Added after the last scored build,
-  and checked for exactness instead: the tuned decode tiles, up to 4 concurrent requests (a request's decode is
-  identical alone or batched; prompts prefilled together can differ at rounding level), the RAM tier, the sampler
-  rework for requests without a small `top_k`, and rank 0's token broadcast. The one-card profiles were not run on it.
-  A build on ROCm 10 with the MTP head (`xtx-xt`) scored 12 and
-  18 in two runs; the same build with the EXL3 checkpoints ([how-it-works.md](how-it-works.md#exl3-checkpoints))
-  scored 13 at 3.05 bpw and 12 at 4.05 bpw, one run each.
+- **What the agentic benchmark covered**: the two-card builds that scored 12-13 had the uneven split, int8 dense layers,
+  one MoE all-reduce per block, the split-K GEMVs, the top-k-first sampler, 16k chunks with blocked PLE, expert reuse in
+  prefill, the host-memory all-reduce and the tuned prefill tiles (swept again since, on upstream's rewritten prefill
+  GEMM, whose NVFP4 answers differ). Added after the last scored build, and checked for exactness instead: the tuned
+  decode tiles, up to 4 concurrent requests (a request's decode is identical alone or batched; prompts prefilled
+  together can differ at rounding level), the RAM tier, the sampler rework for requests without a small `top_k`, and
+  rank 0's token broadcast. The one-card profiles were not run on it. A build on ROCm 10 with the MTP head (`xtx-xt`)
+  scored 12 and 18 in two runs; the same build with the EXL3 checkpoints
+  ([how-it-works.md](how-it-works.md#exl3-checkpoints)) scored 13 at 3.05 bpw and 12 at 4.05 bpw, one run each.
 - **Exactness checks**: a fixed set of 120 greedy prompts (not published) gave identical answers for the host-memory
   all-reduce, the tuned NVFP4 tiles (prefill and decode), expert reuse in prefill, a single request on the 4-request
   build, and the review-fix branch against the swept one. Kernel checks prove the blocked prefill MoE and batched decode
@@ -1251,7 +1251,7 @@ left on the XT). Host RAM is the kernel's `Mlocked` count after start.
 **Every profile and checkpoint** (one server each, `rdna3/serve.sh`): RAM is the growth of the kernel's `Mlocked`
 count from before the start to after it, and the expert cache the planned size, of 24,576 experts (the same on both
 cards: each rank plans on its own free memory, then both take the smaller plan), both from the servers of the summary
-above (`xtx-xt` at 262,144 tokens of context; an earlier build: this one locks 1.2 GiB more RAM and caches 7 % more
+above (`xtx-xt` at 262,144 tokens of context; an earlier build: a later one locks 1.2 GiB more RAM and caches 7 % more
 experts with NVFP4, 6,977 -> 7,464 slots); VRAM, from an earlier build, is the highest `mem_info_vram_used` sampled
 every 50 ms over an agent-like first turn (a title request decoding while a ~21k-token prompt is read), the decode
 answers, `quick_bench.py` and the depth sweep, the desktop's share included.
@@ -1346,22 +1346,23 @@ A prefill chunk runs every token through every layer, so each chunk streams all 
 (~700 MB per layer per card). Bigger chunks mean less streaming: in the A/B test, 16k-token chunks read an 8.4k prompt
 in 4.3 s instead of 5.5 s, and 54-101k-token reads at depth 2-6 % faster ([benchmarks.md](benchmarks.md) has the current
 speeds). To fit them, the prefill MoE and the PLE layer run 4096 tokens at a time inside the chunk (the NVFP4 MoE blocks
-are bit-identical, and 8192 tokens long in `xtx-xt` and `xtx-xt-4x262k`: +8 % on cold reads; the PLE blocks can round
-differently, checked to tolerance and validated on the agentic benchmark for one request), and experts already in the
-GPU cache are gathered on the GPU instead of crossing PCIe again (`--moe-prefill-hit-d2d`, with `hipMemcpyBatchAsync` on
-ROCm, or one copy per entry on older HIP): a third of the experts stay off PCIe per chunk, an agent turn's first token
-1.55 -> 1.18 s. A single card keeps 8k chunks (its working memory is smaller). The per-layer-embedding rows of a prefill
-are read from disk on a thread by rank 0 only, which broadcasts them, and a long prompt's next chunk's rows are read
-while a chunk computes (they took ~1.1 s per 16k-token chunk, the GPUs idle); on two cards each block of a chunk's
-routed experts and of its GatedDeltaNet output starts its all-reduce while the next block computes, and the QSA indexer
-scores 16 query rows a program (the same bits): fully cold reads ~25 % shorter
+are bit-identical, and 8192 tokens long in `xtx-xt` and `xtx-xt-4x262k`: +8 % on cold reads on an earlier build; the PLE
+blocks can round differently, checked to tolerance and validated on the agentic benchmark for one request), and experts
+already in the GPU cache are gathered on the GPU instead of crossing PCIe again (`--moe-prefill-hit-d2d`, with
+`hipMemcpyBatchAsync` on ROCm, or one copy per entry on older HIP): a third of the experts stay off PCIe per chunk, an
+agent turn's first token 1.55 -> 1.18 s. A single card keeps 8k chunks (its working memory is smaller). The
+per-layer-embedding rows of a prefill are read from disk on a thread by rank 0 only, which broadcasts them, and a long
+prompt's next chunk's rows are read while a chunk computes (they took ~1.1 s per 16k-token chunk, the GPUs idle); on two
+cards each block of a chunk's routed experts and of its GatedDeltaNet output starts its all-reduce while the next block
+computes, and the QSA indexer scores 16 query rows a program (the same bits): fully cold reads ~25 % shorter
 ([journey.md](journey.md#33-short-turns-the-host-waiting-at-every-layer-2026-10-18-and-19)). The rows are read over four
 io_uring rings, a row across a 4 KiB page as its two pages apart (one thread drove 240-290k reads a second; reads
 spanning two 4 KiB units, even 2.5 % of a batch, halved the batch's rate), the rows read before stay in a RAM cache (an
 agent session's n-grams recur across its turns), and a long block's experts run their full tiles in one launch and their
-remaining rows in smaller tiles in a second (the same bits): NVFP4 cold reads ~6 % shorter, EXL3 agent turns ~6 % (~7 %
-with the row cache). The input embedding lives in RAM, a row per token read across PCIe, and its VRAM goes to the
-expert cache: decode 1-6 % faster, agent turns ~3 % shorter
+remaining rows in smaller tiles in a second (the same bits; NVFP4 blocks of more than 6144 tokens since upstream's
+rewritten prefill GEMM, on which the re-swept tiles cut NVFP4 cold reads another 12 %): NVFP4 cold reads ~6 % shorter on
+an earlier build, EXL3 agent turns ~6 % (~7 % with the row cache). The input embedding lives in RAM, a row per token
+read across PCIe, and its VRAM goes to the expert cache: decode 1-6 % faster, agent turns ~3 % shorter
 ([journey.md](journey.md#34-disk-reads-on-four-rings-tail-tiles-the-input-embedding-in-ram-2026-10-19)).
 
 A short chunk (up to 1280 tokens on Qwen3.8-Flash-Next, an agent's tool result) does not stream the whole layers: it
@@ -1515,17 +1516,19 @@ in [journey.md](journey.md); the options themselves in [options.md](options.md).
 
 ## Rule 0: precision before speed
 
-After a faster build lost a third of its score on an agentic benchmark (see "bf16 attention KV, not int8" below),
-every change must be either **bit-exact** (same greedy answers on a fixed set of 120 prompts, or a kernel check with
-identical outputs) or **validated by the agentic benchmark** (the author's, private: a coding agent fixing 29 planted
-bugs over long sessions). Short fidelity tests (scored benchmarks, needle tests, teacher-forced probes) are used to
-reject changes, never to accept them alone. The changes made after the last agentic run are bit-exact or exact by
-kernel tests, except these, each described where it is documented: prompts prefilled together in one batch (up to 4
-requests) can differ at rounding level; ROCm 10's own Triton 3.8 rounds differently from the 3.7.1 of that run
+After a faster build lost a third of its score on an agentic benchmark (see "bf16 attention KV, not int8" below), every
+change must be either **bit-exact** (same greedy answers on a fixed set of 120 prompts, or a kernel check with identical
+outputs) or **validated by the agentic benchmark** (the author's, private: a coding agent fixing 29 planted bugs over
+long sessions). Short fidelity tests (scored benchmarks, needle tests, teacher-forced probes) are used to reject
+changes, never to accept them alone. The changes made after the last agentic run are bit-exact or exact by kernel tests,
+except these, each described where it is documented: prompts prefilled together in one batch (up to 4 requests) can
+differ at rounding level; ROCm 10's own Triton 3.8 rounds differently from the 3.7.1 of that run
 ([journey.md](journey.md#18-rocm-10s-own-triton-2026-10-05)); upstream's NVFP4 decode kernel changed 5 of 15 greedy
 answers ([journey.md](journey.md#23-upstream-up-to-ee9789f-2026-10-10)); the EXL3 dense weights are rebuilt in fp64
-([options.md](options.md)); and `--hybrid` moves its answers with the expert cache's contents. The ROCm 10 base was
-run on the agentic benchmark with the MTP head: 12 and 18 of 29 in two runs.
+([options.md](options.md)); upstream's fp32 NVFP4 global scales and rewritten NVFP4 prefill GEMM changed 25 of 42 greedy
+outputs, EXL3 none ([journey.md](journey.md#35-upstream-up-to-cc56b6b-2026-10-20)); and `--hybrid` moves its answers
+with the expert cache's contents. The ROCm 10 base was run on the agentic benchmark with the MTP head: 12 and 18 of 29
+in two runs.
 
 - **Gives**: speed that did not cost quality on the agentic benchmark.
 - **Costs**: slower progress; some real speedups were dropped (int8 KV, grouped prefills).
@@ -3063,7 +3066,30 @@ first two reads took 13.58 and 34.70 s, not seen again). One card (`xtx`, EXL3 3
   or 8k slices; every variant the same indices) found the shipped one the fastest (the best within 1.6 %); a faster
   select needs another algorithm, for ~1 % of a cold read: not attempted.
 
-## 35. Still open
+## 35. Upstream up to cc56b6b (2026-10-20)
+
+29 commits merged, the authors' kept. Two of them change NVFP4's numbers on purpose: the global scales stay fp32
+(`0db5023`; as fp16 most were subnormal, up to 1.7e-3 relative error per row) and the Triton prefill GEMM is rewritten
+(`03c2c9c`: the weight tile is the MMA's A operand, one dot per K step instead of two). EXL3 kept its bits: 42 of 42
+answers the same in two runs on `xtx-xt-4x262k`. Nine files conflicted; upstream had moved the NVFP4 launches to
+`kernel/nvfp4_moe.py`, given the CPU executor a format per layer and rewritten the qwen4_exp dense reader, and this
+tree's pieces moved onto those. The CPU and GPU suites passed where they passed before, yet the first two NVFP4 starts
+failed while loading the experts: upstream's expert reader now hands the family hook a `layers` argument, and its
+pieces now carry the experts' static activation scales, which the tensor-parallel slicing had no rule for (both fixed
+with a test each; only a real load reaches them).
+
+The RDNA3 prefill tiles had been swept on the old GEMM. On the new one, with the same tiles, an 8192-token MoE block was
+1.8x faster (19.4 -> 10.7 ms) but a 2048-token one 1.4x slower (8.2 -> 11.6 ms; the XT with the XTX's 352-wide slice):
+the 8-warp 1-stage tile of 1537-3071 tokens suits it badly. A grid of 72 tiles at one K step (all of them the same bits)
+per size and card found 4 warps and 2 stages best from 1537 tokens, and the 64-row tile ahead of the 128-row one with
+tail tiles up to 6144 tokens (from 7168 the 128-row one wins). The grid's first-timed config read 1.5x slow (the same
+tile timed again later was fast), so the table was settled by an interleaved A/B of whole MoE blocks. Those ran each
+card on the other's slice width (`HIP_VISIBLE_DEVICES=0` is the XT here, 1 the XTX); run again on each card's own slice:
+1600-2560 tokens 2.8-3.0x faster, 1280 1.4-1.5x, 32 1.3-1.4x, 4096-6144 1.1-1.2x, 7168-8192 even, the same bits
+everywhere. Whole model, NVFP4: cold reads -12 % (210k tokens 64.8-64.9 -> 56.9 s), decode +1.4-2.7 %, agent turns the
+same ([CHANGELOG](../../CHANGELOG.md)).
+
+## 36. Still open
 
 - In NVFP4 the model needs ~63 GiB of RAM for its experts alone (the engine keeps every expert in RAM). The EXL3 3.05
   bpw checkpoint needs 42.6 GiB and served under a 56 GiB container limit, but a real 64 GB machine is untested
@@ -3518,14 +3544,12 @@ be slower (one-time kernel preparation): run it twice.
 docker run --rm -w /opt/FreeToken --entrypoint python3 freetoken-rdna3:latest -m pytest -q -p no:cacheprovider tests
 ```
 
-About 3.5 minutes (210 s on the reference machine), no GPU needed, on the tree the image was built from: 1788 passed,
-999 skipped and 4 failures that fail the same way on upstream: 3 come from the environment (they need flashinfer, an
-NVIDIA-only package:
+About 3 minutes (155 s on the reference machine with `--cpus 8`), no GPU needed, on the tree the image was built
+from: 1809 passed, 1086 skipped and 3 failures that fail the same way on upstream, from the environment (they need
+flashinfer, an NVIDIA-only package:
 `test_cache_budget.py::test_adjust_config_defaults_moe_cache_auto_for_auto_resolved_offload_backend`,
 `test_cache_budget.py::test_adjust_config_resolves_num_tokens_generic`,
-`test_offload.py::test_adjust_config_converts_moe_cache_rate_to_cache_size`), and
-`qwen4_exp/test_weight.py::test_every_registry_architecture_is_claimed_by_an_aot_entry` finds two of upstream's GGUF
-architectures without an AOT entry.
+`test_offload.py::test_adjust_config_converts_moe_cache_rate_to_cache_size`).
 
 To test source changes without rebuilding, mount your tree instead (`-v "$PWD":/src:ro -w /src -e
 PYTHONPATH=/src/python`); `test_swiglu_clamp.py::test_cpu_extension_supports_swiglu_clamp` then fails too, because the
@@ -3554,7 +3578,7 @@ docker run --rm --device=/dev/kfd --device=/dev/dri --security-opt seccomp=uncon
 | `int8_gemv_check.py` | the int8 GEMV against a dequantized reference, eager and in a graph |
 | `int8_rows_check.py` | several rows at once give each row exactly what a batch of one gives, for every tuned shape |
 | `exl3_check.py` | the EXL3 tile dequant bit-exact with the torch reference (K = 1-8, three codebooks), the split-K GEMV, the n-gram row decode |
-| `exl3_moe_check.py` | the EXL3 routed-expert path (rotations + products) against a dense reference: decode, prefill, a 384 / 256 two-rank split, prefill token blocks bit-identical to one pass, a CUDA-graph replay |
+| `exl3_moe_check.py` | the EXL3 routed-expert path (rotations + products) against a dense reference: decode, prefill, a 384 / 256 two-rank split, prefill token blocks bit-identical to one pass, a CUDA-graph replay; its torch reference decodes on the CPU with as many threads as the container's `--cpus` quota (with torch's default oversubscribing it, a CPU decode of the same tiles came out different now and then) |
 | `moe_block_check.py` | the token-blocked NVFP4 prefill MoE returns exactly what the one-shot call returns |
 | `host_allreduce_check.py` (2 GPUs: `HIP_VISIBLE_DEVICES=0,1`) | the host-memory all-reduce against RCCL |
 | `host_kv_check.py` | the RAM-tier copies (device -> RAM -> device) are exact |
@@ -3613,12 +3637,12 @@ How this repository relates to upstream FreeToken and how to keep it current. Fo
 
 ## What this tree is
 
-Upstream [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken) at `9b68e00` ("fix(engine): upload cuda
-graphs at capture so a stream wait cannot block the first launch (#697)"), plus the changes listed file by file in
+Upstream [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken) at `cc56b6b` ("feat(gguf): serve
+GLM-5.3-Flash GGUF checkpoints on glm5-next (#721)"), plus the changes listed file by file in
 [changes-from-upstream.md](changes-from-upstream.md). The history is upstream's own up to `0d652e7`, then this
 project's commits on top (the first one holds everything up to 0.1.0), a merge of upstream up
 to `ee9789f`, five upstream commits cherry-picked (`74a3877`, `9c635a1`, `7d6490c`, `9b68e00`, `b6193e8`, authors
-kept) and a merge of the rest up to `9b68e00`. Once the `upstream` remote is set up (below),
+kept), a merge of the rest up to `9b68e00` and a merge up to `cc56b6b`. Once the `upstream` remote is set up (below),
 `git diff $(git merge-base HEAD upstream/main)` shows every change against the upstream version this tree is based on.
 
 ## The stack on top of upstream (oldest first)
@@ -3649,6 +3673,17 @@ which this tree's split kernel did, and its executor speaks HIP's memops (`20102
 the stack. Kept over upstream: `kernel/triton/moe_align.py` on ROCm instead of the staged align of `0bca88f` (the same
 Triton 3.8 bug, fixed in the kernel here); the hybrid publish / merge kernels instead of upstream's copies around the
 doorbell, which it keeps on ROCm. The prefill through the slot cache needs one slot pool (`b416f85`'s default here).
+
+At the merge of `cc56b6b`: upstream's CPU MoE executor serves a format per MoE layer (`e8c6bf1`) and computes GGUF
+experts with ggml-cpu instead of its Q4_0 kernels (`c8559fd`); this tree's EXL3 experts (with their own fp16 decode,
+which upstream dropped from the shared header in `0db5023`), route grouping and hybrid flag words sit on it, and
+`FREETOKEN_HYBRID_FETCH_FRACTION` fills its per-layer fractions. Upstream moved the NVFP4 launches to
+`kernel/nvfp4_moe.py` (`ac6a15d`) and rewrote the Triton prefill GEMM (`03c2c9c`): the RDNA3 decode tiles and the skip
+of the CPU's routes moved with the launches, the RDNA3 prefill tiles were swept again on the new GEMM. NVFP4 global
+scales are fp32 (`0db5023`); with the rewritten GEMM, NVFP4 answers differ from the build before, EXL3 ones do not. The
+qwen4_exp dense reader is upstream's scheme-driven one (`163d1de`), with this tree's tensor-parallel sharding, EXL3
+reconstruction and MTP head on top; the expert-piece hook takes upstream's `layers` argument, and the TP slicing keeps
+the experts' static activation scales (`e4f69d9`) whole on every rank.
 
 ## Keeping current
 
@@ -3708,9 +3743,9 @@ Infinity Cache and promises gains that serving does not see.
 
 This repository is a modified version of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken) (Apache
 License 2.0), taken at `0d652e7` and merged with upstream up to `ee9789f`, then up to `9b68e00` (five of its commits
-cherry-picked first, then the rest merged). Every file changed or added relative to upstream is listed here with the
-reason. Line counts are `added/removed`, against the upstream commit a section or row names, `0d652e7` otherwise;
-`git diff 9b68e00` gives the current ones. Files the merge made
+cherry-picked first, then the rest merged), then up to `cc56b6b`. Every file changed or added relative to upstream is
+listed here with the reason. Line counts are `added/removed`, against the upstream commit a section or row names,
+`0d652e7` otherwise; `git diff cc56b6b` gives the current ones. Files the merge made
 identical to upstream again are gone from the tables ([maintaining.md](maintaining.md#the-stack-on-top-of-upstream-oldest-first)).
 Who wrote what: [credits.md](credits.md).
 
@@ -3728,7 +3763,7 @@ Who wrote what: [credits.md](credits.md).
 
 | File | Lines | Change |
 |---|---:|---|
-| `python/freetoken/models/qwen4_exp/weight.py` | 203/11 | per-rank sharding of the split weights (even or uneven split; the rest, the vision tower included, replicated) |
+| `python/freetoken/models/qwen4_exp/weight.py` | 203/11 | per-rank sharding of the split weights (even or uneven split; the rest, the vision tower included, replicated), ahead of upstream's scheme-driven dense reader (`163d1de`) |
 | `python/freetoken/models/qwen3_vl/vision.py` | 18/23 | the Qwen VL vision tower never split (whole on a rank) instead of tensor-parallel modules whose weights nothing sharded; a rank without a tower places nothing |
 | `python/freetoken/models/qwen4_exp/model.py` | 3/1 | the vision tower built on rank 0 only (rank 0 encodes for every rank) |
 | `python/freetoken/models/qwen4_exp/attention.py` | 20/7 | attention heads and output projection sharded |
@@ -3769,7 +3804,7 @@ Who wrote what: [credits.md](credits.md).
 
 | File | Lines | Change |
 |---|---:|---|
-| `python/freetoken/moe/fused_nvfp4.py` | 73/8 | tuned NVFP4 prefill / decode tiles for RDNA3 (opt-in, bit-exact); token-blocked prefill MoE (the decode tiles swept again for upstream's marlin decode kernel, `7644984`) |
+| `python/freetoken/moe/fused_nvfp4.py`, `kernel/nvfp4_moe.py` | 73/8, 23/1 against `cc56b6b` | tuned NVFP4 prefill / decode tiles for RDNA3 (opt-in, bit-exact); token-blocked prefill MoE. The decode tiles were swept again for upstream's marlin decode kernel (`7644984`) and live in `kernel/nvfp4_moe.py`, where upstream moved the launches (`ac6a15d`); the prefill tiles were swept again for upstream's rewritten prefill GEMM (`03c2c9c`) |
 | `python/freetoken/moe/offload_cache.py` | 16/2 | expert reuse during prefill on ROCm |
 | `python/freetoken/kernel/batch_memcpy.py`, `kernel/csrc/jit/batch_memcpy.cuh` | 55/0, 86/1 | `hipMemcpyBatchAsync` (HIP >= 7.1) with a per-copy fallback |
 
@@ -3904,15 +3939,15 @@ Line counts here are on top of the lines listed in the sections above.
 
 | File | Lines | Change |
 |---|---:|---|
-| `python/freetoken/kernel/csrc/cpu_moe/cpu_moe_ext.cpp`, `format.h`, `kernels/exl3.cpp` | 125/6, 19/0, new against `9b68e00` | on upstream's executor split into formats and GPU sync backends (`2010271`, which also brought HIP's own memops): EXL3 experts (mul1, 2-4 bits, AVX2 + F16C, software prefetch, one decode for the rows sharing an expert, column blocks `FREETOKEN_CPU_MOE_EXL3_COLS`) as a format that runs its tasks whole (`MoeFormat::run_task`); the routes of rows sharing an expert run back to back (`FREETOKEN_CPU_MOE_GROUP`); two pinned flag words polled beside the doorbell for the hybrid kernels, and the task word exported; `FREETOKEN_CPU_MOE_ROUTE_STATS` |
-| `python/freetoken/moe/cpu_executor.py` | 144/4 against `9b68e00` | each tensor-parallel rank's pool on its own half of the cores; the EXL3 banks read in place; the hybrid publish / merge path (`FREETOKEN_HYBRID_FLAG_IN_KERNEL`) over device views of the pinned IO rows and flag words; the pools' cores by slice size (`FREETOKEN_CPU_MOE_CORES_BY_SLICE`, off) or with SMT siblings (`FREETOKEN_CPU_MOE_SMT`, off) |
+| `python/freetoken/kernel/csrc/cpu_moe/cpu_moe_ext.cpp`, `format.h`, `kernels/exl3.cpp` | 126/9, 19/0, new against `cc56b6b` | on upstream's executor split into formats, a format per MoE layer (`e8c6bf1`), and GPU sync backends (`2010271`, which also brought HIP's own memops): EXL3 experts (mul1, 2-4 bits, AVX2 + F16C, software prefetch, one decode for the rows sharing an expert, column blocks `FREETOKEN_CPU_MOE_EXL3_COLS`) as a format that runs its tasks whole (`MoeFormat::run_task`); the routes of rows sharing an expert run back to back (`FREETOKEN_CPU_MOE_GROUP`); two pinned flag words polled beside the doorbell for the hybrid kernels, and the task word exported; `FREETOKEN_CPU_MOE_ROUTE_STATS`; `kernels/exl3.cpp` keeps its own fp16 decode (upstream dropped the shared one, `0db5023`) |
+| `python/freetoken/moe/cpu_executor.py` | 144/4 against `cc56b6b` | each tensor-parallel rank's pool on its own half of the cores; the EXL3 banks read in place; the hybrid publish / merge path (`FREETOKEN_HYBRID_FLAG_IN_KERNEL`) over device views of the pinned IO rows and flag words; the pools' cores by slice size (`FREETOKEN_CPU_MOE_CORES_BY_SLICE`, off) or with SMT siblings (`FREETOKEN_CPU_MOE_SMT`, off) |
 | `python/freetoken/kernel/triton/hybrid_split.py`, `kernel/host_mapped.py` | new, 7/0 | the hybrid layer's two GPU ends as one kernel each, carrying the handshake (system-scope atomics on the pinned flag words); a device view of an existing pinned tensor |
 | `python/freetoken/moe/offload_kernels.py`, `moe/offload_cache.py` | 35/21, 2/2 | upstream's hybrid ensure kernel (which splits the routes, `f02fbb1`) reads the routes as vectors and tells this step's slots by their usage stamp (same decisions; 1.1-2.2x faster at 4 rows, 1.5-8.5x at 16, synthetic routing), with barriers between its phases |
 | `python/freetoken/layers/moe.py` | 35/3 | the publish / merge path; steps of fewer than `FREETOKEN_HYBRID_MIN_REQS` requests take the offload path |
-| `python/freetoken/engine/engine.py` | 13/5 | the executor's row bound counts the MTP verify rows (sized up front, a larger task refused); `FREETOKEN_HYBRID_FETCH_FRACTION`; the TP CPU group handed to the executor |
+| `python/freetoken/engine/engine.py` | 13/5 | the executor's row bound counts the MTP verify rows (sized up front, a larger task refused); `FREETOKEN_HYBRID_FETCH_FRACTION` (one share for every layer, in upstream's per-layer fractions); the TP CPU group handed to the executor |
 | `python/freetoken/layers/quantization/moe/nvfp4.py`, `layers/quantization/moe/exl3.py` | 8/2, 14/3 | CPU decode allowed under tensor parallelism with NVFP4; an EXL3 CPU format (mul1, 2-4 bits); both kernels take inactive slots (`FREETOKEN_HYBRID_SKIP_CPU_ROUTES`) |
-| `python/freetoken/kernel/triton/nvfp4_fused_moe.py`, `moe/fused_nvfp4.py`, `kernel/triton/exl3.py`, `moe/fused_exl3.py` | 7/0, 4/0, 17/7, 6/3 | the decode GEMVs write zeros for a slot of -1 without a read; the EXL3 rotation and scale kernels read slot 0's scales for it |
-| `tests/moe/test_cpu_moe_exl3.py`, `tests/moe/test_cpu_moe.py`, `tests/moe/test_nvfp4_backends.py` | new, 56/0 against `9b68e00`, 24/0 | the EXL3 path against the reference codec, tensor-parallel slices, skipped routes, rows sharing an expert, the size check; the publish / merge path eager and replayed in a graph, a step without a CPU route among them; the GPU skip of the CPU's routes bit-identical (NVFP4, EXL3) |
+| `python/freetoken/kernel/triton/nvfp4_fused_moe.py`, `kernel/nvfp4_moe.py`, `kernel/triton/exl3.py`, `moe/fused_exl3.py` | 7/0, 4/0, 17/7, 6/3 | the decode GEMVs write zeros for a slot of -1 without a read; the EXL3 rotation and scale kernels read slot 0's scales for it |
+| `tests/moe/test_cpu_moe_exl3.py`, `tests/moe/test_cpu_moe.py`, `tests/moe/test_nvfp4_backends.py` | new, 56/0 against `cc56b6b`, 24/0 | the EXL3 path against the reference codec, tensor-parallel slices, skipped routes, rows sharing an expert, the size check; the publish / merge path eager and replayed in a graph, a step without a CPU route among them; the GPU skip of the CPU's routes bit-identical (NVFP4, EXL3) |
 
 ## Decode on two cards, bit-exact
 
@@ -3968,8 +4003,20 @@ Line counts here are on top of the lines listed in the sections above.
 | File | Lines | Change |
 |---|---:|---|
 | `python/freetoken/kernel/csrc/row_store/row_store_ext.cpp`, `models/qwen4_exp/ple_disk.py`, `tests/kernels/test_row_store.py` | 333/49, 12/3, 57/0 | the disk row store splits a fill of 256 rows or more over four io_uring rings, one helper thread each (`FREETOKEN_ROW_STORE_RINGS`), reads a row across a 4 KiB page as its two pages, the second after another row's read (on the reference NVMe, reads spanning two 4 KiB units, even 2.5 % of a batch, halved the batch's rate), and can keep the rows it read in a RAM cache, which the store reading the prefills does (`FREETOKEN_PLE_ROW_CACHE_ROWS`) |
-| `python/freetoken/kernel/triton/moe_align.py`, `moe/fused_nvfp4.py`, `moe/fused_exl3.py`, `tests/moe/test_prefill_tail_tiles.py` | 107/1, 35/17, 15/1, new | `moe_align_split`: each expert's full tiles in one launch, its remaining rows in smaller tiles in a second; NVFP4 prefill blocks of 3072 tokens or more, 128 + 32-row tiles in both GEMMs (`FREETOKEN_NVFP4_PREFILL_TAIL_TILES`), EXL3's gate-up GEMM 64 + 32-row tiles from 3072 tokens (`FREETOKEN_EXL3_PREFILL_TAIL_TILES`); the same K order, the same bits |
+| `python/freetoken/kernel/triton/moe_align.py`, `moe/fused_nvfp4.py`, `moe/fused_exl3.py`, `tests/moe/test_prefill_tail_tiles.py` | 107/1, 35/17, 15/1, new | `moe_align_split`: each expert's full tiles in one launch, its remaining rows in smaller tiles in a second; NVFP4 prefill blocks of more than 6144 tokens, 128 + 32-row tiles in both GEMMs (`FREETOKEN_NVFP4_PREFILL_TAIL_TILES`), EXL3's gate-up GEMM 64 + 32-row tiles from 3072 tokens (`FREETOKEN_EXL3_PREFILL_TAIL_TILES`); the same K order, the same bits |
 | `python/freetoken/layers/embedding.py`, `engine/engine.py`, `tests/layers/test_embed_host.py` | 49/0, 7/0, new | an input embedding not tied to the LM head kept in pinned, device-mapped host memory, read by the same lookup kernel (`FREETOKEN_EMBED_HOST`); the engine moves it after the int8 compaction, before the memory reading that sizes the expert cache and the K/V pool |
+
+## On upstream up to `cc56b6b`
+
+Line counts here are against the merge of `cc56b6b`, on top of the lines listed in the sections above.
+
+| File | Lines | Change |
+|---|---:|---|
+| `python/freetoken/moe/fused_nvfp4.py`, `tests/moe/test_nvfp4_prefill_tiles.py`, `tests/moe/test_short_prefill_tiles.py`, `tests/moe/test_prefill_tail_tiles.py` | 14/13, 20/16, 3/2, 3/3 | the RDNA3 prefill tiles swept again on upstream's rewritten prefill GEMM (`03c2c9c`): 4 warps and 2 stages on both GEMMs from 1537 to 6144 tokens and on the down GEMM up to 64 and from 641 to 1536, a 64-row tile up to 6144 tokens, the 128-row one with tail tiles above (the same K step, the same bits); untuned prefills take upstream's tiles |
+| `python/freetoken/models/qwen4_exp/weight.py`, `layers/quantization/moe/nvfp4.py`, `tests/models/qwen4_exp/test_weight.py`, `tests/models/qwen4_exp/test_tp_shard.py` | 6/3, 2/0, 11/0, 11/0 | the expert-piece hook takes the `layers` upstream's reader passes; the tensor-parallel slicing keeps the experts' static activation scales (`e4f69d9`) whole on every rank |
+| `python/freetoken/layers/embedding.py`, `tests/layers/test_lm_head_dump.py` | 2/2, new | the prompt top-k dump of a tied LM head (`FREETOKEN_DUMP_PROMPT_TOPK`) computes its logits as the forward does (it called an `F.linear` that was never imported) |
+| `rdna3/tests/exl3_moe_check.py` | 17/0 | the torch reference on as many CPU threads as the container's quota: oversubscribed, it decoded the same tiles differently now and then and the check failed |
+| `tests/moe/test_cpu_moe_exl3.py`, `tests/moe/test_prefill_cached.py`, `tests/models/qwen4_exp/test_mtp.py`, `rdna3/bench/nvfp4_*_sweep.py`, `rdna3/bench/exl3_*_bench.py`, `rdna3/tests/moe_block_check.py` | 3/3, 4/4, 1/1, 9/7, 3/3, 2/2 | the executor's per-layer formats, fp32 NVFP4 globals, the launches in `kernel/nvfp4_moe.py` |
 
 ## Tooling and documentation
 

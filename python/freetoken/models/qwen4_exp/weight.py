@@ -747,13 +747,16 @@ class _CheckpointMoELayers:
         return getattr(self._config, name)
 
 
-def iter_expert_pieces(model_path: str, config, kind, *, parallel: bool = False, workers: int = 8,
+def iter_expert_pieces(model_path: str, config, kind, *, layers=None, parallel: bool = False, workers: int = 8,
                        chunk: int = 8 << 20):
     """The family hook of moe/expert_pieces.iter_expert_pieces: None (the generic readers) unless the MTP head is
-    built, in which case the checkpoint's NVFP4 experts are followed by the MTP's 512, quantized to NVFP4 here."""
+    built, in which case the checkpoint's NVFP4 experts are followed by the MTP's 512, quantized to NVFP4 here.
+    ``layers`` (bank layers of one format, experts of several formats) reaches the NVFP4 and FP8 readers only."""
     from freetoken.layers.quantization import QuantKind
     from freetoken.models.nvfp4_banks import iter_nvfp4_expert_pieces
 
+    if layers is not None and (kind is QuantKind.EXL3 or getattr(config, "mtp_layers", 0)):
+        raise NotImplementedError("qwen4_exp reads EXL3 experts and the MTP head's for every MoE layer, in one format")
     if kind is QuantKind.EXL3:
         return _exl3_expert_pieces(model_path, config, parallel=parallel, workers=workers, chunk=chunk)
     if getattr(config, "mtp_layers", 0) and kind is not QuantKind.NVFP4:
@@ -762,7 +765,7 @@ def iter_expert_pieces(model_path: str, config, kind, *, parallel: bool = False,
         # official FP8 checkpoints share qwen3_5_moe's block-fp8 expert layout; None leaves the generic readers
         from freetoken.models.qwen3_5_moe.weight import iter_expert_pieces as qwen3_5_pieces
 
-        return qwen3_5_pieces(model_path, config, kind, parallel=parallel, workers=workers, chunk=chunk)
+        return qwen3_5_pieces(model_path, config, kind, layers=layers, parallel=parallel, workers=workers, chunk=chunk)
     main = iter_nvfp4_expert_pieces(model_path, _CheckpointMoELayers(config),
                                     nvfp4_expert_spec(model_path, config),
                                     parallel=parallel, workers=workers, chunk=chunk)

@@ -211,15 +211,15 @@ With three or four requests a step runs one row each and the head only writes it
 - **Agentic benchmark** (the author's, private: a coding agent in OpenCode fixing 29 bugs planted in a ~50k-line
   codebase, long sessions, single runs): builds with the int8 attention KV cache fixed 8-9 bugs, builds with the bf16 KV
   12-14. The int8 KV is out of every profile ([options.md](options.md)).
-- **What the agentic benchmark covered**: the two-card builds that scored 12-13 had the uneven split, int8 dense
-  layers, one MoE all-reduce per block, the split-K GEMVs, the top-k-first sampler, 16k chunks with blocked PLE,
-  expert reuse in prefill, the host-memory all-reduce and the tuned prefill tiles. Added after the last scored build,
-  and checked for exactness instead: the tuned decode tiles, up to 4 concurrent requests (a request's decode is
-  identical alone or batched; prompts prefilled together can differ at rounding level), the RAM tier, the sampler
-  rework for requests without a small `top_k`, and rank 0's token broadcast. The one-card profiles were not run on it.
-  A build on ROCm 10 with the MTP head (`xtx-xt`) scored 12 and
-  18 in two runs; the same build with the EXL3 checkpoints ([how-it-works.md](how-it-works.md#exl3-checkpoints))
-  scored 13 at 3.05 bpw and 12 at 4.05 bpw, one run each.
+- **What the agentic benchmark covered**: the two-card builds that scored 12-13 had the uneven split, int8 dense layers,
+  one MoE all-reduce per block, the split-K GEMVs, the top-k-first sampler, 16k chunks with blocked PLE, expert reuse in
+  prefill, the host-memory all-reduce and the tuned prefill tiles (swept again since, on upstream's rewritten prefill
+  GEMM, whose NVFP4 answers differ). Added after the last scored build, and checked for exactness instead: the tuned
+  decode tiles, up to 4 concurrent requests (a request's decode is identical alone or batched; prompts prefilled
+  together can differ at rounding level), the RAM tier, the sampler rework for requests without a small `top_k`, and
+  rank 0's token broadcast. The one-card profiles were not run on it. A build on ROCm 10 with the MTP head (`xtx-xt`)
+  scored 12 and 18 in two runs; the same build with the EXL3 checkpoints
+  ([how-it-works.md](how-it-works.md#exl3-checkpoints)) scored 13 at 3.05 bpw and 12 at 4.05 bpw, one run each.
 - **Exactness checks**: a fixed set of 120 greedy prompts (not published) gave identical answers for the host-memory
   all-reduce, the tuned NVFP4 tiles (prefill and decode), expert reuse in prefill, a single request on the 4-request
   build, and the review-fix branch against the swept one. Kernel checks prove the blocked prefill MoE and batched decode
@@ -327,7 +327,7 @@ left on the XT). Host RAM is the kernel's `Mlocked` count after start.
 **Every profile and checkpoint** (one server each, `rdna3/serve.sh`): RAM is the growth of the kernel's `Mlocked`
 count from before the start to after it, and the expert cache the planned size, of 24,576 experts (the same on both
 cards: each rank plans on its own free memory, then both take the smaller plan), both from the servers of the summary
-above (`xtx-xt` at 262,144 tokens of context; an earlier build: this one locks 1.2 GiB more RAM and caches 7 % more
+above (`xtx-xt` at 262,144 tokens of context; an earlier build: a later one locks 1.2 GiB more RAM and caches 7 % more
 experts with NVFP4, 6,977 -> 7,464 slots); VRAM, from an earlier build, is the highest `mem_info_vram_used` sampled
 every 50 ms over an agent-like first turn (a title request decoding while a ~21k-token prompt is read), the decode
 answers, `quick_bench.py` and the depth sweep, the desktop's share included.

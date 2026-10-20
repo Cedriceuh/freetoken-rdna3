@@ -2,9 +2,9 @@
 
 This repository is a modified version of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken) (Apache
 License 2.0), taken at `0d652e7` and merged with upstream up to `ee9789f`, then up to `9b68e00` (five of its commits
-cherry-picked first, then the rest merged). Every file changed or added relative to upstream is listed here with the
-reason. Line counts are `added/removed`, against the upstream commit a section or row names, `0d652e7` otherwise;
-`git diff 9b68e00` gives the current ones. Files the merge made
+cherry-picked first, then the rest merged), then up to `cc56b6b`. Every file changed or added relative to upstream is
+listed here with the reason. Line counts are `added/removed`, against the upstream commit a section or row names,
+`0d652e7` otherwise; `git diff cc56b6b` gives the current ones. Files the merge made
 identical to upstream again are gone from the tables ([maintaining.md](maintaining.md#the-stack-on-top-of-upstream-oldest-first)).
 Who wrote what: [credits.md](credits.md).
 
@@ -22,7 +22,7 @@ Who wrote what: [credits.md](credits.md).
 
 | File | Lines | Change |
 |---|---:|---|
-| `python/freetoken/models/qwen4_exp/weight.py` | 203/11 | per-rank sharding of the split weights (even or uneven split; the rest, the vision tower included, replicated) |
+| `python/freetoken/models/qwen4_exp/weight.py` | 203/11 | per-rank sharding of the split weights (even or uneven split; the rest, the vision tower included, replicated), ahead of upstream's scheme-driven dense reader (`163d1de`) |
 | `python/freetoken/models/qwen3_vl/vision.py` | 18/23 | the Qwen VL vision tower never split (whole on a rank) instead of tensor-parallel modules whose weights nothing sharded; a rank without a tower places nothing |
 | `python/freetoken/models/qwen4_exp/model.py` | 3/1 | the vision tower built on rank 0 only (rank 0 encodes for every rank) |
 | `python/freetoken/models/qwen4_exp/attention.py` | 20/7 | attention heads and output projection sharded |
@@ -63,7 +63,7 @@ Who wrote what: [credits.md](credits.md).
 
 | File | Lines | Change |
 |---|---:|---|
-| `python/freetoken/moe/fused_nvfp4.py` | 73/8 | tuned NVFP4 prefill / decode tiles for RDNA3 (opt-in, bit-exact); token-blocked prefill MoE (the decode tiles swept again for upstream's marlin decode kernel, `7644984`) |
+| `python/freetoken/moe/fused_nvfp4.py`, `kernel/nvfp4_moe.py` | 73/8, 23/1 against `cc56b6b` | tuned NVFP4 prefill / decode tiles for RDNA3 (opt-in, bit-exact); token-blocked prefill MoE. The decode tiles were swept again for upstream's marlin decode kernel (`7644984`) and live in `kernel/nvfp4_moe.py`, where upstream moved the launches (`ac6a15d`); the prefill tiles were swept again for upstream's rewritten prefill GEMM (`03c2c9c`) |
 | `python/freetoken/moe/offload_cache.py` | 16/2 | expert reuse during prefill on ROCm |
 | `python/freetoken/kernel/batch_memcpy.py`, `kernel/csrc/jit/batch_memcpy.cuh` | 55/0, 86/1 | `hipMemcpyBatchAsync` (HIP >= 7.1) with a per-copy fallback |
 
@@ -198,15 +198,15 @@ Line counts here are on top of the lines listed in the sections above.
 
 | File | Lines | Change |
 |---|---:|---|
-| `python/freetoken/kernel/csrc/cpu_moe/cpu_moe_ext.cpp`, `format.h`, `kernels/exl3.cpp` | 125/6, 19/0, new against `9b68e00` | on upstream's executor split into formats and GPU sync backends (`2010271`, which also brought HIP's own memops): EXL3 experts (mul1, 2-4 bits, AVX2 + F16C, software prefetch, one decode for the rows sharing an expert, column blocks `FREETOKEN_CPU_MOE_EXL3_COLS`) as a format that runs its tasks whole (`MoeFormat::run_task`); the routes of rows sharing an expert run back to back (`FREETOKEN_CPU_MOE_GROUP`); two pinned flag words polled beside the doorbell for the hybrid kernels, and the task word exported; `FREETOKEN_CPU_MOE_ROUTE_STATS` |
-| `python/freetoken/moe/cpu_executor.py` | 144/4 against `9b68e00` | each tensor-parallel rank's pool on its own half of the cores; the EXL3 banks read in place; the hybrid publish / merge path (`FREETOKEN_HYBRID_FLAG_IN_KERNEL`) over device views of the pinned IO rows and flag words; the pools' cores by slice size (`FREETOKEN_CPU_MOE_CORES_BY_SLICE`, off) or with SMT siblings (`FREETOKEN_CPU_MOE_SMT`, off) |
+| `python/freetoken/kernel/csrc/cpu_moe/cpu_moe_ext.cpp`, `format.h`, `kernels/exl3.cpp` | 126/9, 19/0, new against `cc56b6b` | on upstream's executor split into formats, a format per MoE layer (`e8c6bf1`), and GPU sync backends (`2010271`, which also brought HIP's own memops): EXL3 experts (mul1, 2-4 bits, AVX2 + F16C, software prefetch, one decode for the rows sharing an expert, column blocks `FREETOKEN_CPU_MOE_EXL3_COLS`) as a format that runs its tasks whole (`MoeFormat::run_task`); the routes of rows sharing an expert run back to back (`FREETOKEN_CPU_MOE_GROUP`); two pinned flag words polled beside the doorbell for the hybrid kernels, and the task word exported; `FREETOKEN_CPU_MOE_ROUTE_STATS`; `kernels/exl3.cpp` keeps its own fp16 decode (upstream dropped the shared one, `0db5023`) |
+| `python/freetoken/moe/cpu_executor.py` | 144/4 against `cc56b6b` | each tensor-parallel rank's pool on its own half of the cores; the EXL3 banks read in place; the hybrid publish / merge path (`FREETOKEN_HYBRID_FLAG_IN_KERNEL`) over device views of the pinned IO rows and flag words; the pools' cores by slice size (`FREETOKEN_CPU_MOE_CORES_BY_SLICE`, off) or with SMT siblings (`FREETOKEN_CPU_MOE_SMT`, off) |
 | `python/freetoken/kernel/triton/hybrid_split.py`, `kernel/host_mapped.py` | new, 7/0 | the hybrid layer's two GPU ends as one kernel each, carrying the handshake (system-scope atomics on the pinned flag words); a device view of an existing pinned tensor |
 | `python/freetoken/moe/offload_kernels.py`, `moe/offload_cache.py` | 35/21, 2/2 | upstream's hybrid ensure kernel (which splits the routes, `f02fbb1`) reads the routes as vectors and tells this step's slots by their usage stamp (same decisions; 1.1-2.2x faster at 4 rows, 1.5-8.5x at 16, synthetic routing), with barriers between its phases |
 | `python/freetoken/layers/moe.py` | 35/3 | the publish / merge path; steps of fewer than `FREETOKEN_HYBRID_MIN_REQS` requests take the offload path |
-| `python/freetoken/engine/engine.py` | 13/5 | the executor's row bound counts the MTP verify rows (sized up front, a larger task refused); `FREETOKEN_HYBRID_FETCH_FRACTION`; the TP CPU group handed to the executor |
+| `python/freetoken/engine/engine.py` | 13/5 | the executor's row bound counts the MTP verify rows (sized up front, a larger task refused); `FREETOKEN_HYBRID_FETCH_FRACTION` (one share for every layer, in upstream's per-layer fractions); the TP CPU group handed to the executor |
 | `python/freetoken/layers/quantization/moe/nvfp4.py`, `layers/quantization/moe/exl3.py` | 8/2, 14/3 | CPU decode allowed under tensor parallelism with NVFP4; an EXL3 CPU format (mul1, 2-4 bits); both kernels take inactive slots (`FREETOKEN_HYBRID_SKIP_CPU_ROUTES`) |
-| `python/freetoken/kernel/triton/nvfp4_fused_moe.py`, `moe/fused_nvfp4.py`, `kernel/triton/exl3.py`, `moe/fused_exl3.py` | 7/0, 4/0, 17/7, 6/3 | the decode GEMVs write zeros for a slot of -1 without a read; the EXL3 rotation and scale kernels read slot 0's scales for it |
-| `tests/moe/test_cpu_moe_exl3.py`, `tests/moe/test_cpu_moe.py`, `tests/moe/test_nvfp4_backends.py` | new, 56/0 against `9b68e00`, 24/0 | the EXL3 path against the reference codec, tensor-parallel slices, skipped routes, rows sharing an expert, the size check; the publish / merge path eager and replayed in a graph, a step without a CPU route among them; the GPU skip of the CPU's routes bit-identical (NVFP4, EXL3) |
+| `python/freetoken/kernel/triton/nvfp4_fused_moe.py`, `kernel/nvfp4_moe.py`, `kernel/triton/exl3.py`, `moe/fused_exl3.py` | 7/0, 4/0, 17/7, 6/3 | the decode GEMVs write zeros for a slot of -1 without a read; the EXL3 rotation and scale kernels read slot 0's scales for it |
+| `tests/moe/test_cpu_moe_exl3.py`, `tests/moe/test_cpu_moe.py`, `tests/moe/test_nvfp4_backends.py` | new, 56/0 against `cc56b6b`, 24/0 | the EXL3 path against the reference codec, tensor-parallel slices, skipped routes, rows sharing an expert, the size check; the publish / merge path eager and replayed in a graph, a step without a CPU route among them; the GPU skip of the CPU's routes bit-identical (NVFP4, EXL3) |
 
 ## Decode on two cards, bit-exact
 
@@ -262,8 +262,20 @@ Line counts here are on top of the lines listed in the sections above.
 | File | Lines | Change |
 |---|---:|---|
 | `python/freetoken/kernel/csrc/row_store/row_store_ext.cpp`, `models/qwen4_exp/ple_disk.py`, `tests/kernels/test_row_store.py` | 333/49, 12/3, 57/0 | the disk row store splits a fill of 256 rows or more over four io_uring rings, one helper thread each (`FREETOKEN_ROW_STORE_RINGS`), reads a row across a 4 KiB page as its two pages, the second after another row's read (on the reference NVMe, reads spanning two 4 KiB units, even 2.5 % of a batch, halved the batch's rate), and can keep the rows it read in a RAM cache, which the store reading the prefills does (`FREETOKEN_PLE_ROW_CACHE_ROWS`) |
-| `python/freetoken/kernel/triton/moe_align.py`, `moe/fused_nvfp4.py`, `moe/fused_exl3.py`, `tests/moe/test_prefill_tail_tiles.py` | 107/1, 35/17, 15/1, new | `moe_align_split`: each expert's full tiles in one launch, its remaining rows in smaller tiles in a second; NVFP4 prefill blocks of 3072 tokens or more, 128 + 32-row tiles in both GEMMs (`FREETOKEN_NVFP4_PREFILL_TAIL_TILES`), EXL3's gate-up GEMM 64 + 32-row tiles from 3072 tokens (`FREETOKEN_EXL3_PREFILL_TAIL_TILES`); the same K order, the same bits |
+| `python/freetoken/kernel/triton/moe_align.py`, `moe/fused_nvfp4.py`, `moe/fused_exl3.py`, `tests/moe/test_prefill_tail_tiles.py` | 107/1, 35/17, 15/1, new | `moe_align_split`: each expert's full tiles in one launch, its remaining rows in smaller tiles in a second; NVFP4 prefill blocks of more than 6144 tokens, 128 + 32-row tiles in both GEMMs (`FREETOKEN_NVFP4_PREFILL_TAIL_TILES`), EXL3's gate-up GEMM 64 + 32-row tiles from 3072 tokens (`FREETOKEN_EXL3_PREFILL_TAIL_TILES`); the same K order, the same bits |
 | `python/freetoken/layers/embedding.py`, `engine/engine.py`, `tests/layers/test_embed_host.py` | 49/0, 7/0, new | an input embedding not tied to the LM head kept in pinned, device-mapped host memory, read by the same lookup kernel (`FREETOKEN_EMBED_HOST`); the engine moves it after the int8 compaction, before the memory reading that sizes the expert cache and the K/V pool |
+
+## On upstream up to `cc56b6b`
+
+Line counts here are against the merge of `cc56b6b`, on top of the lines listed in the sections above.
+
+| File | Lines | Change |
+|---|---:|---|
+| `python/freetoken/moe/fused_nvfp4.py`, `tests/moe/test_nvfp4_prefill_tiles.py`, `tests/moe/test_short_prefill_tiles.py`, `tests/moe/test_prefill_tail_tiles.py` | 14/13, 20/16, 3/2, 3/3 | the RDNA3 prefill tiles swept again on upstream's rewritten prefill GEMM (`03c2c9c`): 4 warps and 2 stages on both GEMMs from 1537 to 6144 tokens and on the down GEMM up to 64 and from 641 to 1536, a 64-row tile up to 6144 tokens, the 128-row one with tail tiles above (the same K step, the same bits); untuned prefills take upstream's tiles |
+| `python/freetoken/models/qwen4_exp/weight.py`, `layers/quantization/moe/nvfp4.py`, `tests/models/qwen4_exp/test_weight.py`, `tests/models/qwen4_exp/test_tp_shard.py` | 6/3, 2/0, 11/0, 11/0 | the expert-piece hook takes the `layers` upstream's reader passes; the tensor-parallel slicing keeps the experts' static activation scales (`e4f69d9`) whole on every rank |
+| `python/freetoken/layers/embedding.py`, `tests/layers/test_lm_head_dump.py` | 2/2, new | the prompt top-k dump of a tied LM head (`FREETOKEN_DUMP_PROMPT_TOPK`) computes its logits as the forward does (it called an `F.linear` that was never imported) |
+| `rdna3/tests/exl3_moe_check.py` | 17/0 | the torch reference on as many CPU threads as the container's quota: oversubscribed, it decoded the same tiles differently now and then and the check failed |
+| `tests/moe/test_cpu_moe_exl3.py`, `tests/moe/test_prefill_cached.py`, `tests/models/qwen4_exp/test_mtp.py`, `rdna3/bench/nvfp4_*_sweep.py`, `rdna3/bench/exl3_*_bench.py`, `rdna3/tests/moe_block_check.py` | 3/3, 4/4, 1/1, 9/7, 3/3, 2/2 | the executor's per-layer formats, fp32 NVFP4 globals, the launches in `kernel/nvfp4_moe.py` |
 
 ## Tooling and documentation
 

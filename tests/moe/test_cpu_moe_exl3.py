@@ -81,7 +81,7 @@ def test_cpu_exl3_matches_reference_codec(bits, M, lo, i):
     E, H, I, top_k = 6, 256, 256, 3
     experts = _experts(E, H, I, bits, seed=bits * 10 + M)
     ex = CpuMoeExecutor(_cache(experts, lo, i), top_k=top_k, activation="silu", apply_router_weight_on_input=False,
-                        num_threads=4, max_tokens=4, device=torch.device("cpu"), fmt="exl3")
+                        num_threads=4, max_tokens=4, device=torch.device("cpu"))
     gen = torch.Generator().manual_seed(M)
     x = (torch.randn(M, H, generator=gen) * 0.5).bfloat16()
     ids = torch.stack([torch.randperm(E, generator=gen)[:top_k] for _ in range(M)]).int()
@@ -98,7 +98,7 @@ def test_cpu_moe_task_larger_than_max_tokens_is_refused():
 
     experts = _experts(2, 128, 128, 3, seed=0)
     ex = CpuMoeExecutor(_cache(experts, 0, 128), top_k=1, activation="silu", apply_router_weight_on_input=False,
-                        num_threads=2, max_tokens=2, device=torch.device("cpu"), fmt="exl3")
+                        num_threads=2, max_tokens=2, device=torch.device("cpu"))
     with pytest.raises(Exception, match="outside the executor's layers or IO"):
         ex._ext.run(0, 3)
 
@@ -111,7 +111,7 @@ def test_cpu_exl3_rows_sharing_an_expert_match_one_row_at_a_time():
     E, H, I, top_k, M = 3, 256, 256, 2, 4
     experts = _experts(E, H, I, 3, seed=7)
     ex = CpuMoeExecutor(_cache(experts, 0, I), top_k=top_k, activation="silu", apply_router_weight_on_input=False,
-                        num_threads=4, max_tokens=M, device=torch.device("cpu"), fmt="exl3")
+                        num_threads=4, max_tokens=M, device=torch.device("cpu"))
     gen = torch.Generator().manual_seed(3)
     x = (torch.randn(M, H, generator=gen) * 0.5).bfloat16()
     ids = torch.tensor([[0, 1], [1, 0], [0, 2], [2, 1]], dtype=torch.int32)  # every expert on two or three rows

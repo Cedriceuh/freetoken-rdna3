@@ -1393,7 +1393,30 @@ first two reads took 13.58 and 34.70 s, not seen again). One card (`xtx`, EXL3 3
   or 8k slices; every variant the same indices) found the shipped one the fastest (the best within 1.6 %); a faster
   select needs another algorithm, for ~1 % of a cold read: not attempted.
 
-## 35. Still open
+## 35. Upstream up to cc56b6b (2026-10-20)
+
+29 commits merged, the authors' kept. Two of them change NVFP4's numbers on purpose: the global scales stay fp32
+(`0db5023`; as fp16 most were subnormal, up to 1.7e-3 relative error per row) and the Triton prefill GEMM is rewritten
+(`03c2c9c`: the weight tile is the MMA's A operand, one dot per K step instead of two). EXL3 kept its bits: 42 of 42
+answers the same in two runs on `xtx-xt-4x262k`. Nine files conflicted; upstream had moved the NVFP4 launches to
+`kernel/nvfp4_moe.py`, given the CPU executor a format per layer and rewritten the qwen4_exp dense reader, and this
+tree's pieces moved onto those. The CPU and GPU suites passed where they passed before, yet the first two NVFP4 starts
+failed while loading the experts: upstream's expert reader now hands the family hook a `layers` argument, and its
+pieces now carry the experts' static activation scales, which the tensor-parallel slicing had no rule for (both fixed
+with a test each; only a real load reaches them).
+
+The RDNA3 prefill tiles had been swept on the old GEMM. On the new one, with the same tiles, an 8192-token MoE block was
+1.8x faster (19.4 -> 10.7 ms) but a 2048-token one 1.4x slower (8.2 -> 11.6 ms; the XT with the XTX's 352-wide slice):
+the 8-warp 1-stage tile of 1537-3071 tokens suits it badly. A grid of 72 tiles at one K step (all of them the same bits)
+per size and card found 4 warps and 2 stages best from 1537 tokens, and the 64-row tile ahead of the 128-row one with
+tail tiles up to 6144 tokens (from 7168 the 128-row one wins). The grid's first-timed config read 1.5x slow (the same
+tile timed again later was fast), so the table was settled by an interleaved A/B of whole MoE blocks. Those ran each
+card on the other's slice width (`HIP_VISIBLE_DEVICES=0` is the XT here, 1 the XTX); run again on each card's own slice:
+1600-2560 tokens 2.8-3.0x faster, 1280 1.4-1.5x, 32 1.3-1.4x, 4096-6144 1.1-1.2x, 7168-8192 even, the same bits
+everywhere. Whole model, NVFP4: cold reads -12 % (210k tokens 64.8-64.9 -> 56.9 s), decode +1.4-2.7 %, agent turns the
+same ([CHANGELOG](../../CHANGELOG.md)).
+
+## 36. Still open
 
 - In NVFP4 the model needs ~63 GiB of RAM for its experts alone (the engine keeps every expert in RAM). The EXL3 3.05
   bpw checkpoint needs 42.6 GiB and served under a 56 GiB container limit, but a real 64 GB machine is untested

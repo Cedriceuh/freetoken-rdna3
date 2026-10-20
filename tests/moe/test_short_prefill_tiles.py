@@ -29,9 +29,10 @@ def test_nvfp4_short_tiles_keep_the_bits(monkeypatch, M):
     w = torch.rand(M, NV_TOPK, generator=gen).to(dev)
     monkeypatch.setattr(fm, "NVFP4_PREFILL_TUNED", True)
     new = fm.fused_experts_nvfp4(x, *bank, w, ids, NV_E, "silu", False)
-    # the tiles these sizes took before: the shipped 16-row 8-warp tile up to 64 tokens, _TUNED_MID above
+    # the tiles these sizes took before: the then-shipped 16-row 8-warp tile up to 64 tokens, _TUNED_MID above
+    tile16 = dict(BLOCK_SIZE_M=16, BLOCK_SIZE_N=64, BLOCK_SIZE_KB=32, GROUP_SIZE_M=1, num_warps=8, num_stages=4)
     monkeypatch.setattr(fm, "_prefill_configs",
-                        lambda m: (fm._prefill_config(m),) * 2 if m <= 64 else (fm._TUNED_MID, fm._TUNED_MID))
+                        lambda m, *_: (tile16,) * 2 if m <= 64 else (fm._TUNED_MID, fm._TUNED_MID))
     old = fm.fused_experts_nvfp4(x, *bank, w, ids, NV_E, "silu", False)
     assert torch.equal(new, old)
 

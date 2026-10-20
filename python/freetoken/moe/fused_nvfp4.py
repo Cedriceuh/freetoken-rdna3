@@ -131,29 +131,30 @@ def fused_experts_decode_nvfp4_serial(
 # FREETOKEN_NVFP4_PREFILL_TUNED=1: tiles swept on the 7900 XTX / XT for Qwen3.8-Flash-Next (512 experts, top-10,
 # hidden 2560, intermediate 352 / 288 per rank; rdna3/bench/nvfp4_prefill_sweep.py). Only BLOCK_M / BLOCK_N / warps /
 # stages change (BLOCK_KB stays 32), so each output keeps the same K accumulation: bit-identical results.
-# Measured per MoE layer, 4096-token block: gate_up 12.1 -> 6.6 ms, down 7.2 -> 4.8 ms; 1536 tokens: 5.3 -> 4.1 and
-# 3.2 -> 2.4 ms. The two GEMMs may use different BLOCK_M (then the tokens are aligned once per BLOCK_M).
+# The two GEMMs may use different BLOCK_M (then the tokens are aligned once per BLOCK_M). Swept again on upstream's
+# rewritten prefill GEMM (one MoE block, interleaved, the same bits, each card on its own slice): 1600-2560 tokens
+# 2.8-3.0x faster with 4 warps and 2 stages (XTX 9.7-10.3 -> 3.3-3.6 ms), 1280 1.4-1.5x, 32 1.3-1.4x; up to 6144 tokens
+# the 64-row tile beats the 128-row one with tail tiles (6144: 9.1-9.2 -> 7.6 ms on both cards), from 7168 it does not.
 NVFP4_PREFILL_TUNED = os.environ.get("FREETOKEN_NVFP4_PREFILL_TUNED", "0") == "1"
-_TUNED_MID = dict(BLOCK_SIZE_M=64, BLOCK_SIZE_N=64, BLOCK_SIZE_KB=32, GROUP_SIZE_M=8, num_warps=8, num_stages=1)
+_TUNED_MID = dict(BLOCK_SIZE_M=64, BLOCK_SIZE_N=64, BLOCK_SIZE_KB=32, GROUP_SIZE_M=8, num_warps=4, num_stages=2)
 _TUNED_BIG_GATE_UP = dict(BLOCK_SIZE_M=128, BLOCK_SIZE_N=128, BLOCK_SIZE_KB=32, GROUP_SIZE_M=8, num_warps=8,
                           num_stages=2)
-# Short prefills (agent turns: ~5-25 rows an expert) run 4-warp tiles: per GEMM, bit-identical to the tiles they
-# replace, 7900 XTX / XT, random routing over 512 experts: 32-64 tokens 5-13x faster than the shipped 8-warp 4-stage
-# tile, 128-512 tokens 1.7-2.5x and 768-1536 1.4-1.8x faster than _TUNED_MID; past ~2048 tokens within 9 %, kept.
+# Short prefills (agent turns: ~5-25 rows an expert) run 4-warp tiles, bit-identical to the tiles they replace; on the
+# prefill GEMM before upstream's rewrite, 7900 XTX / XT, random routing over 512 experts: 32-64 tokens 5-13x faster than
+# the then-shipped 8-warp 4-stage tile, 128-512 tokens 1.7-2.5x and 768-1536 1.4-1.8x faster than the 8-warp 64-row one.
 _TUNED_TINY_GATE_UP = dict(BLOCK_SIZE_M=16, BLOCK_SIZE_N=64, BLOCK_SIZE_KB=32, GROUP_SIZE_M=1, num_warps=4,
                            num_stages=2)
-_TUNED_TINY_DOWN = dict(BLOCK_SIZE_M=16, BLOCK_SIZE_N=128, BLOCK_SIZE_KB=32, GROUP_SIZE_M=1, num_warps=4, num_stages=1)
+_TUNED_TINY_DOWN = dict(BLOCK_SIZE_M=16, BLOCK_SIZE_N=128, BLOCK_SIZE_KB=32, GROUP_SIZE_M=1, num_warps=4, num_stages=2)
 _TUNED_SMALL = dict(BLOCK_SIZE_M=16, BLOCK_SIZE_N=64, BLOCK_SIZE_KB=32, GROUP_SIZE_M=1, num_warps=4, num_stages=1)
 _TUNED_SHORT_GATE_UP = dict(BLOCK_SIZE_M=32, BLOCK_SIZE_N=64, BLOCK_SIZE_KB=32, GROUP_SIZE_M=8, num_warps=4,
                             num_stages=2)
-_TUNED_SHORT_DOWN = dict(BLOCK_SIZE_M=32, BLOCK_SIZE_N=64, BLOCK_SIZE_KB=32, GROUP_SIZE_M=8, num_warps=4, num_stages=1)
-# FREETOKEN_NVFP4_PREFILL_TAIL_TILES (default 1): on the 128-row tiles of a >= 3072-token block, each expert's rows past
+_TUNED_SHORT_DOWN = dict(BLOCK_SIZE_M=32, BLOCK_SIZE_N=64, BLOCK_SIZE_KB=32, GROUP_SIZE_M=8, num_warps=4, num_stages=2)
+# FREETOKEN_NVFP4_PREFILL_TAIL_TILES (default 1): on the 128-row tiles of a > 6144-token block, each expert's rows past
 # its last full 128-row tile go to 32-row tiles of a second launch (both GEMMs), instead of a 128-row tile mostly
 # padding (an expert gets ~160 rows of an 8192-token block). Only BLOCK_M / BLOCK_N / warps / stages change: the same
 # bits.
-# 8192-token block, random routing, 7900 XTX / XT: gate_up 12.3 -> 9.4-9.9 ms, down (128-row tiles too) 7.0 ->
-# 6.0-6.2 ms; the whole MoE block with this model's routing (96 dumped 8192-token blocks): 1921 -> 1696 ms (XTX's
-# slice), 1892 -> 1682 ms (XT's)
+# On the prefill GEMM before upstream's rewrite, 8192-token block, random routing, 7900 XTX / XT: gate_up 12.3 ->
+# 9.4-9.9 ms, down (128-row tiles too) 7.0 -> 6.0-6.2 ms
 _TAIL_TILES = os.environ.get("FREETOKEN_NVFP4_PREFILL_TAIL_TILES", "1") == "1"
 _TAIL_GATE_UP = dict(BLOCK_SIZE_M=32, BLOCK_SIZE_N=64, BLOCK_SIZE_KB=32, GROUP_SIZE_M=8, num_warps=4, num_stages=2)
 _TAIL_DOWN = dict(BLOCK_SIZE_M=32, BLOCK_SIZE_N=128, BLOCK_SIZE_KB=32, GROUP_SIZE_M=8, num_warps=8, num_stages=2)
@@ -170,7 +171,7 @@ def _prefill_configs(M: int, top_k: int, num_experts: int, device_index: int) ->
         return _TUNED_SMALL, _TUNED_SMALL
     if M <= 1536:
         return _TUNED_SHORT_GATE_UP, _TUNED_SHORT_DOWN
-    if M >= 3072:
+    if M > 6144:
         return _TUNED_BIG_GATE_UP, _TUNED_MID
     return _TUNED_MID, _TUNED_MID
 

@@ -1,4 +1,4 @@
-"""Tile sweep of the NVFP4 decode expert GEMV (moe/fused_nvfp4.py `_decode_nvfp4_marlin_kernel`) on RDNA3.
+"""Tile sweep of the NVFP4 decode expert GEMV (kernel/nvfp4_moe.py `_decode_nvfp4_marlin_kernel`) on RDNA3.
 
 The shipped decode tiles were swept on qwen35/qwen3moe shapes (plus a deep-K variant measured on qwen4_exp gate_up);
 this times, for Qwen3.8-Flash per rank (gate_up N = 2 * inter, K = 2560; down N = 2560, K = inter), each
@@ -18,7 +18,8 @@ import torch
 import triton
 
 from freetoken.kernel.triton.e4m3_compat import e4m3_kernel_view
-from freetoken.moe import fused_nvfp4 as fm
+from freetoken.kernel import nvfp4_moe as fm
+from freetoken.kernel.triton.nvfp4_fused_moe import _decode_nvfp4_marlin_kernel
 
 L, K_TOP = 48, 10
 
@@ -31,7 +32,7 @@ def launch(a, packed, scale, glob, c, tw, ids, mul_routed, a_row_is_route, block
     sc = e4m3_kernel_view(scale)
     total = M * top_k
     a_wide = a.stride(1) == 1 and a.stride(0) % 8 == 0 and a.data_ptr() % 16 == 0
-    fm._decode_nvfp4_marlin_kernel[(total, triton.cdiv(N, block_n))](
+    _decode_nvfp4_marlin_kernel[(total, triton.cdiv(N, block_n))](
         a, p32, sc, glob, c, tw, ids, total, N, K,
         a.stride(0), a.stride(1), p32.stride(0), p32.stride(1), p32.stride(2),
         sc.stride(0), sc.stride(1), sc.stride(2), glob.stride(0), glob.stride(1),
@@ -63,7 +64,7 @@ def main() -> None:
     def bank(n: int, k: int):
         return (torch.randint(0, 256, (S, n, k // 2), dtype=torch.uint8, device="cuda", generator=g),
                 torch.randint(0x30, 0x40, (S, n, k // 16), dtype=torch.uint8, device="cuda", generator=g).view(fp8),
-                torch.full((S, n), 0.01, dtype=torch.float16, device="cuda"))
+                torch.full((S, n), 0.01, dtype=torch.float32, device="cuda"))
 
     gu, dn = bank(2 * I, H), bank(H, I)
     print(f"inter {I}, slots {S}, banks {sum(t.numel() * t.element_size() for t in gu + dn) / 2**20:.0f} MiB", flush=True)

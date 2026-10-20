@@ -51,10 +51,10 @@ for inter in [int(x) for x in sys.argv[1:]] or [384, 256]:
     del gu, dn
     p_gu = torch.randint(0, 255, (S, 2 * inter, H // 2), device=dev, dtype=torch.uint8)
     s_gu = torch.rand(S, 2 * inter, H // 16, device=dev).to(torch.float8_e4m3fn)
-    g_gu = torch.rand(S, 2 * inter, device=dev).half()
+    g_gu = torch.rand(S, 2 * inter, device=dev)
     p_dn = torch.randint(0, 255, (S, H, inter // 2), device=dev, dtype=torch.uint8)
     s_dn = torch.rand(S, H, inter // 16, device=dev).to(torch.float8_e4m3fn)
-    g_dn = torch.rand(S, H, device=dev).half()
+    g_dn = torch.rand(S, H, device=dev)
     ids64 = [i.long() for i in ids]
 
     def nvfp4_step():

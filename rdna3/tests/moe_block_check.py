@@ -14,10 +14,10 @@ E, H, I, K = 32, 512, 128, 10
 fp8 = torch.float8_e4m3fn
 gate_up = torch.randint(0, 256, (E, 2 * I, H // 2), dtype=torch.uint8, device=dev)
 gate_up_scale = (torch.rand(E, 2 * I, H // 16, device=dev) * 0.5 + 0.25).to(fp8)
-gate_up_global = torch.rand(E, 2 * I, device=dev, dtype=torch.float16) * 0.01
+gate_up_global = torch.rand(E, 2 * I, device=dev, dtype=torch.float32) * 0.01
 down = torch.randint(0, 256, (E, H, I // 2), dtype=torch.uint8, device=dev)
 down_scale = (torch.rand(E, H, I // 16, device=dev) * 0.5 + 0.25).to(fp8)
-down_global = torch.rand(E, H, device=dev, dtype=torch.float16) * 0.01
+down_global = torch.rand(E, H, device=dev, dtype=torch.float32) * 0.01
 banks = (gate_up, gate_up_scale, gate_up_global, down, down_scale, down_global)
 
 bad = 0

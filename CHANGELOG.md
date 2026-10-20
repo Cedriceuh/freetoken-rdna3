@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- Upstream FreeToken merged up to `cc56b6b` (29 commits); the authors' commits are kept. On this tree's path: NVFP4
+  global scales stay in fp32 (upstream's precision fix: stored as fp16, most of them were subnormal) and the Triton
+  NVFP4 prefill GEMM is upstream's rewrite, with this tree's RDNA3 tiles swept again on it (4 warps and 2 stages on both
+  GEMMs from 1537 to 6144 tokens, 2 stages on the down GEMM up to 64 and from 641 to 1536 tokens; a 64-row tile up to
+  6144 tokens, the 128-row one with tail tiles above; every tile gives the same bits): one prefill MoE block of
+  1600-2560 tokens 2.8-3.0x faster than with the tiles before. NVFP4 answers therefore differ from the build before (17
+  of 42 greedy outputs the same; a sample of the others, read by hand, says the same in other words), EXL3 ones do not.
+  Upstream's CPU MoE executor serves a format per layer and GGUF experts through ggml-cpu (its Q4_0 kernels are gone);
+  this tree's EXL3 CPU experts, route grouping and hybrid flags ride on it. The qwen4_exp dense reader is upstream's
+  scheme-driven one, with this tree's tensor-parallel sharding, EXL3 checkpoints and MTP head on top. `xtx-xt-4x262k`
+  (NVFP4 with a 3 x 262k pool, EXL3 3.05 bpw with 1,050,000 tokens), the build before (three NVFP4 runs, two EXL3)
+  against this one (two each): NVFP4 cold reads of 40k / 113k / 159k / 210k tokens 12.39-12.42 / 34.11-34.25 /
+  48.66-48.78 / 64.77-64.93 s -> 10.89-10.91 / 29.87-29.90 / 42.57-42.58 / 56.85-56.95 s, decode 90.1-91.1 -> 92.4-92.5
+  tok/s, four requests 30.2-30.4 -> 31.2-31.3 tok/s each, agent turns 0.710-0.720 -> 0.709-0.728 s, 2k-token turns
+  1.142-1.153 -> 1.132-1.133 s; EXL3 42 of 42 answers the same in both runs, agent turns 0.490-0.497 -> 0.485-0.487 s,
+  decode 92.4-93.4 -> 92.8-93.7 tok/s, cold reads within 0.5 %. NVFP4 expert slots -0.5 % (9,255 -> 9,209: the globals
+  take 4 bytes). The CPU suite fails only where it failed before, minus one (the AOT entries of upstream's GGUF
+  architectures); the GPU tests (the 93 files with GPU-gated tests, each card) fail only where they failed before, minus
+  three.
 - The input embedding in RAM, the same bits. Qwen3.8-Flash-Next's input table (248,320 x 2560 bf16, not tied to the LM
   head) stays in pinned, device-mapped host memory and the same lookup kernel reads its rows across PCIe
   (`FREETOKEN_EMBED_HOST`); the 606 MiB a rank it held in VRAM go to the expert cache. `xtx-xt-4x262k` with a 3 x 262k

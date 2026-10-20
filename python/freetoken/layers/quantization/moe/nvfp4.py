@@ -77,6 +77,8 @@ def _tp_slice_pieces(pieces: dict[str, torch.Tensor], cfg: MoEConfig) -> dict[st
             out[role] = t[:, :, lo // GROUP:(lo + local) // GROUP]  # block axis: one scale per 16 values
         elif role == "down_global":
             out[role] = t  # per output (hidden) row or scalar: not on the intermediate axis
+        elif role.endswith("_input"):
+            out[role] = t  # the static activation scale of the whole input, the same on every rank
         else:
             raise ValueError(f"nvfp4 expert piece role {role!r} has no TP slicing rule")
     return out

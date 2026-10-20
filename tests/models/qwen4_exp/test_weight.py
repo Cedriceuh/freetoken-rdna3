@@ -497,6 +497,17 @@ def test_every_registry_architecture_is_claimed_by_an_aot_entry():
     assert set(_MODEL_REGISTRY) - claimed == set()
 
 
+def test_expert_pieces_hook_takes_the_layers_the_generic_reader_passes():
+    """moe/expert_pieces.iter_expert_pieces calls the family hook with ``layers=``; one format is every layer here."""
+    from freetoken.layers.quantization import QuantKind
+    from freetoken.models.qwen4_exp import weight
+
+    config = SimpleNamespace(mtp_layers=0)
+    assert weight.iter_expert_pieces("unused", config, QuantKind.NVFP4, layers=None) is None  # the generic reader
+    with pytest.raises(NotImplementedError, match="one format"):
+        weight.iter_expert_pieces("unused", config, QuantKind.EXL3, layers=[0])
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs cuda")
 def test_fusion_pad_rides_the_tensor_device():
     """safetensors loads straight to cuda; a cpu-allocated pad row would break torch.cat."""

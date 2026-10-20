@@ -71,22 +71,23 @@ A prefill chunk runs every token through every layer, so each chunk streams all 
 (~700 MB per layer per card). Bigger chunks mean less streaming: in the A/B test, 16k-token chunks read an 8.4k prompt
 in 4.3 s instead of 5.5 s, and 54-101k-token reads at depth 2-6 % faster ([benchmarks.md](benchmarks.md) has the current
 speeds). To fit them, the prefill MoE and the PLE layer run 4096 tokens at a time inside the chunk (the NVFP4 MoE blocks
-are bit-identical, and 8192 tokens long in `xtx-xt` and `xtx-xt-4x262k`: +8 % on cold reads; the PLE blocks can round
-differently, checked to tolerance and validated on the agentic benchmark for one request), and experts already in the
-GPU cache are gathered on the GPU instead of crossing PCIe again (`--moe-prefill-hit-d2d`, with `hipMemcpyBatchAsync` on
-ROCm, or one copy per entry on older HIP): a third of the experts stay off PCIe per chunk, an agent turn's first token
-1.55 -> 1.18 s. A single card keeps 8k chunks (its working memory is smaller). The per-layer-embedding rows of a prefill
-are read from disk on a thread by rank 0 only, which broadcasts them, and a long prompt's next chunk's rows are read
-while a chunk computes (they took ~1.1 s per 16k-token chunk, the GPUs idle); on two cards each block of a chunk's
-routed experts and of its GatedDeltaNet output starts its all-reduce while the next block computes, and the QSA indexer
-scores 16 query rows a program (the same bits): fully cold reads ~25 % shorter
+are bit-identical, and 8192 tokens long in `xtx-xt` and `xtx-xt-4x262k`: +8 % on cold reads on an earlier build; the PLE
+blocks can round differently, checked to tolerance and validated on the agentic benchmark for one request), and experts
+already in the GPU cache are gathered on the GPU instead of crossing PCIe again (`--moe-prefill-hit-d2d`, with
+`hipMemcpyBatchAsync` on ROCm, or one copy per entry on older HIP): a third of the experts stay off PCIe per chunk, an
+agent turn's first token 1.55 -> 1.18 s. A single card keeps 8k chunks (its working memory is smaller). The
+per-layer-embedding rows of a prefill are read from disk on a thread by rank 0 only, which broadcasts them, and a long
+prompt's next chunk's rows are read while a chunk computes (they took ~1.1 s per 16k-token chunk, the GPUs idle); on two
+cards each block of a chunk's routed experts and of its GatedDeltaNet output starts its all-reduce while the next block
+computes, and the QSA indexer scores 16 query rows a program (the same bits): fully cold reads ~25 % shorter
 ([journey.md](journey.md#33-short-turns-the-host-waiting-at-every-layer-2026-10-18-and-19)). The rows are read over four
 io_uring rings, a row across a 4 KiB page as its two pages apart (one thread drove 240-290k reads a second; reads
 spanning two 4 KiB units, even 2.5 % of a batch, halved the batch's rate), the rows read before stay in a RAM cache (an
 agent session's n-grams recur across its turns), and a long block's experts run their full tiles in one launch and their
-remaining rows in smaller tiles in a second (the same bits): NVFP4 cold reads ~6 % shorter, EXL3 agent turns ~6 % (~7 %
-with the row cache). The input embedding lives in RAM, a row per token read across PCIe, and its VRAM goes to the
-expert cache: decode 1-6 % faster, agent turns ~3 % shorter
+remaining rows in smaller tiles in a second (the same bits; NVFP4 blocks of more than 6144 tokens since upstream's
+rewritten prefill GEMM, on which the re-swept tiles cut NVFP4 cold reads another 12 %): NVFP4 cold reads ~6 % shorter on
+an earlier build, EXL3 agent turns ~6 % (~7 % with the row cache). The input embedding lives in RAM, a row per token
+read across PCIe, and its VRAM goes to the expert cache: decode 1-6 % faster, agent turns ~3 % shorter
 ([journey.md](journey.md#34-disk-reads-on-four-rings-tail-tiles-the-input-embedding-in-ram-2026-10-19)).
 
 A short chunk (up to 1280 tokens on Qwen3.8-Flash-Next, an agent's tool result) does not stream the whole layers: it
