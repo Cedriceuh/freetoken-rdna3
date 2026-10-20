@@ -16,7 +16,7 @@ the work.
 | | |
 |---|---|
 | GPUs | one or two RX 7900 XTX (24 GB) / RX 7900 XT (20 GB); other cards: [which GPUs](docs/rdna3/limits.md#which-gpus) |
-| RAM | 128 GB recommended: the server locks 51 to 82 GiB, depending on the checkpoint and the number of cards ([table](#which-checkpoint)), more with conversations kept in RAM, and the system and your programs need ~30 GiB beside it ([how to count](docs/rdna3/limits.md#how-much-ram-do-i-need)) |
+| RAM | 128 GB recommended: the server locks ~52 to ~83 GiB, depending on the checkpoint and the number of cards ([table](#which-checkpoint)), more with conversations kept in RAM, and the system and your programs need ~30 GiB beside it ([how to count](docs/rdna3/limits.md#how-much-ram-do-i-need)) |
 | Disk | 85 to 135 GB for the model, ~27 GB for the image (~29 GB more while it builds) |
 | System | Linux x86_64 with the in-kernel `amdgpu` driver, and Docker. ROCm, PyTorch and the rest come inside the image |
 
@@ -94,7 +94,7 @@ the other terms: [glossary](docs/rdna3/README.md#terms-used-in-these-pages).
 | `rdna3/download.sh` | `nvfp4` | `exl3-3.05` | `exl3-4.05` |
 | Hugging Face | [RadixArk/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4) | [turboderp/Qwen3.8-Flash-Next-exl3](https://huggingface.co/turboderp/Qwen3.8-Flash-Next-exl3) | [turboderp/Qwen3.8-Flash-Next-exl3](https://huggingface.co/turboderp/Qwen3.8-Flash-Next-exl3) |
 | Download | 135 GB | 85 GB | 108 GB |
-| RAM locked: two cards; one card | 82 GiB; 73 GiB | 60 GiB; 51 GiB | 75 GiB; 66 GiB |
+| RAM locked: two cards; one card | ~83 GiB; ~74 GiB | ~61 GiB; ~52 GiB | ~76 GiB; ~67 GiB |
 | Decode, `xtx-xt` | 78-96 tok/s | 95-117 tok/s | 86-94 tok/s |
 | Decode, `xtx` | 36-44 tok/s | 52-58 tok/s | 37-47 tok/s |
 

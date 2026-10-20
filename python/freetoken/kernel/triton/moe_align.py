@@ -213,8 +213,114 @@ def _scatter(
     tl.store(sorted_token_ids_ptr + pos, offs, mask=valid)
 
 
+@triton.jit
+def _cumsum_split(
+    counts_ptr,
+    full_cumsum_ptr,
+    rest_cumsum_ptr,
+    full_tokens_ptr,
+    full_post_pad_ptr,
+    rest_post_pad_ptr,
+    effective_E: tl.constexpr,
+    big: tl.constexpr,
+    small: tl.constexpr,
+    E_PADDED: tl.constexpr,
+):
+    # per expert: its first (count // big) * big tokens in big blocks, the rest in small blocks
+    lane = tl.arange(0, E_PADDED)
+    m = lane < effective_E
+    c = tl.load(counts_ptr + lane, mask=m, other=0)
+    full_blk = tl.where(m, c // big, 0)
+    rest_blk = tl.where(m, (c - full_blk * big + small - 1) // small, 0)
+    tl.store(full_tokens_ptr + lane, full_blk * big, mask=m)
+    tl.store(full_cumsum_ptr + lane, (tl.cumsum(full_blk, axis=0) - full_blk) * big, mask=m)
+    tl.store(rest_cumsum_ptr + lane, (tl.cumsum(rest_blk, axis=0) - rest_blk) * small, mask=m)
+    tl.store(full_cumsum_ptr + effective_E, tl.sum(full_blk, axis=0) * big)
+    tl.store(rest_cumsum_ptr + effective_E, tl.sum(rest_blk, axis=0) * small)
+    tl.store(full_post_pad_ptr, tl.sum(full_blk, axis=0) * big)
+    tl.store(rest_post_pad_ptr, tl.sum(rest_blk, axis=0) * small)
+
+
+@triton.jit(do_not_specialize=["numel"])
+def _scatter_split(
+    topk_ids_ptr,
+    full_sorted_ptr,
+    rest_sorted_ptr,
+    full_cumsum_ptr,
+    rest_cumsum_ptr,
+    full_tokens_ptr,
+    fill_counter_ptr,
+    numel,
+    effective_E: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < numel
+    e = tl.load(topk_ids_ptr + offs, mask=mask, other=-1)
+    valid = mask & (e >= 0) & (e < effective_E)
+    rank = tl.atomic_add(fill_counter_ptr + e, 1, mask=valid)
+    nfull = tl.load(full_tokens_ptr + e, mask=valid, other=0)
+    in_full = valid & (rank < nfull)
+    in_rest = valid & (rank >= nfull)
+    full_pos = tl.load(full_cumsum_ptr + e, mask=in_full, other=0) + rank
+    rest_pos = tl.load(rest_cumsum_ptr + e, mask=in_rest, other=0) + rank - nfull
+    tl.store(full_sorted_ptr + full_pos, offs, mask=in_full)
+    tl.store(rest_sorted_ptr + rest_pos, offs, mask=in_rest)
+
+
 def _div_ceil(a: int, b: int) -> int:
     return (a + b - 1) // b
+
+
+def moe_align_split(
+    topk_ids: torch.Tensor,
+    big: int,
+    small: int,
+    num_experts: int,
+) -> Tuple[Tuple[torch.Tensor, torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """``moe_align_block_size`` in two parts: each expert's first ``(count // big) * big`` tokens in ``big``-token
+    blocks (all full), the rest padded to ``small``-token blocks. Each part is a ``(sorted_token_ids, expert_ids,
+    num_tokens_post_pad)`` triple for its own GEMM launch; an expert's tokens go to either part (which ones is
+    nondeterministic, as the order inside an expert is in ``moe_align_block_size``). The large-batch path only."""
+    assert topk_ids.dtype == torch.int32 and topk_ids.is_contiguous()
+    assert big % small == 0 and small > 0
+    device = topk_ids.device
+    numel = topk_ids.numel()
+    effective_E = num_experts + 1
+    full_len = max(numel, big)
+    rest_len = min(numel, effective_E * (big - 1)) + effective_E * (small - 1)
+    full_sorted = torch.full((full_len,), numel, dtype=torch.int32, device=device)
+    rest_sorted = torch.full((rest_len,), numel, dtype=torch.int32, device=device)
+    full_eids = torch.empty((_div_ceil(full_len, big),), dtype=torch.int32, device=device)
+    rest_eids = torch.empty((_div_ceil(rest_len, small),), dtype=torch.int32, device=device)
+    full_ntpp = torch.empty((1,), dtype=torch.int32, device=device)
+    rest_ntpp = torch.empty((1,), dtype=torch.int32, device=device)
+    counts = torch.zeros((effective_E,), dtype=torch.int32, device=device)
+    fill_counter = torch.empty((effective_E,), dtype=torch.int32, device=device)
+    full_cumsum = torch.empty((effective_E + 1,), dtype=torch.int32, device=device)
+    rest_cumsum = torch.empty((effective_E + 1,), dtype=torch.int32, device=device)
+    full_tokens = torch.empty((effective_E,), dtype=torch.int32, device=device)
+
+    n_big = max(numel, effective_E)
+    # counts + the fill counter's zeroing only: the sorted arrays are sentinel-filled above
+    _fill_and_count[(triton.cdiv(n_big, 256),)](
+        topk_ids, full_sorted, counts, fill_counter, numel, 0, numel, effective_E,
+        triton.next_power_of_2(effective_E + 1), BLOCK_SIZE=256, num_warps=8, num_stages=3,
+    )
+    _cumsum_split[(1,)](
+        counts, full_cumsum, rest_cumsum, full_tokens, full_ntpp, rest_ntpp, effective_E, big, small,
+        triton.next_power_of_2(effective_E),
+    )
+    for cumsum, eids, ntpp, bs in ((full_cumsum, full_eids, full_ntpp, big), (rest_cumsum, rest_eids, rest_ntpp, small)):
+        _fill_expert_ids[(triton.cdiv(eids.numel(), 256),)](
+            cumsum, eids, ntpp, bs, effective_E, effective_E.bit_length(), BLOCK_SIZE=256, num_warps=4, num_stages=3,
+        )
+    _scatter_split[(triton.cdiv(max(numel, 1), 256),)](
+        topk_ids, full_sorted, rest_sorted, full_cumsum, rest_cumsum, full_tokens, fill_counter, numel, effective_E,
+        BLOCK_SIZE=256, num_warps=8, num_stages=3,
+    )
+    return (full_sorted, full_eids, full_ntpp), (rest_sorted, rest_eids, rest_ntpp)
 
 
 def moe_align_block_size(
@@ -329,4 +435,4 @@ def moe_align_block_size(
     return sorted_token_ids, expert_ids, num_tokens_post_pad
 
 
-__all__ = ["moe_align_block_size"]
+__all__ = ["moe_align_block_size", "moe_align_split"]

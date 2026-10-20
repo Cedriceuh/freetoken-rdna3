@@ -255,6 +255,15 @@ Line counts here are on top of the lines listed in the sections above.
 | `tests/models/qwen4_exp/test_predict_votes.py` | new | with NVFP4 experts (`auto`), a short prefill copies ahead only the experts at least two tokens predict (`FREETOKEN_PREFILL_PREDICT_MIN_VOTES`, in `models/qwen4_exp/moe.py`) |
 | `python/freetoken/models/qwen4_exp/ple_disk.py`, `scheduler/prefill.py`, `tests/models/qwen4_exp/test_ple_disk.py` | 140/18, 1/0, 36/0 | a prefill's PLE rows read on a thread with a store of its own (the lookup waits for them), and the next chunk's rows read ahead while a chunk of a longer prompt computes, taken when its tokens match (`FREETOKEN_PLE_PREFILL_PREFETCH`; a chunked request carries the whole prompt); at TP>1 only rank 0 reads them and broadcasts the bytes at the lookup (`FREETOKEN_PLE_PREFILL_RANK0`) |
 | `python/freetoken/engine/engine.py` | 6/1 | one device synchronize before the decode step that follows a prefill whose compute stream waited for RCCL's on the GPU (`moe/prefill_hooks.py`'s flag): the decode graphs replayed after such a wait ran a third slower at four requests |
+## Disk reads on four rings, tail tiles, the input embedding in RAM (bit-exact)
+
+Line counts here are on top of the lines listed in the sections above.
+
+| File | Lines | Change |
+|---|---:|---|
+| `python/freetoken/kernel/csrc/row_store/row_store_ext.cpp`, `models/qwen4_exp/ple_disk.py`, `tests/kernels/test_row_store.py` | 333/49, 12/3, 57/0 | the disk row store splits a fill of 256 rows or more over four io_uring rings, one helper thread each (`FREETOKEN_ROW_STORE_RINGS`), reads a row across a 4 KiB page as its two pages, the second after another row's read (on the reference NVMe, reads spanning two 4 KiB units, even 2.5 % of a batch, halved the batch's rate), and can keep the rows it read in a RAM cache, which the store reading the prefills does (`FREETOKEN_PLE_ROW_CACHE_ROWS`) |
+| `python/freetoken/kernel/triton/moe_align.py`, `moe/fused_nvfp4.py`, `moe/fused_exl3.py`, `tests/moe/test_prefill_tail_tiles.py` | 107/1, 35/17, 15/1, new | `moe_align_split`: each expert's full tiles in one launch, its remaining rows in smaller tiles in a second; NVFP4 prefill blocks of 3072 tokens or more, 128 + 32-row tiles in both GEMMs (`FREETOKEN_NVFP4_PREFILL_TAIL_TILES`), EXL3's gate-up GEMM 64 + 32-row tiles from 3072 tokens (`FREETOKEN_EXL3_PREFILL_TAIL_TILES`); the same K order, the same bits |
+| `python/freetoken/layers/embedding.py`, `engine/engine.py`, `tests/layers/test_embed_host.py` | 49/0, 7/0, new | an input embedding not tied to the LM head kept in pinned, device-mapped host memory, read by the same lookup kernel (`FREETOKEN_EMBED_HOST`); the engine moves it after the int8 compaction, before the memory reading that sizes the expert cache and the K/V pool |
 
 ## Tooling and documentation
 

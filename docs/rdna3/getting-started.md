@@ -8,7 +8,7 @@ how to check that it worked. The two downloads (a 25 GB base image, an 85-135 GB
 | | Two cards (`xtx-xt`) | One card (`xtx` or `xt`) |
 |---|---|---|
 | GPUs | RX 7900 XTX 24 GB + RX 7900 XT 20 GB | one RX 7900 XTX 24 GB or RX 7900 XT 20 GB |
-| System RAM the server locks: NVFP4; EXL3 3.05 / 4.05 bpw (keep ~30 GiB more for the system) | 82 GiB; 60 / 75 GiB: a **128 GB** machine | 73 GiB; 51 / 66 GiB |
+| System RAM the server locks: NVFP4; EXL3 3.05 / 4.05 bpw (keep ~30 GiB more for the system) | ~83 GiB; ~61 / ~76 GiB: a **128 GB** machine | ~74 GiB; ~52 / ~67 GiB |
 | Disk | 135 GB for the NVFP4 model (85 / 108 GB in EXL3 3.05 / 4.05 bpw), ~27 GB for the image, ~29 GB more while building | same |
 | Software | Linux x86_64 with the in-kernel `amdgpu` driver (`/dev/kfd` present), Docker | same |
 | Tested on | Ubuntu 26.04 LTS, kernel 7.0 (older kernels untested) | same |
@@ -77,7 +77,7 @@ profiles: [which checkpoint](../../README.md#which-checkpoint)).
 |---|---:|---:|---:|
 | `rdna3/download.sh` name | `nvfp4` | `exl3-3.05` | `exl3-4.05` |
 | Download | 135 GB | 85 GB | 108 GB |
-| RAM locked: two cards; one card | 82 GiB; 73 GiB | 60 GiB; 51 GiB | 75 GiB; 66 GiB |
+| RAM locked: two cards; one card | ~83 GiB; ~74 GiB | ~61 GiB; ~52 GiB | ~76 GiB; ~67 GiB |
 | Decode, `xtx-xt` / `xtx` / `xt` | 78-96 / 36-44 / 29-34 tok/s | 95-117 / 52-58 / 41-46 tok/s | 86-94 / 37-47 / 29-36 tok/s |
 
 EXL3 3.05 bpw is the smallest, needs the least RAM and decodes the fastest on every measured profile (its experts are

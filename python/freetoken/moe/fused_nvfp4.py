@@ -24,6 +24,7 @@ from freetoken.kernel.triton.nvfp4_fused_moe import (
     _prefill_nvfp4_moe_kernel,
 )
 from freetoken.layers import gated_act_and_mul
+from freetoken.kernel.triton.moe_align import moe_align_split
 from freetoken.moe.fused import blocks_to_slots, moe_align_block_size
 from freetoken.moe.prefill_hooks import BLOCK_DONE
 from freetoken.utils import init_logger
@@ -289,6 +290,16 @@ _TUNED_SMALL = dict(BLOCK_SIZE_M=16, BLOCK_SIZE_N=64, BLOCK_SIZE_KB=32, GROUP_SI
 _TUNED_SHORT_GATE_UP = dict(BLOCK_SIZE_M=32, BLOCK_SIZE_N=64, BLOCK_SIZE_KB=32, GROUP_SIZE_M=8, num_warps=4,
                             num_stages=2)
 _TUNED_SHORT_DOWN = dict(BLOCK_SIZE_M=32, BLOCK_SIZE_N=64, BLOCK_SIZE_KB=32, GROUP_SIZE_M=8, num_warps=4, num_stages=1)
+# FREETOKEN_NVFP4_PREFILL_TAIL_TILES (default 1): on the 128-row tiles of a >= 3072-token block, each expert's rows past
+# its last full 128-row tile go to 32-row tiles of a second launch (both GEMMs), instead of a 128-row tile mostly
+# padding (an expert gets ~160 rows of an 8192-token block). Only BLOCK_M / BLOCK_N / warps / stages change: the same
+# bits.
+# 8192-token block, random routing, 7900 XTX / XT: gate_up 12.3 -> 9.4-9.9 ms, down (128-row tiles too) 7.0 ->
+# 6.0-6.2 ms; the whole MoE block with this model's routing (96 dumped 8192-token blocks): 1921 -> 1696 ms (XTX's
+# slice), 1892 -> 1682 ms (XT's)
+_TAIL_TILES = os.environ.get("FREETOKEN_NVFP4_PREFILL_TAIL_TILES", "1") == "1"
+_TAIL_GATE_UP = dict(BLOCK_SIZE_M=32, BLOCK_SIZE_N=64, BLOCK_SIZE_KB=32, GROUP_SIZE_M=8, num_warps=4, num_stages=2)
+_TAIL_DOWN = dict(BLOCK_SIZE_M=32, BLOCK_SIZE_N=128, BLOCK_SIZE_KB=32, GROUP_SIZE_M=8, num_warps=8, num_stages=2)
 
 
 def _prefill_configs(M: int) -> tuple[Dict[str, int], Dict[str, int]]:
@@ -406,30 +417,37 @@ def fused_experts_nvfp4(
     dev, dt = hidden_states.device, hidden_states.dtype
     cfg_up, cfg_down = _prefill_configs(M)
 
-    align_up = moe_align_block_size(topk_ids, cfg_up["BLOCK_SIZE_M"], num_experts)
-    align_down = (align_up if cfg_down["BLOCK_SIZE_M"] == cfg_up["BLOCK_SIZE_M"]
-                  else moe_align_block_size(topk_ids, cfg_down["BLOCK_SIZE_M"], num_experts))
-    if slot_map is not None:
-        mapped_up = (align_up[0], blocks_to_slots(align_up[1], slot_map), align_up[2])
-        align_down = mapped_up if align_down is align_up else (align_down[0], blocks_to_slots(align_down[1], slot_map), align_down[2])
-        align_up = mapped_up
+    slots = (lambda al: al) if slot_map is None else (lambda al: (al[0], blocks_to_slots(al[1], slot_map), al[2]))
+    if _TAIL_TILES and cfg_up is _TUNED_BIG_GATE_UP:
+        full, rest = (slots(al) for al in moe_align_split(topk_ids, 128, 32, num_experts))
+        parts_up = ((full, _TUNED_BIG_GATE_UP), (rest, _TAIL_GATE_UP))
+        parts_down = ((full, _TUNED_BIG_GATE_UP), (rest, _TAIL_DOWN))
+    else:
+        align_up = moe_align_block_size(topk_ids, cfg_up["BLOCK_SIZE_M"], num_experts)
+        align_down = (align_up if cfg_down["BLOCK_SIZE_M"] == cfg_up["BLOCK_SIZE_M"]
+                      else moe_align_block_size(topk_ids, cfg_down["BLOCK_SIZE_M"], num_experts))
+        align_up = slots(align_up)
+        align_down = align_up if cfg_down["BLOCK_SIZE_M"] == cfg_up["BLOCK_SIZE_M"] else slots(align_down)
+        parts_up, parts_down = ((align_up, cfg_up),), ((align_down, cfg_down),)
     tw = topk_weights.reshape(-1).contiguous()
     num_valid = topk_ids.numel()
 
     ic1 = torch.empty((M, top_k, two_i), device=dev, dtype=dt)
-    _prefill_gemm(
-        hidden_states, gate_up_packed, gate_up_scale, gate_up_global, ic1,
-        tw, *align_up, num_valid, top_k,
-        apply_router_weight_on_input, cfg_up,
-    )
+    for align, cfg in parts_up:
+        _prefill_gemm(
+            hidden_states, gate_up_packed, gate_up_scale, gate_up_global, ic1,
+            tw, *align, num_valid, top_k,
+            apply_router_weight_on_input, cfg,
+        )
     ic2 = torch.empty((M * top_k, inter), device=dev, dtype=dt)
     gated_act_and_mul(activation, ic1.view(-1, two_i), ic2, alpha=act_alpha, limit=act_limit)
     ic3 = torch.empty((M, top_k, H), device=dev, dtype=dt)
-    _prefill_gemm(
-        ic2, down_packed, down_scale, down_global, ic3,
-        tw, *align_down, num_valid, 1,
-        not apply_router_weight_on_input, cfg_down,
-    )
+    for align, cfg in parts_down:
+        _prefill_gemm(
+            ic2, down_packed, down_scale, down_global, ic3,
+            tw, *align, num_valid, 1,
+            not apply_router_weight_on_input, cfg,
+        )
     out = torch.empty_like(hidden_states)
     moe_sum_reduce_triton(ic3, out)
     return out

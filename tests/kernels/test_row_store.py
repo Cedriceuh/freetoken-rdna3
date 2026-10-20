@@ -64,6 +64,63 @@ def test_rows_come_back_bitwise_across_extents_and_files(tmp_path, use_io_uring)
     assert int(flag[0]) == 1
 
 
+@pytest.mark.parametrize("rings", ["1", "4"])
+@pytest.mark.parametrize("use_io_uring", [True, False])
+def test_rows_across_pages_come_back_bitwise_on_split_fills(tmp_path, monkeypatch, rings, use_io_uring):
+    # with direct I/O a row across a page boundary reads its two pages apart (one read across two 4 KiB units slows
+    # the whole batch); a fill of >= 256 rows splits over FREETOKEN_ROW_STORE_RINGS io_uring rings
+    monkeypatch.setenv("FREETOKEN_ROW_STORE_RINGS", rings)
+    crosses = lambda i: (i * ROW_BYTES) // 4096 != ((i + 1) * ROW_BYTES - 1) // 4096
+    rows = next(n for n in range(8000, 9000) if crosses(n - 1))  # the last row's second page is the file's partial tail
+    table = _table(rows, seed=4)
+    path = tmp_path / "t.bin"
+    path.write_bytes(table.numpy().tobytes())
+    store = _row_store.RowStore(paths=[str(path)], extent_file=[0], extent_base=[0], rows_per_extent=rows,
+                                row_bytes=ROW_BYTES, row_stride=ROW_BYTES, use_io_uring=use_io_uring)
+    if "O_DIRECT" not in store.io_backend():
+        pytest.skip(f"no direct I/O under {tmp_path}: rows are read whole")
+    assert (" x4" in store.io_backend()) == (rings == "4" and store.io_backend().startswith("io_uring"))
+
+    # only rows across pages: every one needs two reads in flight at once
+    crossing = torch.tensor([i for i in range(rows) if crosses(i)], dtype=torch.int64)
+    assert crossing.numel() >= 256 and int(crossing[-1]) == rows - 1
+    assert torch.equal(_stage(store, crossing), table[crossing])
+    # mixed, with duplicates, larger than every ring's window
+    gen = torch.Generator().manual_seed(5)
+    many = torch.randint(0, rows, (6000,), dtype=torch.int64, generator=gen)
+    many[:500] = crossing.repeat(2)[:500]
+    assert torch.equal(_stage(store, many), table[many])
+    # below the split threshold: one ring
+    assert torch.equal(_stage(store, many[:100]), table[many[:100]])
+
+
+@pytest.mark.parametrize("use_io_uring", [True, False])
+def test_ram_cache_serves_rows_read_before_bitwise(tmp_path, use_io_uring):
+    rows = 3000
+    table = _table(rows, seed=6)
+    path = tmp_path / "t.bin"
+    path.write_bytes(table.numpy().tobytes())
+    make = lambda cache_rows: _row_store.RowStore(
+        paths=[str(path)], extent_file=[0], extent_base=[0], rows_per_extent=rows, row_bytes=ROW_BYTES,
+        row_stride=ROW_BYTES, use_io_uring=use_io_uring, cache_rows=cache_rows)
+    store = make(1024)
+    assert store.cache_rows == 1024 and "RAM cache of 1024 rows" in store.io_backend()
+    gen = torch.Generator().manual_seed(8)
+    first = torch.randperm(rows, generator=gen)[:500]
+    assert torch.equal(_stage(store, first), table[first]) and store.cache_hits == 0
+    # the same rows again come from the cache, mixed with new ones and duplicates
+    again = torch.cat([first[:300], torch.randperm(rows, generator=gen)[:400], first[:50]])
+    hits_before = store.cache_hits
+    assert torch.equal(_stage(store, again), table[again])
+    assert store.cache_hits - hits_before >= 350  # first[:300] and its 50 repeats, at least
+    # a cache much smaller than the rows read evicts, and stays bitwise
+    small = make(16)
+    many = torch.randint(0, rows, (4000,), dtype=torch.int64, generator=gen)
+    for _ in range(3):
+        assert torch.equal(_stage(small, many), table[many])
+    assert small.cache_rows == 16 and make(0).cache_rows == 0
+
+
 def test_geometry_and_bounds_are_checked_up_front(tmp_path):
     table = _table(64, seed=3)
     path = tmp_path / "t.bin"

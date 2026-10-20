@@ -15,9 +15,9 @@ usual on consumer boards): every exchange between them goes through system RAM.
 
 | Where | What |
 |---|---|
-| GPU VRAM | dense weights (int8), the KV cache of the attention layers, the GDN recurrent states, and an **expert cache** filling everything else (on `xtx-xt`: 7.0k of the 24,576 experts, on each card) |
-| System RAM | **every expert** (~63 GiB, pinned; each rank holds its own share of every expert), conversations moved off the GPUs (the RAM tier), the ranks' exchange buffer |
-| Disk | the n-gram embedding tables, read row by row on demand (the page cache keeps the hot rows) |
+| GPU VRAM | dense weights (int8) except the input embedding, the KV cache of the attention layers, the GDN recurrent states, and an **expert cache** filling everything else (on `xtx-xt`: 7.5k of the 24,576 experts, on each card) |
+| System RAM | **every expert** (~63 GiB, pinned; each rank holds its own share of every expert), the input embedding (1.2 GiB, a row per token read across PCIe), the PLE rows prefills read (a RAM cache, 0.12-0.17 GiB), conversations moved off the GPUs (the RAM tier), the ranks' exchange buffer |
+| Disk | the n-gram embedding tables, read row by row on demand (direct I/O, no page cache; a large fill over four io_uring rings) |
 
 ## One decode step
 
@@ -69,18 +69,25 @@ cards, changing only tiles that keep the summation order (bit-exact).
 
 A prefill chunk runs every token through every layer, so each chunk streams all 512 experts of every layer over PCIe
 (~700 MB per layer per card). Bigger chunks mean less streaming: in the A/B test, 16k-token chunks read an 8.4k prompt
-in 4.3 s instead of 5.5 s, and 54-101k-token reads at depth 2-6 % faster ([benchmarks.md](benchmarks.md) has the
-current speeds). To fit them, the prefill MoE and the PLE layer run 4096 tokens at a time inside the chunk (the
-NVFP4 MoE blocks are bit-identical, and 8192 tokens long in `xtx-xt` and `xtx-xt-4x262k`: +8 % on cold reads; the PLE blocks can round differently, checked to tolerance and validated on the agentic
-benchmark for one request), and experts already in the GPU cache are gathered on the GPU instead of crossing PCIe
-again (`--moe-prefill-hit-d2d`, with `hipMemcpyBatchAsync` on ROCm, or one copy per entry on older HIP): a third of
-the experts stay off PCIe per chunk, an agent turn's first token 1.55 -> 1.18 s. A single card keeps 8k chunks
-(its working memory is smaller). The per-layer-embedding rows of a prefill are read from disk on a thread by rank 0
-only, which broadcasts them, and a long prompt's next chunk's rows are read while a chunk computes (they took ~1.1 s
-per 16k-token chunk, the GPUs idle); on two cards each block of a chunk's routed experts and of its GatedDeltaNet
-output starts its all-reduce while the next block computes, and the QSA indexer scores 16 query rows a program (the
-same bits): fully cold reads ~25 % shorter
-([journey.md](journey.md#33-short-turns-the-host-waiting-at-every-layer-2026-10-18-and-19)).
+in 4.3 s instead of 5.5 s, and 54-101k-token reads at depth 2-6 % faster ([benchmarks.md](benchmarks.md) has the current
+speeds). To fit them, the prefill MoE and the PLE layer run 4096 tokens at a time inside the chunk (the NVFP4 MoE blocks
+are bit-identical, and 8192 tokens long in `xtx-xt` and `xtx-xt-4x262k`: +8 % on cold reads; the PLE blocks can round
+differently, checked to tolerance and validated on the agentic benchmark for one request), and experts already in the
+GPU cache are gathered on the GPU instead of crossing PCIe again (`--moe-prefill-hit-d2d`, with `hipMemcpyBatchAsync` on
+ROCm, or one copy per entry on older HIP): a third of the experts stay off PCIe per chunk, an agent turn's first token
+1.55 -> 1.18 s. A single card keeps 8k chunks (its working memory is smaller). The per-layer-embedding rows of a prefill
+are read from disk on a thread by rank 0 only, which broadcasts them, and a long prompt's next chunk's rows are read
+while a chunk computes (they took ~1.1 s per 16k-token chunk, the GPUs idle); on two cards each block of a chunk's
+routed experts and of its GatedDeltaNet output starts its all-reduce while the next block computes, and the QSA indexer
+scores 16 query rows a program (the same bits): fully cold reads ~25 % shorter
+([journey.md](journey.md#33-short-turns-the-host-waiting-at-every-layer-2026-10-18-and-19)). The rows are read over four
+io_uring rings, a row across a 4 KiB page as its two pages apart (one thread drove 240-290k reads a second; reads
+spanning two 4 KiB units, even 2.5 % of a batch, halved the batch's rate), the rows read before stay in a RAM cache (an
+agent session's n-grams recur across its turns), and a long block's experts run their full tiles in one launch and their
+remaining rows in smaller tiles in a second (the same bits): NVFP4 cold reads ~6 % shorter, EXL3 agent turns ~6 % (~7 %
+with the row cache). The input embedding lives in RAM, a row per token read across PCIe, and its VRAM goes to the
+expert cache: decode 1-6 % faster, agent turns ~3 % shorter
+([journey.md](journey.md#34-disk-reads-on-four-rings-tail-tiles-the-input-embedding-in-ram-2026-10-19)).
 
 A short chunk (up to 1280 tokens on Qwen3.8-Flash-Next, an agent's tool result) does not stream the whole layers: it
 routes to only part of the experts, so it reads its routed experts from the slot cache, the next layer's predicted by
@@ -194,7 +201,7 @@ branch `3.05bpw_h5_ng5` (routed experts at 3 bits per weight, most other linears
   weight reader (the CPU expert executor of `--hybrid` does read EXL3 experts: [cpu-experts.md](cpu-experts.md)). FTW conversion is untested. The vision tower reads the checkpoint's bf16
   `qkv` (image input checked with one image per branch).
 
-With the profiles' settings, MTP head on, one request (decode: greedy, from 9k tokens to the profile's maximum context;
+Measured with an earlier build (this one reads faster, caches more experts and locks 1.2 GiB more RAM: [CHANGELOG.md](../../CHANGELOG.md)), with the profiles' settings, MTP head on, one request (decode: greedy, from 9k tokens to the profile's maximum context;
 RAM: locked while serving;
 [benchmarks.md](benchmarks.md#depth-sweep-exl3-checkpoints) has every step, the cold reads and the sampled decode):
 

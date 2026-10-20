@@ -63,6 +63,55 @@ class VocabParallelEmbedding(BaseOP):
         return y
 
 
+# FREETOKEN_EMBED_HOST (default 1 on ROCm, 0 elsewhere): an input embedding not tied to the LM head, looked up by the
+# indexing kernel, keeps its table in pinned, device-mapped host memory (kernel/host_mapped.py) instead of VRAM. The same
+# kernel reads the same rows, one per token across PCIe (5 KiB with 2560 bf16 columns); the VRAM goes to the pools sized
+# after the weights (Qwen3.8-Flash-Next: 248,320 x 2560 bf16 rows, 606 MiB a rank at TP=2)
+_EMBED_HOST = os.environ.get("FREETOKEN_EMBED_HOST", "1" if torch.version.hip is not None else "0") == "1"
+
+
+def place_embeddings_on_host(root: BaseOP) -> int:
+    """FREETOKEN_EMBED_HOST: move the eligible input tables under ``root`` to mapped host memory; returns the bytes."""
+    from freetoken.kernel.host_mapped import host_mapped_empty
+    from .quantization.embedding.unquantized import UnquantizedEmbeddingMethod
+
+    if not _EMBED_HOST or not torch.cuda.is_available():
+        return 0
+    tables: list[VocabParallelEmbedding] = []
+    tied: set[int] = set()
+    seen: set[int] = set()
+
+    def walk(op: BaseOP) -> None:
+        if id(op) in seen:
+            return
+        seen.add(id(op))
+        if isinstance(op, ParallelLMHead):
+            if op.tied_embedding is not None:
+                tied.add(id(op.tied_embedding))
+        elif isinstance(op, VocabParallelEmbedding) and isinstance(op.quant_method, UnquantizedEmbeddingMethod):
+            tables.append(op)
+        for value in vars(op).values():
+            for item in value if isinstance(value, (list, tuple)) else (value,):
+                if isinstance(item, BaseOP):
+                    walk(item)
+
+    walk(root)
+    moved = 0
+    for op in tables:
+        w = op.weight
+        if id(op) in tied or not isinstance(w, torch.Tensor) or not w.is_cuda:
+            continue
+        host = host_mapped_empty(tuple(w.shape), w.dtype, w.device)
+        host.copy_(w)
+        op.weight = host
+        moved += w.numel() * w.element_size()
+    w = None  # the last table's VRAM goes back with the others before empty_cache
+    if moved:
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+    return moved
+
+
 _DUMP_DIR = os.environ.get("FREETOKEN_DUMP_PROMPT_TOPK", "")
 _DUMP_COUNT = 0
 

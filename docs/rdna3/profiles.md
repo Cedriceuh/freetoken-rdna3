@@ -54,7 +54,7 @@ A comment may follow a value on the same line. Copy a file to make your own prof
 | `FREETOKEN_NVFP4_PREFILL_BLOCK` | `8192` | the NVFP4 prefill MoE 8192 tokens at a time instead of 4096: cold reads +7.9 % (arms alternated), the same bits; 16384 left the XT 0.65 GiB of VRAM at the peak of a 255k-token read ([options.md](options.md)) |
 | `FREETOKEN_HOST_KV` | `1` | conversations evicted from the GPUs go to RAM (9.5 GiB locked) and come back in ~2 s; exact |
 | `FREETOKEN_MTP` / `FREETOKEN_SPEC_VERIFY_M` | `1` / `4` | the checkpoint's MTP head drafts up to 3 tokens a step for a request decoding alone (two at once in `xtx-xt`, `FREETOKEN_SPEC_BS_MAX=2`: +8-15 % each): +35 % decode at `rdna3/serve.sh`'s sampling (+6-13 % on one card), greedy answers unchanged; `rdna3/serve.sh --no-mtp` turns it off ([limits.md](limits.md#speculative-decoding-mtp)) |
-| `--moe-strategy offload --moe-cache-auto` | | experts live in RAM; every byte of VRAM left after the dense weights and the KV is an expert cache (7.0k of the 24,576 experts, on each card) |
+| `--moe-strategy offload --moe-cache-auto` | | experts live in RAM; every byte of VRAM left after the dense weights and the KV is an expert cache (7.5k of the 24,576 experts, on each card) |
 | `--expert-load parallel` | | reads the expert files into RAM with parallel readers; `auto` (the engine's default) does the same but falls back to a slower serial read when free RAM is short: use `auto` on a machine with little RAM to spare |
 | `--quant-backend moe.nvfp4=triton` | | the Triton NVFP4 expert kernels (the other backends need NVIDIA hardware) |
 | `--ple-backend disk` | | the 51 GB n-gram embedding tables are read from the checkpoint files on demand |
@@ -71,7 +71,7 @@ With several requests, each one's decode is computed row by row as if it were al
 batch can differ at rounding level. The 4-request setting, the tuned decode tiles and the RAM tier are checked for
 exactness, not on the agentic benchmark ([benchmarks.md](benchmarks.md#precision)).
 
-RAM: 82 GiB while serving, all of it locked (measured: ~63 GiB of experts, 9.5 GiB for the RAM tier, the rest the two processes); 60 GiB with the EXL3 3.05 bpw checkpoint, 75 GiB with 4.05 bpw.
+RAM: ~83 GiB while serving, all of it locked (82 measured with an earlier build: ~63 GiB of experts, 9.5 GiB for the RAM tier, the rest the two processes; this build adds 1.2 GiB, the input embedding and the PLE row cache); ~61 GiB with the EXL3 3.05 bpw checkpoint, ~76 GiB with 4.05 bpw.
 
 With an EXL3 checkpoint
 ([how-it-works.md](how-it-works.md#exl3-checkpoints)) the same profile applies: the
@@ -90,7 +90,7 @@ them at once (`KV_TOKENS=1050000`), `xtx-xt-1m` serves one conversation of up to
 262,144, `FREETOKEN_ROPE_MAX_POSITION`). The RAM tier is off (`FREETOKEN_HOST_KV=0`): the pool already lives in RAM.
 Measured with EXL3 3.05 bpw (~77 GiB of host RAM locked by `xtx-xt-4x262k`, ~75 GiB by `xtx-xt-1m`), and NVFP4 on
 `xtx-xt-4x262k` with a pool of three contexts (`-- --kv-reserve-tokens 787500`: agent turns, a 259,728-token
-prompt, four agents at once; 94 GiB locked after the start, ~97 GiB in use). On the 126 GiB reference machine that
+prompt, four agents at once; 94 GiB locked after the start, ~97 GiB in use; an earlier build, this one locks 1.2 GiB more). On the 126 GiB reference machine that
 fits with little else running (13-15 GiB of other programs beside the desktop ran it out of memory), and four NVFP4
 contexts (~100 GiB, with benchmark tools beside them) did not fit: with NVFP4 on 128 GB,
 `rdna3/serve.sh xtx-xt-4x262k --model DIR -- --kv-reserve-tokens 787500`, or two conversations (525000) to keep room.
@@ -112,7 +112,7 @@ verify steps mostly stay at 2 rows, the extra rows' missing experts crossing PCI
 | `FREETOKEN_HOST_KV_TOKENS` / `_SNAPSHOTS` | `131072` / `16` | the RAM tier sized to the context (~5 GiB locked, estimated) |
 | context | 131,072 | what fits: the XT's VRAM peaked at 19,367 of 20,464 MiB over a sweep to 124k tokens |
 
-RAM: 73 GiB while serving, locked (measured on each card; EXL3: 51 GiB at 3.05 bpw, 66 GiB at 4.05 bpw).
+RAM: ~74 GiB while serving, locked (73 measured on each card with an earlier build, plus 1.2 GiB; EXL3: ~52 GiB at 3.05 bpw, ~67 GiB at 4.05 bpw).
 
 The cards are picked by VRAM: `xt` takes the smallest card with at least 20 GiB, `xtx` the smallest with 24 GiB, so a
 machine with both keeps the other card free. The one-card profiles were measured for speed, not run on the agentic
@@ -125,7 +125,7 @@ a note when you start one (`TESTED=0` in the file).
 
 - **`xtx-xtx`**: `xtx-xt` with an even split, the NVFP4 prefill MoE 4096 tokens at a time and drafts verified for one
   request at a time (`FREETOKEN_NVFP4_PREFILL_BLOCK`, `FREETOKEN_SPEC_BS_MAX` unset: untested on these pairs). Both cards plan on 24 GB instead of the XT's 20 GB, each holding half of
-  every expert: ~9k cached experts instead of 7.0k (estimate), so decode at least as fast as `xtx-xt`. The tuned NVFP4
+  every expert: ~9k cached experts instead of 7.5k (estimate), so decode at least as fast as `xtx-xt`. The tuned NVFP4
   decode tiles are keyed to the 0.55 split, so the even split's decode shapes use default tiles. An EXL3 checkpoint
   refuses the even split (its expert slices must be whole 128-wide blocks): add `FREETOKEN_TP_SPLIT=0.6` to the file
   for it (untested, as for `xt-xt`).

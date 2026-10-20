@@ -18,7 +18,7 @@ Neither profile is agent-validated yet.
   (`kernel/host_mapped.py`): the decode and verify kernels read the ~2051 selected tokens of each row in place across
   PCIe, and a prefill first copies the K/V rows its tokens select from the batch's history
   (`FREETOKEN_QSA_STAGE_SELECTED`), one layer at a time, to a VRAM buffer (`kernel/triton/qsa/stage.py`, 28 GB/s), so
-  its rows do not each cross PCIe. The index tiers stay in VRAM. At 1M the engine then plans 11,261 expert slots per
+  its rows do not each cross PCIe. The index tiers stay in VRAM. At 1M the engine (an earlier build) then plans 11,261 expert slots per
   card (9,800 for `xtx-xt` at 262k with the K/V in VRAM) and locks ~75 GiB of host RAM; the 7900 XTX peaked at 23.20 of
   23.98 GiB (sysfs) during a 1M read with the desktop on it. The answers are bit-identical to the K/V in VRAM (the same
   text at 29k and 118k).

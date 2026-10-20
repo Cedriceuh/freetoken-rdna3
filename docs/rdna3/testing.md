@@ -23,8 +23,8 @@ be slower (one-time kernel preparation): run it twice.
 docker run --rm -w /opt/FreeToken --entrypoint python3 freetoken-rdna3:latest -m pytest -q -p no:cacheprovider tests
 ```
 
-About 3.5 minutes (210 s on the reference machine), no GPU needed, on the tree the image was built from: 1770 passed,
-958 skipped and 4 failures that fail the same way on upstream: 3 come from the environment (they need flashinfer, an
+About 3.5 minutes (210 s on the reference machine), no GPU needed, on the tree the image was built from: 1788 passed,
+999 skipped and 4 failures that fail the same way on upstream: 3 come from the environment (they need flashinfer, an
 NVIDIA-only package:
 `test_cache_budget.py::test_adjust_config_defaults_moe_cache_auto_for_auto_resolved_offload_backend`,
 `test_cache_budget.py::test_adjust_config_resolves_num_tokens_generic`,

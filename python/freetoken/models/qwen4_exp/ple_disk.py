@@ -61,6 +61,12 @@ _PREFILL_PREFETCH = os.environ.get("FREETOKEN_PLE_PREFILL_PREFETCH", "1") == "1"
 # their bytes to the other ranks at the lookup (every rank stages every head, so the bytes are the same): half the
 # disk reads, and rank 0's no longer compete with another rank's for the same rows
 _PREFILL_RANK0 = os.environ.get("FREETOKEN_PLE_PREFILL_RANK0", "1") == "1"
+# FREETOKEN_PLE_ROW_CACHE_ROWS (default 1048576): a RAM cache of the rows read before, in the store the thread reads the
+# prefills with: an agent session's n-grams recur across its turns (a session reading this repository's source files one
+# turn each found ~40 % of a turn's rows read by an earlier turn; a 1M-row cache kept them all). 176 MiB with NVFP4's
+# 160-byte rows (16 of them tags and stamps), 118 MiB with EXL3's. The bytes of the reads, so the same bits; 0 turns it
+# off
+_ROW_CACHE_ROWS = int(os.environ.get("FREETOKEN_PLE_ROW_CACHE_ROWS", str(1 << 20)))
 _SYNC_ENV = "FREETOKEN_PLE_SYNC"  # auto | wait | gate
 
 logger = init_logger(__name__)
@@ -263,7 +269,7 @@ class DiskRowTable:
             raise ValueError(
                 f"PLE row source holds {source.total_rows} rows but the hash addresses {need}; incomplete checkpoint?"
             )
-        def store() -> PleStore:
+        def store(cache_rows: int = 0) -> PleStore:
             return PleStore(
                 paths=list(source.paths),
                 extent_file=list(source.extent_file),
@@ -276,6 +282,7 @@ class DiskRowTable:
                 head_offsets=offsets,
                 eos_token_id=self.eos_token_id,
                 use_io_uring=os.getenv(_IO_URING_ENV, "1") != "0",
+                cache_rows=cache_rows,
             )
 
         from freetoken.distributed import try_get_tp_info
@@ -287,7 +294,8 @@ class DiskRowTable:
         self._store = store()
         # FREETOKEN_PLE_PREFILL_PREFETCH: a store of its own (its own io_uring ring) for the next chunk's rows, on the
         # ranks that read prefill rows
-        self._prefetch_store = store() if _PREFILL_PREFETCH and (self._is_rank0 or not self._rank0_reads) else None
+        self._prefetch_store = (store(_ROW_CACHE_ROWS) if _PREFILL_PREFETCH and (self._is_rank0 or not self._rank0_reads)
+                                else None)
         self._share = False  # this prefill's lookup broadcasts rank 0's rows (FREETOKEN_PLE_PREFILL_RANK0)
         self._next = None  # (slot, run, thread, state) of the read thread (slot / run None: no read ahead)
         self._pending_fill = None  # (ready event, state) of this prefill's rows being read on the thread
@@ -327,7 +335,8 @@ class DiskRowTable:
         self._readback_event = torch.cuda.Event()
         sync = "wait-sync" if self._wait_sync else "launch-gating"
         reads = ", prefill rows read by rank 0" if self._rank0_reads else ""
-        logger.info_rank0(f"PLE disk backend: {self._store.io_backend()}, {sync}{reads}")
+        pf = f"; prefill store: {self._prefetch_store.io_backend()}" if self._prefetch_store is not None else ""
+        logger.info_rank0(f"PLE disk backend: {self._store.io_backend()}, {sync}{reads}{pf}")
 
     # ---------------- host side (engine thread, before the forward launches) ----------------
 

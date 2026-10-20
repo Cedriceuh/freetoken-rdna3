@@ -696,6 +696,13 @@ class Engine:
             int8_weight_only.convert_model(self.model)
             if os.environ.get("FREETOKEN_INT8_COMPACT", "1") == "1":
                 int8_weight_only.compact_device_tensors(self.model)
+        from freetoken.layers.embedding import place_embeddings_on_host
+
+        # after the compaction (it would bring the table back to VRAM), before the post-weights memory snapshot
+        moved = place_embeddings_on_host(self.model)
+        if moved:
+            logger.info_rank0(f"input embedding in mapped host memory (FREETOKEN_EMBED_HOST): {moved / 2**20:.0f} MiB "
+                              "of VRAM a rank left to the pools")
 
     def _load_weight_state_dict(self, config: EngineConfig) -> Dict[str, torch.Tensor]:
         model_state = self.model.state_dict()

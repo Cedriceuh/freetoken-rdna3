@@ -98,15 +98,16 @@ ckpt_kind() {  # $1 = checkpoint directory: nvfp4, exl3-<bits> or unknown, from 
 ckpt_label() { case "$1" in nvfp4) echo NVFP4 ;; exl3-*) echo "EXL3 ${1#exl3-} bpw" ;; *) echo "this checkpoint" ;; esac; }
 
 # What a server locks in host RAM (all of it is locked), in GiB, right after its start: the experts and the processes
-# (the measured totals of docs/rdna3/limits.md minus the RAM tier), plus either the RAM tier (FREETOKEN_HOST_KV: 9.5 GiB
-# on two cards, ~5 per 131,072 tokens on one) or, with the K/V in host RAM (FREETOKEN_QSA_KV_HOST), the K/V pool at
-# 14,144 bytes per token and card. Within 2 GiB of the four measured layouts with the K/V in RAM (EXL3 3.05 bpw 4 x 262k
-# and 1M, NVFP4 3 and 4 x 262k). One 262k conversation takes 262,500 tokens of pool (the decode's spare page
-# included): 6.9 GiB on two cards.
+# (the measured totals of docs/rdna3/limits.md minus the RAM tier, plus 1.2 for what this build keeps in RAM beyond
+# them: the input embedding, FREETOKEN_EMBED_HOST, and the PLE row cache; +1.18 measured on xtx-xt with NVFP4, +1.19
+# on one card with EXL3), plus either the RAM tier (FREETOKEN_HOST_KV: 9.5 GiB on two cards, ~5 per 131,072 tokens on
+# one) or, with the K/V in host RAM (FREETOKEN_QSA_KV_HOST), the K/V pool at 14,144 bytes per token and card. Within 2
+# GiB of the four measured layouts with the K/V in RAM (EXL3 3.05 bpw 4 x 262k and 1M, NVFP4 3 and 4 x 262k). One 262k
+# conversation takes 262,500 tokens of pool (the decode's spare page included): 6.9 GiB on two cards.
 ram_core() {
   case "$1:$2" in
-    2:nvfp4) echo 72.5 ;; 2:exl3-3.05) echo 50.5 ;; 2:exl3-4.05) echo 65.5 ;;
-    1:nvfp4) echo 68 ;; 1:exl3-3.05) echo 46 ;; 1:exl3-4.05) echo 61 ;;
+    2:nvfp4) echo 73.7 ;; 2:exl3-3.05) echo 51.7 ;; 2:exl3-4.05) echo 66.7 ;;
+    1:nvfp4) echo 69.2 ;; 1:exl3-3.05) echo 47.2 ;; 1:exl3-4.05) echo 62.2 ;;
   esac
 }
 ram_locked() {  # $1 GPUs, $2 checkpoint, $3 K/V pool in host RAM in tokens (0: K/V in VRAM), $4 the RAM tier's

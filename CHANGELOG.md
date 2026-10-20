@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+- The input embedding in RAM, the same bits. Qwen3.8-Flash-Next's input table (248,320 x 2560 bf16, not tied to the LM
+  head) stays in pinned, device-mapped host memory and the same lookup kernel reads its rows across PCIe
+  (`FREETOKEN_EMBED_HOST`); the 606 MiB a rank it held in VRAM go to the expert cache. `xtx-xt-4x262k` with a 3 x 262k
+  pool, two runs each: 8,768 -> 9,255 slots with NVFP4, 11,554 -> 12,095 with EXL3 3.05 bpw; NVFP4 agent turns
+  0.728-0.729 -> 0.707-0.711 s, decode 89.7-89.9 -> 91.2-91.7 tok/s, four requests 29.0-29.3 -> 30.5 tok/s each; EXL3
+  agent turns 0.485-0.487 -> 0.472 s, decode 93.5-93.6 -> 94.3-94.5 tok/s, four requests 36.2 -> 36.8-37.1; cold reads
+  unchanged. One card (`xtx`, EXL3, 131k): 4,783-4,793 -> 5,459-5,468 slots, decode 52.3-52.7 -> 55.4 tok/s, agent turns
+  1.120-1.126 -> 1.083-1.086 s. The server locks 1.2 GiB more RAM (`serve.sh --check` counts it).
+- Faster PLE row reads and long prefills, the same bits. The disk row store splits a large fill over four io_uring
+  rings, one thread each (`FREETOKEN_ROW_STORE_RINGS`: one thread drove 240-290k reads a second, the disk takes ~490k),
+  and reads a row that crosses a 4 KiB page as its two pages, apart (on the reference NVMe, reads spanning two 4 KiB
+  units, even 2.5 % of a batch, halved the whole batch's rate); the store that reads the prefills keeps the rows it read
+  in a RAM cache (`FREETOKEN_PLE_ROW_CACHE_ROWS`, 1M rows: 176 MiB with NVFP4, 118 MiB with EXL3), as an agent session's
+  n-grams recur across its turns. A long NVFP4 prefill block runs each expert's full 128-row tiles in one launch and its
+  remaining rows in 32-row tiles in a second (`FREETOKEN_NVFP4_PREFILL_TAIL_TILES`), EXL3's gate-up GEMM full 64-row
+  tiles and 32-row remainders (`FREETOKEN_EXL3_PREFILL_TAIL_TILES`). On `xtx-xt-4x262k` with the reference machine's
+  launcher settings and a 3 x 262k pool, the previous build -> this one without `FREETOKEN_EMBED_HOST`, two runs each:
+  NVFP4 cold reads of 113k tokens 36.2-36.3 -> 34.1-34.2 s, 159k 51.5-51.6 -> 48.6-48.8 s, 210k 68.7 -> 64.9-65.0 s,
+  agent turns at 45k (~520 tokens) 0.741 -> 0.730 s, ~2,600-token turns 1.21 -> 1.16 s (the cache); EXL3 3.05 bpw agent
+  turns 0.523-0.526 -> 0.494-0.495 s (0.485-0.488 with the cache), ~2,600-token turns 0.99 -> 0.94 s (the cache), cold
+  reads of 40k 12.5 -> 11.9 s, 113k 34.0-34.1 -> 33.2-33.3 s, 210k 64.4 -> 63.1-63.2 s; one card (`xtx`, EXL3) cold
+  reads of 40k / 113k 21.0-21.1 / 59.1-59.2 -> 20.5-20.6 / 58.1-58.2 s. Through the depth sweep to 260k (without the
+  cache): the new blocks read 5-12 % faster (NVFP4) and 4-10 % (EXL3), the following agent turns 1.5-5 % and 4-8 %
+  shorter. The same answers; decode, four requests and one-word turns unchanged.
 - Short agent turns and cold reads, the same bits. A prefill's per-layer-embedding rows are read from the checkpoint
   on a thread, by rank 0 only, which broadcasts them (`FREETOKEN_PLE_PREFILL_PREFETCH`, `FREETOKEN_PLE_PREFILL_RANK0`:
   the GPUs idled ~50 ms an agent turn and ~1.1 s a 16k-token chunk while every rank read them), and the next chunk's

@@ -13,6 +13,7 @@ import torch
 
 from freetoken.kernel import moe_sum_reduce_triton
 from freetoken.kernel.triton.exl3 import exl3_gemm_down_out, exl3_gemv, exl3_mid, exl3_moe_gemm, exl3_out, exl3_rotate_in
+from freetoken.kernel.triton.moe_align import moe_align_split
 from freetoken.moe.fused import blocks_to_slots, moe_align_block_size
 from freetoken.moe.prefill_hooks import BLOCK_DONE
 
@@ -26,6 +27,13 @@ _PREFILL_BLOCK_M = 32
 # short prefills (agent turns: ~5-10 routes an expert) take 16-row tiles: the same K order, so the same bits; the whole
 # MoE block 11-19 % faster at 32-512 tokens on both cards, slower from ~1024 (I = 384 / 256, random routing)
 _SHORT_PREFILL_BLOCK_M, _SHORT_PREFILL_TOKENS = 16, 512
+# FREETOKEN_EXL3_PREFILL_TAIL_TILES (default 1): from 3072 tokens (an expert gets ~64 routes or more), the gate|up GEMM
+# runs each expert's full 64-row tiles in one launch and its remaining rows in 32-row tiles in a second one (the down
+# GEMM keeps its 32-row tiles: no gain there). The same K order, so the same bits. 4096-token block, random routing:
+# 4.27 -> 3.74 ms (7900 XTX's 384-wide slice), 4.03 -> 3.67 ms (XT's 256); the whole MoE block with this model's
+# routing (96 dumped 4096-token blocks): 919 -> 884 ms (XTX), 790 -> 762 ms (XT)
+_TAIL_TILES = os.environ.get("FREETOKEN_EXL3_PREFILL_TAIL_TILES", "1") == "1"
+_TAIL_MIN_TOKENS = 3072
 # FREETOKEN_HYBRID_SKIP_CPU_ROUTES=0: under --moe-strategy hybrid the decode GEMVs still decode the routes the CPU
 # computes (on slot 0, weight 0) instead of writing zeros for them without a read
 SKIP_CPU_ROUTES = os.environ.get("FREETOKEN_HYBRID_SKIP_CPU_ROUTES", "1") != "0"
@@ -75,7 +83,13 @@ def fused_experts_exl3(
             slots = slot_map[slots.long()]
             expert_ids = blocks_to_slots(expert_ids, slot_map)
         a1 = exl3_rotate_in(hidden_states, gate_up_suh, slots, top_k, dtype=torch.float16)
-        c1 = exl3_moe_gemm(a1, gate_up, sorted_ids, expert_ids, ntpp, codebook, block_m=block_m)
+        if _TAIL_TILES and block_m == _PREFILL_BLOCK_M and M >= _TAIL_MIN_TOKENS:
+            c1 = None
+            for (sid, eid, n), bm in zip(moe_align_split(topk_ids, 64, block_m, num_experts), (64, block_m)):
+                eid = eid if slot_map is None else blocks_to_slots(eid, slot_map)
+                c1 = exl3_moe_gemm(a1, gate_up, sid, eid, n, codebook, block_m=bm, out=c1)
+        else:
+            c1 = exl3_moe_gemm(a1, gate_up, sorted_ids, expert_ids, ntpp, codebook, block_m=block_m)
         del a1
         a2 = exl3_mid(c1, slots, gate_up_svh, down_suh, dtype=torch.float16)
         del c1

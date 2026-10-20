@@ -327,7 +327,8 @@ left on the XT). Host RAM is the kernel's `Mlocked` count after start.
 **Every profile and checkpoint** (one server each, `rdna3/serve.sh`): RAM is the growth of the kernel's `Mlocked`
 count from before the start to after it, and the expert cache the planned size, of 24,576 experts (the same on both
 cards: each rank plans on its own free memory, then both take the smaller plan), both from the servers of the summary
-above (`xtx-xt` at 262,144 tokens of context); VRAM, from an earlier build, is the highest `mem_info_vram_used` sampled
+above (`xtx-xt` at 262,144 tokens of context; an earlier build: this one locks 1.2 GiB more RAM and caches 7 % more
+experts with NVFP4, 6,977 -> 7,464 slots); VRAM, from an earlier build, is the highest `mem_info_vram_used` sampled
 every 50 ms over an agent-like first turn (a title request decoding while a ~21k-token prompt is read), the decode
 answers, `quick_bench.py` and the depth sweep, the desktop's share included.
 

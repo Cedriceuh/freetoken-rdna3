@@ -5,8 +5,8 @@
 > 3.05 / 4.05 bits per weight, on one or two consumer GPUs, with an OpenAI- and Anthropic-compatible API. With NVFP4
 > on an RX 7900 XTX + RX 7900 XT and the model's MTP head drafting tokens (on by default): 88 tok/s decode at the
 > sampling `rdna3/serve.sh` gives (65.5 without the head), 78-96 tok/s greedy up to 260k tokens of context, 3.8 s to
-> read a cold 8.3k-token prompt (~2220 tok/s), up to 4 concurrent requests; uses ~82 GiB of system RAM for this model.
-> EXL3 3.05 bpw on the same cards: 95-117 tok/s greedy up to 260k tokens, 60 GiB of RAM.
+> read a cold 8.3k-token prompt (~2220 tok/s), up to 4 concurrent requests; uses ~83 GiB of system RAM for this model.
+> EXL3 3.05 bpw on the same cards: 95-117 tok/s greedy up to 260k tokens, ~61 GiB of RAM.
 
 Key facts: the engine keeps every expert in pinned system RAM (~63 GiB for this model in NVFP4, ~43 GiB with the EXL3
 3.05 bpw checkpoint; each rank pins its own share) and caches the most used experts in VRAM; two cards run
