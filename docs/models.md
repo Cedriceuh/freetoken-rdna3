@@ -47,10 +47,10 @@ These families accept image input by default; pass `--text-model-only` to skip t
   misses stream over PCIe.
 - **cpu** — misses are computed on the CPU instead of fetched.
 - **hybrid** — per step, fetches some misses over PCIe and computes the rest on
-  CPU, overlapped. Run `ft bench bw` once per machine to calibrate the split.
+  CPU, overlapped. Run `ft bench bw --model <checkpoint>` once per machine and
+  model to calibrate the split.
 - **auto** — dense models always resolve to `fused`; MoE models resolve to
-  `offload`, upgraded to `hybrid` when a cached `ft bench bw` profile
-  recommends it. Unified-memory GPUs differ, see below.
+  `offload`. Unified-memory GPUs differ, see below.
 
 ### Unified-memory GPUs (GB10 / DGX Spark)
 
@@ -78,12 +78,20 @@ unset on PCIe GPUs: wider grids add no bandwidth there.
 
 ## Notes
 
+- A checkpoint that fails to load: from a source checkout, run `PYTHONPATH=python python scripts/checkpoint_diagnose/diagnose.py <checkpoint dir or HF repo id>`. It reads the headers, not the weights, says whether FreeToken or the checkpoint is at fault, and for a local checkpoint gives the commands that fix a non-standard one; see [its README](../scripts/checkpoint_diagnose/README.md). GGUF files are checked with [scripts/gguf_check](../scripts/gguf_check/README.md).
 - `ft checkpoint` conversion is optional — it pre-converts a checkpoint into
   FreeToken's fast-load format, and `ft serve --model` auto-detects the result.
 - An FTW converted by an older build with `--moe-backend fused` or `triton` keeps
   its experts as dense weights and no longer loads; reconvert it with `ft checkpoint`.
 - FTW files converted by builds before the quantization refactor may fail to load;
   see [ftw-hotfix.md](ftw-hotfix.md) for the affected checkpoints and the repair tool.
+- Muse-Glimmer keeps the attention gate as its own linear next to `qkv_proj`; an FTW converted
+  when the gate was fused into `qkvg_proj` no longer loads, reconvert it with `ft checkpoint`.
+- NVFP4 global scales are kept in fp32. An NVFP4 FTW that stores them as fp16 (converted by an
+  older build) is refused at load; reconvert it with `ft checkpoint`.
+- Qwen3.5 / Qwen3.6 / Qwen3.8-27B load their zero-centred norm weights as stored and add the 1 in
+  fp32 at runtime. An FTW of these models converted by an older build stores the norms with the 1
+  already added: it loads without an error but gives wrong output; reconvert it with `ft checkpoint`.
 - An FTW converted before its family served images holds no vision encoder: `ft serve`
   refuses it unless started with `--text-model-only` (or `--mm-disable vision`); reconvert it
   with `ft checkpoint`, or add the encoder in place with [scripts/ftw_hotfix.py](ftw-hotfix.md).
@@ -107,7 +115,7 @@ unset on PCIe GPUs: wider grids add no bandwidth there.
   Bounded output differs from exact by construction and does not depend on the prefill chunk size.
   Under expert offload the prefill time is bounded by streaming each layer's experts, so decoder
   replay saves decoder-layer compute, not prefill time.
-  Run `ft bench bw --model dsv4.1-flash` to measure local PCIe and CPU bandwidth before
+  Run `ft bench bw --model <checkpoint>` to measure local PCIe and CPU bandwidth before
   choosing a MoE strategy; `--moe-strategy hybrid` splits expert misses using those
   measurements. With `--moe-cache-auto`, `--kv-reserve-tokens` sets the token capacity reserved
   before the expert cache is allocated, subject to the attention pool's structural minimum; size it

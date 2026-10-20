@@ -14,6 +14,33 @@
 namespace freetoken::cpu_moe {
 namespace {
 
+inline float fp16_to_f32(uint16_t h) {
+  const uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+  uint32_t exp = (h >> 10) & 0x1Fu;
+  uint32_t man = h & 0x3FFu;
+  uint32_t f;
+  if (exp == 0) {
+    if (man == 0) {
+      f = sign;
+    } else {
+      exp = 127 - 15 + 1;
+      while ((man & 0x400u) == 0) {
+        man <<= 1;
+        --exp;
+      }
+      man &= 0x3FFu;
+      f = sign | (exp << 23) | (man << 13);
+    }
+  } else if (exp == 0x1Fu) {
+    f = sign | 0x7F800000u | (man << 13);
+  } else {
+    f = sign | ((exp + (127 - 15)) << 23) | (man << 13);
+  }
+  float out;
+  std::memcpy(&out, &f, sizeof(out));
+  return out;
+}
+
 // =====================================================================================
 // EXL3 experts (exllamav3 trellis, mul1 codebook, 2..4 bits per weight) on the host banks of
 // layers/quantization/moe/exl3.py: the GPU kernels' math (kernel/triton/exl3.py). W = diag(suh) H Wq H diag(svh),

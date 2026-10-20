@@ -24,6 +24,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -48,9 +49,11 @@ std::unique_ptr<MoeFormat> make_bf16_format(const MoeParams& p, const FormatArgs
 std::unique_ptr<MoeFormat> make_nvfp4_format(const MoeParams& p, const FormatArgs& a);
 std::unique_ptr<MoeFormat> make_mxfp4_format(const MoeParams& p, const FormatArgs& a);
 std::unique_ptr<MoeFormat> make_ds_fp4_format(const MoeParams& p, const FormatArgs& a);
-std::unique_ptr<MoeFormat> make_q4_0_format(const MoeParams& p, const FormatArgs& a);
 std::unique_ptr<MoeFormat> make_fp8_block_format(const MoeParams& p, const FormatArgs& a);
 std::unique_ptr<MoeFormat> make_exl3_format(const MoeParams& p, const FormatArgs& a);
+std::unique_ptr<MoeFormat> make_gguf_format(const MoeParams& p, const FormatArgs& a);
+std::unique_ptr<MoeFormat> make_gguf_scaled_format(const MoeParams& p, const FormatArgs& a);
+void set_ggml_cpu(uintptr_t addr);
 
 namespace {
 
@@ -97,9 +100,9 @@ inline MoeTask from_word(uint64_t w) {
 
 // Every weight format this module serves, keyed by the name cpu_executor.py passes; weight_formats() exports the names.
 const std::pair<const char*, std::unique_ptr<MoeFormat> (*)(const MoeParams&, const FormatArgs&)> kFormats[] = {
-    {"bf16", make_bf16_format},     {"nvfp4", make_nvfp4_format}, {"mxfp4_triton", make_mxfp4_format},
-    {"ds_fp4", make_ds_fp4_format}, {"q4_0", make_q4_0_format},   {"fp8_block", make_fp8_block_format},
-    {"exl3", make_exl3_format},
+    {"bf16", make_bf16_format},     {"nvfp4", make_nvfp4_format},         {"mxfp4_triton", make_mxfp4_format},
+    {"ds_fp4", make_ds_fp4_format}, {"fp8_block", make_fp8_block_format}, {"gguf", make_gguf_format},
+    {"gguf_scaled", make_gguf_scaled_format}, {"exl3", make_exl3_format},
 };
 
 std::unique_ptr<MoeFormat> make_format(const std::string& name, const MoeParams& p, const FormatArgs& a) {
@@ -107,6 +110,9 @@ std::unique_ptr<MoeFormat> make_format(const std::string& name, const MoeParams&
     if (name == n) return make(p, a);
   throw std::invalid_argument("unknown CPU MoE weight format " + name);
 }
+
+// One format instance as cpu_executor.py passes it: name, bank tables by role, integer options.
+using FormatSpec = std::tuple<std::string, std::map<std::string, uint64_t>, std::map<std::string, int64_t>>;
 
 struct CpuMoeExecutor {
   // A host-function callback gets one pointer, so it carries the executor with the task.
@@ -117,12 +123,10 @@ struct CpuMoeExecutor {
 
   const int num_layers, num_experts;
   const bool apply_on_input;
-  MoeParams params;  // the format keeps a reference; declared before fmt
-  std::unique_ptr<MoeFormat> fmt;
-  const std::string fmt_name;
-  bool preps_inter = false;
-  bool rounds_routes = false;
-  bool runs_task = false;  // the format runs its tasks whole (MoeFormat::run_task)
+  MoeParams params;  // the formats keep a reference; declared before fmts
+  std::vector<std::unique_ptr<MoeFormat>> fmts;
+  std::vector<std::string> fmt_names;  // [fmts], as cpu_executor.py named them
+  std::vector<int> layer_fmt;  // [num_layers], index into fmts
   int n_iblk = 0, n_hblk = 0;  // kRowBlock blocks per intermediate row and per output row
 
   // Pinned IO shared by every layer and batch size (one task in flight): [max_tokens, H] x and y, [max_tokens, top_k] ids and w.
@@ -197,9 +201,8 @@ struct CpuMoeExecutor {
 
   CpuMoeExecutor(int num_threads_, int num_layers_, int num_experts_, int top_k_,
                  int hidden_size, int inter_size, int max_tokens_, int activation_id,
-                 int apply_router_weight_on_input, const std::string& weight_format,
-                 std::map<std::string, uint64_t> banks, std::map<std::string, int64_t> options,
-                 double swiglu_alpha_, double swiglu_limit_,
+                 int apply_router_weight_on_input, std::vector<FormatSpec> formats,
+                 std::vector<int> layer_formats, double swiglu_alpha_, double swiglu_limit_,
                  std::vector<int> core_ids_, uintptr_t x_ptr, uintptr_t ids_ptr, uintptr_t w_ptr,
                  uintptr_t y_ptr)
       : num_layers(num_layers_),
@@ -207,7 +210,6 @@ struct CpuMoeExecutor {
         apply_on_input(apply_router_weight_on_input != 0),
         params{top_k_, max_tokens_, hidden_size, inter_size, activation_id, static_cast<float>(swiglu_alpha_),
                static_cast<float>(swiglu_limit_)},
-        fmt_name(weight_format),
         io_x(reinterpret_cast<const bf16_t*>(x_ptr)),
         io_ids(reinterpret_cast<const int32_t*>(ids_ptr)),
         io_w(reinterpret_cast<const float*>(w_ptr)),
@@ -215,10 +217,15 @@ struct CpuMoeExecutor {
         num_threads(num_threads_ > 0 ? num_threads_ : 1),
         core_ids(std::move(core_ids_)) {
     if (params.top_k > kMaxTopK) throw std::invalid_argument("CPU MoE supports top_k <= " + std::to_string(kMaxTopK));
-    fmt = make_format(weight_format, params, FormatArgs{weight_format, std::move(banks), std::move(options)});
-    preps_inter = fmt->preps_inter();
-    rounds_routes = fmt->rounds_routes();
-    runs_task = fmt->runs_task();
+    for (auto& [name, banks, options] : formats) {
+      fmts.push_back(make_format(name, params, FormatArgs{name, std::move(banks), std::move(options)}));
+      fmt_names.push_back(name);
+    }
+    if (static_cast<int>(layer_formats.size()) != num_layers)
+      throw std::invalid_argument("CPU MoE needs the format of every layer");
+    for (const int f : layer_formats)
+      if (f < 0 || f >= static_cast<int>(fmts.size())) throw std::out_of_range("CPU MoE layer format index out of range");
+    layer_fmt = std::move(layer_formats);
     n_iblk = (params.I + kRowBlock - 1) / kRowBlock;
     n_hblk = (params.H + kRowBlock - 1) / kRowBlock;
     g_scratch.assign(static_cast<size_t>(params.max_tokens) * params.top_k * params.I, 0);
@@ -249,7 +256,16 @@ struct CpuMoeExecutor {
     return MoeTask{static_cast<uint64_t>(layer_id), static_cast<uint64_t>(num_tokens)};
   }
 
-  std::string isa_name() const { return fmt->isa_name(); }
+  std::string isa_name() const {
+    std::vector<std::string> names;
+    for (const auto& f : fmts)
+      if (const std::string n = f->isa_name(); std::find(names.begin(), names.end(), n) == names.end()) names.push_back(n);
+    std::string out;
+    for (const auto& n : names) out += (out.empty() ? "" : ",") + n;
+    return out;
+  }
+
+  const MoeFormat& format_of(const MoeTask& t) const { return *fmts[layer_fmt[t.layer]]; }
 
   // Whether any route of the task names an expert; do_pass1 and do_pass2 skip the others.
   bool has_routes(const MoeTask& t) const {
@@ -289,8 +305,8 @@ struct CpuMoeExecutor {
     const float w_in = apply_on_input ? io_w[static_cast<size_t>(tok) * top_k + k] : 1.0f;
     const int i0 = static_cast<int>(ib) * kRowBlock;
     const int i1 = std::min(I, i0 + kRowBlock);
-    fmt->gate_up(static_cast<int>(t.layer), e, tok, i0, i1, io_x + (size_t)tok * H, w_in,
-                 g_scratch.data() + ((size_t)tok * top_k + k) * I);
+    format_of(t).gate_up(static_cast<int>(t.layer), e, tok, i0, i1, io_x + (size_t)tok * H, w_in,
+                         g_scratch.data() + ((size_t)tok * top_k + k) * I);
   }
 
   // Pass 2 item p = one kRowBlock block of one token's output row, summed over its routes.
@@ -312,7 +328,9 @@ struct CpuMoeExecutor {
       ++n;
     }
     float part[kMaxTopK * kRowBlock];
-    if (n > 0) fmt->down(static_cast<int>(t.layer), h0, h1, routes, n, part);
+    const MoeFormat& f = format_of(t);
+    if (n > 0) f.down(static_cast<int>(t.layer), h0, h1, routes, n, part);
+    const bool rounds_routes = f.rounds_routes();
     bf16_t* y_row = io_y + (size_t)tok * H;
     for (int h = h0; h < h1; ++h) {
       float acc = 0.0f;
@@ -331,8 +349,9 @@ struct CpuMoeExecutor {
 
   void run_task_body(const MoeTask& t) {
     int local_sense = 0;
-    if (runs_task) {
-      fmt->run_task(task_view(t), [&] { barrier(local_sense); });
+    MoeFormat& f = *fmts[layer_fmt[t.layer]];
+    if (f.runs_task()) {
+      f.run_task(task_view(t), [&] { barrier(local_sense); });
       return;
     }
     for (;;) {
@@ -343,11 +362,11 @@ struct CpuMoeExecutor {
     barrier(local_sense);
     // Prepare the intermediate rows (per token,route) for the down GEMV, see prep_inter.
     // Needs all of pass1 done (a full row spans every iblk).
-    if (preps_inter) {
+    if (prt_total > 0) {
       for (;;) {
         int64_t r = prt_next.fetch_add(1, std::memory_order_relaxed);
         if (r >= prt_total) break;
-        fmt->prep_inter(r, g_scratch.data() + (size_t)r * params.I);
+        f.prep_inter(r, g_scratch.data() + (size_t)r * params.I);
       }
       barrier(local_sense);
     }
@@ -432,16 +451,17 @@ struct CpuMoeExecutor {
 
   void submit(MoeTask t) {
     const int num_tokens = static_cast<int>(t.num_tokens);
+    MoeFormat& fmt = *fmts[layer_fmt[t.layer]];
     if (route_stats_every > 0) route_stats(t);
     p1_total = static_cast<int64_t>(num_tokens) * params.top_k * n_iblk;
-    grp_on = !runs_task && group_routes && num_tokens > 1 &&
-             (fmt_name == "bf16" || fmt_name == "nvfp4" || fmt_name == "q4_0");
-    if (grp_on || runs_task) {
+    const std::string& fmt_name = fmt_names[layer_fmt[t.layer]];
+    grp_on = !fmt.runs_task() && group_routes && num_tokens > 1 && (fmt_name == "bf16" || fmt_name == "nvfp4");
+    if (grp_on || fmt.runs_task()) {
       const int64_t groups = build_groups(t);
       if (grp_on) p1_total = groups * n_iblk;
     }
     p2_total = static_cast<int64_t>(num_tokens) * n_hblk;
-    prt_total = preps_inter ? static_cast<int64_t>(num_tokens) * params.top_k : 0;
+    prt_total = fmt.preps_inter() ? static_cast<int64_t>(num_tokens) * params.top_k : 0;
     p1_next.store(0, std::memory_order_relaxed);
     p2_next.store(0, std::memory_order_relaxed);
     prt_next.store(0, std::memory_order_relaxed);
@@ -450,8 +470,8 @@ struct CpuMoeExecutor {
     bar_sense.store(0, std::memory_order_relaxed);
     // Prepare the per-token input once, up front.
     // Single-threaded: tiny for decode, and done before the workers are woken below.
-    for (int tok = 0; tok < num_tokens; ++tok) fmt->prep_input(tok, io_x + (size_t)tok * params.H);
-    if (runs_task) fmt->prepare_task(task_view(t));
+    for (int tok = 0; tok < num_tokens; ++tok) fmt.prep_input(tok, io_x + (size_t)tok * params.H);
+    if (fmt.runs_task()) fmt.prepare_task(task_view(t));
     {
       std::lock_guard<std::mutex> lk(task_mtx);
       cur_task = t;
@@ -627,14 +647,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   using freetoken::cpu_moe::CpuMoeExecutor;
   using freetoken::cpu_moe::GpuSync;
   py::class_<CpuMoeExecutor>(m, "CpuMoeExecutor")
-      .def(py::init<int, int, int, int, int, int, int, int, int, std::string,
-                    std::map<std::string, uint64_t>, std::map<std::string, int64_t>,
-                    double, double, std::vector<int>, uintptr_t, uintptr_t, uintptr_t, uintptr_t>(),
+      .def(py::init<int, int, int, int, int, int, int, int, int, std::vector<freetoken::cpu_moe::FormatSpec>,
+                    std::vector<int>, double, double, std::vector<int>, uintptr_t, uintptr_t, uintptr_t,
+                    uintptr_t>(),
            py::arg("num_threads"), py::arg("num_layers"), py::arg("num_experts"),
            py::arg("top_k"), py::arg("hidden_size"), py::arg("inter_size"),
            py::arg("max_tokens"), py::arg("activation_id"),
-           py::arg("apply_router_weight_on_input"), py::arg("weight_format"),
-           py::arg("banks"), py::arg("options"), py::arg("swiglu_alpha"), py::arg("swiglu_limit"),
+           py::arg("apply_router_weight_on_input"), py::arg("formats"), py::arg("layer_formats"),
+           py::arg("swiglu_alpha"), py::arg("swiglu_limit"),
            py::arg("core_ids"), py::arg("x_ptr"), py::arg("ids_ptr"), py::arg("w_ptr"),
            py::arg("y_ptr"))
       .def("submit_with_cuda_stream", &CpuMoeExecutor::submit_with_cuda_stream,
@@ -673,6 +693,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // (act_apply falls through to gelu_tanh); the probe turns a stale extension
   // into a loud rebuild instruction instead of wrong model outputs.
   m.def("max_generic_act_id", []() { return static_cast<int>(freetoken::cpu_moe::ACT_SWIGLU_CLAMP); });
+  // The ggml-cpu variant the gguf format calls: the kernel table address that freetoken.kernel.ggml_cpu.select() returns.
+  m.def("set_ggml_cpu", &freetoken::cpu_moe::set_ggml_cpu, py::arg("api"));
   m.def("weight_formats", []() {
     py::list names;
     for (const auto& f : freetoken::cpu_moe::kFormats) names.append(f.first);

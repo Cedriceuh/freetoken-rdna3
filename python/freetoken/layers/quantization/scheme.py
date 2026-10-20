@@ -125,9 +125,11 @@ def exl3_params(scheme: QuantScheme) -> tuple[int, int]:
     return int(bits), int(codebook)
 
 
-def gguf_scheme(types: Iterable[int]) -> QuantScheme:
-    """Packed ggml blocks, one ggml type per fused part (``types`` follows the parts' order)."""
-    return QuantScheme(QuantKind.GGUF, WeightDesc("ggml:" + ",".join(str(int(t)) for t in types), None, None), {"weight"})
+def gguf_scheme(types: Iterable[int], scaled: bool = False) -> QuantScheme:
+    """Packed ggml blocks, one ggml type per fused part (``types`` follows the parts' order).
+
+    ``scaled``: the NVFP4 tensors carry the fp32 ``<name>.scale`` (weight_scale_2) that llama.cpp's converter writes."""
+    return QuantScheme(QuantKind.GGUF, WeightDesc("ggml:" + ",".join(str(int(t)) for t in types), None, "f32" if scaled else None), {"weight"})
 
 
 def gguf_types(scheme: QuantScheme) -> tuple[int, ...]:

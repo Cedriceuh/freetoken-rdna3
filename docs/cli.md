@@ -11,7 +11,7 @@ ft <command> [args]
 | `ft ctl` | Query and manage a running server over HTTP |
 | `ft launch` | Configure and launch a coding agent against a server |
 | `ft checkpoint` | Convert an HF checkpoint to the FTW fast-load format |
-| `ft bench bw` | Benchmark CPU vs PCIe bandwidth to calibrate the MoE backend |
+| `ft bench bw` | Benchmark CPU vs PCIe bandwidth to calibrate hybrid MoE decode |
 
 `ft --version` prints the installed version (torch-free; nightly wheels carry a
 `+g<sha>` build stamp, tagged releases a bare version). Every command supports
@@ -81,7 +81,7 @@ See [models.md](models.md#moe-strategies) for what each strategy does.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--moe-strategy` | auto | `fused`/`offload`/`cpu`/`hybrid`; auto → offload, or hybrid with a `ft bench bw` profile; fused on unified-memory GPUs (GB10), see [models.md](models.md#unified-memory-gpus-gb10--dgx-spark). `--moe-backend` is the deprecated old spelling |
+| `--moe-strategy` | auto | `fused`/`offload`/`cpu`/`hybrid`; auto → offload; fused on unified-memory GPUs (GB10), see [models.md](models.md#unified-memory-gpus-gb10--dgx-spark). `--moe-backend` is the deprecated old spelling |
 | `--quant-backend` | auto | Kernel per quantized layer type, `layer[.kind]=name` entries: `linear=marlin,moe=b12x` or `moe.nvfp4=triton`. A layer-level entry applies to every kind whose table lists the name |
 | `--nvfp4-backend` | — | Deprecated: stands in for `--quant-backend moe.nvfp4=<marlin\|b12x\|triton>` (`flashinfer` means b12x); cannot be combined with `--quant-backend` |
 | `--moe-cache-size` / `--moe-cache-rate` / `--moe-cache-mem` / `--moe-cache-auto` | auto | GPU expert-cache size as slots / fraction of all experts / memory such as `12GiB` / sized from free VRAM (mutually exclusive; auto is enabled by default for offload-family strategies) |
@@ -89,7 +89,7 @@ See [models.md](models.md#moe-strategies) for what each strategy does.
 | `--moe-cache-split` | equal | How the pools share the slots: `equal` (in proportion to their layer counts), or `profile:<path>`: every pool keeps `top_k` slots and the rest go to the most used experts in the profile's per-layer expert counts. With `offload`, a pool smaller than the expert count lowers `--max-running-requests` to its slots / top_k |
 | `--kv-reserve-tokens` | 8192 | KV token floor reserved before `--moe-cache-auto` fills experts |
 | `--moe-cpu-threads` | physical cores | CPU worker threads for the cpu/hybrid executor |
-| `--moe-cpu-layers` | all on GPU | With `offload`: which MoE layers decode on CPU (`3,7,11`, a count, a fraction, or `auto`). `auto` is for Windows/WSL only, where CUDA pinned memory is capped; every value needs an expert format the CPU executor serves (bf16, fp8_block, nvfp4, mxfp4) |
+| `--moe-cpu-layers` | all on GPU | With `offload`: which MoE layers decode on CPU (`3,7,11`, a count, a fraction, or `auto`). `auto` is for Windows/WSL only, where CUDA pinned memory is capped; every value needs an expert format the CPU executor serves (bf16, fp8_block, nvfp4, mxfp4, GGUF on x86 CPUs) |
 | `--moe-hybrid-max-fetch` | auto | With `hybrid`: max experts fetched over PCIe per layer per step; rest computed on CPU |
 | `--moe-prefill-hit-d2d` | off | Prefill: copy cache-hit experts device-side, stream only misses (CUDA >= 13) |
 | `--disable-moe-prefill-overlap` | overlap on | Disable the two-buffer prefill copy overlap |
@@ -198,20 +198,24 @@ strategies alike (DeepSeek-V4 experts serve offload only);
 ## ft bench bw
 
 ```bash
-ft bench bw                       # once per GPU
-ft bench bw --dtype nvfp4,bf16    # only the formats you serve
-ft bench bw --gpu 1               # a specific GPU (UUID or nvidia-smi index, as for ft serve)
+ft bench bw --model /path/to/model.gguf   # every MoE layer kind of a checkpoint (GGUF or HF)
+ft bench bw                               # canonical geometry per expert format
+ft bench bw --gpu 1                       # a specific GPU (UUID or nvidia-smi index, as for ft serve)
 ```
 
-Measures host-RAM vs PCIe bandwidth with the real cpu/offload MoE kernels and writes a
-profile that `ft serve --moe-strategy auto` and `--moe-hybrid-max-fetch -1` then read.
+Measures host-RAM vs PCIe bandwidth with the real cpu/offload MoE kernels and writes one
+row per MoE layer kind, which `ft serve --moe-strategy hybrid --moe-hybrid-max-fetch -1` reads
+to split each layer's misses.
 
-- One profile per GPU, at `~/.cache/freetoken/benchbw/<gpu-uuid>.json`.
-- Keyed on expert format + GPU, so a profile from other hardware is ignored rather than
-  misapplied. An older single `benchbw.json` still counts if its GPU name matches.
-- What to measure: `--dtype`, `--model`, `--formats`, `--isa`.
-- `--threshold` (default 2.0) sets the call: recommend hybrid when CPU bandwidth beats PCIe
-  by that factor.
+- One profile per GPU, at `~/.cache/freetoken/benchbw/<gpu-uuid>.json`; a profile from other
+  hardware or another profile version is ignored.
+- A row's key is the layer's CPU format and options, expert shape, top_k and CPU worker
+  threads; a layer without an exact row keeps a fetch cap of 1. Bench with the same
+  `--cpu-threads` as the server's `--moe-cpu-threads`.
+- Each run replaces the rows it benched and keeps the others.
+- What to measure: `--model` (checkpoint paths or presets), `--dtype`, `--formats`, `--isa`.
+- `--threshold` (default 2.0) sets each row's `recommended`: hybrid when CPU bandwidth beats
+  PCIe by that factor.
 
 On NVLink-C2C hosts, see [models.md](models.md#nvlink-c2c-hosts-gh200--gb200)
 for `FREETOKEN_H2D_BLOCKS_PER_BANK` if `PCIe-gather` sits well below the linear H2D ceiling.

@@ -205,6 +205,16 @@ def resolve_threads_and_affinity(requested: int, weights: list[int] | None = Non
     return len(reps), list(reps)
 
 
+def _format_label(name: str, opts: tuple) -> str:
+    """One format instance as the startup log names it, e.g. ``gguf(gate_up=IQ2_XXS, down=IQ4_NL)``."""
+    if name in ("gguf", "gguf_scaled"):
+        from freetoken.layers.quantization.ggml_types import type_name
+
+        gate_up, down = dict(opts)["gate_up_type"], dict(opts)["down_type"]
+        return f"{name}(gate_up={type_name(gate_up)}, down={type_name(down)})"
+    return name + (f"({', '.join(f'{k}={v}' for k, v in opts)})" if opts else "")
+
+
 class CpuMoeExecutor:
     """Decode-time CPU expert compute over an ``OffloadMoeCache``'s host banks
     (the formats ``_cpu_moe.weight_formats()`` lists — see ``_resolve_banks``)."""
@@ -221,29 +231,44 @@ class CpuMoeExecutor:
         device: torch.device,
         swiglu_alpha: float = 1.702,
         swiglu_limit: float | None = None,
-        fmt: str | None = None,
-        act_block: int | None = None,
+        layer_formats: list[tuple[str, dict[str, int]]] | None = None,
         tp_cpu_group=None,
     ) -> None:
         from freetoken.kernel import _cpu_moe
         from freetoken.moe.legacy_format import canonical_role
 
-        fmt = fmt or cache.quant_format
-        if fmt not in _cpu_moe.weight_formats():
-            raise NotImplementedError(
-                f"--moe-strategy cpu/hybrid computes experts on the CPU and supports "
-                f"{sorted(_cpu_moe.weight_formats())} formats, but this checkpoint's experts are "
-                f"{fmt!r}; use --moe-strategy offload (GPU-side dequant) instead."
-            )
+        # layer_formats[l] = (format, options) of layer l; None runs every layer in cache.quant_format
+        if layer_formats is None:
+            layer_formats = [(cache.quant_format, {})] * int(cache.num_layers)
+        assert len(layer_formats) == cache.num_layers, (len(layer_formats), cache.num_layers)
+        keys = [(name, tuple(sorted(opts.items()))) for name, opts in layer_formats]
+        specs = list(dict.fromkeys(keys))
+        names = sorted({name for name, _ in specs})
+        for f in names:
+            if f not in _cpu_moe.weight_formats():
+                raise NotImplementedError(
+                    f"--moe-strategy cpu/hybrid computes experts on the CPU and supports "
+                    f"{sorted(_cpu_moe.weight_formats())} formats, but this checkpoint's experts are "
+                    f"{f!r}; use --moe-strategy offload (GPU-side dequant) instead."
+                )
+            if f in ("gguf", "gguf_scaled"):
+                from freetoken.kernel import ggml_cpu
+
+                if (variant := ggml_cpu.select()) is None:
+                    raise NotImplementedError(
+                        "--moe-strategy cpu/hybrid cannot compute GGUF experts here: this build has no ggml-cpu kernels (x86-64 only); "
+                        "use --moe-strategy offload instead."
+                    )
+                _cpu_moe.set_ggml_cpu(variant.api)
         if activation not in _ACT_IDS:
             raise NotImplementedError(f"CPU MoE backend: unsupported activation {activation!r}")
-        if apply_router_weight_on_input and fmt in ("mxfp4_triton", "ds_fp4"):
-            raise NotImplementedError(f"CPU MoE backend: {fmt} experts apply the router weight on the output only")
+        if apply_router_weight_on_input and (output_only := {"mxfp4_triton", "ds_fp4"} & set(names)):
+            raise NotImplementedError(f"CPU MoE backend: {sorted(output_only)} experts apply the router weight on the output only")
         # ABI probe: a stale prebuilt _cpu_moe.so accepts newer act ids without
         # error and silently computes the wrong activation in the generic
         # epilogue -- fail loudly with the rebuild instruction instead. (mxfp4
         # handles its act inside the kernel and predates the marker.)
-        if _ACT_IDS[activation] >= 3 and fmt != "mxfp4_triton":
+        if _ACT_IDS[activation] >= 3 and names != ["mxfp4_triton"]:
             supported = getattr(_cpu_moe, "max_generic_act_id", lambda: 2)()
             if _ACT_IDS[activation] > supported:
                 raise RuntimeError(
@@ -256,16 +281,24 @@ class CpuMoeExecutor:
         self.num_layers = int(cache.num_layers)
         self.num_experts = int(cache.num_experts)
         self.top_k = int(top_k)
-        self.quant_format = fmt
+        self.quant_format = ",".join(names)
         self.device = device
         self.max_tokens = int(max_tokens)
         self.apply_router_weight_on_input = bool(apply_router_weight_on_input)
         # The per-layer tensors and their pointer tables must outlive the executor
         # (C++ holds raw addresses into both).
         self._banks: list[torch.Tensor] = []
-        banks, options, (self.H, self.I) = self._resolve_banks(
-            {canonical_role(name): per_layer for name, per_layer in cache.bank_sources.items()}, fmt
-        )
+        by_role = {canonical_role(name): per_layer for name, per_layer in cache.bank_sources.items()}
+        # every format's tables address every layer, but a format reads only its own layers' rows
+        formats, shapes = [], set()
+        for name, opts in specs:
+            banks, options, shape = self._resolve_banks(by_role, name, keys.index((name, opts)), dict(opts))
+            formats.append((name, banks, {**dict(opts), **options}))
+            shapes.add(shape)
+        if len(shapes) != 1:
+            raise NotImplementedError(f"CPU MoE formats disagree on the expert shape (hidden, intermediate): {sorted(shapes)}")
+        (self.H, self.I), = shapes
+        layer_counts = {spec: keys.count(spec) for spec in specs}
 
         # ds_fp4: the reference FP8 activation round-trip is a scalar per-element chain
         # that the C++ side runs single-threaded on the CUDA host-callback thread --
@@ -274,12 +307,15 @@ class CpuMoeExecutor:
         # round-trip as a captured GPU kernel BEFORE the D2H (see decode_submit) and tell
         # the C++ side to skip its own. Measured on DeepSeek-V4-Flash bs=1 decode:
         # 12.85 -> 15.65 tok/s, output bit-identical (tests/moe/test_dsfp4_prequant.py).
-        self._gpu_prequant = fmt == "ds_fp4" and device.type == "cuda" and _DSFP4_GPU_PREQUANT
         # the W4A8 activation round-trip block follows the checkpoint's fp8 block (128 on V4, 32 on V4.1)
-        self._act_block = act_block
-        if fmt == "ds_fp4":
-            assert act_block is not None, "ds_fp4 experts need act_block, the checkpoint's fp8 activation quant block"
-            options.update(act_block=int(act_block), input_prequant=int(self._gpu_prequant))
+        blocks = {options.get("act_block") for name, _, options in formats if name == "ds_fp4"}
+        assert None not in blocks, "ds_fp4 experts need the act_block option, the checkpoint's fp8 activation quant block"
+        # the GPU round-trip rewrites the whole input, so only when every layer is ds_fp4 with one block
+        self._gpu_prequant = names == ["ds_fp4"] and len(blocks) == 1 and device.type == "cuda" and _DSFP4_GPU_PREQUANT
+        self._act_block = next(iter(blocks)) if self._gpu_prequant else None
+        for name, _, options in formats:
+            if name == "ds_fp4":
+                options["input_prequant"] = int(self._gpu_prequant)
         if self._gpu_prequant:
             logger.info_rank0(
                 "ds_fp4: input FP8 round-trip moved to the GPU "
@@ -340,9 +376,8 @@ class CpuMoeExecutor:
             max_tokens=self.max_tokens,
             activation_id=_ACT_IDS[activation],
             apply_router_weight_on_input=1 if apply_router_weight_on_input else 0,
-            weight_format=fmt,
-            banks=banks,
-            options=options,
+            formats=formats,
+            layer_formats=[specs.index(k) for k in keys],
             swiglu_alpha=float(swiglu_alpha),
             swiglu_limit=float(swiglu_limit) if swiglu_limit is not None else float("inf"),
             core_ids=core_ids,
@@ -404,9 +439,11 @@ class CpuMoeExecutor:
             self._watchdog.start()
 
 
+        fmt_label = "; ".join(f"{_format_label(name, opts)}: {n} layers" for (name, opts), n in layer_counts.items())
         logger.info_rank0(
             f"CPU MoE executor ready: threads={nthreads} (pinned to cores "
-            f"{core_ids[0]}..{core_ids[-1]}) isa={self.isa} fmt={fmt} "
+            f"{core_ids[0]}..{core_ids[-1]}) isa={self.isa} "
+            f"fmt={fmt_label} "
             f"H={self.H} I={self.I} experts={self.num_experts} layers={self.num_layers} "
             f"top_k={self.top_k} act={activation} max_tokens={self.max_tokens} "
             f"spin_wait={self.spin_wait} "
@@ -451,23 +488,23 @@ class CpuMoeExecutor:
         """Per-layer table addresses keyed by canonical bank role."""
         return {role: self._make_table(layers).data_ptr() for role, layers in roles.items()}
 
-    def _resolve_fp8_block_banks(self, banks: dict) -> tuple[dict, dict, tuple[int, int]]:
+    def _resolve_fp8_block_banks(self, banks: dict, rep: int = 0) -> tuple[dict, dict, tuple[int, int]]:
         """Block-FP8 schema: row-major e4m3 + one bf16 scale per 128x128 block; the scale banks pad their last dim, so C++ gets the real row stride."""
         gu, gus = banks["gate_up"], banks["gate_up_scale"]
         dn, dns = banks["down"], banks["down_scale"]
-        assert gu[0].element_size() == 1 and dn[0].element_size() == 1, (gu[0].dtype, dn[0].dtype)
-        assert gus[0].dtype == torch.bfloat16 and dns[0].dtype == torch.bfloat16, (gus[0].dtype, dns[0].dtype)
-        I = int(gu[0].shape[1] // 2)
-        H = int(gu[0].shape[2])
-        assert gu[0].shape[1] == 2 * I
-        assert tuple(dn[0].shape[1:]) == (H, I), (dn[0].shape, H, I)
-        assert gus[0].shape[1] == (2 * I + 127) // 128 and gus[0].shape[2] >= (H + 127) // 128, (gus[0].shape, H, I)
-        assert dns[0].shape[1] == (H + 127) // 128 and dns[0].shape[2] >= (I + 127) // 128, (dns[0].shape, H, I)
+        assert gu[rep].element_size() == 1 and dn[rep].element_size() == 1, (gu[rep].dtype, dn[rep].dtype)
+        assert gus[rep].dtype == torch.bfloat16 and dns[rep].dtype == torch.bfloat16, (gus[rep].dtype, dns[rep].dtype)
+        I = int(gu[rep].shape[1] // 2)
+        H = int(gu[rep].shape[2])
+        assert gu[rep].shape[1] == 2 * I
+        assert tuple(dn[rep].shape[1:]) == (H, I), (dn[rep].shape, H, I)
+        assert gus[rep].shape[1] == (2 * I + 127) // 128 and gus[rep].shape[2] >= (H + 127) // 128, (gus[rep].shape, H, I)
+        assert dns[rep].shape[1] == (H + 127) // 128 and dns[rep].shape[2] >= (I + 127) // 128, (dns[rep].shape, H, I)
         banks = self._tables(gate_up=gu, down=dn, gate_up_scale=gus, down_scale=dns)
-        options = dict(gu_scale_stride=int(gus[0].stride(1)), dn_scale_stride=int(dns[0].stride(1)))
+        options = dict(gu_scale_stride=int(gus[rep].stride(1)), dn_scale_stride=int(dns[rep].stride(1)))
         return banks, options, (H, I)
 
-    def _resolve_banks(self, banks: dict, fmt: str) -> tuple[dict, dict, tuple[int, int]]:
+    def _resolve_banks(self, banks: dict, fmt: str, rep: int = 0, opts: dict | None = None) -> tuple[dict, dict, tuple[int, int]]:
         """Return (banks, options, (H, I)) for the C++ ctor: banks maps each canonical role
         the format reads to its per-layer table's address, options holds its integer settings.
 
@@ -477,123 +514,124 @@ class CpuMoeExecutor:
         (see ``_make_table``), not a single bank's -- the C++ side resolves
         ``tbl[layer_id]`` per task.
         """
+        if fmt in ("gguf", "gguf_scaled"):
+            return self._resolve_gguf_banks(banks, rep, int(opts["gate_up_type"]), int(opts["down_type"]), scaled=fmt == "gguf_scaled")
         if fmt == "bf16":
             gate_up = banks["gate_up"]
             down = banks["down"]
-            if gate_up[0].dtype != torch.bfloat16 or down[0].dtype != torch.bfloat16:
+            if gate_up[rep].dtype != torch.bfloat16 or down[rep].dtype != torch.bfloat16:
                 raise NotImplementedError(
-                    f"bf16 CPU MoE requires bf16 banks, got {gate_up[0].dtype}/{down[0].dtype}"
+                    f"bf16 CPU MoE requires bf16 banks, got {gate_up[rep].dtype}/{down[rep].dtype}"
                 )
-            H = int(gate_up[0].shape[2])
-            I = int(gate_up[0].shape[1] // 2)
-            assert gate_up[0].shape[1] == 2 * I
-            assert tuple(down[0].shape[1:]) == (H, I), (down[0].shape, H, I)
+            H = int(gate_up[rep].shape[2])
+            I = int(gate_up[rep].shape[1] // 2)
+            assert gate_up[rep].shape[1] == 2 * I
+            assert tuple(down[rep].shape[1:]) == (H, I), (down[rep].shape, H, I)
             banks = self._tables(gate_up=gate_up, down=down)
             return banks, {}, (H, I)
 
-        if fmt == "q4_0":
-            return self._resolve_q4_0_banks(banks)
-
         if fmt == "mxfp4_triton":
-            return self._resolve_mxfp4_banks(banks)
+            return self._resolve_mxfp4_banks(banks, rep)
 
         if fmt == "ds_fp4":
-            return self._resolve_dsfp4_banks(banks)
+            return self._resolve_dsfp4_banks(banks, rep)
 
         if fmt == "fp8_block":
-            return self._resolve_fp8_block_banks(banks)
+            return self._resolve_fp8_block_banks(banks, rep)
 
         if fmt == "exl3":
-            return self._resolve_exl3_banks(banks)
+            return self._resolve_exl3_banks(banks, rep)
 
-        # nvfp4: packed e2m1 (2/byte) + fp8-e4m3 per-16 block scales + fp16 row globals.
+        # nvfp4: packed e2m1 (2/byte) + fp8-e4m3 per-16 block scales + fp32 row globals.
         gup, gus, gug = banks["gate_up"], banks["gate_up_scale"], banks["gate_up_global"]
         dnp, dns, dng = banks["down"], banks["down_scale"], banks["down_global"]
-        assert gup[0].dtype == torch.uint8 and dnp[0].dtype == torch.uint8, (gup[0].dtype, dnp[0].dtype)
-        assert gus[0].element_size() == 1 and dns[0].element_size() == 1, "block scales must be 1 byte"
-        assert gug[0].dtype == torch.float16 and dng[0].dtype == torch.float16, (gug[0].dtype, dng[0].dtype)
-        I = int(gup[0].shape[1] // 2)
-        H = int(gup[0].shape[2] * 2)
-        assert gup[0].shape[1] == 2 * I
+        assert gup[rep].dtype == torch.uint8 and dnp[rep].dtype == torch.uint8, (gup[rep].dtype, dnp[rep].dtype)
+        assert gus[rep].element_size() == 1 and dns[rep].element_size() == 1, "block scales must be 1 byte"
+        assert gug[rep].dtype == torch.float32 and dng[rep].dtype == torch.float32, (gug[rep].dtype, dng[rep].dtype)
+        I = int(gup[rep].shape[1] // 2)
+        H = int(gup[rep].shape[2] * 2)
+        assert gup[rep].shape[1] == 2 * I
         assert H % 16 == 0 and I % 16 == 0, (H, I)
-        assert tuple(dnp[0].shape[1:]) == (H, I // 2), (dnp[0].shape, H, I)
-        assert tuple(gus[0].shape[1:]) == (2 * I, H // 16), (gus[0].shape, I, H)
-        assert tuple(dns[0].shape[1:]) == (H, I // 16), (dns[0].shape, H, I)
-        assert tuple(gug[0].shape[1:]) == (2 * I,) and tuple(dng[0].shape[1:]) == (H,)
+        assert tuple(dnp[rep].shape[1:]) == (H, I // 2), (dnp[rep].shape, H, I)
+        assert tuple(gus[rep].shape[1:]) == (2 * I, H // 16), (gus[rep].shape, I, H)
+        assert tuple(dns[rep].shape[1:]) == (H, I // 16), (dns[rep].shape, H, I)
+        assert tuple(gug[rep].shape[1:]) == (2 * I,) and tuple(dng[rep].shape[1:]) == (H,)
         banks = self._tables(gate_up=gup, down=dnp, gate_up_scale=gus, gate_up_global=gug, down_scale=dns, down_global=dng)
         return banks, {}, (H, I)
 
-    def _resolve_exl3_banks(self, banks: dict) -> tuple[dict, dict, tuple[int, int]]:
+    def _resolve_exl3_banks(self, banks: dict, rep: int = 0) -> tuple[dict, dict, tuple[int, int]]:
         """EXL3 trellis banks (layers/quantization/moe/exl3.py), read in place: gate_up [S, H/16, 2I/16, 16K] and
         down [S, I/16, H/16, 16K] int16, with the fp16 input (suh) and output (svh) channel scales."""
         gu, dn = banks["gate_up"], banks["down"]
         gs, gv, ds, dv = banks["gate_up_suh"], banks["gate_up_svh"], banks["down_suh"], banks["down_svh"]
-        assert gu[0].dtype == torch.int16 and dn[0].dtype == torch.int16, (gu[0].dtype, dn[0].dtype)
-        H, I = int(gu[0].shape[1] * 16), int(gu[0].shape[2] * 8)
-        bits = int(gu[0].shape[3] // 16)
-        assert tuple(dn[0].shape[1:]) == (I // 16, H // 16, 16 * bits), (dn[0].shape, H, I)
-        assert tuple(gs[0].shape[1:]) == (2, H) and tuple(gv[0].shape[1:]) == (2 * I,), (gs[0].shape, gv[0].shape)
-        assert tuple(ds[0].shape[1:]) == (I,) and tuple(dv[0].shape[1:]) == (H,), (ds[0].shape, dv[0].shape)
-        assert all(t[0].dtype == torch.float16 for t in (gs, gv, ds, dv))
+        assert gu[rep].dtype == torch.int16 and dn[rep].dtype == torch.int16, (gu[rep].dtype, dn[rep].dtype)
+        H, I = int(gu[rep].shape[1] * 16), int(gu[rep].shape[2] * 8)
+        bits = int(gu[rep].shape[3] // 16)
+        assert tuple(dn[rep].shape[1:]) == (I // 16, H // 16, 16 * bits), (dn[rep].shape, H, I)
+        assert tuple(gs[rep].shape[1:]) == (2, H) and tuple(gv[rep].shape[1:]) == (2 * I,), (gs[rep].shape, gv[rep].shape)
+        assert tuple(ds[rep].shape[1:]) == (I,) and tuple(dv[rep].shape[1:]) == (H,), (ds[rep].shape, dv[rep].shape)
+        assert all(t[rep].dtype == torch.float16 for t in (gs, gv, ds, dv))
         banks = self._tables(gate_up=gu, down=dn, gate_up_suh=gs, gate_up_svh=gv, down_suh=ds, down_svh=dv)
         return banks, {"bits": bits}, (H, I)
 
-    def _resolve_q4_0_banks(self, banks: dict) -> tuple[dict, dict, tuple[int, int]]:
-        """Native GGUF Q4_0 schema (gemma4 GGUF): per-32 blocks (fp16 scale + 16 nibble
-        bytes), row-major over K -- the *same* packed banks the GPU offload path streams.
-        gate_up is [S, 2I, H//32*18], down is [S, H, I//32*18]; the C++ W4A16 GEMV reads a
-        row in place (18 bytes / 32 K) and dequantizes weights inside the K-loop."""
-        gate_up, down = banks["gate_up"], banks["down"]
-        assert gate_up[0].dtype == torch.uint8 and down[0].dtype == torch.uint8, (
-            gate_up[0].dtype, down[0].dtype,
-        )
-        I = int(gate_up[0].shape[1] // 2)
-        H = int(down[0].shape[1])
-        assert gate_up[0].shape[1] == 2 * I
-        assert H % 32 == 0 and I % 32 == 0, (H, I)
-        assert int(gate_up[0].shape[2]) == (H // 32) * 18, (gate_up[0].shape, H)
-        assert int(down[0].shape[2]) == (I // 32) * 18, (down[0].shape, I)
-        banks = self._tables(gate_up=gate_up, down=down)
-        return banks, {}, (H, I)
+    def _resolve_gguf_banks(self, banks: dict, rep: int, gate_up_type: int, down_type: int, scaled: bool = False) -> tuple[dict, dict, tuple[int, int]]:
+        """GGUF rows read in place: gate_up [E, 2I, row_bytes(H)] (gate rows, then up rows) and down [E, H, row_bytes(I)], one ggml type each; float rows keep their dtype.
 
-    def _resolve_mxfp4_banks(self, banks: dict) -> tuple[dict, dict, tuple[int, int]]:
+        ``scaled`` adds global [E, 4] fp32, each expert's (gate, up, down, 1) NVFP4 weight_scale_2."""
+        from freetoken.layers.quantization.ggml_types import float_dtype, row_bytes, type_name
+
+        gate_up, down = banks["gate_up"], banks["down"]
+        H, I = int(down[rep].shape[1]), int(gate_up[rep].shape[1] // 2)
+        for role, t, ggml_type, k in (("gate_up", gate_up[rep], gate_up_type, H), ("down", down[rep], down_type, I)):
+            dtype = float_dtype(ggml_type) if float_dtype(ggml_type) is not None else torch.uint8
+            if t.dtype != dtype or t.shape[-1] * t.element_size() != row_bytes(ggml_type, k):
+                raise ValueError(f"MoE layer {rep} {role} bank {tuple(t.shape)} {t.dtype} is not {type_name(ggml_type)} rows of {k} values")
+        types = {"gate_up_type": gate_up_type, "down_type": down_type}
+        if not scaled:
+            return self._tables(gate_up=gate_up, down=down), types, (H, I)
+        scales = banks["global"]
+        if scales[rep].dtype != torch.float32 or tuple(scales[rep].shape) != (gate_up[rep].shape[0], 4) or not scales[rep].is_contiguous():
+            raise ValueError(f"MoE layer {rep} global bank {tuple(scales[rep].shape)} {scales[rep].dtype} is not contiguous [experts, 4] fp32")
+        return self._tables(gate_up=gate_up, down=down, **{"global": scales}), types, (H, I)
+
+    def _resolve_mxfp4_banks(self, banks: dict, rep: int = 0) -> tuple[dict, dict, tuple[int, int]]:
         """gpt-oss mxfp4 ``mxfp4_triton`` schema: transposed split-K blocks/scales
         (N innermost) + per-output-row biases. The C++ kernel streams K and
         accumulates a contiguous N-block, so the GPU-tiled layout is read in place
         (no repack, no extra host memory). Block scales are e8m0 (1 byte / 32 K)."""
         gub, gus, gob = banks["gate_up"], banks["gate_up_scale"], banks["gate_up_bias"]
         dnb, dns, dob = banks["down"], banks["down_scale"], banks["down_bias"]
-        assert gub[0].dtype == torch.uint8 and dnb[0].dtype == torch.uint8, (gub[0].dtype, dnb[0].dtype)
-        assert gus[0].dtype == torch.uint8 and dns[0].dtype == torch.uint8, (gus[0].dtype, dns[0].dtype)
-        assert gob[0].dtype == torch.bfloat16 and dob[0].dtype == torch.bfloat16, (gob[0].dtype, dob[0].dtype)
+        assert gub[rep].dtype == torch.uint8 and dnb[rep].dtype == torch.uint8, (gub[rep].dtype, dnb[rep].dtype)
+        assert gus[rep].dtype == torch.uint8 and dns[rep].dtype == torch.uint8, (gus[rep].dtype, dns[rep].dtype)
+        assert gob[rep].dtype == torch.bfloat16 and dob[rep].dtype == torch.bfloat16, (gob[rep].dtype, dob[rep].dtype)
         # gate_up_blocks [E, H//2, 2I]; down_blocks [E, I//2, H]
-        H = int(gub[0].shape[1] * 2)
-        I = int(gub[0].shape[2] // 2)
-        assert gub[0].shape[2] == 2 * I
+        H = int(gub[rep].shape[1] * 2)
+        I = int(gub[rep].shape[2] // 2)
+        assert gub[rep].shape[2] == 2 * I
         assert H % 32 == 0 and I % 32 == 0, (H, I)
-        assert tuple(dnb[0].shape[1:]) == (I // 2, H), (dnb[0].shape, H, I)
-        assert tuple(gus[0].shape[1:]) == (H // 32, 2 * I), (gus[0].shape, H, I)
-        assert tuple(dns[0].shape[1:]) == (I // 32, H), (dns[0].shape, H, I)
-        assert tuple(gob[0].shape[1:]) == (2 * I,) and tuple(dob[0].shape[1:]) == (H,)
+        assert tuple(dnb[rep].shape[1:]) == (I // 2, H), (dnb[rep].shape, H, I)
+        assert tuple(gus[rep].shape[1:]) == (H // 32, 2 * I), (gus[rep].shape, H, I)
+        assert tuple(dns[rep].shape[1:]) == (I // 32, H), (dns[rep].shape, H, I)
+        assert tuple(gob[rep].shape[1:]) == (2 * I,) and tuple(dob[rep].shape[1:]) == (H,)
         banks = self._tables(gate_up=gub, down=dnb, gate_up_scale=gus, down_scale=dns, gate_up_bias=gob, down_bias=dob)
         return banks, {}, (H, I)
 
-    def _resolve_dsfp4_banks(self, banks: dict) -> tuple[dict, dict, tuple[int, int]]:
+    def _resolve_dsfp4_banks(self, banks: dict, rep: int = 0) -> tuple[dict, dict, tuple[int, int]]:
         """DeepSeek-V4 ``ds_fp4`` schema: row-major e2m1 (2/byte) + e8m0 per-32 block
         scales, no global, no bias. Layout matches nvfp4 (K contiguous per output row),
         so the C++ GEMV reads it in place. The kernel additionally FP8-round-trips the
         activations (the checkpoint's fp8 block) to match the DeepSeek W4A8 reference."""
         gup, gus = banks["gate_up"], banks["gate_up_scale"]
         dnp, dns = banks["down"], banks["down_scale"]
-        assert gup[0].dtype == torch.uint8 and dnp[0].dtype == torch.uint8, (gup[0].dtype, dnp[0].dtype)
-        assert gus[0].element_size() == 1 and dns[0].element_size() == 1, "block scales must be 1 byte"
-        I = int(gup[0].shape[1] // 2)
-        H = int(gup[0].shape[2] * 2)
-        assert gup[0].shape[1] == 2 * I
+        assert gup[rep].dtype == torch.uint8 and dnp[rep].dtype == torch.uint8, (gup[rep].dtype, dnp[rep].dtype)
+        assert gus[rep].element_size() == 1 and dns[rep].element_size() == 1, "block scales must be 1 byte"
+        I = int(gup[rep].shape[1] // 2)
+        H = int(gup[rep].shape[2] * 2)
+        assert gup[rep].shape[1] == 2 * I
         assert H % 32 == 0 and I % 32 == 0, (H, I)  # e8m0 scales per 32 along K
-        assert tuple(dnp[0].shape[1:]) == (H, I // 2), (dnp[0].shape, H, I)
-        assert tuple(gus[0].shape[1:]) == (2 * I, H // 32), (gus[0].shape, I, H)
-        assert tuple(dns[0].shape[1:]) == (H, I // 32), (dns[0].shape, H, I)
+        assert tuple(dnp[rep].shape[1:]) == (H, I // 2), (dnp[rep].shape, H, I)
+        assert tuple(gus[rep].shape[1:]) == (2 * I, H // 32), (gus[rep].shape, I, H)
+        assert tuple(dns[rep].shape[1:]) == (H, I // 32), (dns[rep].shape, H, I)
         banks = self._tables(gate_up=gup, down=dnp, gate_up_scale=gus, down_scale=dns)
         return banks, {}, (H, I)
 
