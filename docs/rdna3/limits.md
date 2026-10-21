@@ -130,13 +130,13 @@ On in the profiles except `gre` (`FREETOKEN_MTP=1 FREETOKEN_SPEC_VERIFY_M=4`); `
 ([options.md](options.md#speculative-decoding-with-the-mtp-head-qwen38-flash-next)). Measured on `xtx-xt`,
 `xtx` and `xt` with Qwen3.8-Flash-Next ([benchmarks.md](benchmarks.md#speculative-decoding-mtp-head)):
 
-- **One request at a time gains, and up to four at once in `xtx-xt` and its K/V-in-RAM variants.** On `xtx-xt`, a
-  request alone decodes 35 % faster at the sampling `rdna3/serve.sh` gives and 35-60 % faster greedy along a sweep to
-  260k of context. With more decoding at once than `FREETOKEN_SPEC_BS_MAX` (4 in `xtx-xt` and its K/V-in-RAM variants, 1
-  in the other profiles), steps run one row per request: from the send to the last token, 3-4 requests take 3-4 % longer
-  (an earlier build); two agents at ~100k of context decode 8-15 % faster each with `2` than with `1`. With `4`, 3-4
-  requests verify 2 rows each (`FREETOKEN_SPEC_BS_DEEP=2`), on `xtx-xt-4x262k`: +6-9 % at three, +3-6 % at four greedy
-  (-0.3 to +2.5 % at T 0.6).
+- **One request gains the most.** On `xtx-xt`, a request alone decodes 35 % faster at the sampling `rdna3/serve.sh`
+  gives and 35-60 % faster greedy along a sweep to 260k of context.
+- **Up to four at once in `xtx-xt` and its K/V-in-RAM variants.** There up to four requests decoding together verify
+  drafts (`FREETOKEN_SPEC_BS_MAX=4`), 2 rows each past two (`FREETOKEN_SPEC_BS_DEEP=2`): on `xtx-xt-4x262k` +6-9 % each
+  at three, +3-6 % at four greedy (-0.3 to +2.5 % at T 0.6). Where more requests decode than `FREETOKEN_SPEC_BS_MAX`
+  allows (1 in the other profiles), steps run one row per request: on `xtx-xt` with `1`, 3-4 requests took 3-4 % longer
+  than without the head (an earlier build).
 - **One card gains less**: +6-13 % at `rdna3/serve.sh`'s sampling and +9-16 % greedy on `xtx` or `xt`. Its step costs
   keep the verify steps mostly at 2 rows: the extra rows' missing experts cross PCIe there.
 - **Greedy answers are unchanged**: identical to plain decode on every profile (chat prompts, 60 code and math items,

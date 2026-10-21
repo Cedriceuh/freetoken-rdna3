@@ -55,9 +55,10 @@ Every step explained, with client set-ups and running it as a service:
   and thinking are supported. On two cards up to four
   requests run at once, so sub-agents work in parallel. Set-ups:
   [connect a client](docs/rdna3/getting-started.md#7-connect-a-client).
-- **Work on long inputs**: 262,144 tokens per conversation on two cards, 131,072 on one. `xtx-xt-4x262k` keeps four
-  full-length conversations at once, `xtx-xt-1m` one of up to 1M tokens, as many as your RAM holds: each 262k
-  conversation takes 6.9 GiB of it ([long-context](docs/rdna3/long-context.md), `rdna3/serve.sh --check`).
+- **Work on long inputs**: 262,144 tokens per conversation on two cards, 131,072 on one. With the attention K/V moved
+  to RAM, `xtx-xt-4x262k` holds four such conversations at once (three with NVFP4 on 128 GB) and `xtx-xt-1m` one of up to 1M
+  tokens; each 262k
+  conversation then takes 6.9 GiB of RAM ([long context](docs/rdna3/long-context.md), `rdna3/serve.sh --check`).
 - **Switch between conversations**: one pushed off the GPUs is kept in system RAM and resumes in ~2 s instead of being
   read again.
 - **Send images** with `rdna3/serve.sh ... --vision` ([images](docs/rdna3/limits.md#images-vision)).
@@ -71,8 +72,8 @@ A profile holds every setting for one GPU setup; `rdna3/serve.sh <profile>` pick
 | Your GPUs | Profile | Context | Requests at once | Status |
 |---|---|---:|---:|---|
 | RX 7900 XTX + RX 7900 XT | `xtx-xt` | 262k, shared by the requests | 4 | measured |
-| the same, several long agent conversations | `xtx-xt-4x262k` | 262k each | up to 4, as your RAM allows | measured |
-| the same, one very long document | `xtx-xt-1m` | 1M | 4, sharing 1M | measured with EXL3 3.05 bpw |
+| the same, several agents with long conversations (K/V in RAM) | `xtx-xt-4x262k` | 262k each | up to 4, as your RAM allows | measured |
+| the same, one conversation past 262k (K/V in RAM) | `xtx-xt-1m` | 1M | 4, sharing 1M | measured with EXL3 3.05 bpw |
 | two RX 7900 XTX | `xtx-xtx` | 262k | 4 | untested; EXL3 needs `FREETOKEN_TP_SPLIT=0.6` |
 | two RX 7900 XT | `xt-xt` | 262k | 4 | untested; EXL3 needs `FREETOKEN_TP_SPLIT=0.6` |
 | one RX 7900 XTX | `xtx` | 131k | 1 | measured |
@@ -95,10 +96,8 @@ the other terms: [glossary](docs/rdna3/README.md#terms-used-in-these-pages).
 | Hugging Face | [RadixArk/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4) | [turboderp/Qwen3.8-Flash-Next-exl3](https://huggingface.co/turboderp/Qwen3.8-Flash-Next-exl3) | [turboderp/Qwen3.8-Flash-Next-exl3](https://huggingface.co/turboderp/Qwen3.8-Flash-Next-exl3) |
 | Download | 135 GB | 85 GB | 108 GB |
 | RAM locked: two cards; one card | ~83 GiB; ~74 GiB | ~61 GiB; ~52 GiB | ~76 GiB; ~67 GiB |
-| Decode, `xtx-xt` | 78-96 tok/s | 95-117 tok/s | 86-94 tok/s |
-| Decode, `xtx` | 36-44 tok/s | 52-58 tok/s | 37-47 tok/s |
 
-EXL3 3.05 bpw is the smallest and decodes the fastest on every measured profile: its experts are smaller, so more of
+EXL3 3.05 bpw is the smallest and decodes the fastest on every measured profile ([speed](#speed)): its experts are smaller, so more of
 them stay in VRAM (the checkpoints also differ in how many of the MTP head's drafts are kept). On the
 maintainers' agentic benchmark (29 planted bugs to fix in long agent sessions, on an earlier build) NVFP4 fixed 12 and
 18 in two runs, EXL3 3.05 bpw 13 and 4.05 bpw 12 in one run each: too few runs to rank them.
@@ -121,8 +120,8 @@ profile's maximum context with blocks the server has never seen, like large tool
 | `xtx`, 9k to 124k tokens | 1520-1670 tok/s; 1.5-1.6 s | 1700-1820 tok/s; 1.0-1.2 s | 1640-1820 tok/s; 1.3-1.5 s |
 | `xt`, 9k to 124k tokens | 1350-1480 tok/s; 1.6-1.8 s | 1500-1600 tok/s; 1.2-1.3 s | 1450-1620 tok/s; 1.5-1.6 s |
 
-An "agent turn" is ~1k new tokens (a tool result) added to a conversation the server already holds (an earlier build:
-since the short-prefill changes, 200-250-token turns take 11-13 % less time to their first token on another workload).
+An "agent turn" is ~1k new tokens (a tool result) added to a conversation the server already holds (that column comes
+from an earlier build, before the latest short-prefill changes).
 Requests running at once share the GPUs: on `xtx-xt-4x262k`, four agents at 257-260k tokens decode at 29.6-31.6 tok/s
 each, one alone at 95.1 (EXL3 3.05 bpw, one pass on an earlier build than the tables above). All the numbers:
 [benchmarks](docs/rdna3/benchmarks.md).

@@ -13,15 +13,15 @@ names another (all three checkpoints: [README](../../README.md#which-checkpoint)
 | `xtx-xtx` *(untested)* | 2x RX 7900 XTX 24 GB | 262,144 | expected >= `xtx-xt` | – | – | – | 4 requests |
 | `xt-xt` *(untested)* | 2x RX 7900 XT 20 GB | 262,144 | expected a little below `xtx-xt` | – | – | – | 4 requests |
 | `gre` *(untested)* | RX 7900 GRE 16 GB | 65,536 | expected ~20 tok/s at best (head off) | – | – | – | 1 request |
-| `xtx-xt-4x262k` | RX 7900 XTX 24 GB + RX 7900 XT 20 GB | 262,144 per request, 4 at once | EXL3 3.05 (one pass, earlier build): 95.1 tok/s alone at 259k, 29.6-31.6 each with 4 | – | – | EXL3 3.05: 142-360-token turns 0.46-0.59 s alone at 224k | 4 requests |
-| `xtx-xt-1m` | RX 7900 XTX 24 GB + RX 7900 XT 20 GB | 1,000,000 | EXL3 3.05, greedy, earlier builds: 84.2-93.0 tok/s at 118k, 498k and 988k | – | – | – | 4 requests, sharing 1M |
+| `xtx-xt-4x262k` | RX 7900 XTX 24 GB + RX 7900 XT 20 GB | 262,144 each, 4 at once | EXL3 3.05: 95.1 tok/s alone at 259k, 29.6-31.6 each with 4 | – | – | EXL3 3.05: 142-360-token turns alone 0.46-0.59 s at 224k | 4 requests |
+| `xtx-xt-1m` | RX 7900 XTX 24 GB + RX 7900 XT 20 GB | 1,000,000, shared | EXL3 3.05, greedy: 84.2 / 93.0 / 84.7 tok/s at 118k / 498k / 988k | – | – | – | 4 requests |
 
 "Decode" is one request's 512-token answers at the sampling `rdna3/serve.sh` gives (temperature 0.6; median of 12);
 "deep decode" is greedy decode at every context step from 9k to 260k on two cards and 124k on one; "agent turn" is the
 time to the first token when ~1k new tokens are added to a cached conversation, over the same steps (an earlier
-build: since the short-prefill changes, 200-250-token turns take 11-13 % less time to their first token on another
-workload; not re-measured this way). The profiles turn
-the MTP head on; `rdna3/serve.sh <profile> --no-mtp` turns it off (numbers in brackets). All numbers:
+build). The two profiles with the K/V in RAM were measured with EXL3 3.05 bpw on earlier builds
+([long-context.md](long-context.md)). The profiles turn the MTP head on; `rdna3/serve.sh <profile> --no-mtp` turns it
+off (numbers in brackets). All numbers:
 [benchmarks.md](benchmarks.md). `--hybrid` (off by default) has the CPU compute part of the expert misses: NVFP4 decode +46 % on
 `xtx`, +51 % on `xt`, +2 % on `xtx-xt`, measured on an earlier build than this table ([cpu-experts.md](cpu-experts.md)).
 
@@ -84,21 +84,25 @@ instead of 51. On two cards `serve.sh` lowers `--memory-ratio` to 0.77 (0.76 fro
 
 ## `xtx-xt-4x262k` and `xtx-xt-1m`: the K/V in host RAM
 
-The `xtx-xt` settings with the attention K/V in pinned host memory (`FREETOKEN_QSA_KV_HOST=1`), so the K/V pool is no
-longer bounded by VRAM: `xtx-xt-4x262k` keeps each request to the model's native 262,144 positions and holds four of
-them at once (`KV_TOKENS=1050000`), `xtx-xt-1m` serves one conversation of up to 1M tokens (the plain rope past 262,144,
-`FREETOKEN_ROPE_MAX_POSITION`). The RAM tier is off (`FREETOKEN_HOST_KV=0`): the pool already lives in RAM. As in
-`xtx-xt`, three and four requests at once verify drafts too, 2 rows each: in `xtx-xt-4x262k` +6-9 % each at three,
-+3-6 % at four greedy (-0.3 to +2.5 % at T 0.6) ([benchmarks.md](benchmarks.md#several-requests-and-agents-at-once-xtx-xt)).
-Measured with EXL3 3.05 bpw (~77 GiB of host RAM locked by `xtx-xt-4x262k`, ~75 GiB by `xtx-xt-1m`), and NVFP4 on
-`xtx-xt-4x262k` with a pool of three contexts (`-- --kv-reserve-tokens 787500`: agent turns, a 259,728-token
-prompt, four agents at once; 94 GiB locked after the start, ~97 GiB in use; an earlier build, this one locks 1.2 GiB more). On the 126 GiB reference machine that
-fits with little else running (13-15 GiB of other programs beside the desktop ran it out of memory), and four NVFP4
-contexts (~100 GiB, with benchmark tools beside them) did not fit: with NVFP4 on 128 GB,
-`rdna3/serve.sh xtx-xt-4x262k --model DIR -- --kv-reserve-tokens 787500`, or two conversations (525000) to keep room.
-How to count for your RAM: [limits.md](limits.md#how-much-ram-do-i-need). A
-request alone decodes a few percent slower than on `xtx-xt` (the kernels read the K/V across PCIe), its prompt reads
-faster (more expert slots). Measurements: [long-context.md](long-context.md).
+The `xtx-xt` settings with the attention K/V in pinned host RAM instead of VRAM, so the pool of tokens the requests
+share is no longer bounded by VRAM. What differs:
+
+| Setting | `xtx-xt-4x262k` | `xtx-xt-1m` | Why |
+|---|---|---|---|
+| `CTX` | 262,144 | 1,000,000 | the longest request |
+| `KV_TOKENS` | 1,050,000 | unset (= `CTX`) | the pool every request shares: four full contexts (and the decode's spare page per request), or one of 1M |
+| `FREETOKEN_QSA_KV_HOST` | `1` | `1` | the K/V in RAM, 14,144 bytes per token on each card (6.9 GiB per 262k conversation on two cards) |
+| `FREETOKEN_ROPE_MAX_POSITION` | unset | `1048576` | positions past the 262,144 the model was trained on (the same rope below them) |
+| `FREETOKEN_HOST_KV` | `0` | `0` | no RAM tier: the pool already lives in RAM |
+| `FREETOKEN_NVFP4_PREFILL_BLOCK` | `8192` | unset (4096) | as in `xtx-xt`; `xtx-xt-1m` keeps the default |
+| `MEMORY` | `104g` | `104g` | the container's RAM limit (`110g` in `xtx-xt`) |
+
+Measured with EXL3 3.05 bpw (~77 GiB of RAM locked by `xtx-xt-4x262k`, ~75 GiB by `xtx-xt-1m`), and NVFP4 on
+`xtx-xt-4x262k` with three contexts: four do not fit with NVFP4 on 128 GB, so start it with
+`rdna3/serve.sh xtx-xt-4x262k --model DIR -- --kv-reserve-tokens 787500` (three conversations, 94 GiB locked after the
+start), or `525000` (two) to keep room. A request alone decodes a few percent slower than on `xtx-xt` (the kernels read
+the K/V across PCIe) and reads prompts a little faster (more expert slots). Which one to pick, what they cost and their
+measurements: [long-context.md](long-context.md); how to count your RAM: [limits.md](limits.md#how-much-ram-do-i-need).
 
 ## `xtx` and `xt`: one card
 

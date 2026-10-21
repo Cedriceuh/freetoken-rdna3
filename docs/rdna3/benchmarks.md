@@ -82,7 +82,7 @@ an answer, so it is not the prefill evicting the cache), and attention itself ad
 
 Each sweep ran after the decode answers and `quick_bench.py` on the same server. The ~1k-token agent turn takes
 0.8-0.9 s at every depth: such a turn reads only its routed experts through the expert cache and reuses the previous
-prompt's tokens ([how-it-works.md](how-it-works.md#prefill)).
+prompt's tokens ([how-it-works.md](how-it-works.md#short-chunks-agent-turns)).
 
 ## Depth sweep, one card
 
@@ -128,20 +128,21 @@ Median of two passes, MTP head on:
 
 Each cell: TG (tok/s) / PP of the new block (tok/s) / agent turn. On two cards the agent turns take 0.70-0.94 s at
 3.05 bpw against 0.80-0.93 s with NVFP4: such a turn copies the routed experts the cache lacks
-([how-it-works.md](how-it-works.md#prefill)), and a 3.05 bpw expert weighs 1.86 MB against 2.76 MB (not measured
+([how-it-works.md](how-it-works.md#short-chunks-agent-turns)), and a 3.05 bpw expert weighs 1.86 MB against 2.76 MB (not measured
 apart).
 
 ## Agent turns on real code (`xtx-xt`)
 
 Conversations built from this repository's own source and docs (77-113k tokens), then 8 turns each: a ~2k-token tool
-result and a ~250-token answer, temperature 0.6 (what the reference machine's agent client sends):
+result and a ~250-token answer, temperature 0.6 (what the reference machine's agent client sends). An earlier build,
+when `xtx-xt` verified drafts for at most two requests (`FREETOKEN_SPEC_BS_MAX=2`; now 4):
 
 | Per request | With the head | Without |
 |---|---:|---:|
 | One conversation: decode | 71.1 tok/s | 55.8 tok/s |
 | One conversation: time to the first token of a turn | 1.75 s | 1.73 s |
 | Two conversations at once (sub-agents), `FREETOKEN_SPEC_BS_MAX=1`: decode | 31.1 tok/s | 33.2 tok/s |
-| Same, `FREETOKEN_SPEC_BS_MAX=2` (the profile's setting): decode | 33.6-34.4 tok/s | |
+| Same, `FREETOKEN_SPEC_BS_MAX=2`: decode | 33.6-34.4 tok/s | |
 | Two conversations at once: time to the first token | 1.96 s | 1.95 s |
 
 Two requests share each decode step. With `FREETOKEN_SPEC_BS_MAX=1` the head then only writes its KV, so each gets
@@ -174,8 +175,9 @@ sampling:
 With 2 to 4 rows each at four requests (NVFP4, every step at that count): 35.2 tok/s at 2 rows, 31.7 at 3, 30.4 at 4,
 31.3 with one row.
 
-With the head and `FREETOKEN_SPEC_BS_MAX=1`, only a request decoding alone verifies drafts: with two or more, steps run
-one row per request and the head only writes its KV, an eager pass that costs 3-4 % at 3-4 requests; a lone request finishes 13 % sooner.
+With `FREETOKEN_SPEC_BS_MAX=1` (an earlier setting of `xtx-xt`; the untested `xtx-xtx` and `xt-xt` keep it), only a
+request decoding alone verifies drafts: with two or more, steps run one row per request and the head only writes its KV,
+an eager pass that cost 3-4 % at 3-4 requests on `xtx-xt` (an earlier build); a lone request finishes 13 % sooner.
 
 A request's decode is computed the same way alone or batched (per-row kernels); prompts prefilled in the same batch can
 differ at rounding level, as they already do with prefix caching.
@@ -217,8 +219,8 @@ to ~41k tokens; GPU ms per step, phases summed):
 | Of which the forward | 21.4 | 25.2 | 31.7 | 35.5 | 48.6 | 59.1 | 35.6 | 43.9 |
 | Steps measured | 1640 | 1745 | 1434 | 25 | 68 | 272 | 1022 | 1022 |
 
-With three or four requests and `FREETOKEN_SPEC_BS_MAX=2` (as in these runs) a step runs one row each and the head only
-writes its KV.
+These runs used `FREETOKEN_SPEC_BS_MAX=2`: with three or four requests a step ran one row each and the head only wrote
+its KV (now 2 rows each in `xtx-xt` and its K/V-in-RAM variants, [above](#several-requests-and-agents-at-once-xtx-xt)).
 
 ## Precision
 

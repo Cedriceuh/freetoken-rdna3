@@ -67,46 +67,51 @@ cards, changing only tiles that keep the summation order (bit-exact).
 
 ## Prefill
 
-A prefill chunk runs every token through every layer, so each chunk streams all 512 experts of every layer over PCIe
-(~700 MB per layer per card). Bigger chunks mean less streaming: in the A/B test, 16k-token chunks read an 8.4k prompt
-in 4.3 s instead of 5.5 s, and 54-101k-token reads at depth 2-6 % faster ([benchmarks.md](benchmarks.md) has the current
-speeds). To fit them, the prefill MoE and the PLE layer run 4096 tokens at a time inside the chunk (the NVFP4 MoE blocks
-are bit-identical, and 8192 tokens long in `xtx-xt` and `xtx-xt-4x262k`: +8 % on cold reads on an earlier build; the PLE
-blocks can round differently, checked to tolerance and validated on the agentic benchmark for one request), and experts
-already in the GPU cache are gathered on the GPU instead of crossing PCIe again (`--moe-prefill-hit-d2d`, with
-`hipMemcpyBatchAsync` on ROCm, or one copy per entry on older HIP): a third of the experts stay off PCIe per chunk, an
-agent turn's first token 1.55 -> 1.18 s. A single card keeps 8k chunks (its working memory is smaller). The
-per-layer-embedding rows of a prefill are read from disk on a thread by rank 0 only, which broadcasts them, and a long
-prompt's next chunk's rows are read while a chunk computes (they took ~1.1 s per 16k-token chunk, the GPUs idle); on two
-cards each block of a chunk's routed experts and of its GatedDeltaNet output starts its all-reduce while the next block
-computes, and the QSA indexer scores 16 query rows a program (the same bits): fully cold reads ~25 % shorter
-([journey.md](journey.md#33-short-turns-the-host-waiting-at-every-layer-2026-10-18-and-19)). The rows are read over four
-io_uring rings, a row across a 4 KiB page as its two pages apart (one thread drove 240-290k reads a second; reads
-spanning two 4 KiB units, even 2.5 % of a batch, halved the batch's rate), the rows read before stay in a RAM cache (an
-agent session's n-grams recur across its turns), and a long block's experts run their full tiles in one launch and their
-remaining rows in smaller tiles in a second (the same bits; NVFP4 blocks of more than 6144 tokens since upstream's
-rewritten prefill GEMM, on which the re-swept tiles cut NVFP4 cold reads another 12 %): NVFP4 cold reads ~6 % shorter on
-an earlier build, EXL3 agent turns ~6 % (~7 % with the row cache). The input embedding lives in RAM, a row per token
-read across PCIe, and its VRAM goes to the expert cache: decode 1-6 % faster, agent turns ~3 % shorter
-([journey.md](journey.md#34-disk-reads-on-four-rings-tail-tiles-the-input-embedding-in-ram-2026-10-19)).
+A prefill chunk runs every token through every layer, so a long chunk streams all 512 experts of every layer over PCIe
+(~700 MB per layer per card). What this build does about it ([benchmarks.md](benchmarks.md) has the current speeds):
 
-A short chunk (up to 1280 tokens on Qwen3.8-Flash-Next, an agent's tool result) does not stream the whole layers: it
-routes to only part of the experts, so it reads its routed experts from the slot cache, the next layer's predicted by
-that layer's router and copied while this one computes, and only the missing ones cross PCIe (the same bits, the GEMM
-tiles are those of the expert ids). With the K/V in host RAM it copies to VRAM only the K/V rows its tokens select, and
-the tokenizer reuses the previous prompt's tokens instead of encoding the whole conversation again. An agent turn of
-130-340 tokens took 0.40-0.48 s to its first token at 25k, one of 142-360 tokens 0.46-0.59 s at 224k, on
-`xtx-xt-4x262k` with EXL3 3.05 bpw (NVFP4 0.58-0.70 s at 25k), on an earlier build
-([journey.md](journey.md#27-agent-turns-short-prefills-through-the-expert-cache-2026-10-14)). Short prefills now take
-expert tiles sized for a few rows an expert and no longer wait on the GPU in every GatedDeltaNet layer: the time to
-the first token of 200-250-token turns at 34k 11-13 % shorter, of one-word turns 42 % on NVFP4 and 5 % on EXL3
-([journey.md](journey.md#31-short-agent-turns-2026-10-17-and-18)). The predicted experts' copy plan, which the copy
-engine needs on the host, is read once the layer's GEMMs are queued rather than in a sync that emptied the GPU's queue
-at every layer, Triton kernels launch through a shorter host path, the int8 weights are dequantized in one pass, the
-PLE rows are read as above, with EXL3 too the missing experts' copy overlaps the shared expert, and with NVFP4, whose
-short turns keep PCIe saturated, only the experts at least two tokens predict are copied ahead: one-word turns at 34k a
-further ~20 % shorter on EXL3 and 12 % on NVFP4, agent turns of 500-750 tokens 15 % and 13 %
-([journey.md](journey.md#33-short-turns-the-host-waiting-at-every-layer-2026-10-18-and-19)).
+- **Big chunks.** 16k-token chunks on two cards, 8k on one (its working memory is smaller): each chunk streams the
+  experts once, so in the A/B test an 8.4k prompt read in 4.3 s instead of 5.5 s with 4k chunks, and 54-101k-token
+  reads at depth 2-6 % faster. To fit, the MoE and the PLE layer run 4096 tokens at a time inside the chunk (the NVFP4
+  MoE 8192 in `xtx-xt` and `xtx-xt-4x262k`). The NVFP4 MoE blocks are bit-identical (an EXL3 block of 25 tokens or
+  fewer rounds differently: [options.md](options.md#experts-moe)); the PLE blocks can round differently, checked to
+  tolerance and validated on the agentic benchmark for one request.
+- **Experts already on the GPU** are gathered there instead of crossing PCIe again (`--moe-prefill-hit-d2d`, with
+  `hipMemcpyBatchAsync` on ROCm, or one copy per entry on older HIP): a third of the experts stay off PCIe per chunk.
+- **The all-reduces overlap the compute** on two cards: each block of a chunk's routed experts and of its
+  GatedDeltaNet output starts its all-reduce while the next block computes (the same bits).
+- **The per-layer-embedding rows come from disk** without stopping the GPUs: rank 0 alone reads them, on a thread,
+  over four io_uring rings, and broadcasts them; while a chunk computes, the next chunk's rows are read (they took
+  ~1.1 s per 16k-token chunk with the GPUs idle). The rows read before stay in a RAM cache, since an agent session's
+  n-grams recur across its turns.
+- **Kernels shaped for RDNA3**, all with the same bits: the QSA indexer scores 16 query rows a program, a long expert
+  block runs its full tiles in one launch and its remaining rows in smaller tiles in a second, and kernels that
+  spilled registers run more warps.
+- **The input embedding lives in RAM**, a row per token read across PCIe, and its VRAM goes to the expert cache.
+
+The PLE reads on a thread, the all-reduce overlap and the indexer's 16 rows together made fully cold reads ~25 %
+shorter ([journey.md](journey.md#33-short-turns-the-host-waiting-at-every-layer-2026-10-18-and-19)).
+
+### Short chunks: agent turns
+
+A short chunk (up to 1280 tokens on Qwen3.8-Flash-Next, typically an agent's tool result) routes to only part of the
+experts, so it does not stream whole layers:
+
+- **It reads its routed experts through the expert cache**, and only the missing ones cross PCIe. The next layer's
+  experts are predicted by that layer's router applied to this layer's input, and copied while this one computes;
+  with NVFP4, whose short turns keep PCIe saturated, only the experts at least two tokens predict are copied ahead.
+  The same bits: the GEMM tiles follow the expert ids.
+- **With the K/V in host RAM** it copies to VRAM only the K/V rows its tokens select.
+- **The tokenizer reuses the previous prompt's tokens** instead of encoding the whole conversation again.
+- **The host keeps the GPU busy**: the predicted experts' copy plan is read once the layer's GEMMs are queued (not in a
+  sync at every layer), Triton kernels launch through a shorter host path, the int8 weights are dequantized in one
+  pass, and the expert tiles are sized for a few rows an expert.
+
+On `xtx-xt-4x262k`, a ~520-token agent turn at 45k of context takes ~0.49 s to its first token with EXL3 3.05 bpw and
+0.71-0.73 s with NVFP4 (three 262k contexts); a 142-360-token turn at 224k took 0.46-0.59 s with EXL3 on an earlier build.
+How each step was measured: [journey.md](journey.md#27-agent-turns-short-prefills-through-the-expert-cache-2026-10-14),
+[section 31](journey.md#31-short-agent-turns-2026-10-17-and-18) and
+[section 33](journey.md#33-short-turns-the-host-waiting-at-every-layer-2026-10-18-and-19).
 
 ## Sampling on ROCm
 

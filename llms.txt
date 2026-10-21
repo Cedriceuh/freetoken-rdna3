@@ -40,7 +40,7 @@ build).
 - [Testing](docs/rdna3/testing.md): CPU suite, GPU checks, micro-benchmarks, the release validation procedure
 - [Maintaining](docs/rdna3/maintaining.md): relation to upstream, sync and release procedure
 - [Changes from upstream](docs/rdna3/changes-from-upstream.md): every modified file with the reason
-- [Long context](docs/rdna3/long-context.md): the K/V in host RAM: four 262k conversations at once or one of 1M, YaRN or the plain rope, measured to 988k
+- [Long context](docs/rdna3/long-context.md): the K/V in host RAM: four 262k conversations at once (`xtx-xt-4x262k`) or one of up to 1M (`xtx-xt-1m`), what they cost, quality measured to 988k
 - [CPU experts](docs/rdna3/cpu-experts.md): `--hybrid`, the CPU computing part of the expert misses: when it pays, what it costs
 - [Credits](docs/rdna3/credits.md): who wrote what
 - [Docs index and glossary](docs/rdna3/README.md): the pages above by what you want to do, and the terms they use

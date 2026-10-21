@@ -531,6 +531,27 @@ Decode with the K/V on the host, measured in the afternoon of 2026-10-10:
 - **Measurement traps** of the quality runs: teacher-forcing a text sent as a chat *user* turn measures mostly the
   probability of `<|im_end|>` (~94 % at every position); the stdlib is memorized (raw NLL 0.06, top-1 98.5 %), so it
   only serves retrieval with planted values.
+- **YaRN or the plain rope past 262,144.** YaRN is the model card's setting (`rope_type: yarn`, `factor: 4`,
+  `original_max_position_embeddings: 262144`); upstream's `--hf-overrides` sets it without editing `config.json`, the
+  section replaced whole: `{"text_config": {"rope_parameters": {"rope_type": "yarn", "factor": 4.0,
+  "original_max_position_embeddings": 262144, "rope_theta": 10000000, "partial_rotary_factor": 0.25,
+  "mrope_interleaved": true, "mrope_section": [11, 11, 10]}}}` (EXL3 3.05 at 497k: the same text as the `config.json`
+  edit, 12/12, read at 2036 tok/s, decode 85; the config it builds is checked on the CPU by
+  `tests/models/qwen4_exp/test_config.py`). Its table covers `original x factor` positions, bit-identical to HF
+  transformers 5.16.1's rotary embedding, within two float32 ulps of 5.18's (`tests/layers/test_rotary_yarn.py`).
+  Retrieval 100 % from 29k to 988k with both. Harder set (30 code questions, 6 notes, 3 two-hop notes): YaRN 19/19 at
+  237k, 25/25 at 498k, 33/36 at 988k; the plain rope 32/36 at 988k; the two-hop questions fail at 988k with both (the
+  answer is the pointer note). Short texts (12 texts of 2.6-5.2k tokens of this repository, teacher-forced, raw
+  completions): next-token NLL 1.1298 without YaRN, 1.1339 with factor 4 (+0.4 %), 1.1307 with factor 2; KL to no-YaRN
+  0.032 and 0.018, top-1 agreement 93.4 % and 95.1 %. A 988k-token text of this repository: the plain rope's NLL
+  0.46-0.79 nats per token at every depth, YaRN factor 4 0.2-1.3 % worse up to ~650k and 1-3 % better beyond. Kept:
+  the plain rope (`xtx-xt-1m`), the same bits as without it below 262,144.
+- **What the host K/V and the wide table cost** (decode tok/s at 118k, EXL3 3.05): K/V in VRAM, 262k table (`xtx-xt`
+  at 250k of context, 9,932 expert slots) 90.6; K/V on the host, 262k table (12,667 slots) 86.6; K/V on the host, 1M
+  table (11,261 slots) 84.2.
+- **Two cold requests at once** (498k + 237k): both 12/12 with the same answers as alone; the 7900 XTX peaked at 23.09
+  of 23.98 GiB (sysfs, desktop included), the 7900 XT at 17.44 of 19.98. The 498k request decoded at 6.3 tok/s while
+  the other one was read (prefill goes first, upstream's policy).
 
 NVFP4 on `xtx-xt-4x262k`, 2026-10-15: the four-context pool locked 100.3 GiB and, with benchmark tools running beside
 it, ran the 126 GiB host out of memory (a global OOM). With three contexts (`--kv-reserve-tokens 787500`) it locked
@@ -846,6 +867,12 @@ Found on the way:
   at random, and that rank fell back to one copy per expert: full-layer short prefills ~10 % slower. Fixed (the copy
   waits for the fill), and a failed mode is now logged.
 
+All of it against the `main` before (time to the first token at 25k of context, arms alternated, 9/9 answers
+identical): 130-340-token turns NVFP4 `xtx-xt-4x262k` (3 x 262k pool) 1.22-1.24 -> 0.58-0.70 s and EXL3 3.05 bpw
+0.86-0.89 -> 0.40-0.48 s, ~1k-token turns 1.33-1.34 -> 0.93-0.98 s and 0.94-0.99 -> 0.69-0.74 s, 3k-token turns -2 to
+-8 %; decode unchanged (-2 to +4 %). At 173k / 224k on EXL3 3.05 bpw: 1.13-1.25 -> 0.43-0.50 s and 1.31-1.43 ->
+0.46-0.59 s. The tokenizer's prompt prefix: ~0.5 s -> 1-3 ms at 224k.
+
 ## 28. Upstream up to 9b68e00 (2026-10-16)
 
 Five commits cherry-picked, then the rest merged. Upstream had rewritten the files this tree's `--hybrid` lives in: its
@@ -858,8 +885,15 @@ a review of the port found that a reset repeated by every thread could make the 
 prefill through the cache gated to one slot pool of at least two layers of experts. transformers 5.18 rounds a few
 values of its YaRN reference up to two ulps away from 5.16: the test now allows that, the engine's rows are unchanged.
 Upstream's fix of the Triton 3.8 histogram bug (a staged align, `0bca88f`) was left out: `moe_align.py` here has no such
-compare. On `xtx-xt-4x262k` with NVFP4 and EXL3 3.05 bpw the answers stayed the same, bit for bit
-([CHANGELOG](../../CHANGELOG.md)).
+compare. The image took transformers 5.18 (the config, the chat-template tokens, tool calls, a ~105k-token text and the image
+preprocessing read the same as with 5.16, bit for bit), flashlib 0.4.0 and numpy 2.5.3. Against the build before the
+merge (`xtx-xt-4x262k`, NVFP4 with three 262k contexts and EXL3 3.05 bpw with four): greedy with the MTP head 14/14 and
+a 25k-token agent conversation 9/9, the same answers on both; decode per turn -0.8 to +0.9 %; agent-turn time to the
+first token 0.59-1.69 s against 0.59-1.66 (NVFP4), 0.40-1.46 against 0.40-1.45 (EXL3); cold reads of 36k / 46k tokens
+2375 / 2512 tok/s against 2387 / 2525 (NVFP4), 2565 / 2680 against 2552 / 2661 (EXL3); four 20k-token requests decoding
+together (NVFP4) 29.0-29.9 tok/s each against 28.9-29.9; a 259,728-token prompt read at 2338 tok/s, 400 tokens at
+74.7 tok/s. One card without `--hybrid`: greedy 14/14 the same. `--hybrid` was not compared: two runs of the build
+before the merge already gave different greedy answers (7 of 14 the same).
 
 ## 29. Three and four requests, and cold reads (2026-10-16)
 
@@ -898,6 +932,10 @@ block, the fastest per token there (gate_up 1.11 ms per 1k), read 98k / 116k tok
 same values were slower and dropped: the E2M1 codes decoded by bit arithmetic instead of the 16-entry table (+17 to +23
 %), and the activations loaded as one contiguous tile and split into even / odd columns in registers (gate_up up to
 2.3x).
+
+With the token-major GatedDeltaNet conv, the NVFP4 MoE in 8192-token blocks (NVFP4) and two pipeline stages in the
+EXL3 prefill GEMMs (EXL3), against the `main` before (the same texts, arms alternated): NVFP4 `xtx-xt-4x262k` (3 x 262k pool) 98k tokens 44.8-44.9 -> 40.2-40.3 s, 116k
+52.8 -> 46.8-46.9 s (+11 to +13 %); EXL3 3.05 bpw 98k 40.2 -> 38.2 s, 116k 47.0-47.1 -> 44.3-45.5 s (+3 to +6 %).
 
 ## 30. A rank killed by the host's OOM killer (2026-10-17)
 
@@ -1413,8 +1451,15 @@ tail tiles up to 6144 tokens (from 7168 the 128-row one wins). The grid's first-
 tile timed again later was fast), so the table was settled by an interleaved A/B of whole MoE blocks. Those ran each
 card on the other's slice width (`HIP_VISIBLE_DEVICES=0` is the XT here, 1 the XTX); run again on each card's own slice:
 1600-2560 tokens 2.8-3.0x faster, 1280 1.4-1.5x, 32 1.3-1.4x, 4096-6144 1.1-1.2x, 7168-8192 even, the same bits
-everywhere. Whole model, NVFP4: cold reads -12 % (210k tokens 64.8-64.9 -> 56.9 s), decode +1.4-2.7 %, agent turns the
-same ([CHANGELOG](../../CHANGELOG.md)).
+everywhere. Whole model, `xtx-xt-4x262k` (NVFP4 with a 3 x 262k pool, EXL3 3.05 bpw with 1,050,000 tokens), the build before
+(three NVFP4 runs, two EXL3) against this one (two each): NVFP4 cold reads of 40k / 113k / 159k / 210k tokens
+12.39-12.42 / 34.11-34.25 / 48.66-48.78 / 64.77-64.93 s -> 10.89-10.91 / 29.87-29.90 / 42.57-42.58 / 56.85-56.95 s
+(-12 %), decode 90.1-91.1 -> 92.4-92.5 tok/s, four requests 30.2-30.4 -> 31.2-31.3 tok/s each, agent turns
+0.710-0.720 -> 0.709-0.728 s, 2k-token turns 1.142-1.153 -> 1.132-1.133 s; NVFP4 greedy outputs 17 of 42 the same (a
+sample of the others, read by hand, says the same in other words). EXL3 42 of 42 answers the same in both runs, agent
+turns 0.490-0.497 -> 0.485-0.487 s, decode 92.4-93.4 -> 92.8-93.7 tok/s, cold reads within 0.5 %. NVFP4 expert slots
+-0.5 % (9,255 -> 9,209: the globals take 4 bytes). The CPU suite fails only where it failed before, minus one; the GPU
+tests (the 93 files with GPU-gated tests, each card) only where they failed before, minus three.
 
 ## 36. Verify rows from the head's confidence, sampled drafts, three and four requests verifying (2026-10-20 and 21)
 
