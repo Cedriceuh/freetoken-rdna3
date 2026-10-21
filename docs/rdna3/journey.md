@@ -1416,7 +1416,60 @@ card on the other's slice width (`HIP_VISIBLE_DEVICES=0` is the XT here, 1 the X
 everywhere. Whole model, NVFP4: cold reads -12 % (210k tokens 64.8-64.9 -> 56.9 s), decode +1.4-2.7 %, agent turns the
 same ([CHANGELOG](../../CHANGELOG.md)).
 
-## 36. Still open
+## 36. Verify rows from the head's confidence, sampled drafts, three and four requests verifying (2026-10-20 and 21)
+
+A published inference engine schedules its verification from a trained confidence head that predicts each draft's
+acceptance. Qwen3.8-Flash-Next's MTP head has none (no such tensor in the NVFP4 or EXL3 checkpoints); its own top-1
+probability stood in. Runs on `xtx-xt-4x262k` with a 300k-token pool, 14 prompts x 1024 tokens greedy and at T 0.6.
+
+- **The head's probability predicts acceptance.** Over ~10k verify steps per quant, the head's top-1 probability (T 1)
+  predicts whether the first draft is kept far better than the running per-position acceptance that picks the rows
+  (Brier 0.126 against 0.177 greedy, 0.133 against 0.197 at T 0.6; EXL3 the same), and it is close to calibrated
+  (drafts at 0.5-0.7 kept 0.67 of the time, above 0.999 0.997). The first draft's probability also predicts the deeper
+  ones (draft 1 kept 0.58 of the time after a first draft below 0.5, 0.92 after one above 0.999; the running acceptance
+  stays at 0.72-0.82). Computed in a fixed-order kernel so both cards get the same bits and pick the same rows.
+- **But the choice comes too late to pay.** The rows of the next step are chosen while the GPU still drafts. Waiting
+  for every draft's probability (the head always drafting 3): 1.8-3.3 % slower (the host waits 2.7 ms a step, a 2-row
+  step pays the whole chain: 25 ms against 20-21). Waiting for the first draft only (0.6 ms, while the GPU runs the
+  chain), the running acceptance past it: greedy +0.4-0.5 % on NVFP4 (101.8-102.0 against 101.0-101.4 tok/s), +0.1-0.4 %
+  on EXL3, the same answers. At T 0.6 the arms read +2 % (NVFP4) and -1.1 % (EXL3): the row count changes how the
+  draws fall, so each arm samples other texts; a simulation with the real step costs (the chain is drafted before the
+  choice, so fewer rows save only the rows) gives +0.4-0.7 % for both. A logistic fit of the deeper drafts on the
+  first one: +0.4 % greedy and -2.6 % at T 0.6 against the first draft alone. A 1-row step when the first draft is
+  doubtful: with the head such a step takes 17.6 (NVFP4) and 18.2 ms (EXL3) against 18.6 and 19.9 at 2 rows, so it
+  pays only below ~0.06-0.09. All dropped.
+- **Real step costs.** The period of a step (one request, every step at the same row count; NVFP4 from the decode rate
+  and the tokens kept per step, EXL3 3.05 bpw on the host clock): NVFP4 18.6 / 22.6 / 25.6 ms at 2 / 3 / 4 rows, EXL3
+  19.9 / 23.5 / 27.6: about the ratios of the shipped table. A table built from the GPU events (forward + verify + head
+  + chain) has the wrong shape, as the captured step's GPU time includes its wait for the host's PLE fill: 1.5-3.3 %
+  slower with it. Both cards stay 99 % busy (`gpu_busy_percent`) at one request.
+- **Sampled drafts at T 0.6.** `FREETOKEN_SPEC_SAMPLED_DRAFTS=1`, measured only at T 1.0 before: a drawn draft is kept
+  with probability Σ min(p, q), the argmax with p(argmax), and the arms kept more tokens per step in almost every
+  512-step window. 14 prompts x 1024 tokens NVFP4 91.0-91.5 -> 94.0-94.2 tok/s, EXL3 92.9-93.0 -> 97.0; 5 prompts at
+  28k-130k of context NVFP4 82.6-82.7 -> 82.8-83.0, EXL3 85.8-85.9 -> 91.9; 2 prompts at 75k-89k EXL3 88.5-88.6 ->
+  87.9-88.0; two requests NVFP4 62.3 -> 61.5-61.6, EXL3 65.0 -> 65.9; single prompts -9 to +18 % (other texts). Greedy
+  answers unchanged. Now the default.
+- **Three and four requests verifying, 2 rows each.** Verifying was off past two requests (4 rows each at four requests
+  had given 26.3 tok/s against 35.35). On this build, four requests with every step at one row count (NVFP4, one run
+  each): 31.3 tok/s each at 1 row, 35.2 at 2, 31.7 at 3, 30.4 at 4 (GPU time per step 30.5 / 49.0 / 73.3 / 86.8 ms). So
+  `FREETOKEN_SPEC_BS_DEEP`: past it, up to `FREETOKEN_SPEC_BS_MAX`, a step verifies 2 rows each. `xtx-xt-4x262k` with 4
+  / 2: three requests +6.4 % (NVFP4) and +8.9 % (EXL3), four +3 to +6 % greedy (at T 0.6 -0.3 % and +2.5 %). `xtx-xt`
+  (K/V in VRAM, smaller expert cache, one run each, two series): three requests NVFP4 +2 % and +17 %, EXL3 +5 % and +12
+  %, four at T 0.6 -1 to +8 %; its sweep to 260k the same and no out-of-memory with the two more graphs. `xtx-xt-1m`
+  (EXL3): +10 % at three, +4-12 % at four. All three take 4 / 2. The same greedy answers on prompts read apart
+  ([benchmarks.md](benchmarks.md#several-requests-and-agents-at-once-xtx-xt)).
+- **A capture-order bug on the way.** The first runs of that setting stopped on an illegal memory access as soon as two
+  requests verified 4 rows. The verify step's rollback buffers (GDN states, PLE conv and n-gram windows) are sized by
+  the eager forward before each capture and grow with the requests, freeing the old ones; the captures ran the most
+  rows first, so 2 requests x 4 rows was captured before 4 requests x 2 rows, whose eager forward freed the buffers the
+  first graph writes. The shapes with the most rows, then the most requests, now run eagerly before any capture. No
+  profile before captured a shape with more requests after one with fewer (`FREETOKEN_SPEC_VERIFY_MS=2,4` with
+  `FREETOKEN_SPEC_BS_MAX=2` would have).
+- **The rare start fault again.** Once in ~70 starts over the night (NVFP4, the first prefill, the XTX this time: a
+  write permission fault at a host-range address, surfaced in the expert cache's copy plan), with the changes above
+  switched off. The test servers' memory maps were saved at each start since, for the next one to name its buffer.
+
+## 37. Still open
 
 - In NVFP4 the model needs ~63 GiB of RAM for its experts alone (the engine keeps every expert in RAM). The EXL3 3.05
   bpw checkpoint needs 42.6 GiB and served under a 56 GiB container limit, but a real 64 GB machine is untested
@@ -1424,7 +1477,8 @@ same ([CHANGELOG](../../CHANGELOG.md)).
 - Not run on the agentic benchmark since its last run: Triton 3.8, not bit-exact with that run's 3.7.1 (section 18);
   upstream's NVFP4 decode kernel (section 23, 5 of 15 greedy answers changed); the fp64 rebuild of EXL3's dense
   weights (section 20); `--hybrid` (section 24), whose answers also move with the expert cache's contents (section 27);
-  and the two profiles with the K/V in RAM, `xtx-xt-1m` and `xtx-xt-4x262k` (section 22).
+  the two profiles with the K/V in RAM, `xtx-xt-1m` and `xtx-xt-4x262k` (section 22); and the drafts drawn under each
+  request's sampling, with three and four requests verifying on `xtx-xt-4x262k` (section 36).
 - ROCm 10 / PyTorch 2.13 and ROCm 10.1 / PyTorch 2.14 (rechecked 2026-10-10), the image's bases since 2026-10-02:
   `F.linear` changes its sums with the row count for some shapes ((3072, 256), (6656, 2560)): serving does not use it
   for them (int8 or table GEMVs), but `test_qsa_spec_rows`' toy projections did, which made it fail on 3-4 rows;
@@ -1433,7 +1487,8 @@ same ([CHANGELOG](../../CHANGELOG.md)).
   card within tens of MiB of full (section 21; the torch allocator is now capped 512 MiB short of that). One at start
   on 2026-10-07, ~3 s after the CUDA graphs were captured, with 3.9 GiB free on the XTX (EXL3 3.05 bpw; 1 start in
   ~32 that night, the 16 starts of a series after it were clean); one more at the first request of a start on
-  2026-10-19 (on the XT, 1 of the night's 41 EXL3 starts, section 34): cause not found.
+  2026-10-19 (on the XT, 1 of the night's 41 EXL3 starts, section 34), and one on 2026-10-20 (NVFP4, the XTX, the first
+  prefill, 1 in ~70 starts, section 36): cause not found.
 - Expert misses are 30-35 % of a decode step with the MTP head (section 20): the next lever for decode (on one card
   `--hybrid` computes part of them on the CPU, section 24), not a cache policy (an online one gains ~8 % of the misses
   at best on a recorded trace). More VRAM for the cache: a desktop-aware plan for the card that drives the display (the
@@ -1452,7 +1507,8 @@ same ([CHANGELOG](../../CHANGELOG.md)).
 - Decode at three and four requests: the expert misses are ~9 ms of a four-request step (estimated), its largest part,
   and prefetching them on a side stream inside the replayed graphs made the step longer (section 29): a copy kernel
   beside the compute holds CUs for the whole PCIe transfer, and the copy engine would need host-known addresses
-  (section 32). At four requests the host spends 23.7-25.0 ms of a 26.3-27.7 ms forward inside it
+  (section 32). At four requests with `FREETOKEN_SPEC_BS_MAX=2` (no verify step then) the host spends 23.7-25.0 ms of a
+  26.3-27.7 ms forward inside it
   (`FREETOKEN_SPEC_TIMING`, one run), then 1.4-1.5 ms launching the MTP head's KV pass (0.33 ms of GPU time). What
   holds it there (py-spy on rank 0, NVFP4, one run): 72 % of the scheduler thread's samples wait on the step's sampled
   tokens before the PLE fill, so the host is ahead of the GPU, not its limit.

@@ -55,8 +55,8 @@ guesses: read the decode columns across checkpoints as an order of magnitude.
 
 With the head, one request decodes 35 % faster on two cards at the sampling above (+35 to +60 % greedy along the
 sweep) and 6-13 % faster on one card (+9 to +16 % greedy); reading a block takes from 5 % longer (`xt`) to 1 % less. With more
-requests decoding than `FREETOKEN_SPEC_BS_MAX` (2 in `xtx-xt` and its K/V-in-RAM variants, 1 in the other profiles),
-the head only writes its KV: see the table further down.
+requests decoding than `FREETOKEN_SPEC_BS_MAX` (4 in `xtx-xt` and its K/V-in-RAM variants, 1 in the other profiles),
+the head only writes its KV: see the tables further down.
 
 Without the head, decode loses 11 % from 9k to 260k on two cards and 16 % from 9k to 124k on one card (with it,
 the text of each step decides how many drafts are kept). Where the one-card drop
@@ -158,6 +158,22 @@ out-of-memory retry.
 | 1 / 2 / 3 / 4 requests at once, greedy answers of 93-200 tokens, time from the send to the last token (two rounds) | with the head 3.6 / 5.9 / 8.4-8.6 / 10.1 s; without it 4.1-4.2 / 5.9-6.0 / 8.2-8.3 / 9.8 s |
 | 5 requests with different sampling settings (greedy, T=1, top-p only, top-k 1000 + top-p decoding together; top-k 20 + top-p queued behind them), 256-token answers | ~27-28 tok/s for each of the 4 decoding together |
 
+In `xtx-xt` and its K/V-in-RAM variants three and four requests verify too, 2 rows each (`FREETOKEN_SPEC_BS_MAX=4`,
+`FREETOKEN_SPEC_BS_DEEP=2`), against the setting before (`2` / `2`: 3-4 requests run one row each). On `xtx-xt-4x262k`, greedy 768-token
+answers unless noted, tok/s per request, two runs each, a 300k-token pool, the MTP head drafting under each request's
+sampling:
+
+| Requests | NVFP4 before -> now | EXL3 3.05 bpw before -> now |
+|---|---:|---:|
+| 3 at once | 38.4 -> 40.8-40.9 | 44.4 -> 48.3 |
+| 4 started 1.5 s apart | 34.2-34.3 -> 35.3-35.4 | 41.0-41.9 -> 43.6-43.7 |
+| 4 at once (512 tokens) | 31.3-32.8 -> 33.8-33.9 | 38.3 -> 40.2-40.3 |
+| 4 started apart, T 0.6 | 32.4-33.3 -> 32.0-33.5 | 40.5-41.2 -> 41.8-42.0 |
+| 1 (four 768-token answers in turn) | 95.9-96.0 -> 95.8-96.0 | 97.0 -> 96.9-97.1 |
+
+With 2 to 4 rows each at four requests (NVFP4, every step at that count): 35.2 tok/s at 2 rows, 31.7 at 3, 30.4 at 4,
+31.3 with one row.
+
 With the head and `FREETOKEN_SPEC_BS_MAX=1`, only a request decoding alone verifies drafts: with two or more, steps run
 one row per request and the head only writes its KV, an eager pass that costs 3-4 % at 3-4 requests; a lone request finishes 13 % sooner.
 
@@ -201,7 +217,8 @@ to ~41k tokens; GPU ms per step, phases summed):
 | Of which the forward | 21.4 | 25.2 | 31.7 | 35.5 | 48.6 | 59.1 | 35.6 | 43.9 |
 | Steps measured | 1640 | 1745 | 1434 | 25 | 68 | 272 | 1022 | 1022 |
 
-With three or four requests a step runs one row each and the head only writes its KV.
+With three or four requests and `FREETOKEN_SPEC_BS_MAX=2` (as in these runs) a step runs one row each and the head only
+writes its KV.
 
 ## Precision
 
@@ -216,10 +233,12 @@ With three or four requests a step runs one row each and the head only writes it
   prefill, the host-memory all-reduce and the tuned prefill tiles (swept again since, on upstream's rewritten prefill
   GEMM, whose NVFP4 answers differ). Added after the last scored build, and checked for exactness instead: the tuned
   decode tiles, up to 4 concurrent requests (a request's decode is identical alone or batched; prompts prefilled
-  together can differ at rounding level), the RAM tier, the sampler rework for requests without a small `top_k`, and
-  rank 0's token broadcast. The one-card profiles were not run on it. A build on ROCm 10 with the MTP head (`xtx-xt`)
-  scored 12 and 18 in two runs; the same build with the EXL3 checkpoints
-  ([how-it-works.md](how-it-works.md#exl3-checkpoints)) scored 13 at 3.05 bpw and 12 at 4.05 bpw, one run each.
+  together can differ at rounding level), the RAM tier, the sampler rework for requests without a small `top_k`, rank
+  0's token broadcast, the MTP head's drafts drawn under each request's sampling (exact speculative sampling) and three
+  or four requests verifying 2 rows each on `xtx-xt-4x262k` (greedy answers unchanged). The one-card profiles were not
+  run on it. A build on ROCm 10 with the MTP head (`xtx-xt`) scored 12 and 18 in two runs; the same build with the EXL3
+  checkpoints ([how-it-works.md](how-it-works.md#exl3-checkpoints)) scored 13 at 3.05 bpw and 12 at 4.05 bpw, one run
+  each.
 - **Exactness checks**: a fixed set of 120 greedy prompts (not published) gave identical answers for the host-memory
   all-reduce, the tuned NVFP4 tiles (prefill and decode), expert reuse in prefill, a single request on the 4-request
   build, and the review-fix branch against the swept one. Kernel checks prove the blocked prefill MoE and batched decode

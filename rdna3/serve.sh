@@ -22,8 +22,8 @@
 #   --vision           accept image input: builds the vision tower on rank 0 (measured on xtx-xt, xtx and xt:
 #                      docs/rdna3/benchmarks.md); images are scaled down to 1024 tokens (one per 32x32 pixels),
 #                      `-- --image-max-tokens N` changes it
-#   --no-mtp           decode without the MTP draft head the profiles except gre turn on (it speeds up one request at a time;
-#                      docs/rdna3/limits.md)
+#   --no-mtp           decode without the MTP draft head the profiles except gre turn on (it speeds up a request alone,
+#                      up to four at once on xtx-xt and its K/V-in-RAM variants; docs/rdna3/limits.md)
 #   --hybrid           compute part of each decode step's expert misses on the CPU instead of copying them (off by
 #                      default, NVFP4: +46 % on xtx, +51 % on xt, on xtx-xt +2 % for one request and +15 % with 4;
 #                      EXL3: +5 % on xtx, even on xtx-xt; docs/rdna3/cpu-experts.md)

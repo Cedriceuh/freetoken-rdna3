@@ -35,6 +35,7 @@ def test_stacked_layers_roll_back_in_one_copy(monkeypatch):
 
 
 def _depth_env(monkeypatch, m=4, costs=None, dynamic=True, bs_max=1):
+    monkeypatch.setattr(spec, "SPEC_BS_DEEP", bs_max)
     monkeypatch.setattr(spec, "SPEC_M", m)
     monkeypatch.setattr(spec, "SPEC_MS", tuple(range(1, m + 1)))
     monkeypatch.setattr(spec, "SPEC_DYNAMIC", dynamic)
@@ -122,6 +123,25 @@ def test_one_card_costs_favour_two_rows(monkeypatch):
     assert high.best_rows() == 4
     monkeypatch.setenv("FREETOKEN_SPEC_COSTS", "4:30")
     assert spec._costs(1)[4] == 30.0 and spec._costs(1)[2] == 53.0
+
+
+def test_wide_batches_verify_two_rows(monkeypatch):
+    """FREETOKEN_SPEC_BS_DEEP: past it (up to SPEC_BS_MAX) a step verifies 2 rows per request and the head drafts one
+    guess; at most it, the rows the acceptance asks for."""
+    _depth_env(monkeypatch, bs_max=4)
+    monkeypatch.setattr(spec, "SPEC_BS_DEEP", 2)
+    high = spec.DepthStats()
+    high.rate = [0.95, 0.9, 0.85]
+    reqs = [_Req(drafts=3, stats=high) for _ in range(4)]
+    assert spec.rows_for(reqs[:2]) == 4 and spec.draft_depth(reqs[:2]) == 3
+    assert spec.rows_for(reqs[:3]) == 2 and spec.draft_depth(reqs[:3]) == 1
+    assert spec.rows_for(reqs) == 2 and spec.draft_depth(reqs, 2) == 1
+    assert spec.rows_for(reqs + [_Req(drafts=3, stats=high)]) == 1 and spec.draft_depth(reqs + [_Req()]) == 0
+    monkeypatch.setattr(spec, "SPEC_BS_DEEP", 4)  # the default: SPEC_BS_MAX
+    assert spec.rows_for(reqs) == 4 and spec.draft_depth(reqs) == 3
+    monkeypatch.setattr(spec, "SPEC_BS_DEEP", 2)
+    monkeypatch.setattr(spec, "SPEC_MS", (1, 3, 4))  # no 2-row graphs: one row past SPEC_BS_DEEP, and no drafts
+    assert spec.rows_for(reqs) == 1 and spec.draft_depth(reqs) == 0
 
 
 def test_runtime_cache_rebuild_refused_with_verify_rows(monkeypatch):

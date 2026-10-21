@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Dict, List
 import torch
 from freetoken.core import Batch, Req, get_global_ctx
 from freetoken.distributed import get_tp_info
-from freetoken.spec_decode import SPEC_BS_MAX, SPEC_M, SPEC_MS
+from freetoken.spec_decode import SHALLOW_M, SPEC_BS_DEEP, SPEC_BS_MAX, SPEC_M, SPEC_MS
 from freetoken.utils import init_logger, mem_GB
 from freetoken.utils.progress import emit_progress
 from tqdm import tqdm
@@ -136,6 +136,28 @@ def _upload_graph(graph: torch.cuda.CUDAGraph, stream: torch.cuda.Stream) -> Non
     stream.synchronize()
 
 
+def capture_shapes(ms: tuple[int, ...], bs_list: list[int], bs_max: int, bs_deep: int) -> list[tuple[int, int]]:
+    """The (rows per request, batch size) graphs to capture. Steps of more than ``bs_max`` requests run ``ms[0]`` rows
+    (rows_for), so the other row counts only need the batch sizes up to ``bs_max``'s padded one; past ``bs_deep``
+    requests at most SHALLOW_M rows each, so the deeper row counts stop at its padded batch size."""
+    verify_bs = next((bs for bs in bs_list if bs >= bs_max), max(bs_list))
+    deep_bs = next((bs for bs in bs_list if bs >= bs_deep), max(bs_list))
+    return [(m, bs) for m in ms for bs in bs_list if m == ms[0] or bs <= (verify_bs if m <= SHALLOW_M else deep_bs)]
+
+
+def sizing_shapes(shapes: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """The (rows per request, batch size) shapes to run eagerly before any capture. The spec_decode buffers are sized
+    by the eager forwards: the head's streams once, by the first one's rows; the per-request rollback buffers grow with
+    the requests, freeing the old ones under any graph captured before. So the most rows, then the verify shape with
+    the most requests."""
+    verify = [s for s in shapes if s[0] > 1]
+    if not verify:
+        return []
+    most_rows = max(shapes, key=lambda s: (s[0] * s[1], s[1]))
+    most_reqs = max(verify, key=lambda s: (s[1], s[0] * s[1]))
+    return list(dict.fromkeys([most_rows, most_reqs]))
+
+
 class GraphRunner:
     def __init__(
         self,
@@ -203,17 +225,16 @@ class GraphRunner:
         self._reset_moe_offload_cache()
 
         # spec_decode: one graph per (batch size, rows per request); the capture batch carries m rows per request.
-        # Steps of more than SPEC_BS_MAX requests run SPEC_MS[0] rows (rows_for), so the other row counts only need
-        # the batch sizes up to SPEC_BS_MAX's padded one. The most rows first (then the most rows per request): the
-        # eager forward before the first capture of each kind sizes the spec_decode buffers for all of them.
-        verify_bs = next((bs for bs in self.graph_bs_list if bs >= SPEC_BS_MAX), self.max_graph_bs)
-        shapes = [(m, bs) for m in SPEC_MS for bs in self.graph_bs_list if m == SPEC_MS[0] or bs <= verify_bs]
+        # The most rows first (then the most rows per request).
+        shapes = capture_shapes(SPEC_MS, self.graph_bs_list, SPEC_BS_MAX, SPEC_BS_DEEP)
         pbar = tqdm(
             sorted(shapes, key=lambda s: (s[0] * s[1], s[0]), reverse=True),
             desc="Preparing for capturing CUDA graphs...",
             unit="graph",
             disable=not get_tp_info().is_primary(),  # disable for non-primary ranks
         )
+        for m, bs in sizing_shapes(shapes):
+            self._eager_shape(m, bs, model)
         pool = None
         for m, bs in pbar:
             self.dummy_req.device_len += m - 1
@@ -249,6 +270,23 @@ class GraphRunner:
         self._reset_moe_offload_cache()
         free_memory = get_free_memory(self.device)
         logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
+
+    def _eager_shape(self, m: int, bs: int, model: BaseLLMModel) -> None:
+        """One eager decode forward of ``bs`` requests x ``m`` rows on the dummy request (sizes the spec buffers)."""
+        self.dummy_req.device_len += m - 1
+        batch = Batch(reqs=[self.dummy_req] * bs, phase="decode")
+        batch.padded_reqs = batch.reqs
+        batch.spec_m = m
+        self.attn_backend.prepare_for_capture(batch)
+        self.buffer.set_batch(batch)
+        dummy_slot = (self.dummy_req.linear_slot_idx
+                      if self.dummy_req.linear_slot_idx is not None
+                      else self.dummy_req.table_idx)
+        self.buffer.table_idx[:bs].fill_(dummy_slot)
+        with get_global_ctx().forward_batch(batch):
+            self.buffer.logits[: bs * m] = model.forward()
+        self._reset_moe_offload_cache()
+        self.dummy_req.device_len -= m - 1
 
     def can_use_cuda_graph(self, batch: Batch) -> bool:
         return batch.is_decode and batch.size <= self.max_graph_bs and any(

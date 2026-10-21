@@ -18,10 +18,12 @@ Image input is off by default (`rdna3/serve.sh --vision`): the vision tower runs
 broadcast, with no measurable cost on two cards and ~1.5-2 % of decode on one. The tuning is switched by environment
 variables (docs/rdna3/options.md gives each default); what is on by default is bit-exact, agent-validated, or checked
 for exactness without the agentic benchmark (the sampler rework, exact by kernel tests; the rank token broadcast,
-checked in `check`-mode server runs). Precision rule: a change is either bit-exact (identical greedy answers) or validated on an agentic
-benchmark (a ROCm 10 build with the MTP head scored 12 and 18 of 29 there); an int8 KV cache that passed every short
-test cut the agentic score from 12-14 to 8-9 and is off in every profile (kept as an option, not recommended).
-Tested only on RX 7900 XTX + XT; NVIDIA, RDNA4 and TP>2 untested (this model cannot run above TP=2 in this build).
+checked in `check`-mode server runs; the MTP head's drafts drawn under each request's sampling, exact speculative
+sampling with greedy answers unchanged). Precision rule: a change is either bit-exact (identical greedy answers) or
+validated on an agentic benchmark (a ROCm 10 build with the MTP head scored 12 and 18 of 29 there); an int8 KV cache
+that passed every short test cut the agentic score from 12-14 to 8-9 and is off in every profile (kept as an option, not
+recommended). Tested only on RX 7900 XTX + XT; NVIDIA, RDNA4 and TP>2 untested (this model cannot run above TP=2 in this
+build).
 
 ## Docs
 

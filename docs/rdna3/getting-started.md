@@ -138,7 +138,7 @@ loading: that once left GPU memory held until a reboot
 | `--port N`, `--host ADDR` | where the API listens (default `127.0.0.1:1919`). `--host 0.0.0.0` serves your network: the API has no authentication unless started with `-- --api-key KEY` ([security](limits.md#anything-else-to-know)) |
 | `--ctx N` | a shorter context than the profile's. Where the K/V lives in VRAM, the room it frees goes to the expert cache; with `xtx-xt-1m` it shrinks the K/V kept in RAM; with `xtx-xt-4x262k` it only caps each conversation (the RAM pool is `--kv-reserve-tokens`) |
 | `--vision` | accept images ([limits](limits.md#images-vision)); off by default, no measurable speed cost on two cards, ~1.5-2 % of decode on one |
-| `--no-mtp` | turn off the MTP draft head: the head speeds up a request decoding alone (+35 % on `xtx-xt`) and costs 3-4 % when 3-4 requests decode at once ([limits](limits.md#speculative-decoding-mtp)) |
+| `--no-mtp` | turn off the MTP draft head: the head speeds up a request decoding alone (+35 % on `xtx-xt`) and up to four at once on `xtx-xt` and its K/V-in-RAM variants; it costs 3-4 % where more requests decode than it verifies (the other profiles, an earlier build; [limits](limits.md#speculative-decoding-mtp)) |
 | `--hybrid` | the CPU computes part of the experts missing from VRAM; off by default, not agent-validated. Measured on an earlier build: NVFP4 +46 % decode on `xtx`, +51 % on `xt`, on `xtx-xt` +2 % for one request and +15 % each with four; EXL3 3.05 bpw +5 % on `xtx`, even on `xtx-xt` ([cpu-experts](cpu-experts.md)) |
 | `--served-name ID` | the model id `/v1/models` reports (default `qwen3.8-flash-next`) |
 | `--name NAME`, `--image REF`, `--memory SIZE` | container name, image, container RAM limit |

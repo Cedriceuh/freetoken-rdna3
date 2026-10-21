@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- Three and four requests verify the MTP head's drafts too, 2 rows each, in `xtx-xt`, `xtx-xt-1m` and `xtx-xt-4x262k`
+  (`FREETOKEN_SPEC_BS_MAX=4` with the new `FREETOKEN_SPEC_BS_DEEP=2`: more than 2 rows per request only up to two
+  requests). At four requests 2 rows pay where 3 and 4 do not (NVFP4, one row count for every step, one run each: 31.3
+  tok/s each at 1 row, 35.2 at 2, 31.7 at 3, 30.4 at 4). Against the setting before, `xtx-xt-4x262k`, two runs each with
+  a 300k-token pool: three requests NVFP4 38.4 -> 40.8-40.9 tok/s each, EXL3 3.05 bpw 44.4 -> 48.3; four started apart
+  34.2-34.3 -> 35.3-35.4 and 41.0-41.9 -> 43.6-43.7; four at once 31.3-32.8 -> 33.8-33.9 and 38.3 -> 40.2-40.3; one
+  request unchanged; the same greedy answers on prompts read apart. Two more CUDA graphs per card: ~280-380 MiB less
+  VRAM free after the capture, the same expert slots. `xtx-xt` (the K/V in VRAM, one run each, two series): three
+  requests NVFP4 32.1 -> 32.8 and 28.6 -> 33.4, EXL3 39.8 -> 42.0 and 38.7 -> 43.2, a sweep to 260k the same, no
+  out-of-memory; `xtx-xt-1m` (EXL3): three 41.1 -> 45.4, four 36.2 -> 40.7.
+- The MTP head's drafts for a sampled request are drawn under its sampling by default
+  (`FREETOKEN_SPEC_SAMPLED_DRAFTS=1`, measured at T 1.0 only before): kept more often at `serve.sh`'s T 0.6.
+  `xtx-xt-4x262k`, two runs each: 14 prompts x 1024 tokens NVFP4 91.0-91.5 -> 94.0-94.2 tok/s, EXL3 3.05 bpw 92.9-93.0
+  -> 97.0; 5 prompts at 28k-130k of context 82.6-82.7 -> 82.8-83.0 and 85.8-85.9 -> 91.9; two requests 62.3 -> 61.5-61.6
+  and 65.0 -> 65.9; `xtx-xt` with NVFP4 (one run): 82.3 -> 86.7 tok/s, four requests on ~60k-token prompts 16.2 -> 18.2
+  tok/s each. Greedy answers unchanged; sampled ones keep the same distribution (exact speculative sampling) but other
+  draws.
+- Fixed: the CUDA graph captures could free the verify step's rollback buffers under a graph captured before (an illegal
+  memory access once requests verified), when a capture with more requests followed one with fewer; no shipped profile
+  captured in that order. The buffers are now sized before any capture.
 - Upstream FreeToken merged up to `cc56b6b` (29 commits); the authors' commits are kept. On this tree's path: NVFP4
   global scales stay in fp32 (upstream's precision fix: stored as fp16, most of them were subnormal) and the Triton
   NVFP4 prefill GEMM is upstream's rewrite, with this tree's RDNA3 tiles swept again on it (4 warps and 2 stages on both

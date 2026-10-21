@@ -276,6 +276,7 @@ Line counts here are against the merge of `cc56b6b`, on top of the lines listed 
 | `python/freetoken/layers/embedding.py`, `tests/layers/test_lm_head_dump.py` | 2/2, new | the prompt top-k dump of a tied LM head (`FREETOKEN_DUMP_PROMPT_TOPK`) computes its logits as the forward does (it called an `F.linear` that was never imported) |
 | `rdna3/tests/exl3_moe_check.py` | 17/0 | the torch reference on as many CPU threads as the container's quota: oversubscribed, it decoded the same tiles differently now and then and the check failed |
 | `tests/moe/test_cpu_moe_exl3.py`, `tests/moe/test_prefill_cached.py`, `tests/models/qwen4_exp/test_mtp.py`, `rdna3/bench/nvfp4_*_sweep.py`, `rdna3/bench/exl3_*_bench.py`, `rdna3/tests/moe_block_check.py` | 3/3, 4/4, 1/1, 9/7, 3/3, 2/2 | the executor's per-layer formats, fp32 NVFP4 globals, the launches in `kernel/nvfp4_moe.py` |
+| `python/freetoken/spec_decode.py`, `engine/graph.py`, `tests/test_spec_decode.py`, `tests/engine/test_graph_sizing.py` | 27/10, 44/6, 20/0, new | `FREETOKEN_SPEC_BS_DEEP`: past it (up to `FREETOKEN_SPEC_BS_MAX`) a verify step runs at most 2 rows per request and the head drafts one guess, the graphs of more rows only up to it; the spec_decode buffers sized by eager forwards of the most rows, then the most requests, before any capture (they grow with the requests and freed the old ones under graphs captured before); `FREETOKEN_SPEC_SAMPLED_DRAFTS` on by default |
 
 ## Tooling and documentation
 

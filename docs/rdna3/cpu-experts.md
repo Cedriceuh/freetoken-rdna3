@@ -46,7 +46,7 @@ does not win it back (82.5 / 33.3).
 
 **NVFP4 with the K/V in RAM**: `xtx-xt-4x262k` with `--kv-reserve-tokens 787500` (3 x 262k), 20k-token conversations
 decoding together, the decode step's period over five 300-step windows (`FT_STATS_EVERY` + `FT_MOE_STATS`; MTP head
-on, no drafts at three or more):
+on, no drafts at three or more with `FREETOKEN_SPEC_BS_MAX=2` then):
 
 | Requests at once | `offload` | `--hybrid` (the CPU takes 1.8-2.8 of 2.7-4.4 misses a layer) |
 |---|---:|---:|

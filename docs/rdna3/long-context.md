@@ -116,7 +116,7 @@ on distinct Python stdlib contexts (no shared prefix, planted values as in the r
 | Step | Result |
 |---|---|
 | 4 cold prompts of 255.7-257.9k tokens sent together | read one after another (prefill goes first): 1,027,138 tokens in 463 s (2218 tok/s), every answer right (13/13, 13/13, 12/12, 8/8) |
-| 4 next turns together (257-260k, ~800 new tokens each) | first token after 3.0-4.2 s, decode 29.4-30.1 tok/s each (no drafts past two requests) |
+| 4 next turns together (257-260k, ~800 new tokens each) | first token after 3.0-4.2 s, decode 29.4-30.1 tok/s each (no drafts past two requests: `FREETOKEN_SPEC_BS_MAX=2` then) |
 | 2 next turns together (259-261k) | first token 1.8-2.9 s, decode 57.2 and 60.6 tok/s |
 | 1 next turn alone (261k) | first token 1.8 s, decode 91.3 tok/s (94.1 on `xtx-xt` at 237k, K/V in VRAM) |
 | 4 turns together to the cap | first token 3.0-4.6 s; each conversation ends at exactly 262,144 tokens (1,048,576 in the pool at once), no error |

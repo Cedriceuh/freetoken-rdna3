@@ -53,7 +53,7 @@ A comment may follow a value on the same line. Copy a file to make your own prof
 | `FREETOKEN_NVFP4_PREFILL_TUNED` / `_DECODE_TUNED` | `1` | expert GEMM tiles swept on these cards for this model (the decode ones for this split's shapes): one prefill MoE block of 1600-2560 tokens 2.8-3.0x faster than the tiles before, long prompts -11 % on an earlier build, the down decode GEMV x1.06-1.19 in the kernel sweep, bit-exact against the default tiles |
 | `FREETOKEN_NVFP4_PREFILL_BLOCK` | `8192` | the NVFP4 prefill MoE 8192 tokens at a time instead of 4096: cold reads +7.9 % (arms alternated, an earlier build), the same bits; 16384 left the XT 0.65 GiB of VRAM at the peak of a 255k-token read ([options.md](options.md)) |
 | `FREETOKEN_HOST_KV` | `1` | conversations evicted from the GPUs go to RAM (9.5 GiB locked) and come back in ~2 s; exact |
-| `FREETOKEN_MTP` / `FREETOKEN_SPEC_VERIFY_M` | `1` / `4` | the checkpoint's MTP head drafts up to 3 tokens a step for a request decoding alone (two at once in `xtx-xt`, `FREETOKEN_SPEC_BS_MAX=2`: +8-15 % each): +35 % decode at `rdna3/serve.sh`'s sampling (+6-13 % on one card), greedy answers unchanged; `rdna3/serve.sh --no-mtp` turns it off ([limits.md](limits.md#speculative-decoding-mtp)) |
+| `FREETOKEN_MTP` / `FREETOKEN_SPEC_VERIFY_M` | `1` / `4` | the checkpoint's MTP head drafts up to 3 tokens a step for a request decoding alone (up to four at once, 2 rows each past two: `FREETOKEN_SPEC_BS_MAX=4`, `FREETOKEN_SPEC_BS_DEEP=2`): +35 % decode at `rdna3/serve.sh`'s sampling (+6-13 % on one card), greedy answers unchanged; `rdna3/serve.sh --no-mtp` turns it off ([limits.md](limits.md#speculative-decoding-mtp)) |
 | `--moe-strategy offload --moe-cache-auto` | | experts live in RAM; every byte of VRAM left after the dense weights and the KV is an expert cache (7.5k of the 24,576 experts, on each card) |
 | `--expert-load parallel` | | reads the expert files into RAM with parallel readers; `auto` (the engine's default) does the same but falls back to a slower serial read when free RAM is short: use `auto` on a machine with little RAM to spare |
 | `--quant-backend moe.nvfp4=triton` | | the Triton NVFP4 expert kernels (the other backends need NVIDIA hardware) |
@@ -86,8 +86,10 @@ instead of 51. On two cards `serve.sh` lowers `--memory-ratio` to 0.77 (0.76 fro
 
 The `xtx-xt` settings with the attention K/V in pinned host memory (`FREETOKEN_QSA_KV_HOST=1`), so the K/V pool is no
 longer bounded by VRAM: `xtx-xt-4x262k` keeps each request to the model's native 262,144 positions and holds four of
-them at once (`KV_TOKENS=1050000`), `xtx-xt-1m` serves one conversation of up to 1M tokens (the plain rope past
-262,144, `FREETOKEN_ROPE_MAX_POSITION`). The RAM tier is off (`FREETOKEN_HOST_KV=0`): the pool already lives in RAM.
+them at once (`KV_TOKENS=1050000`), `xtx-xt-1m` serves one conversation of up to 1M tokens (the plain rope past 262,144,
+`FREETOKEN_ROPE_MAX_POSITION`). The RAM tier is off (`FREETOKEN_HOST_KV=0`): the pool already lives in RAM. As in
+`xtx-xt`, three and four requests at once verify drafts too, 2 rows each: in `xtx-xt-4x262k` +6-9 % each at three,
++3-6 % at four greedy (-0.3 to +2.5 % at T 0.6) ([benchmarks.md](benchmarks.md#several-requests-and-agents-at-once-xtx-xt)).
 Measured with EXL3 3.05 bpw (~77 GiB of host RAM locked by `xtx-xt-4x262k`, ~75 GiB by `xtx-xt-1m`), and NVFP4 on
 `xtx-xt-4x262k` with a pool of three contexts (`-- --kv-reserve-tokens 787500`: agent turns, a 259,728-token
 prompt, four agents at once; 94 GiB locked after the start, ~97 GiB in use; an earlier build, this one locks 1.2 GiB more). On the 126 GiB reference machine that
@@ -100,7 +102,8 @@ faster (more expert slots). Measurements: [long-context.md](long-context.md).
 
 ## `xtx` and `xt`: one card
 
-Same settings minus the two-card ones (split, imbalance, host all-reduce, 4 requests). `FREETOKEN_NVFP4_DECODE_TUNED`
+Same settings minus the two-card ones (split, imbalance, host all-reduce, 4 requests and the verify of several at once,
+the 8192-token prefill blocks). `FREETOKEN_NVFP4_DECODE_TUNED`
 stays set but its table has no one-card shapes: it only logs a note. The MTP head gains less on one card (+6-13 %, +9-16 % greedy: its
 verify steps mostly stay at 2 rows, the extra rows' missing experts crossing PCIe). Plus:
 

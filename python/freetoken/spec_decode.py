@@ -43,14 +43,21 @@ def _rows_set() -> tuple[int, ...]:
 
 # Rows per request a decode step may run, one captured graph set each (FREETOKEN_SPEC_VERIFY_MS, default 1..SPEC_M
 # with the MTP head): a verify pass costs per row, and with several requests the extra rows touch so many
-# more experts that plain decode wins (measured: 4 requests at m=3 make 69 tok/s in all, 94 plain), so a step
-# runs SPEC_M rows only while at most FREETOKEN_SPEC_BS_MAX requests decode (default 1).
+# more experts that plain decode wins (an earlier build: 4 requests at m=3 made 69 tok/s in all, 94 plain), so a step
+# runs SPEC_M rows only while at most FREETOKEN_SPEC_BS_MAX requests decode (default 1; see SPEC_BS_DEEP).
 SPEC_MS = _rows_set()
 SPEC_BS_MAX = max(1, int(os.environ.get("FREETOKEN_SPEC_BS_MAX", "1")))
-# FREETOKEN_SPEC_SAMPLED_DRAFTS=1: a sampled request's drafts are draws from the MTP head's distribution under its
-# own sampling params (exact verify against that distribution) instead of the head's argmax (a point mass). Measured:
-# 2-7 % more tokens kept per step, the same speed (120 items at the model's T 1.0: 434 s argmax, 439 s drawn), so off
-SPEC_SAMPLED_DRAFTS = os.environ.get("FREETOKEN_SPEC_SAMPLED_DRAFTS", "0") == "1"
+# FREETOKEN_SPEC_BS_DEEP (default SPEC_BS_MAX): more than SHALLOW_M rows per request only while at most this many
+# requests decode; beyond it, up to SPEC_BS_MAX, a step verifies SHALLOW_M rows each (one draft): each extra row of a
+# wide batch brings its own missing experts, so the second row pays where the third and fourth do not (4 requests,
+# NVFP4 xtx-xt-4x262k: 35.2 tok/s each at 2 rows, 31.7 at 3, 30.4 at 4, 31.3 without verifying)
+SPEC_BS_DEEP = min(SPEC_BS_MAX, max(1, int(os.environ.get("FREETOKEN_SPEC_BS_DEEP", str(SPEC_BS_MAX)))))
+SHALLOW_M = 2
+# FREETOKEN_SPEC_SAMPLED_DRAFTS (default 1): a sampled request's drafts are draws from the MTP head's distribution under
+# its own sampling params (exact verify against that distribution) instead of the head's argmax (a point mass): kept
+# more often (sum of min(p, q) against p(argmax)). At T 0.6 (xtx-xt-4x262k): 14 prompts x 1024 tokens +3 % (NVFP4) and
+# +4.4 % (EXL3 3.05), 5 prompts at 28k-130k of context +0.3 % / +7 %; at T 1.0 the same speed. Greedy rows unchanged
+SPEC_SAMPLED_DRAFTS = os.environ.get("FREETOKEN_SPEC_SAMPLED_DRAFTS", "1") == "1"
 # FREETOKEN_SPEC_GLUE_KERNELS=0: a verify step's glue (rollback copies, token-pool writes, kept counts, draft rows) as
 # torch ops; kernel/triton/spec_glue.py does the same integer arithmetic and copies
 SPEC_GLUE_KERNELS = os.environ.get("FREETOKEN_SPEC_GLUE_KERNELS", "1") != "0"
@@ -135,6 +142,14 @@ def _wanted_rows(req) -> int:
     return stats.best_rows() if SPEC_DYNAMIC and stats is not None else SPEC_M
 
 
+def _rows_cap(reqs) -> int:
+    """The most rows per request a step of ``reqs`` may verify: past SPEC_BS_DEEP requests, the most captured row
+    count up to SHALLOW_M (with none above 1, no drafts: the head only writes its KV)."""
+    if len(reqs) <= SPEC_BS_DEEP:
+        return SPEC_M
+    return max((k for k in SPEC_MS if k <= SHALLOW_M), default=1)
+
+
 def _room(req) -> int:
     """Tokens ``req`` may still emit (its ``max_device_len`` is at most the page table's width)."""
     return getattr(req, "remain_len", SPEC_M)
@@ -146,7 +161,7 @@ def draft_depth(reqs, m: int = 1) -> int:
     decode. The chain writes its KV up to the step's last row + depth - 1, kept below ``max_device_len``."""
     if len(reqs) > SPEC_BS_MAX or SPEC_M < 2:
         return 0
-    return min(max(_wanted_rows(r) for r in reqs) - 1, min(_room(r) for r in reqs) - m + 2)
+    return min(min(max(_wanted_rows(r) for r in reqs), _rows_cap(reqs)) - 1, min(_room(r) for r in reqs) - m + 2)
 
 
 def rows_for(reqs) -> int:
@@ -158,7 +173,8 @@ def rows_for(reqs) -> int:
     if len(reqs) > SPEC_BS_MAX or SPEC_MS[-1] == 1:
         m = SPEC_MS[0]
     else:
-        cap = min(max(_wanted_rows(r) for r in reqs), 1 + min(getattr(r, "spec_drafts", SPEC_M - 1) for r in reqs))
+        cap = min(max(_wanted_rows(r) for r in reqs), _rows_cap(reqs),
+                  1 + min(getattr(r, "spec_drafts", SPEC_M - 1) for r in reqs))
         m = max((k for k in SPEC_MS if k <= cap), default=SPEC_MS[0])
     room = min(_room(r) for r in reqs)
     return m if m <= room else max((k for k in SPEC_MS if k <= room), default=1)
@@ -295,5 +311,6 @@ class SpecTimer:
             log.info_rank0(f"[spec-time] {reqs} req x {m} rows, {steps} steps, ms gpu/host: {parts}")
 
 
-__all__ = ["SPEC_BS_MAX", "SPEC_DYNAMIC", "SPEC_GLUE_KERNELS", "SPEC_M", "SPEC_MS", "DepthStats", "RollbackTarget",
-           "SpecTimer", "apply_rollback", "block_contiguous", "draft_depth", "register", "rows_for", "rows_of"]
+__all__ = ["SHALLOW_M", "SPEC_BS_DEEP", "SPEC_BS_MAX", "SPEC_DYNAMIC", "SPEC_GLUE_KERNELS", "SPEC_M", "SPEC_MS",
+           "DepthStats", "RollbackTarget", "SpecTimer", "apply_rollback", "block_contiguous", "draft_depth", "register",
+           "rows_for", "rows_of"]

@@ -24,7 +24,7 @@ docker run --rm -w /opt/FreeToken --entrypoint python3 freetoken-rdna3:latest -m
 ```
 
 About 3 minutes (155 s on the reference machine with `--cpus 8`), no GPU needed, on the tree the image was built
-from: 1809 passed, 1086 skipped and 3 failures that fail the same way on upstream, from the environment (they need
+from: 1812 passed, 1086 skipped and 3 failures that fail the same way on upstream, from the environment (they need
 flashinfer, an NVIDIA-only package:
 `test_cache_budget.py::test_adjust_config_defaults_moe_cache_auto_for_auto_resolved_offload_backend`,
 `test_cache_budget.py::test_adjust_config_resolves_num_tokens_generic`,
