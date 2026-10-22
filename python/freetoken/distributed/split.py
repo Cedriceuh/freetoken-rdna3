@@ -131,6 +131,21 @@ def intermediate_partition(total: int, *, rank: int | None = None, world_size: i
     return tp_partition(total, _intermediate_unit, rank=rank, world_size=world_size)
 
 
+# FREETOKEN_LMHEAD_SPLIT=1 (opt-in, with FREETOKEN_TP_SPLIT, on the models that wire it: qwen4_exp): the LM head's
+# vocabulary rows follow the ranks' shares instead of an even split. Each logit is one rank's dot product, so its bits
+# do not depend on the split (the int8 GEMV keys its K tiles on the head's shape: kernel/triton/int8_gemv.py)
+LMHEAD_SPLIT = os.environ.get("FREETOKEN_LMHEAD_SPLIT", "0") == "1"
+VOCAB_UNIT = 64
+
+
+def vocab_shards(total: int, world_size: int | None = None) -> list[tuple[int, int]] | None:
+    """Every rank's ``(offset, rows)`` of an uneven LM head (FREETOKEN_LMHEAD_SPLIT), or None for the even split."""
+    world_size = get_tp_info().size if world_size is None else world_size
+    if not LMHEAD_SPLIT or tp_shares(world_size) is None or total % VOCAB_UNIT:
+        return None
+    return [tp_partition(total, VOCAB_UNIT, rank=r, world_size=world_size) for r in range(world_size)]
+
+
 __all__ = [
     "ENV",
     "INTERMEDIATE_UNIT",
@@ -140,4 +155,5 @@ __all__ = [
     "set_intermediate_unit",
     "tp_partition",
     "tp_shares",
+    "vocab_shards",
 ]

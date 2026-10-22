@@ -132,8 +132,23 @@ class ParallelLMHead(VocabParallelEmbedding):
         *,
         quant_config: QuantConfig | None = None,
         prefix: str = "",
+        uneven: bool = False,
     ):
         super().__init__(num_embeddings, embedding_dim)
+        # ``uneven`` (a loader that cuts the head by distributed.split.vocab_shards): the ranks' rows follow
+        # FREETOKEN_TP_SPLIT under FREETOKEN_LMHEAD_SPLIT, each rank holding and computing only its own
+        self.vocab_shards = None
+        if uneven and tied_embedding is None:
+            from freetoken.distributed.split import vocab_shards
+
+            self.vocab_shards = vocab_shards(num_embeddings, self.tp_size)
+        if self.vocab_shards is not None:
+            from freetoken.kernel.triton.int8_gemv import share_config
+
+            self.vocab_range = self.vocab_shards[get_tp_info().rank]
+            for _, rows in self.vocab_shards:  # the even head's int8 tiles: the same K order, the same logits
+                share_config((rows, embedding_dim), (self.num_embeddings_tp, embedding_dim))
+            self.num_embeddings_tp = self.vocab_range[1]
         self.has_bias = bias
         self.prefix = prefix
         self.tied_embedding = tied_embedding
@@ -145,6 +160,8 @@ class ParallelLMHead(VocabParallelEmbedding):
             self.quant_method = quant_method_for(quant_config, self, prefix)
             self.quant_method.create_weights(self)
         self.bias = torch.empty(self.num_embeddings_tp) if bias else None
+        # FREETOKEN_SPARSE_LOGITS (set by the engine): decode forwards return this rank's shard of the logits
+        self.decode_local = False
 
     def finalize(self) -> None:
         if self.quant_method is not None:
@@ -188,9 +205,7 @@ class ParallelLMHead(VocabParallelEmbedding):
             local = self.tied_embedding.quant_method.logits(self.tied_embedding, part, self.bias) \
                 if self.tied_embedding is not None else self.quant_method.apply(self, part)
             if self.tp_size > 1:
-                shape = local.shape
-                full = self._comm.all_gather(local).view((self.tp_size,) + shape).permute(1, 0, 2)
-                local = full.reshape(shape[0], self.tp_size * shape[1])
+                local = self.gather_full(local)
             lp = torch.log_softmax(local[:, : self.num_embeddings].float(), dim=-1)
             top = lp.topk(k, dim=-1)
             ids.append(top.indices.cpu())
@@ -221,6 +236,18 @@ class ParallelLMHead(VocabParallelEmbedding):
             logits = self.quant_method.apply(self, x)
         if self.tp_size == 1:
             return logits
+        if self.decode_local and batch.is_decode:
+            return logits  # FREETOKEN_SPARSE_LOGITS: the engine gathers what it needs (gather_full or candidates)
+        return self.gather_full(logits)
+
+    def gather_full(self, logits: torch.Tensor) -> torch.Tensor:
+        """This rank's ``[N, vocab / tp]`` logits -> every rank's, ``[N, vocab]``."""
+        if self.vocab_shards is not None:  # shards of other widths: gathered at the widest, then side by side
+            widest = max(rows for _, rows in self.vocab_shards)
+            padded = logits.new_zeros(logits.shape[0], widest)
+            padded[:, : logits.shape[1]] = logits
+            parts = self._comm.all_gather(padded).view(self.tp_size, logits.shape[0], widest)
+            return torch.cat([parts[r, :, :rows] for r, (_, rows) in enumerate(self.vocab_shards)], dim=-1)
         input_shape = logits.shape
         output_tensor = self._comm.all_gather(logits)
 
@@ -231,3 +258,14 @@ class ParallelLMHead(VocabParallelEmbedding):
         output_tensor = output_tensor.permute(1, 0, 2).contiguous()
         output_tensor = output_tensor.reshape(input_shape[:1] + (self.tp_size * input_shape[1],))
         return output_tensor[:, : self.num_embeddings]
+
+    def candidates(self, logits: torch.Tensor, k: int, rows: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """This rank's ``[N, vocab / tp]`` logits -> ``(vals [N, k] fp32, ids [N, k] int64, argmax [N] int64)`` on every
+        rank: what ``torch.topk(k)`` over ``rows`` of the whole rows and ``torch.argmax`` return
+        (kernel/triton/vocab_topk.py). Only ``tp * N * 2k`` floats cross between the ranks instead of the ``N * vocab``
+        logits."""
+        from freetoken.kernel.triton.vocab_topk import merge_candidates, pack_candidates
+
+        start, width = self.vocab_range
+        packed = pack_candidates(logits, k, start, width)
+        return merge_candidates(self._comm.all_gather(packed), self.tp_size, k, rows)

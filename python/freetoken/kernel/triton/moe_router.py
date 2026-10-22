@@ -9,6 +9,7 @@ The ``num_token_non_padded`` row mask reads the device tensor, so it survives CU
 from __future__ import annotations
 
 import functools
+import os
 from typing import Tuple
 
 import torch
@@ -16,6 +17,13 @@ import triton
 import triton.language as tl
 
 from freetoken.utils.arch import is_sm90_supported
+
+
+# FREETOKEN_ROUTER_KEYS (default 1 on ROCm, where its bits were checked): the top-k picks each expert in one reduction
+# of (value, expert id) keys instead of three (the largest value, the lowest id holding it, the winner's weight by a
+# masked sum), then computes the winner's weight with the softmax's own ops. The same experts, order and bits
+# (tests/kernels/test_router_keys.py)
+_ROUTER_KEYS = os.environ.get("FREETOKEN_ROUTER_KEYS", "1" if torch.version.hip else "0") == "1"
 
 
 @functools.cache
@@ -44,6 +52,7 @@ def _router_triton_kernel(
     RENORMALIZE: tl.constexpr,
     HAS_TOKEN_LIMIT: tl.constexpr,
     launch_pdl: tl.constexpr,
+    KEYS: tl.constexpr = False,
 ) -> None:
     # Row-tiled: each program handles BLOCK_M rows; all reductions run along the
     # expert (N) axis. Tiling rows keeps CTAs large enough to stay occupancy-bound
@@ -65,7 +74,8 @@ def _router_triton_kernel(
     ranked = tl.where(mask_n[None, :], logits, -float("inf"))
     row_max = tl.max(ranked, axis=1)[:, None]
     exp_row = tl.where(mask_n[None, :], tl.exp(ranked - row_max), 0.0)
-    activated = exp_row / tl.sum(exp_row, axis=1)[:, None]
+    denom = tl.sum(exp_row, axis=1)[:, None]
+    activated = exp_row / denom
 
     # Map NaN -> a finite floor
     ranked = tl.where(ranked == ranked, ranked, -1e30)
@@ -75,18 +85,46 @@ def _router_triton_kernel(
     selected_vals = tl.zeros([BLOCK_M, BLOCK_K], dtype=tl.float32)
     selected_idx = tl.zeros([BLOCK_M, BLOCK_K], dtype=tl.int32)
 
-    cur = ranked
-    for k in tl.static_range(K):
-        max_val = tl.max(cur, axis=1)[:, None]
-        lane_id = tl.where(cur == max_val, offs_n[None, :], N + 1)  # lowest expert id wins ties
-        win_lane = tl.min(lane_id, axis=1)[:, None].to(tl.int32)
-        win_activated = tl.sum(
-            tl.where(offs_n[None, :] == win_lane, activated, 0.0), axis=1
-        )[:, None]
-        slot = offs_k[None, :] == k
-        selected_vals = tl.where(slot, win_activated, selected_vals)
-        selected_idx = tl.where(slot, win_lane, selected_idx)
-        cur = tl.where(offs_n[None, :] == win_lane, -float("inf"), cur)
+    if KEYS:
+        # key = ordered value bits (-0.0 as 0.0, as == ties them), then the inverted expert id: the largest key is the
+        # largest value held by the lowest id
+        bits = ranked.to(tl.int32, bitcast=True)
+        bits = tl.where(bits == -2147483648, 0, bits)
+        ordered = tl.where(bits >= 0, bits, bits ^ 0x7FFFFFFF).to(tl.int64)
+        low = 0xFFFFFFFF - offs_n[None, :].to(tl.int64)
+        key = (ordered << 32) | low
+        # a picked lane becomes -inf with its id, as the other path sets it: once only -inf is left (fewer than K
+        # values above it), both pick the lowest id among the -inf lanes, picked ones included
+        NINF: tl.constexpr = -2139095041  # ordered bits of -inf
+        picked = (NINF << 32) | low
+        for k in tl.range(K, loop_unroll_factor=1):  # not unrolled
+            best = tl.max(key, axis=1)[:, None]
+            win_lane = (0xFFFFFFFF - (best & 0xFFFFFFFF)).to(tl.int32)
+            hi = (best >> 32).to(tl.int32)
+            win_val = tl.where(hi >= 0, hi, hi ^ 0x7FFFFFFF).to(tl.float32, bitcast=True)
+            # the softmax's ops on the winner alone (the other path's masked sum only adds zeros to it)
+            win_activated = tl.exp(win_val - row_max) / denom
+            if tl.max(tl.max((hi == NINF).to(tl.int32), axis=1), axis=0) > 0:
+                # a -inf pick may be a lane picked before: its weight is that lane's, read as the other path does
+                win_activated = tl.where(hi == NINF, tl.sum(tl.where(offs_n[None, :] == win_lane, activated, 0.0),
+                                                            axis=1)[:, None], win_activated)
+            slot = offs_k[None, :] == k
+            selected_vals = tl.where(slot, win_activated, selected_vals)
+            selected_idx = tl.where(slot, win_lane, selected_idx)
+            key = tl.where(offs_n[None, :] == win_lane, picked, key)
+    else:
+        cur = ranked
+        for k in tl.static_range(K):
+            max_val = tl.max(cur, axis=1)[:, None]
+            lane_id = tl.where(cur == max_val, offs_n[None, :], N + 1)  # lowest expert id wins ties
+            win_lane = tl.min(lane_id, axis=1)[:, None].to(tl.int32)
+            win_activated = tl.sum(
+                tl.where(offs_n[None, :] == win_lane, activated, 0.0), axis=1
+            )[:, None]
+            slot = offs_k[None, :] == k
+            selected_vals = tl.where(slot, win_activated, selected_vals)
+            selected_idx = tl.where(slot, win_lane, selected_idx)
+            cur = tl.where(offs_n[None, :] == win_lane, -float("inf"), cur)
 
     if launch_pdl:
         tl.extra.cuda.gdc_launch_dependents()
@@ -111,6 +149,7 @@ def fused_topk_softmax(
     topk: int,
     renormalize: bool,
     num_token_non_padded: torch.Tensor | None = None,
+    keys: bool | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Softmax over all experts, top-k, then renormalize; ties keep the lowest expert id.
 
@@ -152,6 +191,7 @@ def fused_topk_softmax(
         RENORMALIZE=renormalize,
         HAS_TOKEN_LIMIT=num_token_non_padded is not None,
         launch_pdl=_pdl_supported(),
+        KEYS=_ROUTER_KEYS if keys is None else keys,
         num_warps=num_warps,
     )
     return weights, indices

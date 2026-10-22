@@ -229,6 +229,7 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
             quant_config=config.quant,
             prefix="lm_head",
+            uneven=True,  # weight.py cuts lm_head.weight by vocab_shards (FREETOKEN_LMHEAD_SPLIT)
         )
         if config.mtp_layers:
             from .mtp import Qwen4ExpMTP

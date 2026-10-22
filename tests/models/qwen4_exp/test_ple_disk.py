@@ -295,6 +295,23 @@ def test_disk_table_matches_oracle(tmp_path, dtype):
 
 
 @requires_cuda
+def test_disk_table_skips_the_gpu_hashing(tmp_path):
+    """The disk store stages the rows the host hashed: an embedding over it returns row ids of the right shape without
+    hashing them on the GPU, and looks up the same rows as the hashed ids give the oracle."""
+    disk, oracle, args = _make_table(tmp_path)
+    emb, hashed = _embedding(), _embedding()
+    emb.attach_table(disk)
+    older, newer = 41, EOS
+    for token in (7, 9, 13):
+        disk.fill([torch.tensor([older, newer, token])], graph=False)
+        meta = _meta([[token]], [[older, newer]], decode=True)
+        ids = hashed.row_ids(meta)
+        assert emb.row_ids(meta).shape == ids.shape
+        assert _bitwise_equal(emb.forward(meta), oracle.lookup(ids.cuda())), f"token {token}"
+        older, newer = newer, token
+
+
+@requires_cuda
 def test_eager_fill_does_not_overwrite_an_in_flight_lookup(tmp_path):
     """The overlap scheduler fills batch k+1 while batch k's lookup copy is still queued behind the
     layers before it (a sleep kernel here): batch k must read its own rows."""

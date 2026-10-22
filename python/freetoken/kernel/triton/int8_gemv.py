@@ -57,6 +57,21 @@ if os.environ.get("FREETOKEN_INT8_TP_TILES", "0") == "1":
     })
 
 
+# shapes that take another shape's tiles (``share_config``): an uneven LM head's shards (FREETOKEN_LMHEAD_SPLIT) take
+# the even head's, so its K order and its bits
+_SHARED: dict[tuple[int, int], tuple[int, int]] = {}
+
+
+def share_config(shape: tuple[int, int], like: tuple[int, int]) -> None:
+    """Run ``shape`` (N, K) with the tiles of ``like``."""
+    _SHARED[tuple(shape)] = tuple(like)
+
+
+def _config(N: int, K: int) -> tuple[int, int, int, int]:
+    N, K = _SHARED.get((N, K), (N, K))
+    return _CONFIGS.get((N, K)) or _default_config(N, K)
+
+
 def _default_config(N: int, K: int) -> tuple[int, int, int, int]:
     # v2 tuning favoured 1-2 rows per program and a K block covering the row (one iteration)
     block_k = min(4096, max(512, triton.next_power_of_2(K)))
@@ -309,7 +324,7 @@ def gemv_int8(x: torch.Tensor, qweight: torch.Tensor, scale: torch.Tensor, *, si
     N, K = qweight.shape
     M = x.shape[0] if x.dim() == 2 else 1
     x2 = x.reshape(M, K) if x.dim() != 2 else x
-    block_n, block_k, split, warps = _CONFIGS.get((N, K)) or _default_config(N, K)
+    block_n, block_k, split, warps = _config(N, K)
     k_per = triton.cdiv(triton.cdiv(K, split), block_k) * block_k
     out = torch.empty((M, N), dtype=torch.bfloat16, device=x.device)
     one_pass = split == 1 and k_per >= K and block_k >= K
@@ -352,7 +367,7 @@ def gemv_int8_hc_mix(x: torch.Tensor, qweight: torch.Tensor, scale: torch.Tensor
     (1, BLOCK_K >= K, 1, 1) one, ``rn`` [M, hc * HD] bf16 -> [M, HD] bf16. None when the config is another one."""
     N, K = qweight.shape
     M = x.shape[0]
-    cfg = _CONFIGS.get((N, K)) or _default_config(N, K)
+    cfg = _config(N, K)
     if cfg[0] != 1 or cfg[2] != 1 or cfg[3] != 1 or cfg[1] < K or N % hc or M > min(ROWS_MAX, 8) or rn.stride(1) != 1:
         return None
     HD = N // hc
@@ -369,7 +384,7 @@ def gemv_int8_act_mul(x: torch.Tensor, qweight: torch.Tensor, scale: torch.Tenso
     N, K = qweight.shape
     M = x.shape[0] if x.dim() == 2 else 1
     x2 = x.reshape(M, K) if x.dim() != 2 else x
-    block_n, block_k, split, warps = _CONFIGS.get((N, K)) or _default_config(N, K)
+    block_n, block_k, split, warps = _config(N, K)
     if split != 1 or N % 2 or M > ROWS_MAX:
         return None
     D = N // 2

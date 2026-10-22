@@ -10,23 +10,53 @@ is p_j without d. All on the device (Gumbel-max draws), no host sync.
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 # above this top-k (or with top-k off) the distribution is built over the whole vocabulary
 _SPARSE_TOPK_MAX = 256
 
+# FREETOKEN_SAMPLE_KERNELS (default 1): on the LM head's candidates (FREETOKEN_SPARSE_LOGITS), rows of at most 64
+# draw in one kernel (kernel/triton/spec_sampling.py) with the bits of the torch ops below
+_SAMPLE_KERNELS = os.environ.get("FREETOKEN_SAMPLE_KERNELS", "1") == "1"
 
-def _distribution(logits: torch.Tensor, temperature: torch.Tensor, top_k: torch.Tensor | None,
-                  top_p: torch.Tensor | None, top_k_max: int | None) -> tuple[torch.Tensor, torch.Tensor]:
-    """``(token ids [N, K], probs [N, K])``: each row's sampling support and its probabilities (zeros past it)."""
-    x = logits.float() / temperature.clamp(min=1e-5).unsqueeze(-1)
-    vocab = x.shape[-1]
+
+def _fused(cands, top_k, q=None) -> bool:
+    if not _SAMPLE_KERNELS or cands is None or top_k is None or not cands[0].is_cuda:
+        return False
+    from freetoken.kernel.triton.spec_sampling import MAX_K
+
+    # a sparse draft q drawn while a wider top_k was in the batch can be wider than the candidates
+    return cands[0].shape[-1] <= MAX_K and (q is None or (isinstance(q, tuple) and q[0].shape[-1] <= MAX_K))
+
+
+def sparse_ok(top_k: torch.Tensor | None, top_k_max: int | None) -> bool:
+    """Whether the rows draw from their top_k_max largest logits only (host-side, no sync)."""
+    return top_k is not None and top_k_max is not None and 0 < top_k_max <= _SPARSE_TOPK_MAX
+
+
+def _distribution(logits: torch.Tensor | None, temperature: torch.Tensor, top_k: torch.Tensor | None,
+                  top_p: torch.Tensor | None, top_k_max: int | None,
+                  cands: tuple[torch.Tensor, torch.Tensor, int] | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(token ids [N, K], probs [N, K])``: each row's sampling support and its probabilities (zeros past it).
+    ``cands = (vals, ids, vocab)``: the top_k_max largest logits of each row as ``torch.topk`` returns them (LM head
+    ``candidates``), in place of ``logits``: the same values in the same order divided by the same temperatures, so
+    the same support and probabilities."""
+    t = temperature.clamp(min=1e-5).unsqueeze(-1)
     # host-side decision (no sync): every sampled row's top_k is <= top_k_max (Sampler.prepare); greedy rows,
     # whose top_k is the vocabulary, are overwritten by the caller
-    sparse = top_k is not None and top_k_max is not None and 0 < top_k_max <= _SPARSE_TOPK_MAX
-    width = top_k_max if sparse else vocab
-    vals, ids = torch.topk(x, width, dim=-1) if sparse else torch.sort(x, dim=-1, descending=True)
-    cols = torch.arange(width, device=x.device)
+    sparse = sparse_ok(top_k, top_k_max)
+    if cands is not None:
+        assert sparse
+        vals, ids, vocab = cands[0] / t, cands[1], cands[2]
+        width = top_k_max
+    else:
+        x = logits.float() / t
+        vocab = x.shape[-1]
+        width = top_k_max if sparse else vocab
+        vals, ids = torch.topk(x, width, dim=-1) if sparse else torch.sort(x, dim=-1, descending=True)
+    cols = torch.arange(width, device=vals.device)
     if top_k is not None:
         k = torch.where(top_k > 0, top_k, torch.full_like(top_k, vocab)).unsqueeze(-1)
         if sparse:  # the top-k-first sampler keeps exactly k
@@ -53,29 +83,62 @@ def _draw(probs: torch.Tensor, gen: torch.Generator | None) -> torch.Tensor:
     return (probs.log() - (-u.log()).log()).argmax(-1)
 
 
-def draft_distribution(logits: torch.Tensor, temperature: torch.Tensor, top_k: torch.Tensor | None = None,
+def draft_distribution(logits: torch.Tensor | None, temperature: torch.Tensor, top_k: torch.Tensor | None = None,
                        top_p: torch.Tensor | None = None, top_k_max: int | None = None,
-                       gen: torch.Generator | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+                       gen: torch.Generator | None = None, cands=None, fused: bool | None = None):
     """A sampled draft: ``(tokens [B], q [B, V])`` -- one draw from the draft head's ``logits [B, V]`` under each
-    request's sampling params, and that distribution over the vocabulary (what :func:`spec_sample` needs)."""
-    ids, probs = _distribution(logits, temperature, top_k, top_p, top_k_max)
+    request's sampling params, and that distribution over the vocabulary (what :func:`spec_sample` needs). With
+    ``cands`` (see :func:`_distribution`) q is sparse: ``(ids [B, K], probs [B, K])``."""
+    if fused is None:
+        fused = _fused(cands, top_k)
+    if fused:
+        from freetoken.kernel.triton.spec_sampling import draft_from_candidates
+
+        return draft_from_candidates(cands[0], cands[1], temperature, top_k, top_p, cands[2], gen=gen)
+    ids, probs = _distribution(logits, temperature, top_k, top_p, top_k_max, cands)
     tokens = ids.gather(-1, _draw(probs, gen).unsqueeze(-1)).squeeze(-1)
+    if cands is not None:
+        return tokens, (ids, probs)
     q = torch.zeros(logits.shape, dtype=torch.float32, device=logits.device).scatter_(-1, ids, probs)
     return tokens, q
 
 
-def spec_sample(rows_logits: torch.Tensor, drafts: torch.Tensor, temperature: torch.Tensor,
+def _q_at(q: torch.Tensor | tuple, at: torch.Tensor) -> torch.Tensor:
+    """``q``'s probabilities of the tokens ``at [..., n]`` (q dense ``[..., V]``, or sparse ``(ids, probs)
+    [..., K]``: a sum with at most one nonzero term, so the same value as the dense gather)."""
+    if not isinstance(q, tuple):
+        return q.gather(-1, at.to(torch.int64))
+    q_ids, q_probs = q
+    return (q_probs.unsqueeze(-2) * (q_ids.unsqueeze(-2) == at.to(q_ids.dtype).unsqueeze(-1))).sum(-1)
+
+
+def spec_sample(rows_logits: torch.Tensor | None, drafts: torch.Tensor, temperature: torch.Tensor,
                 top_k: torch.Tensor | None = None, top_p: torch.Tensor | None = None,
                 top_k_max: int | None = None, gen: torch.Generator | None = None,
-                q: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+                q: torch.Tensor | tuple | None = None, cands=None,
+                fused: bool | None = None) -> tuple[torch.Tensor, torch.Tensor]:
     """``rows_logits [B, m, V]`` (the target after each of a request's m rows), ``drafts [B, m-1]`` (the tokens at
     rows 1..m-1), per-request sampling params ``[B]``; ``q [B, m-1, V]``: the distributions the drafts were drawn from
-    (None: deterministic drafts). Returns ``(tokens [B, m], n_acc [B])``: the first n_acc tokens are the emitted ones
-    (the accepted drafts, then the drawn token); the rest are don't-cares."""
-    reqs, m, vocab = rows_logits.shape
+    (None: deterministic drafts; sparse ``(ids, probs) [B, m-1, K]`` also). Returns ``(tokens [B, m], n_acc [B])``:
+    the first n_acc tokens are the emitted ones (the accepted drafts, then the drawn token); the rest are don't-cares.
+    ``cands = (vals [B, m, K], ids [B, m, K], vocab)`` in place of ``rows_logits`` (see :func:`_distribution`)."""
+    if fused is None:
+        fused = _fused(cands, top_k, q)
+    if fused:
+        from freetoken.kernel.triton.spec_sampling import spec_sample_from_candidates
+
+        return spec_sample_from_candidates(cands[0], cands[1], drafts, temperature, top_k, top_p, cands[2], q=q,
+                                           gen=gen)
+    if cands is not None:
+        reqs, m, kc = cands[0].shape
+        flat = (cands[0].reshape(reqs * m, kc), cands[1].reshape(reqs * m, kc), cands[2])
+        logits_rows = None
+    else:
+        reqs, m, vocab = rows_logits.shape
+        flat, logits_rows = None, rows_logits.reshape(reqs * m, vocab)
     per_row = lambda t: None if t is None else t.repeat_interleave(m)  # noqa: E731
-    ids, probs = _distribution(rows_logits.reshape(reqs * m, vocab), temperature.repeat_interleave(m),
-                               per_row(top_k), per_row(top_p), top_k_max)
+    ids, probs = _distribution(logits_rows, temperature.repeat_interleave(m), per_row(top_k), per_row(top_p),
+                               top_k_max, flat)
     ids, probs = ids.view(reqs, m, -1), probs.view(reqs, m, -1)
     # p_j(d_{j+1}) for the m-1 drafts
     is_draft = ids[:, :-1] == drafts.unsqueeze(-1).to(ids.dtype)
@@ -85,9 +148,9 @@ def spec_sample(rows_logits: torch.Tensor, drafts: torch.Tensor, temperature: to
         accepted = (u < p_draft).to(torch.int64)
         residual = probs[:, :-1].masked_fill(is_draft, 0.0)
     else:
-        q_draft = q.gather(-1, drafts.unsqueeze(-1).to(torch.int64)).squeeze(-1)
+        q_draft = _q_at(q, drafts.unsqueeze(-1)).squeeze(-1)
         accepted = (u * q_draft < p_draft).to(torch.int64)  # u < p / q, without the division
-        residual = (probs[:, :-1] - q.gather(-1, ids[:, :-1].to(torch.int64))).clamp_(min=0.0)
+        residual = (probs[:, :-1] - _q_at(q, ids[:, :-1])).clamp_(min=0.0)
         # p <= q on the whole support (p == q up to rounding): a rejection is then (almost) impossible; draw from p
         empty = residual.sum(-1, keepdim=True) <= 0
         residual = torch.where(empty, probs[:, :-1], residual)
@@ -103,4 +166,4 @@ def spec_sample(rows_logits: torch.Tensor, drafts: torch.Tensor, temperature: to
     return tokens, n_acc
 
 
-__all__ = ["draft_distribution", "spec_sample"]
+__all__ = ["draft_distribution", "sparse_ok", "spec_sample"]

@@ -245,6 +245,9 @@ class DiskRowTable:
     # every rank stages all hash heads from the host store (hashed from the full constants), so
     # NGramEmbedding neither rebases nor all-gathers at TP>1
     serves_all_heads = True
+    # the host hashes each forward's tokens and stages their rows; lookup reads only the row ids' shape, so
+    # NGramEmbedding skips hashing them on the GPU (~40 int64 kernels a decode step)
+    reads_row_ids = False
 
     def __init__(
         self,

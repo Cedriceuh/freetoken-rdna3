@@ -6,6 +6,7 @@ import errno
 import gc
 import math
 import os
+import time
 from datetime import timedelta
 from typing import Any, Dict, Iterable, NamedTuple, Tuple
 
@@ -42,6 +43,13 @@ from freetoken.kvcache.linear_state_pool import (
 )
 
 logger = init_logger(__name__)
+
+# FREETOKEN_SPARSE_LOGITS (default 0): at TP > 1 a decode step's LM head keeps each rank's shard of the logits; a step
+# whose choices need only each row's largest logits (greedy, or sampling from a top_k <= 256, no penalties) all-gathers
+# every rank's k best instead (LM head ``candidates``), any other step the whole rows as before. The same argmax
+# (lowest id among equal maxima) and the same sampling support and probabilities
+SPARSE_LOGITS = os.environ.get("FREETOKEN_SPARSE_LOGITS", "0") == "1"
+
 
 def _clamp_decode_batch_to_pools(config: EngineConfig, pool_sizes: list[int]) -> None:
     """Clamp the decode batch so every GPU-decoded layer's routed experts fit in its pool."""
@@ -614,7 +622,7 @@ class Engine:
             cuda_graph_max_bs=config.cuda_graph_max_bs,
             free_memory=init_free_memory,
             max_seq_len=aligned_max_seq_len,
-            vocab_size=config.model_config.vocab_size,
+            vocab_size=self._graph_vocab(config),
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
             mrope=config.model_config.model_is_mrope,
@@ -622,6 +630,7 @@ class Engine:
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
             self._warmup_prefill()
+        self._warm_sparse_sampling(config)
         _lock_memory()
         _cap_torch_vram(self.device)
 
@@ -1394,11 +1403,62 @@ class Engine:
             cuda_graph_max_bs=config.cuda_graph_max_bs,
             free_memory=free_min,
             max_seq_len=aligned_max_seq_len,
-            vocab_size=config.model_config.vocab_size,
+            vocab_size=self._graph_vocab(config),
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
             mrope=config.model_config.model_is_mrope,
         )
+
+    def _graph_vocab(self, config: EngineConfig) -> int:
+        """The graphs' logits width: the vocabulary, or this rank's shard of it under FREETOKEN_SPARSE_LOGITS (which
+        decode forwards then return; the engine gathers what it needs: the LM head's ``gather_full`` or candidates)."""
+        from freetoken.layers.embedding import ParallelLMHead
+
+        head = getattr(self.model, "lm_head", None)
+        # ROCm only: the merge reproduces ROCm torch.topk's order, the sampling kernels are AMDGPU code
+        self._logits_local = (SPARSE_LOGITS and config.tp_info.size > 1 and isinstance(head, ParallelLMHead)
+                              and head.tied_embedding is None and torch.version.hip is not None)
+        if not self._logits_local:
+            return config.model_config.vocab_size
+        head.decode_local = True
+        return head.num_embeddings_tp
+
+    def _warm_sparse_sampling(self, config: EngineConfig) -> None:
+        """FREETOKEN_SPARSE_LOGITS: set up the LM head's all-gather, and compile the candidates' and the fused draws'
+        kernels for the checkpoint's default top_k now (Triton keeps them in its cache: a few seconds at the first start
+        of an image, none after)."""
+        from freetoken.engine.spec_sample import _SAMPLE_KERNELS
+        from freetoken.kernel.triton.spec_sampling import MAX_K, warm
+        from freetoken.spec_decode import SPEC_MS
+        from freetoken.utils.hf import load_generation_sampling
+
+        if not self.__dict__.get("_logits_local"):
+            return
+        # the process's first all-gather sets up RCCL's path for it (~1 s); with the decode logits kept local the
+        # capture runs none, and the first request's prefill would wait for it
+        t0 = time.perf_counter()
+        head = self.model.lm_head
+        head.gather_full(torch.zeros(1, head.num_embeddings_tp, dtype=torch.bfloat16, device=self.device))
+        torch.cuda.synchronize(self.device)
+        logger.info_rank0(f"LM head all-gather ready in {time.perf_counter() - t0:.1f} s")
+        if not _SAMPLE_KERNELS or not MTP_ENABLED:
+            return
+        k = int(load_generation_sampling(config.model_path).get("top_k") or 0)
+        if not 1 < k <= MAX_K:
+            return
+        t0 = time.perf_counter()
+        start, width = self.model.lm_head.vocab_range
+        warm(self.device, k, width, start, config.tp_info.size, config.max_running_req, tuple(SPEC_MS))
+        logger.info_rank0(f"sampling kernels for top_k {k} ready in {time.perf_counter() - t0:.1f} s")
+
+    def _candidates_ok(self, args: BatchSamplingArgs | None) -> bool:
+        """Whether a decode step's choices need only each row's largest logits: no penalties, and every sampled row
+        drawing from its top_k_max largest logits (spec_sample.sparse_ok); greedy rows need the first one."""
+        from freetoken.engine.spec_sample import sparse_ok
+
+        if not self.__dict__.get("_logits_local") or (args is not None and args.penalties):
+            return False
+        return args is None or args.temperatures is None or sparse_ok(args.top_k, args.top_k_max)
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
@@ -1446,6 +1506,8 @@ class Engine:
         for req in batch.reqs:
             req.complete_one()
 
+        if batch.is_decode and self.__dict__.get("_logits_local"):
+            logits = self.model.lm_head.gather_full(logits)
         if batch.is_decode and batch.spec_m > 1:
             # spec_decode verify step without a draft model: keep each request's first row, roll the
             # recurrent states back to it (every padded request, so the dummy slot stays consistent too)
@@ -1487,10 +1549,20 @@ class Engine:
         again from the last kept row. No host sync: n_acc and the tokens go to the host with the step's copy (the
         acceptance log reads its running sum once every 512 steps)."""
         m, reqs, real = batch.spec_m, batch.padded_size, batch.size
-        rows = logits.view(reqs, m, logits.shape[-1])
-        if args.penalties:
-            rows = self._penalize_verify_rows(rows, batch.input_ids.view(reqs, m), args.penalties)
-        tokens = rows.argmax(-1)  # [reqs, m]: the target's choice after each row
+        cands = None
+        if self._candidates_ok(args):
+            # FREETOKEN_SPARSE_LOGITS: each row's largest logits only (the first is the argmax), from this rank's shard
+            k = 1 if args.temperatures is None else args.top_k_max
+            vals, ids, amax = self.model.lm_head.candidates(logits, k, real * m)  # spec_sample's topk rows
+            tokens = amax.view(reqs, m)
+            cands = (vals.view(reqs, m, k)[:real], ids.view(reqs, m, k)[:real], self.model.lm_head.num_embeddings)
+        else:
+            if self.__dict__.get("_logits_local"):
+                logits = self.model.lm_head.gather_full(logits)
+            rows = logits.view(reqs, m, logits.shape[-1])
+            if args.penalties:
+                rows = self._penalize_verify_rows(rows, batch.input_ids.view(reqs, m), args.penalties)
+            tokens = rows.argmax(-1)  # [reqs, m]: the target's choice after each row
         if SPEC_GLUE_KERNELS and batch.input_ids.is_contiguous():
             from freetoken.kernel.triton.spec_glue import greedy_n_acc
 
@@ -1502,8 +1574,11 @@ class Engine:
         if args.temperatures is not None:  # sampled requests: speculative sampling (exact, spec_sample.py)
             from freetoken.engine.spec_sample import spec_sample
 
-            s_tok, s_acc = spec_sample(rows[:real], drafts_in[:real], args.temperatures, args.top_k, args.top_p,
-                                       args.top_k_max, q=self._draft_q(batch, drafts_in[:real], rows.shape[-1]))
+            vocab = self.model.lm_head.num_embeddings if cands is not None else rows.shape[-1]
+            s_tok, s_acc = spec_sample(None if cands is not None else rows[:real], drafts_in[:real], args.temperatures,
+                                       args.top_k, args.top_p, args.top_k_max,
+                                       q=self._draft_q(batch, drafts_in[:real], vocab, sparse=cands is not None),
+                                       cands=cands)
             if args.greedy_mask is not None:
                 sampled = ~args.greedy_mask.to(torch.bool)[:real]
             else:
@@ -1543,33 +1618,70 @@ class Engine:
         return rows
 
     @staticmethod
-    def _draft_q(batch: Batch, drafts: torch.Tensor, vocab: int) -> torch.Tensor | None:
+    def _draft_q(batch: Batch, drafts: torch.Tensor, vocab: int, sparse: bool = False) -> torch.Tensor | tuple | None:
         """``[reqs, m-1, V]``: the distributions this step's drafts were drawn from (``Req.spec_q``, kept by the
-        drafting step), a point mass for a request whose drafts were its argmax; None when every one was."""
+        drafting step), a point mass for a request whose drafts were its argmax; None when every one was. ``sparse``
+        and every kept q sparse (``(ids, probs)``, FREETOKEN_SPARSE_LOGITS): ``(ids, probs) [reqs, m-1, K]``, a point
+        mass as the draft's id with probability 1 then ids -1."""
         m1 = drafts.shape[1]
         if all(getattr(r, "spec_q", None) is None for r in batch.reqs):
             return None
+        kept = [getattr(r, "spec_q", None) for r in batch.reqs]
+        if sparse and all(q is None or isinstance(q, tuple) for q in kept):
+            width = max(q[0].shape[-1] for q in kept if q is not None)
+            ids_l, probs_l = [], []
+            for i, q in enumerate(kept):
+                if q is None or q[0].shape[0] < m1:
+                    ids = torch.full((m1, width), -1, dtype=torch.int64, device=drafts.device)
+                    ids[:, 0] = drafts[i].to(torch.int64)
+                    probs = torch.zeros((m1, width), dtype=torch.float32, device=drafts.device)
+                    probs[:, 0] = 1.0
+                    q = (ids, probs)
+                elif q[0].shape[-1] < width:  # drawn under a smaller top_k_max: ids -1 (never a draft) at probability 0
+                    pad = width - q[0].shape[-1]
+                    q = (torch.nn.functional.pad(q[0], (0, pad), value=-1), torch.nn.functional.pad(q[1], (0, pad)))
+                ids_l.append(q[0][:m1])
+                probs_l.append(q[1][:m1])
+            return torch.stack(ids_l), torch.stack(probs_l)
         qs = []
-        for i, req in enumerate(batch.reqs):
-            q = getattr(req, "spec_q", None)
+        kept = [q if not isinstance(q, tuple) else
+                torch.zeros(q[0].shape[0], vocab, dtype=torch.float32, device=drafts.device).scatter_(-1, q[0], q[1])
+                for q in kept]
+        for i, q in enumerate(kept):
             if q is None or q.shape[0] < m1:
                 q = torch.zeros(m1, vocab, dtype=torch.float32, device=drafts.device).scatter_(
                     -1, drafts[i].unsqueeze(-1).to(torch.int64), 1.0)
             qs.append(q[:m1])
         return torch.stack(qs)
 
-    def _pick_draft(self, logits: torch.Tensor, real: int, args: BatchSamplingArgs | None
-                    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    def _pick_draft(self, logits: torch.Tensor, real: int, args: BatchSamplingArgs | None, local: bool = False
+                    ) -> tuple[torch.Tensor, torch.Tensor | tuple | None]:
         """Each row's draft from the head's ``logits``: its argmax, or for the sampled requests of ``args`` a draw
-        under the request's sampling params, returned with that distribution ``q [real, V]`` (rank 0's draws)."""
+        under the request's sampling params, returned with that distribution ``q [real, V]`` (rank 0's draws).
+        ``local``: ``logits`` is this rank's shard (FREETOKEN_SPARSE_LOGITS); q is then sparse when the draw needs
+        only the largest logits (``(ids, probs) [real, K]``)."""
         from freetoken.spec_decode import SPEC_SAMPLED_DRAFTS
 
-        tok = logits.argmax(-1)
-        if args is None or args.temperatures is None or not SPEC_SAMPLED_DRAFTS:
+        from freetoken.engine.spec_sample import sparse_ok
+
+        sampled = args is not None and args.temperatures is not None and SPEC_SAMPLED_DRAFTS
+        cands = None
+        if local:
+            # the draft head runs no penalties: only the sampling params decide
+            if not sampled or sparse_ok(args.top_k, args.top_k_max):
+                k = args.top_k_max if sampled else 1
+                vals, ids, tok = self.model.lm_head.candidates(logits, k, real)  # draft_distribution's rows
+                cands = (vals[:real], ids[:real], self.model.lm_head.num_embeddings)
+            else:
+                logits = self.model.lm_head.gather_full(logits)
+        if cands is None:
+            tok = logits.argmax(-1)
+        if not sampled:
             return tok, None
         from freetoken.engine.spec_sample import draft_distribution
 
-        s_tok, q = draft_distribution(logits[:real], args.temperatures, args.top_k, args.top_p, args.top_k_max)
+        s_tok, q = draft_distribution(None if cands is not None else logits[:real], args.temperatures, args.top_k,
+                                      args.top_p, args.top_k_max, cands=cands)
         if args.greedy_mask is not None:
             s_tok = torch.where(args.greedy_mask.to(torch.bool)[:real], tok[:real], s_tok)
         tok = tok.clone()
@@ -1634,6 +1746,7 @@ class Engine:
                 next_tokens, n_acc = tok, torch.ones(reqs, dtype=torch.int64, device=ids.device)
             # row j reads the target's token after row j (valid for j < n_acc)
             streams = model.decode_streams(reqs * m)
+            local = bool(self.__dict__.get("_logits_local"))  # the decode head's logits are this rank's shard
             next_ids = next_tokens.reshape(-1).to(torch.int64)
             depth = draft_depth(batch.reqs, m)
             for req in batch.reqs:
@@ -1654,7 +1767,7 @@ class Engine:
                 # the MoE and the head on each request's last kept row only (one row per request)
                 head_in, streams = mtp.forward(streams, model.embed_tokens.forward(next_ids), batch,
                                                keep=pick if m > 1 else None)
-                tok, q = self._pick_draft(self.model.lm_head.forward(head_in), batch.size, args)
+                tok, q = self._pick_draft(self.model.lm_head.forward(head_in), batch.size, args, local)
                 drafts, qs = [tok], [q]
             self._spec_timer.mark("mtp")
             # chained guesses: the head's own streams at the last kept row stand for the next position's, one row
@@ -1670,12 +1783,16 @@ class Engine:
                 chain = self._chain_batch(batch, chain_pos[:, j] if chain_pos is not None else last + j, delta)
                 with self.ctx.forward_batch(chain):
                     head_in, streams = mtp.forward(streams, model.embed_tokens.forward(drafts[-1]), chain)
-                    tok, q = self._pick_draft(self.model.lm_head.forward(head_in), batch.size, args)
+                    tok, q = self._pick_draft(self.model.lm_head.forward(head_in), batch.size, args, local)
                     drafts.append(tok)
                     qs.append(q)
             if depth > 1:
                 self._spec_timer.mark("chain")
-            if qs[0] is not None:
+            if qs[0] is not None and isinstance(qs[0], tuple):  # sparse: (ids, probs) [real, depth, K]
+                ids_all, probs_all = torch.stack([q[0] for q in qs], dim=1), torch.stack([q[1] for q in qs], dim=1)
+                for i, req in enumerate(batch.reqs):
+                    req.spec_q = (ids_all[i], probs_all[i])
+            elif qs[0] is not None:
                 q_all = torch.stack(qs, dim=1)  # [real, depth, V]
                 for i, req in enumerate(batch.reqs):
                     req.spec_q = q_all[i]

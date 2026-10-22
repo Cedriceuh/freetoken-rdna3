@@ -424,6 +424,13 @@ def _shard_for_rank(name: str, tensor: torch.Tensor, *, config: ModelConfig) -> 
         return tensor.narrow(dim, lo, size).clone()
     if not name.endswith(_TP_SHARDED):
         return tensor
+    if name == "lm_head.weight":
+        from freetoken.distributed.split import vocab_shards
+
+        shards = vocab_shards(tensor.shape[0], tp.size)
+        if shards is not None:  # FREETOKEN_LMHEAD_SPLIT: this rank's rows (ParallelLMHead(uneven=True))
+            lo, rows = shards[tp.rank]
+            return tensor.narrow(0, lo, rows).clone()
     local = shard_tensor(name, tensor, rank=tp.rank, world_size=tp.size, num_kv_heads=config.num_kv_heads)
     # shard_tensor returns an unrecognised key unchanged; a key declared tensor-parallel must come back
     # smaller, except on the kv replication branch where the whole projection IS the rank-local tensor.

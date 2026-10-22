@@ -39,7 +39,7 @@ in two runs.
 | Choice | The XTX (24 GB, ~14 % more compute) takes 55 % of the split work |
 | Alternatives | Even split (this build's default; upstream has no tensor parallelism for this model); 57.5 % or 60 % |
 | For | +4 % decode; both cards finish together; the XT's smaller share of each expert raises the expert-cache size of both cards |
-| Against | ~+0.1 s first-token latency on short prompts; the tuned decode tiles are keyed to this split's shapes; attention and the vocabulary still split evenly |
+| Against | ~+0.1 s first-token latency on short prompts; the tuned decode tiles are keyed to this split's shapes; attention and the input embedding still split evenly (the LM head with `FREETOKEN_LMHEAD_SPLIT` follows the shares) |
 | Evidence | 57.5 % and 60 % overload the XTX in prefill (compute-bound) |
 
 ## int8 dense layers

@@ -47,8 +47,10 @@ intermediate dimension (routed and shared) is split 55 / 45 (60 / 40 with an EXL
 whole 128-wide blocks) and the GDN heads 9 / 7 (key) and 27 / 21 (value): the XTX has 20 % more VRAM and
 ~14 % more compute, so both finish together, and the XT's smaller share of each expert lets both cards cache more
 experts (the ranks all use the smallest card's plan). Attention stays even (2 KV heads cannot be split unevenly). The
-vocabulary stays even; the hyper-connection mixers, the PLE projections, the attention indexer, the norms and the
-routers are replicated; with `--ple-backend disk` (every profile) each rank reads every PLE head from disk.
+input embedding stays even; the LM head's rows follow the same shares with `FREETOKEN_LMHEAD_SPLIT` (on in the two-card
+profiles: each logit is one rank's dot product, so its bits do not depend on the split); the hyper-connection
+mixers, the PLE projections, the attention indexer, the norms and the routers are replicated; with
+`--ple-backend disk` (every profile) each rank reads every PLE head from disk, hashed on the host.
 
 ## Talking between the cards: host-memory all-reduce (+2.5-4.8 %)
 
@@ -126,7 +128,13 @@ Here:
   need no barrier: 0.2 ms for one request, 1 ms for four, on any distribution (upstream's kernels with one block per
   row took 10 ms on a peaked row and 33-60 ms on a flat one);
 - every rank samples its own copy of the logits, and rank 0's tokens are broadcast after each sampled step, so two
-  different GPUs can never drift onto different tokens.
+  different GPUs can never drift onto different tokens;
+- with the MTP head on two cards (`FREETOKEN_SPARSE_LOGITS`, on in the two-card profiles), a decode step needs only
+  each row's top-k: each rank takes the k largest of its half of the logits, the ranks exchange those (2k floats a row
+  instead of the half vocabulary) and a kernel merges them back into `torch.topk`'s values, ids and order (equal bf16
+  logits are frequent, and topk orders them differently for one row and for several: both reproduced); the verify
+  step's speculative sampling and each draft's draw then run as one Triton kernel each, written to give the torch
+  ops' bits (`FREETOKEN_SAMPLE_KERNELS`). Greedy and sampled answers are identical to the whole-vocabulary path.
 
 The sorted path is checked by kernel tests (same kept sets as the float64 definition, seeded draws identical to
 upstream's kernels), the broadcast by `FREETOKEN_TP_SYNC_TOKENS=check` server runs (0 disagreements over ~8k sampled

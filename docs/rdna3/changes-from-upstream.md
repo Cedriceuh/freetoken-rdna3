@@ -278,6 +278,21 @@ Line counts here are against the merge of `cc56b6b`, on top of the lines listed 
 | `tests/moe/test_cpu_moe_exl3.py`, `tests/moe/test_prefill_cached.py`, `tests/models/qwen4_exp/test_mtp.py`, `rdna3/bench/nvfp4_*_sweep.py`, `rdna3/bench/exl3_*_bench.py`, `rdna3/tests/moe_block_check.py` | 3/3, 4/4, 1/1, 9/7, 3/3, 2/2 | the executor's per-layer formats, fp32 NVFP4 globals, the launches in `kernel/nvfp4_moe.py` |
 | `python/freetoken/spec_decode.py`, `engine/graph.py`, `tests/test_spec_decode.py`, `tests/engine/test_graph_sizing.py` | 27/10, 44/6, 20/0, new | `FREETOKEN_SPEC_BS_DEEP`: past it (up to `FREETOKEN_SPEC_BS_MAX`) a verify step runs at most 2 rows per request and the head drafts one guess, the graphs of more rows only up to it; the spec_decode buffers sized by eager forwards of the most rows, then the most requests, before any capture (they grow with the requests and freed the old ones under graphs captured before); `FREETOKEN_SPEC_SAMPLED_DRAFTS` on by default |
 
+## A decode step's glue: the LM head's candidates, one-kernel sampling, the router, the all-reduce, the rollback (bit-exact)
+
+Line counts here are on top of the lines listed in the sections above.
+
+| File | Lines | Change |
+|---|---:|---|
+| `python/freetoken/layers/embedding.py`, `kernel/triton/vocab_topk.py`, `engine/engine.py`, `engine/spec_sample.py`, `tests/kernels/test_vocab_topk.py`, `tests/engine/test_sparse_draft_q.py` | 42/4, new, 138/21, 86/23, new, new | `FREETOKEN_SPARSE_LOGITS`: at TP > 1 a decode step's LM head returns this rank's shard (`gather_full` when a step needs whole rows); a step drawing from each row's top-k gathers every rank's k largest and merges them into `torch.topk`'s values, ids and order for the call's row count, and `torch.argmax`'s pick; the drafts' distributions kept as (ids, probabilities) |
+| `python/freetoken/kernel/triton/spec_sampling.py`, `engine/spec_sample.py`, `tests/kernels/test_spec_sampling.py` | new, (above), new | `FREETOKEN_SAMPLE_KERNELS`: a verify step's speculative sampling and a draft's draw on the candidates in one Triton kernel each, torch's `exp`, `log`, softmax, sum and cumsum orders on gfx1100 written out |
+| `python/freetoken/distributed/split.py`, `layers/embedding.py`, `models/qwen4_exp/model.py`, `models/qwen4_exp/weight.py`, `kernel/triton/int8_gemv.py`, `tests/layers/test_lm_head_split.py` | 16/0, (above), 1/0, 7/0, 18/3, new | `FREETOKEN_LMHEAD_SPLIT`: qwen4_exp's LM head rows follow `FREETOKEN_TP_SPLIT`; any shard height takes the head's int8 GEMV tiles |
+| `python/freetoken/engine/graph.py` | 6/3 | the graphs' mrope positions in a flat buffer, a contiguous `[3, rows]` view per shape |
+| `python/freetoken/models/qwen4_exp/ple.py`, `models/qwen4_exp/ple_disk.py`, `tests/models/qwen4_exp/test_ple_disk.py` | 6/1, 3/0, 17/0 | a PLE table that stages its rows from the host (the disk store) gets uninitialized row ids of the right shape: no n-gram hashing on the GPU |
+| `python/freetoken/kernel/triton/moe_router.py`, `tests/kernels/test_router_keys.py` | 53/13, new | `FREETOKEN_ROUTER_KEYS`: the router's top-k picks each expert with one reduction of (value, id) keys and computes its weight with the softmax's operations; the pick loop is no longer unrolled |
+| `python/freetoken/kernel/host_allreduce.py`, `kernel/csrc/jit/host_allreduce.cuh` | 10/2, 51/14 | `FREETOKEN_HOST_ALLREDUCE_AHEAD`: a thread loads four of the peer's chunks before summing any, in 16-byte loads on uncached pages |
+| `python/freetoken/kernel/triton/spec_glue.py` | 14/4 | `FREETOKEN_SPEC_ROLLBACK_SKIP`: the rollback copy of a request that kept every row exits instead of writing the padding slot |
+
 ## Tooling and documentation
 
 | File | Change |

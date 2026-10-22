@@ -14,6 +14,10 @@ Env:
   FREETOKEN_HOST_ALLREDUCE_TIMEOUT_S  a peer missing for this long traps the kernel (default 300; 0 = never).
                                       Generous on purpose: on a cold kernel cache the two ranks (different
                                       shapes under an uneven split) JIT-compile at different times.
+  FREETOKEN_HOST_ALLREDUCE_AHEAD      1 (default): a thread loads 4 of the peer's 16-byte chunks before it sums any (a
+                                      message of up to 32 KB in one round of PCIe reads), each in one 16-byte load when
+                                      the pages are registered uncached; 0: one chunk at a time, two 8-byte atomic
+                                      loads each. The same bits
   FREETOKEN_HOST_ALLREDUCE_WAITLOG    debug, 1: every call stores how long it waited for the peer (100 MHz
                                       ticks) in the shared region, which then stays in /dev/shm
                                       (freetoken-hostar-*-waitlog) for a reader: int64 [rank][seq % 65536]
@@ -51,7 +55,7 @@ def max_bytes() -> int:
 def _module():
     return load_jit(
         "host_allreduce",
-        "v3",  # v2: alignas(16) out buffer; v3: optional wait log
+        "v6",  # v2: alignas(16) out buffer; v3: optional wait log; v6: the peer's chunks loaded ahead
         cuda_files=["host_allreduce.cuh"],
         cuda_wrappers=[("run", "&HostAllReduce::run")],
     )
@@ -131,6 +135,9 @@ class HostAllReduce:
         self.timeout_ticks = int(timeout_s * 1e8) if timeout_s > 0 else 1 << 62
         self._size = size
         self._run = _module().run
+        # 16-byte plain loads only on uncached pages (no cached copy of the peer's bytes to read)
+        uncached = bool(flags & _HIP_REGISTER_UNCACHED)
+        self._ahead = (2 if uncached else 1) if os.environ.get("FREETOKEN_HOST_ALLREDUCE_AHEAD", "1") == "1" else 0
         dist.barrier(group=cpu_group)
 
     def close(self) -> None:
@@ -154,5 +161,6 @@ class HostAllReduce:
                 and x.numel() * x.element_size() <= self.slot_bytes)
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        self._run(x.view(-1), self.counter, self.base, self.rank, self.slot_bytes, self.timeout_ticks, self.wait_log)
+        self._run(x.view(-1), self.counter, self.base, self.rank, self.slot_bytes, self.timeout_ticks, self.wait_log,
+                  self._ahead)
         return x

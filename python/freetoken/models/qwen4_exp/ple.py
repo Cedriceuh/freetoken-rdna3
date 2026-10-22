@@ -529,7 +529,12 @@ class NGramEmbedding(BaseOP):
 
     def row_ids(self, meta: PLEMetadata) -> torch.Tensor:
         """Table row per (token, hash head) as ``[T, heads]`` int64: the global rows of every head, or,
-        on a head-sharded table, this rank's heads rebased onto its own packed-from-zero shard."""
+        on a head-sharded table, this rank's heads rebased onto its own packed-from-zero shard. A table that
+        stages its rows from the host (``reads_row_ids = False``, the disk store) gets an uninitialized tensor of
+        that shape."""
+        if not getattr(self._table, "reads_row_ids", True):
+            ids = meta.input_ids
+            return torch.empty((ids.numel(), self.num_heads), dtype=torch.int64, device=ids.device)
         rows = self._global_row_ids(meta)
         if not self._sharded():
             return rows

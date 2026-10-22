@@ -67,7 +67,15 @@ template <> __device__ __forceinline__ bf16_bits from_f<bf16_bits>(float v) {
     return bf16_bits{static_cast<uint16_t>(u >> 16)};
 }
 
-template <typename T>
+// kAhead: peer chunks (16 bytes) a thread loads before it sums any. At 4 a message of up to 32 KB (six decode rows of
+// 2560 bf16) crosses PCIe in one round of reads instead of one per kThreads * 16 bytes; the same sums either way
+#if FREETOKEN_USE_ROCM
+using native_u64x2 = uint64_t __attribute__((ext_vector_type(2)));
+#endif
+
+// kWide: the peer's 16 bytes in one non-temporal load (the region is registered uncached, read after the system-scope
+// acquire below) instead of two 8-byte system-scope atomic loads
+template <typename T, int kAhead, bool kWide = false>
 __global__ void host_allreduce_kernel(
     T* __restrict__ x, int64_t n, char* base, int rank, int64_t slot_bytes,
     unsigned long long* counter, int64_t timeout_ticks, unsigned long long* wait_log) {
@@ -125,15 +133,37 @@ __global__ void host_allreduce_kernel(
         constexpr int kPer = 16 / sizeof(T);
         uint4* xv = reinterpret_cast<uint4*>(x);
         const uint64_t* pv = reinterpret_cast<const uint64_t*>(peer);
-        for (int64_t i = threadIdx.x; i < nv; i += kThreads) {
-            uint4 a = xv[i];
-            uint64_t b2[2] = {load_system(pv + 2 * i), load_system(pv + 2 * i + 1)};
-            const T* at = reinterpret_cast<const T*>(&a);
-            const T* bt = reinterpret_cast<const T*>(b2);
-            alignas(16) T out[kPer];  // read back through a uint4 below
+        for (int64_t i0 = threadIdx.x; i0 < nv; i0 += kAhead * kThreads) {
+            uint64_t b2[kAhead][2];
 #pragma unroll
-            for (int k = 0; k < kPer; ++k) out[k] = from_f<T>(to_f(at[k]) + to_f(bt[k]));
-            xv[i] = *reinterpret_cast<const uint4*>(out);
+            for (int j = 0; j < kAhead; ++j) {  // every load in flight before the first sum
+                const int64_t i = i0 + j * kThreads;
+                if (i < nv) {
+#if FREETOKEN_USE_ROCM
+                    if constexpr (kWide) {
+                        const native_u64x2 v = __builtin_nontemporal_load(reinterpret_cast<const native_u64x2*>(pv + 2 * i));
+                        b2[j][0] = v.x;
+                        b2[j][1] = v.y;
+                        continue;
+                    }
+#endif
+                    b2[j][0] = load_system(pv + 2 * i);
+                    b2[j][1] = load_system(pv + 2 * i + 1);
+                }
+            }
+#pragma unroll
+            for (int j = 0; j < kAhead; ++j) {
+                const int64_t i = i0 + j * kThreads;
+                if (i < nv) {
+                    uint4 a = xv[i];
+                    const T* at = reinterpret_cast<const T*>(&a);
+                    const T* bt = reinterpret_cast<const T*>(b2[j]);
+                    alignas(16) T out[kPer];  // read back through a uint4 below
+#pragma unroll
+                    for (int k = 0; k < kPer; ++k) out[k] = from_f<T>(to_f(at[k]) + to_f(bt[k]));
+                    xv[i] = *reinterpret_cast<const uint4*>(out);
+                }
+            }
         }
     } else {
         for (int64_t i = threadIdx.x; i < n; i += kThreads) {
@@ -154,7 +184,8 @@ struct HostAllReduce {
         int64_t rank,
         int64_t slot_bytes,
         int64_t timeout_ticks,
-        int64_t wait_log_ptr
+        int64_t wait_log_ptr,
+        int64_t ahead
     ) {
         using namespace host;
         auto device = SymbolicDevice{};
@@ -173,13 +204,19 @@ struct HostAllReduce {
         auto* base = reinterpret_cast<char*>(base_ptr);
         auto* ctr = static_cast<unsigned long long*>(counter.data_ptr());
         auto* wait_log = reinterpret_cast<unsigned long long*>(wait_log_ptr);
+        // ahead: 0 = one peer chunk at a time; 1 = four ahead, 8-byte atomic loads; 2 = four ahead, 16-byte loads
+        RuntimeCheck(ahead >= 0 && ahead <= 2, "host all-reduce: ahead must be 0, 1 or 2");
         auto launch = LaunchKernel(1, kThreads, device.unwrap());
         if (is_f32) {
-            launch(host_allreduce_kernel<float>, static_cast<float*>(x.data_ptr()), n, base,
-                   static_cast<int>(rank), slot_bytes, ctr, timeout_ticks, wait_log);
+            launch(ahead == 2 ? host_allreduce_kernel<float, 4, true>
+                   : ahead == 1 ? host_allreduce_kernel<float, 4> : host_allreduce_kernel<float, 1>,
+                   static_cast<float*>(x.data_ptr()), n, base, static_cast<int>(rank), slot_bytes, ctr, timeout_ticks,
+                   wait_log);
         } else {
-            launch(host_allreduce_kernel<bf16_bits>, static_cast<bf16_bits*>(x.data_ptr()), n, base,
-                   static_cast<int>(rank), slot_bytes, ctr, timeout_ticks, wait_log);
+            launch(ahead == 2 ? host_allreduce_kernel<bf16_bits, 4, true>
+                   : ahead == 1 ? host_allreduce_kernel<bf16_bits, 4> : host_allreduce_kernel<bf16_bits, 1>,
+                   static_cast<bf16_bits*>(x.data_ptr()), n, base, static_cast<int>(rank), slot_bytes, ctr,
+                   timeout_ticks, wait_log);
         }
     }
 };

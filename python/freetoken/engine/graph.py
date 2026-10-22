@@ -44,8 +44,10 @@ class GraphCaptureBuffer:
             input_ids=torch.zeros(rows, dtype=torch.int32, device=device),
             out_loc=torch.zeros(rows, dtype=torch.int32, device=device),
             positions=torch.zeros(rows, dtype=torch.int32, device=device),
+            # flat: each row count views it as a contiguous [3, rows] (the rope kernels' layout), so no attention layer
+            # copies a strided [3, rows] slice of a [3, max_rows] buffer
             mrope_positions=(
-                torch.zeros(3, rows, dtype=torch.int32, device=device) if mrope else None
+                torch.zeros(3 * rows, dtype=torch.int32, device=device) if mrope else None
             ),
             logits=torch.empty(rows, vocab_size, dtype=torch.float32, device=device),
             table_idx=torch.zeros(bs, dtype=torch.int32, device=device),
@@ -61,7 +63,7 @@ class GraphCaptureBuffer:
         batch.out_loc = self.out_loc[_rows]
         batch.positions = self.positions[_rows]
         if self.mrope_positions is not None:
-            batch.mrope_positions = self.mrope_positions[:, _rows]
+            batch.mrope_positions = self.mrope_positions[: 3 * bs * m].view(3, bs * m)
         batch.linear_table_idx = self.table_idx[_slice]
         # Decode GDN metadata reads the persistent cu_seqlens (constant arange) and the
         # persistent table_idx slot map, so the captured kernels see stable addresses.
@@ -76,7 +78,8 @@ class GraphCaptureBuffer:
             self.out_loc[_rows] = batch.out_loc
         self.positions[_rows] = batch.positions
         if self.mrope_positions is not None:
-            self.mrope_positions[:, _rows] = batch.mrope_positions
+            rows = batch.padded_size * batch.spec_m
+            self.mrope_positions[: 3 * rows].view(3, rows).copy_(batch.mrope_positions)
         if batch.linear_table_idx is not None:
             self.table_idx[_slice] = batch.linear_table_idx
 

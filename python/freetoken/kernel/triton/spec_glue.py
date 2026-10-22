@@ -2,8 +2,8 @@
 (integer arithmetic and copies):
 
 - ``rollback_copy``: one rollback target of ``spec_decode.apply_rollback`` -- each request's state row put back to
-  where its last kept row left it (``step = clamp(n_acc - 1, 0, m - 2)``), or written to the padding slot when the
-  request kept every row -- instead of an arange, where, gather, cast and index_copy per target;
+  where its last kept row left it (``step = clamp(n_acc - 1, 0, m - 2)``); a request that kept every row copies
+  nothing (FREETOKEN_SPEC_ROLLBACK_SKIP) -- instead of an arange, where, gather, cast and index_copy per target;
 - ``write_step_tokens``: the scheduler's token-pool writes after a verify step (the target's tokens at columns
   pos .. pos + m - 1, then the drafts from pos + n_acc on, clamped to the last column; padded rows (pos < 0) write the
   junk last column) instead of two aranges, wheres, clamps and index_puts;
@@ -18,18 +18,27 @@ they do not assert it on the device.
 
 from __future__ import annotations
 
+import os
+
 import torch
 import triton
 import triton.language as tl
 
+# FREETOKEN_SPEC_ROLLBACK_SKIP (default 1): a request that kept every row copies nothing (its state is already in
+# place); 0: its copy goes to the padding slot, as the torch path's fixed-shape index_copy does. Only that slot, which
+# no live request owns, sees a difference
+_SKIP_KEPT = os.environ.get("FREETOKEN_SPEC_ROLLBACK_SKIP", "1") == "1"
+
 
 @triton.jit
 def _rollback_copy_kernel(src, dst, slots, n_acc, pad, m, so, sb, sst, step_add, do, dslot, S,
-                          BLOCK: tl.constexpr):
+                          BLOCK: tl.constexpr, SKIP_KEPT: tl.constexpr):
     o = tl.program_id(0).to(tl.int64)
     b = tl.program_id(1)
     blk = tl.program_id(2)
     n = tl.load(n_acc + b).to(tl.int64)
+    if SKIP_KEPT and n >= m:
+        return
     slot = tl.load(slots + b).to(tl.int64)
     step = tl.minimum(tl.maximum(n - 1, 0), tl.maximum(m - 2, 0))
     dst_slot = tl.where(n >= m, pad, slot).to(tl.int64)
@@ -45,7 +54,8 @@ def rollback_copy(src: torch.Tensor, so: int, sb: int, sst: int, step_add: int, 
     B = slots.numel()
     BLOCK = 2048 if inner >= 2048 else triton.next_power_of_2(inner)
     _rollback_copy_kernel[(outer, B, triton.cdiv(inner, BLOCK))](
-        src, dst, slots, n_acc, pad, m, so, sb, sst, step_add, do, dslot, inner, BLOCK=BLOCK, num_warps=4)
+        src, dst, slots, n_acc, pad, m, so, sb, sst, step_add, do, dslot, inner, BLOCK=BLOCK, SKIP_KEPT=_SKIP_KEPT,
+        num_warps=4)
 
 
 @triton.jit

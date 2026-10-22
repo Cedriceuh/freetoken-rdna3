@@ -44,6 +44,21 @@ What each change measured, and how it was found: [docs/rdna3/journey.md](docs/rd
   verify step's glue in kernels, the PLE rows waited for inside the captured step (`FREETOKEN_PLE_SYNC`), the input
   embedding in RAM (its VRAM to the expert cache). One of these steps: EXL3 3.05 bpw `xtx-xt-4x262k` 85.5 -> 93.9 tok/s at
   one request (sampled).
+- Decode on two cards: each rank's largest logits all-gathered instead of the whole vocabulary's, put back in
+  `torch.topk`'s order; a verify step's and a draft's sampling in one kernel each, with the torch ops' bits; the LM
+  head's rows split like the experts (`FREETOKEN_SPARSE_LOGITS`, `FREETOKEN_LMHEAD_SPLIT`, on in the two-card
+  profiles); the graphs' positions in one flat buffer, no GPU hashing for the disk PLE store. `xtx-xt-4x262k`, one request: EXL3 3.05 bpw 94.1 -> 95.1 tok/s greedy, 95.2 -> 99.8 at T 0.6; NVFP4
+  94.8 -> 96.5 and 94.0 -> 99.3; the same greedy and sampled answers.
+- The MoE router's top-k picks each expert in one reduction instead of three (`FREETOKEN_ROUTER_KEYS`, on by default
+  on ROCm): the same experts and weights, 10-15 -> 5-7 µs a call in serving; `xtx-xt-4x262k` EXL3 3.05 bpw 94.5 -> 95.6
+  tok/s at one request (greedy), 101.4 -> 102.7 at T 0.6, +1.0 % at four; the same greedy and sampled answers.
+- The host all-reduce loads four of the peer's chunks a thread before summing, in 16-byte loads
+  (`FREETOKEN_HOST_ALLREDUCE_AHEAD`): 20 KB messages 10.0 -> 8.5 µs, 80 KB 23.8 -> 19.5, the same sums; +0.2-0.5 % in
+  decode.
+- A verify step no longer copies the GatedDeltaNet states of the requests that kept every row
+  (`FREETOKEN_SPEC_ROLLBACK_SKIP`): +0.5 % at one request, +0.6 % at four (greedy), the same answers.
+- The four above together, against the previous build (`xtx-xt-4x262k`, EXL3 3.05 bpw, two rounds): 94.7 -> 97.8 tok/s
+  greedy at one request, 96.3 -> 103.1 at T 0.6; four requests +3.4 % greedy, +1.9 % at T 0.6; the same answers.
 - Lower prefill VRAM peaks (in-place hyper-connections, blocked GatedDeltaNet prefill), and kernels that spilled
   registers on RDNA3 run more warps (prompt reading +2.6 to +3.5 %).
 
