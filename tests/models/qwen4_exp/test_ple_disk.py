@@ -437,3 +437,44 @@ def test_prefill_reads_on_a_thread_and_ahead(tmp_path, monkeypatch):
     disk.fill([torch.tensor([prompt[6], prompt[7], 2])], graph=False)  # an eager decode fill drops [8, 11) read ahead
     chunk(8, 11)
     assert reads == ["read", "adopt", "read", "read", "read"]
+
+
+@requires_cuda
+def test_draft_reads_fill_the_next_step_from_the_cache(tmp_path):
+    """FREETOKEN_PLE_DRAFT_READS: after a decode step, the next step's first token (the last kept one) and its drafts
+    are read on the thread as they reach the host; the next fill finds every row in the cache and stages the same
+    bytes as the oracle. Drafts the next step does not use cost reads, never rows. Built and driven under inference mode,
+    as the engine does (the thread runs outside the caller's)."""
+    with torch.inference_mode():
+        _draft_reads(tmp_path)
+
+
+def _draft_reads(tmp_path):
+    disk, oracle, args = _make_table(tmp_path)
+    if disk._ahead is None:
+        pytest.skip("FREETOKEN_PLE_DRAFT_READS=0")
+    emb = _embedding()
+    history = [3, 4, EOS, 5, 6]
+
+    def step(ids, tokens):
+        req = SimpleNamespace(input_ids=torch.tensor(ids, dtype=torch.int32), device_len=len(ids) + 1,
+                              cached_len=len(ids))
+        return SimpleNamespace(is_decode=True, input_ids=torch.tensor(tokens, dtype=torch.int32, device="cuda"),
+                               reqs=[req], size=1, padded_size=1, spec_m=len(tokens))
+
+    for nxt, hits in (([11, 12, 13], 3), ([11, 14, 15], 1)):
+        # step N verifies 8 then drafts 9, 10: 9 is kept, 11 is the new token, then the head drafts 12, 13
+        batch = step(history, [8, 9, 10])
+        disk.host_fill_batch(batch, use_graph=False)
+        done = torch.cuda.Event()
+        done.record()
+        disk.ahead_kept(batch, torch.tensor([[9, 11, 0]], dtype=torch.int32), torch.tensor([2]), done)
+        disk.ahead_draft(0, torch.tensor([12], device="cuda"), 1, last=False)  # as the engine calls it at depth 2
+        disk.ahead_draft(1, torch.tensor([13], device="cuda"), 1, last=True)
+        disk.ahead_draft(0, torch.tensor([99], device="cuda"), 1)  # a later step's draft without kept(): no read
+        disk._ahead.join()
+        before = disk._store.cache_hits
+        disk.host_fill_batch(step(history + [8, 9], nxt), use_graph=False)
+        assert disk._store.cache_hits - before == hits * args.num_ngram_heads, nxt
+        ids = emb.row_ids(_meta([nxt], [[8, 9]])).cuda()
+        assert _bitwise_equal(disk.lookup(ids), oracle.lookup(ids)), nxt

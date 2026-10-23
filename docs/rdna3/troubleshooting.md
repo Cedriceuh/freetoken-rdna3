@@ -181,6 +181,13 @@ report the lines with your setup.
 The server was started without `--vision`: `rdna3/serve.sh <profile> --model DIR --vision`. On one card, `--vision`
 costs ~1.5-2 % of decode even without images ([limits.md](limits.md#images-vision)).
 
+## Many `sem.mp-*` files in `/dev/shm`
+
+Earlier builds left five of these 32-byte semaphores in the host's `/dev/shm` at every server stop (the container
+shares the host's IPC namespace); the current build removes its own. They are harmless; to clear the old ones, with no
+server and no other Python multiprocessing program running: `sudo find /dev/shm -maxdepth 1 -name 'sem.mp-*' -user
+root -delete`.
+
 ## Reporting a problem
 
 Open an issue with: the output of `rdna3/serve.sh --check --model DIR <profile>`, the profile and any changed option

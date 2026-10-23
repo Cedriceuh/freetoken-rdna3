@@ -59,6 +59,10 @@ TORCH_TOPK_ENV = "FREETOKEN_QSA_TORCH_TOPK"
 
 # FREETOKEN_QSA_PLAN_KERNEL=0: the per-forward index-write plan as torch ops (the kernel computes the same values)
 _PLAN_KERNEL = os.environ.get("FREETOKEN_QSA_PLAN_KERNEL", "1") != "0"
+# FREETOKEN_QSA_FUSED_WRITES (default 1): after the group compression, the index keys' norm+rope, the indexer queries'
+# norm+rope and the pending-ring store in one launch (qsa_index_writes) instead of three: the same code on the same
+# tiles, the same bits; two launches fewer per QSA layer
+_FUSED_WRITES = os.environ.get("FREETOKEN_QSA_FUSED_WRITES", "1") != "0"
 
 
 def _resolve_block_topk() -> Callable | None:
@@ -106,6 +110,8 @@ class QSASparseMetadata(BaseAttnMetadata):
 
 
 class QSASparseAttnBackend(BaseAttnBackend):
+    takes_gate = True  # qsa_forward(gate=...) returns the gated output (FREETOKEN_QSA_FUSED_GATE)
+
     def __init__(self, config: ModelConfig) -> None:
         from freetoken.kvcache.qsa_pool import QSAKVCache
 
@@ -291,6 +297,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
         layer_id: int,
         batch: Batch,
         kv_only: bool = False,
+        gate: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
         from freetoken.kernel.triton.qsa import qsa_sparse_paged_attention
 
@@ -306,10 +313,10 @@ class QSASparseAttnBackend(BaseAttnBackend):
             # cached plan would bake the warmup's addresses into the graph.
             self._plan_index_writes(md, batch)
 
-        self._update_index_cache(index, md, slot)
+        q_index = self._update_index_cache(index, md, slot, queries=not kv_only)
         if kv_only:  # the K/V and the index keys are written: nothing reads this pass's output
             return None
-        indices = self._select(index, md, slot)
+        indices = self._select(index, md, slot, q_index)
         int8 = self.kvcache.kv_int8
         k_cache, v_cache = self.kvcache.k_cache(layer_id), self.kvcache.v_cache(layer_id)
         if not md.is_decode and getattr(self.kvcache, "kv_on_host", False):
@@ -331,6 +338,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
             k_scale=self.kvcache.k_scale(layer_id) if int8 else None,
             v_scale=self.kvcache.v_scale(layer_id) if int8 else None,
             decode=md.is_decode,
+            gate=gate,
         )
 
     def _plan_index_writes(self, md: QSASparseMetadata, batch: Batch) -> None:
@@ -381,11 +389,13 @@ class QSASparseAttnBackend(BaseAttnBackend):
             torch.int32
         )
 
-    def _update_index_cache(self, index, md: QSASparseMetadata, slot: int) -> None:
-        """Compress each closing group into the slab, then refresh the pending ring."""
+    def _update_index_cache(self, index, md: QSASparseMetadata, slot: int, queries: bool = True) -> torch.Tensor | None:
+        """Compress each closing group into the slab, then refresh the pending ring. FREETOKEN_QSA_FUSED_WRITES (and
+        ``queries``): the indexer queries' norm+rope in the same launch, returned for ``_select``."""
         from freetoken.kernel.triton.qsa import (
             qsa_compress_groups,
             qsa_index_norm_rope,
+            qsa_index_writes,
             qsa_store_rows,
         )
 
@@ -408,6 +418,13 @@ class QSASparseAttnBackend(BaseAttnBackend):
             rope_positions, rope_cache = first, self._index_rope_cache()
         else:
             rope_positions, rope_cache = md.rope_rows, md.k_rope_cache
+        if _FUSED_WRITES and queries:
+            q, q_index, q_positions, q_rope = self._index_queries(index, md)
+            # the ring store after the compression read, as below: the launch's parts touch disjoint memory
+            qsa_index_writes(pooled, rope_positions, rope_cache, index.k_norm_weight, self.kvcache.cmp_k_cache(slot),
+                             md.cmp_rows, q, q_positions, q_rope, index.q_norm_weight, q_index.view(-1, self.index_head_dim),
+                             self.index_heads, ring, md.ring_rows, index.k, index.eps)
+            return q_index
         qsa_index_norm_rope(
             pooled,
             rope_positions,
@@ -420,9 +437,23 @@ class QSASparseAttnBackend(BaseAttnBackend):
         # After the compression read: the ring rows this forward overwrites are exactly the
         # ones a straddling group just consumed.
         qsa_store_rows(ring, md.ring_rows, index.k)
+        return None
 
-    def _select(self, index, md: QSASparseMetadata, slot: int) -> torch.Tensor:
-        """Score complete visible blocks, take the top-k, expand them to token indices."""
+    def _index_queries(self, index, md: QSASparseMetadata):
+        """The indexer queries' norm+rope operands: (input, output scratch, rope rows, rope cache)."""
+        q_index = self._scratch(
+            "q_index", index.q.shape[0], self.index_heads, self.index_head_dim, dtype=self.dtype
+        )
+        if md.q_rope_cache is None:
+            rope_positions, rope_cache = md.positions, self._index_rope_cache()
+        else:
+            rope_positions, rope_cache = md.rope_rows, md.q_rope_cache
+        q = index.q if not index.q.is_contiguous() else index.q.view(-1, self.index_head_dim)
+        return q, q_index, rope_positions, rope_cache
+
+    def _select(self, index, md: QSASparseMetadata, slot: int, q_index: torch.Tensor | None = None) -> torch.Tensor:
+        """Score complete visible blocks, take the top-k, expand them to token indices. ``q_index``: the queries
+        already normed and roped (FREETOKEN_QSA_FUSED_WRITES)."""
         from freetoken.kernel.triton.qsa import (
             expand_qsa_block_indices,
             qsa_index_norm_rope,
@@ -431,22 +462,17 @@ class QSASparseAttnBackend(BaseAttnBackend):
 
         rows = index.q.shape[0]
         positions = md.positions
-        q_index = self._scratch(
-            "q_index", rows, self.index_heads, self.index_head_dim, dtype=self.dtype
-        )
-        if md.q_rope_cache is None:
-            rope_positions, rope_cache = positions, self._index_rope_cache()
-        else:
-            rope_positions, rope_cache = md.rope_rows, md.q_rope_cache
-        qsa_index_norm_rope(
-            index.q if not index.q.is_contiguous() else index.q.view(-1, self.index_head_dim),
-            rope_positions,
-            rope_cache,
-            index.q_norm_weight,
-            index.eps,
-            q_index.view(-1, self.index_head_dim),
-            heads=self.index_heads,
-        )
+        if q_index is None:
+            q, q_index, rope_positions, rope_cache = self._index_queries(index, md)
+            qsa_index_norm_rope(
+                q,
+                rope_positions,
+                rope_cache,
+                index.q_norm_weight,
+                index.eps,
+                q_index.view(-1, self.index_head_dim),
+                heads=self.index_heads,
+            )
         cmp_pages = self._cmp_pages(slot)
         columns = md.block_table.shape[1] * self.cmp_page_size
         indices = self._scratch("indices", rows, self.select_width, dtype=torch.int32)

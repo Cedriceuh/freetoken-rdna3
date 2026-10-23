@@ -30,13 +30,16 @@ _ENABLED = os.environ.get("FREETOKEN_TRITON_GEMV", "1") != "0"
 # FREETOKEN_GEMV_LAST_REDUCES (default 1): a split-K config's last-arriving program sums the partials (the router:
 # 48 launches fewer per decode step); the same bits as the separate reduce kernel
 _LAST_REDUCES = os.environ.get("FREETOKEN_GEMV_LAST_REDUCES", "1") == "1"
+# FREETOKEN_GEMV_SHARED_TILES (default 1): at 2-4 rows (a verify step) each weight tile is loaded once for all the rows
+# instead of once per row, each row summed as alone (the same bits)
+_SHARED_TILES = os.environ.get("FREETOKEN_GEMV_SHARED_TILES", "1") == "1"
 
 
 @triton.jit
 def _gemv_splitk_bf16(a_ptr, w_ptr, part_ptr, N, K, stride_wn, stride_pk, k_per,
                       BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, ROWS: tl.constexpr = 1, stride_am=0,
                       stride_pm=0, out_ptr=None, cnt_ptr=None, stride_om=0, SPLIT: tl.constexpr = 1,
-                      LAST_REDUCES: tl.constexpr = False):
+                      LAST_REDUCES: tl.constexpr = False, SHARE_TILES: tl.constexpr = False):
     """ROWS > 1 (several decoding requests): the unchanged per-row body runs once per activation row (unrolled), so
     each request gets the bits it gets alone -- F.linear at M > 1 would pick another BLAS reduction order."""
     pid_n = tl.program_id(0)
@@ -44,16 +47,44 @@ def _gemv_splitk_bf16(a_ptr, w_ptr, part_ptr, N, K, stride_wn, stride_pk, k_per,
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     n_mask = offs_n < N
     k0 = pid_k * k_per
-    for r in tl.static_range(ROWS):
-        acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    if SHARE_TILES and ROWS > 1 and ROWS <= 4:
+        # FREETOKEN_GEMV_SHARED_TILES: each weight tile loaded once for the 2-4 rows, every row's own sums over the same
+        # tile in the same K order as below (the same bits)
+        acc0 = tl.zeros((BLOCK_N,), dtype=tl.float32)
+        acc1 = tl.zeros((BLOCK_N,), dtype=tl.float32)
+        acc2 = tl.zeros((BLOCK_N,), dtype=tl.float32)
+        acc3 = tl.zeros((BLOCK_N,), dtype=tl.float32)
         for kk in range(0, k_per, BLOCK_K):
             offs_k = k0 + kk + tl.arange(0, BLOCK_K)
             k_mask = offs_k < K
-            a = tl.load(a_ptr + r * stride_am + offs_k, mask=k_mask, other=0.0).to(tl.float32)
             w = tl.load(w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :],
                         mask=n_mask[:, None] & k_mask[None, :], other=0.0).to(tl.float32)
-            acc += tl.sum(w * a[None, :], axis=1)
-        tl.store(part_ptr + r * stride_pm + pid_k * stride_pk + offs_n, acc, mask=n_mask)
+            acc0 += tl.sum(w * tl.load(a_ptr + offs_k, mask=k_mask, other=0.0).to(tl.float32)[None, :], axis=1)
+            acc1 += tl.sum(w * tl.load(a_ptr + stride_am + offs_k, mask=k_mask, other=0.0).to(tl.float32)[None, :],
+                           axis=1)
+            if ROWS > 2:
+                acc2 += tl.sum(w * tl.load(a_ptr + 2 * stride_am + offs_k, mask=k_mask, other=0.0).to(tl.float32)[None, :],
+                               axis=1)
+            if ROWS > 3:
+                acc3 += tl.sum(w * tl.load(a_ptr + 3 * stride_am + offs_k, mask=k_mask, other=0.0).to(tl.float32)[None, :],
+                               axis=1)
+        tl.store(part_ptr + pid_k * stride_pk + offs_n, acc0, mask=n_mask)
+        tl.store(part_ptr + stride_pm + pid_k * stride_pk + offs_n, acc1, mask=n_mask)
+        if ROWS > 2:
+            tl.store(part_ptr + 2 * stride_pm + pid_k * stride_pk + offs_n, acc2, mask=n_mask)
+        if ROWS > 3:
+            tl.store(part_ptr + 3 * stride_pm + pid_k * stride_pk + offs_n, acc3, mask=n_mask)
+    else:
+        for r in tl.static_range(ROWS):
+            acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+            for kk in range(0, k_per, BLOCK_K):
+                offs_k = k0 + kk + tl.arange(0, BLOCK_K)
+                k_mask = offs_k < K
+                a = tl.load(a_ptr + r * stride_am + offs_k, mask=k_mask, other=0.0).to(tl.float32)
+                w = tl.load(w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :],
+                            mask=n_mask[:, None] & k_mask[None, :], other=0.0).to(tl.float32)
+                acc += tl.sum(w * a[None, :], axis=1)
+            tl.store(part_ptr + r * stride_pm + pid_k * stride_pk + offs_n, acc, mask=n_mask)
     if LAST_REDUCES:
         # the last of a tile's SPLIT programs to arrive reduces its partial sums, element by element in split
         # order as _reduce_to_bf16 does (the same bits, one launch fewer); acq_rel at device scope publishes the
@@ -113,7 +144,7 @@ def gemv_bf16(x: torch.Tensor, weight: torch.Tensor, cfg: tuple[int, int, int, i
         x2, weight, part, N, K, weight.stride(0), part.stride(1), k_per,
         BLOCK_N=block_n, BLOCK_K=block_k, ROWS=M, stride_am=x2.stride(0), stride_pm=part.stride(0),
         out_ptr=out if last else None, cnt_ptr=counters if last else None, stride_om=out.stride(0), SPLIT=split,
-        LAST_REDUCES=last, num_warps=warps,
+        LAST_REDUCES=last, SHARE_TILES=_SHARED_TILES, num_warps=warps,
     )
     if not last:
         _reduce_to_bf16[(triton.cdiv(N, 512), M)](part, out, N, part.stride(1), part.stride(0), out.stride(0),

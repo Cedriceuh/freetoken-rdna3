@@ -95,6 +95,9 @@ class TritonExl3MoEKernel(MoEKernel):
         down = routes * i * 2 + routes * h * 2
         return max(gate_up, down) + block * h * 2 + (tokens * h * 2 if tokens > block else 0)
 
+    # the decode GEMVs read a slot being filled from host memory and fill it on the way (moe/fused_exl3.py)
+    decode_reads_misses = ("gate_up", "down")
+
     def apply(self, layer, x, topk_weights, topk_ids, view: ExpertView, *, is_prefill: bool):
         from freetoken.moe.fused_exl3 import fused_experts_exl3
 
@@ -103,7 +106,7 @@ class TritonExl3MoEKernel(MoEKernel):
         return fused_experts_exl3(
             x, t["gate_up"], t["gate_up_suh"], t["gate_up_svh"], t["down"], t["down_suh"], t["down_svh"],
             topk_weights, topk_ids, codebook=codebook, is_prefill=is_prefill, num_experts=view.n,
-            slot_map=view.slot_map,
+            slot_map=view.slot_map, misses=None if is_prefill else view.misses,
         )
 
 

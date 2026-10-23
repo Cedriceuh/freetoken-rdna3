@@ -31,6 +31,7 @@ import triton.language as tl
 from triton.language import target_info
 from triton.runtime.jit import constexpr_function
 
+from freetoken.kernel.triton.activation import _LOG2E, _fast_ex2
 from freetoken.kernel.triton.e4m3_compat import e4m3_native_cx, e4m3_u8_to_f32
 from freetoken.kernel.triton.nvfp4_linear import _nvfp4_pair_f32
 
@@ -186,6 +187,9 @@ def _decode_nvfp4_marlin_kernel(
     MUL_ROUTED_WEIGHT: tl.constexpr,
     compute_type: tl.constexpr,
     SKIP_INACTIVE: tl.constexpr = False,  # a slot of -1 (a route the CPU computes, hybrid): zeros, no weight read
+    MISS: tl.constexpr = False,  # FREETOKEN_MOE_MISS_READS: the cache's copy plan (see _miss_row)
+    ev_ptr=None, src_ptr=None, num_ptr=None, hostp_ptr=None,
+    BANK_P: tl.constexpr = 0, BANK_S: tl.constexpr = 0, MP: tl.constexpr = 1,
 ):
     """Marlin-style NVFP4 decode GEMV: wide int32 weight loads + deferred reduction.
 
@@ -232,6 +236,24 @@ def _decode_nvfp4_marlin_kernel(
 
     p_base = packed_ptr + slot * stride_pe + offs_n[:, None] * stride_pn
     s_base = scale_ptr + slot * stride_se + offs_n[:, None] * stride_sn
+    if MISS:
+        row = _miss_row(ev_ptr, src_ptr, num_ptr, slot, MP)
+        if row >= 0:
+            # the slot is being filled this step: its rows from the host bank, written into the slot on the way
+            hp = tl.load(hostp_ptr + BANK_P).to(packed_ptr.dtype) + row * stride_pe + offs_n[:, None] * stride_pn
+            hs = tl.load(hostp_ptr + BANK_S).to(scale_ptr.dtype) + row * stride_se + offs_n[:, None] * stride_sn
+            partial = _marlin_partial(hp, hs, n_mask, a_base, stride_ak, stride_pkw, stride_sblk, K_WORDS,
+                                      BLOCK_SIZE_N, BLOCK_SIZE_KW, UNROLL, A_WIDE,
+                                      a_ptr.dtype.element_ty == tl.bfloat16, p_base, s_base, True)
+            accumulator = tl.sum(partial, axis=1)
+            g = tl.load(global_ptr + slot * stride_ge + offs_n * stride_gn, mask=n_mask, other=0.0).to(tl.float32)
+            accumulator = accumulator * g
+            if MUL_ROUTED_WEIGHT:
+                weight = tl.load(topk_weights_ptr + token_id * stride_tw_m + route_k * stride_tw_k)
+                accumulator = accumulator * weight
+            c_ptrs = c_ptr + token_id * stride_cm + route_k * stride_ck + offs_n * stride_cn
+            tl.store(c_ptrs, accumulator.to(compute_type), mask=(route_id < total_routes) & n_mask)
+            return
     for kw_start in range(0, tl.cdiv(K_WORDS, BLOCK_SIZE_KW), UNROLL):
         for u in tl.static_range(UNROLL):
             widx = (kw_start + u) * BLOCK_SIZE_KW + offs_kw
@@ -299,6 +321,175 @@ def _decode_nvfp4_marlin_kernel(
 
     c_ptrs = c_ptr + token_id * stride_cm + route_k * stride_ck + offs_n * stride_cn
     tl.store(c_ptrs, accumulator.to(compute_type), mask=(route_id < total_routes) & n_mask)
+
+
+@triton.jit
+def _miss_row(ev_ptr, src_ptr, num_ptr, slot, MP: tl.constexpr):
+    """The host bank row of ``slot`` if the expert cache fills it this step (its copy plan: ``ev`` the slots filled,
+    ``src`` their rows, ``num`` how many, at most MP), else -1."""
+    mo = tl.arange(0, MP)
+    mmask = mo < tl.load(num_ptr).to(tl.int32)
+    hit = mmask & (tl.load(ev_ptr + mo, mask=mmask, other=-2).to(tl.int64) == slot) & (slot >= 0)
+    first = tl.min(tl.where(hit, mo, MP), axis=0)  # the plan's first entry for this slot
+    row = tl.load(src_ptr + first, mask=first < MP, other=-1).to(tl.int64)
+    return tl.where(first < MP, row, -1)
+
+
+@triton.jit
+def _marlin_partial(p_base, s_base, n_mask, a_base, stride_ak, stride_pkw, stride_sblk, K_WORDS,
+                    BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_KW: tl.constexpr, UNROLL: tl.constexpr,
+                    A_WIDE: tl.constexpr, A_BF16: tl.constexpr, dp_base=None, ds_base=None,
+                    WRITE: tl.constexpr = False):
+    """_decode_nvfp4_marlin_kernel's K loop for the rows at ``p_base`` / ``s_base``: the same loads, decode and
+    deferred ``[BLOCK_SIZE_N, BLOCK_SIZE_KW]`` partial (reduced by the caller). ``WRITE``: the word and scale tiles
+    loaded are also stored at the same offsets from ``dp_base`` / ``ds_base`` (a slot filled from host memory)."""
+    offs_kw = tl.arange(0, BLOCK_SIZE_KW)
+    offs_kh = tl.arange(0, BLOCK_SIZE_KW // 2)
+    partial = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_KW), dtype=tl.float32)
+    for kw_start in range(0, tl.cdiv(K_WORDS, BLOCK_SIZE_KW), UNROLL):
+        for u in tl.static_range(UNROLL):
+            widx = (kw_start + u) * BLOCK_SIZE_KW + offs_kw
+            w_mask = widx < K_WORDS
+            word = tl.load(p_base + widx[None, :] * stride_pkw, mask=n_mask[:, None] & w_mask[None, :], other=0)
+            hidx = (kw_start + u) * (BLOCK_SIZE_KW // 2) + offs_kh
+            s_ptrs = s_base + hidx[None, :] * stride_sblk
+            s_mask = n_mask[:, None] & (hidx[None, :] < K_WORDS // 2)
+            if WRITE:
+                tl.store(dp_base + widx[None, :] * stride_pkw, word, mask=n_mask[:, None] & w_mask[None, :])
+                s_raw = tl.load(s_ptrs, mask=s_mask, other=0)
+                tl.store(ds_base + hidx[None, :] * stride_sblk, s_raw, mask=s_mask)
+                if e4m3_native_cx():
+                    s_half = s_raw.to(tl.float32)
+                else:
+                    s_half = e4m3_u8_to_f32(s_raw)
+            else:
+                if e4m3_native_cx():
+                    s_half = tl.load(s_ptrs, mask=s_mask, other=0.0).to(tl.float32)
+                else:
+                    s_half = e4m3_u8_to_f32(tl.load(s_ptrs, mask=s_mask, other=0))
+            s_half = s_half * 16384.0
+            scale = tl.interleave(s_half, s_half)
+            if A_WIDE:
+                a64 = a_base.to(tl.pointer_type(tl.int64), bitcast=True)
+                v = tl.load(a64 + widx[:, None] * 2 + tl.arange(0, 2)[None, :], mask=w_mask[:, None], other=0)
+                v0, v1 = tl.split(v)
+                if A_BF16:
+                    a0, a1, a2, a3 = _bf16x4_to_f32(v0)
+                    a4, a5, a6, a7 = _bf16x4_to_f32(v1)
+                else:
+                    a0, a1, a2, a3 = _f16x4_to_f32(v0)
+                    a4, a5, a6, a7 = _f16x4_to_f32(v1)
+            else:
+                kbase = 8 * widx
+                a0 = tl.load(a_base + kbase * stride_ak, mask=w_mask, other=0.0).to(tl.float32)
+                a1 = tl.load(a_base + (kbase + 1) * stride_ak, mask=w_mask, other=0.0).to(tl.float32)
+                a2 = tl.load(a_base + (kbase + 2) * stride_ak, mask=w_mask, other=0.0).to(tl.float32)
+                a3 = tl.load(a_base + (kbase + 3) * stride_ak, mask=w_mask, other=0.0).to(tl.float32)
+                a4 = tl.load(a_base + (kbase + 4) * stride_ak, mask=w_mask, other=0.0).to(tl.float32)
+                a5 = tl.load(a_base + (kbase + 5) * stride_ak, mask=w_mask, other=0.0).to(tl.float32)
+                a6 = tl.load(a_base + (kbase + 6) * stride_ak, mask=w_mask, other=0.0).to(tl.float32)
+                a7 = tl.load(a_base + (kbase + 7) * stride_ak, mask=w_mask, other=0.0).to(tl.float32)
+            acc_w = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_KW), dtype=tl.float32)
+            b0, b4 = _nvfp4_pair_f32(word)
+            b1, b5 = _nvfp4_pair_f32(word >> 4)
+            b2, b6 = _nvfp4_pair_f32(word >> 8)
+            b3, b7 = _nvfp4_pair_f32(word >> 12)
+            acc_w += a0[None, :] * b0
+            acc_w += a1[None, :] * b1
+            acc_w += a2[None, :] * b2
+            acc_w += a3[None, :] * b3
+            acc_w += a4[None, :] * b4
+            acc_w += a5[None, :] * b5
+            acc_w += a6[None, :] * b6
+            acc_w += a7[None, :] * b7
+            partial += acc_w * scale
+    return partial
+
+
+@triton.jit
+def _decode_nvfp4_marlin_act_kernel(
+    a_ptr, packed_ptr, scale_ptr, global_ptr, out_ptr, topk_weights_ptr, topk_ids_ptr,
+    total_routes, I, K,
+    stride_am, stride_ak,
+    stride_pe, stride_pn, stride_pkw,
+    stride_se, stride_sn, stride_sblk,
+    stride_ge, stride_gn,
+    stride_or,
+    stride_tw_m, stride_tw_k,
+    stride_tid_m, stride_tid_k,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_KW: tl.constexpr,
+    UNROLL: tl.constexpr,
+    TOP_K: tl.constexpr,
+    A_WIDE: tl.constexpr,
+    MUL_ROUTED_WEIGHT: tl.constexpr,
+    compute_type: tl.constexpr,
+    SKIP_INACTIVE: tl.constexpr = False,
+    MISS: tl.constexpr = False,  # FREETOKEN_MOE_MISS_READS: the cache's copy plan (see _miss_row)
+    ev_ptr=None, src_ptr=None, num_ptr=None, hostp_ptr=None,
+    BANK_P: tl.constexpr = 0, BANK_S: tl.constexpr = 0, MP: tl.constexpr = 1,
+):
+    """FREETOKEN_NVFP4_ACT_IN_GEMV: the gate | up GEMV of _decode_nvfp4_marlin_kernel and silu_and_mul in one kernel. A
+    program computes BLOCK_SIZE_N gate columns and the BLOCK_SIZE_N up columns I further, each with the GEMV's own K
+    loop and tile shapes (the same values), rounds them as the GEMV stores them, then applies
+    _act_and_mul_kernel's SILU expression: out [routes, I] is what the GEMV then the activation write, one launch fewer."""
+    route_id = tl.program_id(0)
+    n_block_id = tl.program_id(1)
+    token_id = route_id // TOP_K
+    route_k = route_id - token_id * TOP_K
+    offs_n = n_block_id * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    n_mask = offs_n < I
+    out_ptrs = out_ptr + route_id.to(tl.int64) * stride_or + offs_n
+    slot = tl.load(topk_ids_ptr + token_id * stride_tid_m + route_k * stride_tid_k).to(tl.int64)
+    if SKIP_INACTIVE:
+        if slot < 0:  # the GEMV wrote zeros for gate and up: silu(0) * 0
+            tl.store(out_ptrs, tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32).to(compute_type),
+                     mask=(route_id < total_routes) & n_mask)
+            return
+    a_base = a_ptr + token_id * stride_am
+    K_WORDS = K // 8
+    gate_n = offs_n
+    up_n = I + offs_n
+    pg_base = packed_ptr + slot * stride_pe + gate_n[:, None] * stride_pn
+    sg_base = scale_ptr + slot * stride_se + gate_n[:, None] * stride_sn
+    pu_base = packed_ptr + slot * stride_pe + up_n[:, None] * stride_pn
+    su_base = scale_ptr + slot * stride_se + up_n[:, None] * stride_sn
+    A_BF16 = a_ptr.dtype.element_ty == tl.bfloat16
+    if MISS:
+        row = _miss_row(ev_ptr, src_ptr, num_ptr, slot, MP)
+        if row >= 0:
+            # the slot is being filled this step: its rows from the host bank, written into the slot on the way
+            hp = tl.load(hostp_ptr + BANK_P).to(packed_ptr.dtype) + row * stride_pe
+            hs = tl.load(hostp_ptr + BANK_S).to(scale_ptr.dtype) + row * stride_se
+            pg = _marlin_partial(hp + gate_n[:, None] * stride_pn, hs + gate_n[:, None] * stride_sn, n_mask, a_base,
+                                 stride_ak, stride_pkw, stride_sblk, K_WORDS, BLOCK_SIZE_N, BLOCK_SIZE_KW, UNROLL,
+                                 A_WIDE, A_BF16, pg_base, sg_base, True)
+            pu = _marlin_partial(hp + up_n[:, None] * stride_pn, hs + up_n[:, None] * stride_sn, n_mask, a_base,
+                                 stride_ak, stride_pkw, stride_sblk, K_WORDS, BLOCK_SIZE_N, BLOCK_SIZE_KW, UNROLL,
+                                 A_WIDE, A_BF16, pu_base, su_base, True)
+        else:
+            pg = _marlin_partial(pg_base, sg_base, n_mask, a_base, stride_ak, stride_pkw, stride_sblk, K_WORDS,
+                                 BLOCK_SIZE_N, BLOCK_SIZE_KW, UNROLL, A_WIDE, A_BF16)
+            pu = _marlin_partial(pu_base, su_base, n_mask, a_base, stride_ak, stride_pkw, stride_sblk, K_WORDS,
+                                 BLOCK_SIZE_N, BLOCK_SIZE_KW, UNROLL, A_WIDE, A_BF16)
+    else:
+        pg = _marlin_partial(pg_base, sg_base, n_mask, a_base, stride_ak, stride_pkw, stride_sblk, K_WORDS,
+                             BLOCK_SIZE_N, BLOCK_SIZE_KW, UNROLL, A_WIDE, A_BF16)
+        pu = _marlin_partial(pu_base, su_base, n_mask, a_base, stride_ak, stride_pkw, stride_sblk, K_WORDS,
+                             BLOCK_SIZE_N, BLOCK_SIZE_KW, UNROLL, A_WIDE, A_BF16)
+    gate = tl.sum(pg, axis=1) * tl.load(global_ptr + slot * stride_ge + gate_n * stride_gn, mask=n_mask,
+                                        other=0.0).to(tl.float32)
+    up = tl.sum(pu, axis=1) * tl.load(global_ptr + slot * stride_ge + up_n * stride_gn, mask=n_mask,
+                                      other=0.0).to(tl.float32)
+    if MUL_ROUTED_WEIGHT:
+        weight = tl.load(topk_weights_ptr + token_id * stride_tw_m + route_k * stride_tw_k)
+        gate = gate * weight
+        up = up * weight
+    gate = gate.to(compute_type).to(tl.float32)  # as the GEMV stores them
+    up = up.to(compute_type).to(tl.float32)
+    act = gate / (1.0 + _fast_ex2(-gate * _LOG2E))  # activation.py's SILU, the same ops
+    y = act * up
+    tl.store(out_ptrs, y.to(compute_type), mask=(route_id < total_routes) & n_mask)
 
 
 @triton.jit
@@ -526,6 +717,7 @@ def _prefill_nvfp4_moe_kernel(
 __all__ = [
     "_decode_nvfp4_moe_kernel",
     "_decode_nvfp4_marlin_kernel",
+    "_decode_nvfp4_marlin_act_kernel",
     "_prefill_nvfp4_moe_kernel",
     "_e2m1_lut",
 ]

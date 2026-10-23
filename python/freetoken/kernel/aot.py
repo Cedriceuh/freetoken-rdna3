@@ -41,20 +41,20 @@ class KernelSpec:
 
 
 def _store_spec(element_size: int) -> KernelSpec:
-    from .store import DEFAULT_INDEX_KERNEL_CONFIG
+    from .store import DEFAULT_INDEX_KERNEL_CONFIG, STORE_MODULE
 
     args = make_cpp_args(element_size, *DEFAULT_INDEX_KERNEL_CONFIG)
 
     def build(build_directory: pathlib.Path) -> object:
         return load_jit(
-            "store",
+            STORE_MODULE,
             *args,
             cuda_files=["store.cu"],
             cuda_wrappers=[("launch", f"StoreKernel<{args}>::run")],
             build_directory=str(build_directory),
         )
 
-    return KernelSpec(name=_make_name("store", *args), build=build)
+    return KernelSpec(name=_make_name(STORE_MODULE, *args), build=build)
 
 
 def _index_spec(element_size: int, num_splits: int) -> KernelSpec:

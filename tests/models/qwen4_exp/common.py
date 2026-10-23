@@ -264,8 +264,8 @@ def selection_spy(monkeypatch, backend) -> dict:
     seen: dict[str, torch.Tensor] = {}
     original = QSASparseAttnBackend._select
 
-    def spy(self, index, md, slot):
-        indices = original(self, index, md, slot)
+    def spy(self, index, md, slot, *rest):
+        indices = original(self, index, md, slot, *rest)
         seen["indices"] = indices.clone()
         return indices
 

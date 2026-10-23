@@ -122,6 +122,32 @@ def _reap_backend_workers(processes: List[Any], timeout: float = 5.0) -> None:
             continue
 
 
+def _exit_on_sigterm(signum, frame) -> None:
+    """The SIGTERM that uvicorn re-raises once its graceful stop is done (0.29+): dying of it ran no exit handler, so
+    multiprocessing's named semaphores (the ack queue's, and those the workers left) stayed in /dev/shm, the host's under
+    ``docker run --ipc=host`` (~5 a start). Reap the workers, run multiprocessing's exit handler, let its resource tracker
+    unlink what the workers left, then die of the signal (private multiprocessing API: a failure is only a leak, as
+    before)."""
+    import multiprocessing.util as mp_util
+    from multiprocessing import resource_tracker
+
+    signal.signal(signum, signal.SIG_DFL)  # a second SIGTERM stops the process at once, as before
+    _SHUTTING_DOWN.set()  # the workers' exits are the stop's, not a crash (a SIGTERM before uvicorn took over)
+    processes = getattr(_GLOBAL_STATE, "backend_processes", None) or []
+    _terminate_backend_workers(processes)
+    _reap_backend_workers(processes)
+
+    def cleanup() -> None:
+        mp_util._exit_function()  # the atexit hook: unlinks this process's semaphores
+        resource_tracker._resource_tracker._stop()  # waits for the tracker's own cleanup of the rest
+
+    # bounded: both wait for processes (a worker stuck in its GPU teardown, a stray one holding the tracker's pipe)
+    done = threading.Thread(target=cleanup, name="freetoken-exit", daemon=True)
+    done.start()
+    done.join(10.0)
+    os.kill(os.getpid(), signum)  # then die of it, as before: a supervisor sees the same stop
+
+
 def _unwrap_msg(msg: BaseFrontendMsg) -> List[UserReply]:
     if isinstance(msg, BatchFrontendMsg):
         result = []
@@ -1104,5 +1130,7 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
     if run_shell:
         _serve_and_run_shell(host, port, config.api_key)
         return
-    # uvicorn stays on the main thread (signal handling unchanged); ^C reaches the worker group.
+    # uvicorn stays on the main thread; ^C reaches the worker group. Its SIGTERM handler takes over while it runs and
+    # puts this one back before re-raising the signal it stopped on
+    signal.signal(signal.SIGTERM, _exit_on_sigterm)
     uvicorn.run(app, host=host, port=port)

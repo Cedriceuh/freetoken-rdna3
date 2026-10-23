@@ -224,6 +224,10 @@ def _qsa_merge_splitk_kernel(
     NUM_QUERY_HEADS: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
     BLOCK_SPLITS: tl.constexpr,
+    gate_ptr=None,
+    stride_gate_row=0,
+    stride_gate_head=0,
+    HAS_GATE: tl.constexpr = False,
 ) -> None:
     row = tl.program_id(0).to(tl.int64)
     head = tl.program_id(1)
@@ -250,10 +254,16 @@ def _qsa_merge_splitk_kernel(
     )
     merged = tl.sum(partial_output * weights[:, None], axis=0)
     merged = tl.where(denominator > 0, merged / denominator, 0.0)
-    tl.store(
-        output_ptr + row * stride_output_row + head * stride_output_head + dim_offsets,
-        merged,
-    )
+    if HAS_GATE:  # FREETOKEN_QSA_FUSED_GATE: _sigmoid_gate_mul_kernel's ops on the bf16 output, into [rows, heads * dim]
+        o = merged.to(tl.bfloat16).to(tl.float32)
+        g = tl.load(gate_ptr + row * stride_gate_row + head * stride_gate_head + dim_offsets).to(tl.float32)
+        s = (1.0 / (1.0 + tl.exp(-g))).to(tl.bfloat16).to(tl.float32)
+        tl.store(output_ptr + (row * NUM_QUERY_HEADS + head) * HEAD_DIM + dim_offsets, (o * s).to(tl.bfloat16))
+    else:
+        tl.store(
+            output_ptr + row * stride_output_row + head * stride_output_head + dim_offsets,
+            merged,
+        )
 
 
 def qsa_sparse_paged_attention(
@@ -267,9 +277,13 @@ def qsa_sparse_paged_attention(
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
     decode: bool = False,
+    gate: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run sparse GQA directly over paged BF16 K/V caches, or int8 ones with ``[pages, page_size, kv_heads]``
     fp32 scales (``k_scale`` / ``v_scale``, see kvcache/qsa_pool.py FREETOKEN_QSA_KV_INT8).
+
+    ``gate`` (bf16, ``q``'s shape, any row and head strides): return ``sigmoid_gate_mul(out, gate)`` instead, ``[T,
+    heads * head_dim]``, the gate applied in the split merge when there is one (the same bits, a launch fewer).
 
     ``decode``: pick the tile profile as for one query row, whatever the row count, so each decode row gets the
     bits it would get alone (the split count changes the merge order). Up to 4 rows per rank this is the profile
@@ -411,13 +425,20 @@ def qsa_sparse_paged_attention(
         num_warps=partial_warps,
         num_stages=2,
     )
+    if gate is not None:
+        assert gate.shape == q.shape and gate.dtype == q.dtype == torch.bfloat16 and gate.stride(2) == 1
     if num_splits == 1:
+        if gate is not None:
+            from freetoken.kernel.triton.attn_gate import sigmoid_gate_mul
+
+            return sigmoid_gate_mul(out, gate)
         return out
 
+    gated = None if gate is None else torch.empty((q.shape[0], q.shape[1] * q.shape[2]), dtype=q.dtype, device=q.device)
     _qsa_merge_splitk_kernel[(q.shape[0], q.shape[1])](
         partial_output,
         partial_lse,
-        out,
+        out if gate is None else gated,
         out.stride(0),
         out.stride(1),
         q.shape[0],
@@ -425,10 +446,14 @@ def qsa_sparse_paged_attention(
         NUM_QUERY_HEADS=q.shape[1],
         NUM_SPLITS=num_splits,
         BLOCK_SPLITS=triton.next_power_of_2(num_splits),
+        gate_ptr=gate,
+        stride_gate_row=0 if gate is None else gate.stride(0),
+        stride_gate_head=0 if gate is None else gate.stride(1),
+        HAS_GATE=gate is not None,
         num_warps=2,
         num_stages=1,
     )
-    return out
+    return out if gate is None else gated
 
 
 __all__ = ["qsa_sparse_paged_attention"]

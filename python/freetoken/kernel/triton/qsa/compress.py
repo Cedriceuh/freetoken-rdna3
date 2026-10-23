@@ -207,6 +207,116 @@ def _store_qsa_rows_kernel(
     )
 
 
+@triton.jit
+def _norm_rope_tile(
+    block,
+    x_ptr,
+    positions_ptr,
+    cos_sin_ptr,
+    weight_ptr,
+    out_ptr,
+    dest_rows_ptr,
+    stride_x_row,
+    stride_out_row,
+    stride_cos_sin_row,
+    num_rows,
+    eps,
+    stride_x_head,
+    HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    ROTARY_HALF: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    HAS_DEST_ROWS: tl.constexpr,
+    X_BY_HEAD: tl.constexpr,
+):
+    # _index_norm_rope_kernel's body for row block ``block``, the same ops on the same tile
+    rows = block * BLOCK_R + tl.arange(0, BLOCK_R)
+    live = rows < num_rows
+    dims = tl.arange(0, BLOCK_D)
+    in_dim = dims < HEAD_DIM
+    in_rotary = dims < 2 * ROTARY_HALF
+    pair = dims % ROTARY_HALF
+    partner = tl.where(dims < ROTARY_HALF, dims + ROTARY_HALF, dims - ROTARY_HALF)
+    partner = tl.where(in_rotary, partner, dims)
+    if X_BY_HEAD:
+        base = x_ptr + (rows[:, None] // HEADS).to(tl.int64) * stride_x_row + (rows[:, None] % HEADS) * stride_x_head
+    else:
+        base = x_ptr + rows[:, None].to(tl.int64) * stride_x_row
+    mask = live[:, None] & in_dim[None, :]
+    x = tl.load(base + dims[None, :], mask=mask, other=0.0).to(tl.float32)
+    x_partner = tl.load(base + partner[None, :], mask=mask, other=0.0).to(tl.float32)
+    weight = tl.load(weight_ptr + dims, mask=in_dim, other=0.0).to(tl.float32) + 1.0
+    weight_partner = (
+        tl.load(weight_ptr + partner, mask=in_dim, other=0.0).to(tl.float32) + 1.0
+    )
+    rrms = tl.rsqrt(tl.sum(x * x, axis=1) / HEAD_DIM + eps)
+    y = x * rrms[:, None] * weight[None, :]
+    y_partner = x_partner * rrms[:, None] * weight_partner[None, :]
+    position = tl.load(positions_ptr + rows // HEADS, mask=live, other=0).to(tl.int64)
+    cos_base = cos_sin_ptr + position[:, None] * stride_cos_sin_row
+    rotary_mask = live[:, None] & in_rotary[None, :]
+    cos = tl.load(cos_base + pair[None, :], mask=rotary_mask, other=1.0)
+    sin = tl.load(cos_base + ROTARY_HALF + pair[None, :], mask=rotary_mask, other=0.0)
+    sign = tl.where(dims < ROTARY_HALF, -1.0, 1.0)
+    result = tl.where(in_rotary[None, :], y * cos + sign[None, :] * y_partner * sin, y)
+    if HAS_DEST_ROWS:
+        dest = tl.load(dest_rows_ptr + rows, mask=live, other=-1)
+        live = live & (dest >= 0)
+        dest_row = tl.maximum(dest, 0).to(tl.int64)
+    else:
+        dest_row = rows.to(tl.int64)
+    tl.store(
+        out_ptr + dest_row[:, None] * stride_out_row + dims[None, :],
+        result.to(out_ptr.dtype.element_ty),
+        mask=live[:, None] & in_dim[None, :],
+    )
+
+
+@triton.jit
+def _qsa_index_writes_kernel(
+    k_ptr, k_pos_ptr, k_cos_sin_ptr, k_weight_ptr, k_out_ptr, k_dest_ptr,
+    stride_k_row, stride_k_out, stride_k_cos_sin, k_rows,
+    q_ptr, q_pos_ptr, q_cos_sin_ptr, q_weight_ptr, q_out_ptr,
+    stride_q_row, stride_q_head, stride_q_out, stride_q_cos_sin, q_rows,
+    ring_ptr, ring_slots_ptr, raw_ptr, stride_ring_block, stride_ring_token, stride_raw_row, raw_rows, ring_blocks,
+    eps,
+    K_BLOCKS, Q_BLOCKS,
+    Q_HEADS: tl.constexpr,
+    Q_BY_HEAD: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    ROTARY_HALF: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    WIDTH: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+) -> None:
+    """FREETOKEN_QSA_FUSED_WRITES: a QSA layer's three launches after the group compression in one: the closing groups'
+    index keys normed and roped into the compressed slab (programs [0, K_BLOCKS)), the indexer queries
+    ([K_BLOCKS, K_BLOCKS + Q_BLOCKS)), the raw keys into the pending ring (one program a row after that). Each part is
+    its own kernel's code on its own tile, so the same bits; they read and write disjoint memory."""
+    pid = tl.program_id(0)
+    if pid < K_BLOCKS:
+        _norm_rope_tile(pid, k_ptr, k_pos_ptr, k_cos_sin_ptr, k_weight_ptr, k_out_ptr, k_dest_ptr, stride_k_row,
+                        stride_k_out, stride_k_cos_sin, k_rows, eps, 0, 1, HEAD_DIM, ROTARY_HALF, BLOCK_R, BLOCK_D,
+                        True, False)
+    elif pid < K_BLOCKS + Q_BLOCKS:
+        _norm_rope_tile(pid - K_BLOCKS, q_ptr, q_pos_ptr, q_cos_sin_ptr, q_weight_ptr, q_out_ptr, q_out_ptr,
+                        stride_q_row, stride_q_out, stride_q_cos_sin, q_rows, eps, stride_q_head, Q_HEADS, HEAD_DIM,
+                        ROTARY_HALF, BLOCK_R, BLOCK_D, False, Q_BY_HEAD)
+    else:  # _store_qsa_rows_kernel's body
+        row = pid - K_BLOCKS - Q_BLOCKS
+        dims = tl.arange(0, BLOCK_W)
+        slot = tl.load(ring_slots_ptr + row)
+        valid = (row < raw_rows) & (slot >= 0) & (slot < ring_blocks * PAGE_SIZE)
+        block = tl.maximum(slot, 0) // PAGE_SIZE
+        token = tl.maximum(slot, 0) % PAGE_SIZE
+        values = tl.load(raw_ptr + row * stride_raw_row + dims, mask=valid & (dims < WIDTH), other=0)
+        tl.store(ring_ptr + block.to(tl.int64) * stride_ring_block + token * stride_ring_token + dims, values,
+                 mask=valid & (dims < WIDTH))
+
+
 def qsa_compress_groups(
     raw_keys: torch.Tensor,
     ring: torch.Tensor,
@@ -346,4 +456,75 @@ def qsa_store_rows(
     )
 
 
-__all__ = ["qsa_compress_groups", "qsa_index_norm_rope", "qsa_store_rows"]
+def qsa_index_writes(
+    pooled: torch.Tensor,
+    k_positions: torch.Tensor,
+    k_cos_sin: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    k_out: torch.Tensor,
+    k_dest_rows: torch.Tensor,
+    q: torch.Tensor,
+    q_positions: torch.Tensor,
+    q_cos_sin: torch.Tensor,
+    q_norm_weight: torch.Tensor,
+    q_out: torch.Tensor,
+    heads: int,
+    ring: torch.Tensor,
+    ring_slots: torch.Tensor,
+    raw_keys: torch.Tensor,
+    eps: float,
+) -> None:
+    """``qsa_index_norm_rope(pooled, ..., k_out, dest_rows=k_dest_rows)``, ``qsa_index_norm_rope(q, ..., q_out,
+    heads=heads)`` and ``qsa_store_rows(ring, ring_slots, raw_keys)`` in one launch (FREETOKEN_QSA_FUSED_WRITES), the
+    same checks and bits."""
+    by_head = q.dim() == 3
+    if by_head:
+        if q.shape[1] != heads:
+            raise ValueError("QSA indexer x [tokens, heads, head_dim] must have `heads` heads")
+        q_rows, head_dim, stride_q_head, q_unit = q.shape[0] * heads, q.shape[2], q.stride(1), q.stride(2) == 1
+    else:
+        (q_rows, head_dim), stride_q_head, q_unit = q.shape, 0, q.stride(1) == 1
+    k_rows = pooled.shape[0]
+    rotary_dim = k_cos_sin.shape[1]
+    if pooled.shape[1] != head_dim or q_cos_sin.shape[1] != rotary_dim:
+        raise ValueError("QSA index writes: keys and queries share head_dim and rotary_dim")
+    if rotary_dim % 2 or rotary_dim > head_dim:
+        raise ValueError("QSA indexer rope needs an even rotary_dim <= head_dim")
+    if (pooled.stride(1) != 1 or not q_unit or k_out.stride(1) != 1 or q_out.stride(1) != 1
+            or not k_cos_sin.is_contiguous() or not q_cos_sin.is_contiguous()):
+        raise ValueError("QSA indexer norm+rope needs unit-stride rows")
+    if q_rows % heads:
+        raise ValueError("QSA indexer rows must be a whole number of head groups")
+    if ring.ndim != 3 or raw_keys.ndim != 2 or raw_keys.shape[1] != ring.shape[2]:
+        raise ValueError("QSA row store needs a [blocks, block_size, width] cache")
+    if ring.stride(2) != 1 or raw_keys.stride(1) != 1:
+        raise ValueError("QSA row store needs unit-stride rows")
+    if raw_keys.shape[0] != ring_slots.numel():
+        raise ValueError("QSA row store slots and rows disagree")
+    block_r = 8 if head_dim >= 128 else 16
+    k_blocks, q_blocks = triton.cdiv(k_rows, block_r), triton.cdiv(q_rows, block_r)
+    grid = k_blocks + q_blocks + raw_keys.shape[0]
+    if not grid:
+        return
+    _qsa_index_writes_kernel[(grid,)](
+        pooled, k_positions, k_cos_sin, k_norm_weight, k_out, k_dest_rows,
+        pooled.stride(0), k_out.stride(0), k_cos_sin.stride(0), k_rows,
+        q, q_positions, q_cos_sin, q_norm_weight, q_out,
+        q.stride(0), stride_q_head, q_out.stride(0), q_cos_sin.stride(0), q_rows,
+        ring, ring_slots, raw_keys, ring.stride(0), ring.stride(1), raw_keys.stride(0), raw_keys.shape[0], ring.shape[0],
+        eps,
+        k_blocks, q_blocks,
+        Q_HEADS=heads,
+        Q_BY_HEAD=by_head,
+        HEAD_DIM=head_dim,
+        ROTARY_HALF=rotary_dim // 2,
+        BLOCK_R=block_r,
+        BLOCK_D=triton.next_power_of_2(head_dim),
+        PAGE_SIZE=ring.shape[1],
+        WIDTH=ring.shape[2],
+        BLOCK_W=triton.next_power_of_2(ring.shape[2]),
+        num_warps=4,
+    )
+
+
+__all__ = ["qsa_compress_groups", "qsa_index_norm_rope", "qsa_index_writes", "qsa_store_rows"]

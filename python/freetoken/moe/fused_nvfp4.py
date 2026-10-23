@@ -8,12 +8,12 @@ so no BF16 copy of the experts is ever materialized.
 from __future__ import annotations
 
 import os
-
 from typing import Any, Dict
 
 import torch
 
 from freetoken.kernel import moe_sum_reduce_triton, nvfp4_moe
+from freetoken.kernel.backend import is_flashinfer_installed
 from freetoken.kernel.triton.nvfp4_act_quant import quantize_nvfp4
 from freetoken.layers import gated_act_and_mul
 from freetoken.kernel.triton.moe_align import moe_align_split
@@ -28,6 +28,9 @@ PER_EXPERT_OUTPUT = [False]
 
 # the launches live in kernel/nvfp4_moe.py; the RDNA3 benches and tests call them by these names
 SKIP_CPU_ROUTES = nvfp4_moe.SKIP_CPU_ROUTES
+# FREETOKEN_NVFP4_ACT_IN_GEMV (default 1): decode's gate | up GEMV (marlin) computes silu_and_mul itself, each program
+# both halves of its columns with the GEMV's own tiles (the same bits, one launch fewer per MoE layer)
+_ACT_IN_GEMV = os.environ.get("FREETOKEN_NVFP4_ACT_IN_GEMV", "1") != "0"
 _decode_gemm = nvfp4_moe.decode_gemm
 _decode_gemm_marlin = nvfp4_moe.decode_gemm_marlin
 _prefill_gemm = nvfp4_moe.prefill_gemm
@@ -48,27 +51,48 @@ def _fused_experts_decode_nvfp4(
     apply_router_weight_on_input: bool,
     act_alpha: float = 1.702,
     act_limit: float = 7.0,
+    misses: tuple | None = None,
 ) -> torch.Tensor:
     """Shared decode body (gemm1 -> act -> gemm2 -> sum-reduce); ``gemm_fn`` is either
     the marlin-style int32 GEMV (:func:`freetoken.kernel.nvfp4_moe.decode_gemm_marlin`) or the original LUT-gather
-    GEMV (:func:`freetoken.kernel.nvfp4_moe.decode_gemm`), both with the same calling convention."""
+    GEMV (:func:`freetoken.kernel.nvfp4_moe.decode_gemm`), both with the same calling convention. ``misses``
+    (marlin only, OffloadMoeCache.miss_reads): the copy plan of the slots this step fills, whose packed and scale rows
+    the GEMVs read from host memory and fill themselves."""
     M, H = hidden_states.shape
     top_k = topk_ids.shape[1]
     two_i = gate_up_packed.shape[1]
     inter = two_i // 2
     dev, dt = hidden_states.device, hidden_states.dtype
 
-    ic1 = torch.empty((M, top_k, two_i), device=dev, dtype=dt)
-    gemm_fn(
-        hidden_states, gate_up_packed, gate_up_scale, gate_up_global,
-        ic1, topk_weights, topk_ids, apply_router_weight_on_input, False,
-    )
     ic2 = torch.empty((M * top_k, inter), device=dev, dtype=dt)
-    gated_act_and_mul(activation, ic1.view(-1, two_i), ic2, alpha=act_alpha, limit=act_limit)
+    gu_miss = dn_miss = {}
+    if misses is not None:
+        assert gemm_fn is _decode_gemm_marlin, "only the marlin GEMVs read missing slots from host memory"
+        plan, bank = misses
+        for t, role in ((gate_up_packed, "gate_up"), (gate_up_scale, "gate_up_scale"), (down_packed, "down"),
+                        (down_scale, "down_scale")):  # host and slot rows share one layout
+            assert t[0].numel() * t.element_size() == bank[role][1] == t.stride(0) * t.element_size(), (role, bank)
+        gu_miss = {"misses": plan, "banks": (bank["gate_up"][0], bank["gate_up_scale"][0])}
+        dn_miss = {"misses": plan, "banks": (bank["down"][0], bank["down_scale"][0])}
+    if (_ACT_IN_GEMV and gemm_fn is _decode_gemm_marlin and activation == "silu" and dt == torch.bfloat16
+            and not is_flashinfer_installed()):
+        # FREETOKEN_NVFP4_ACT_IN_GEMV: the gate | up GEMV and silu_and_mul in one launch, the bits of the Triton
+        # activation (flashinfer's, used where it is installed, is another reference)
+        nvfp4_moe.decode_gemm_marlin_act(
+            hidden_states, gate_up_packed, gate_up_scale, gate_up_global, ic2, topk_weights, topk_ids,
+            apply_router_weight_on_input, **gu_miss,
+        )
+    else:
+        ic1 = torch.empty((M, top_k, two_i), device=dev, dtype=dt)
+        gemm_fn(
+            hidden_states, gate_up_packed, gate_up_scale, gate_up_global,
+            ic1, topk_weights, topk_ids, apply_router_weight_on_input, False, **gu_miss,
+        )
+        gated_act_and_mul(activation, ic1.view(-1, two_i), ic2, alpha=act_alpha, limit=act_limit)
     ic3 = torch.empty((M, top_k, H), device=dev, dtype=dt)
     gemm_fn(
         ic2, down_packed, down_scale, down_global,
-        ic3, topk_weights, topk_ids, not apply_router_weight_on_input, True,
+        ic3, topk_weights, topk_ids, not apply_router_weight_on_input, True, **dn_miss,
     )
     if PER_EXPERT_OUTPUT[0]:  # the caller sums them in its own epilogue (FREETOKEN_FUSED_MOE_EPILOGUE)
         return ic3
@@ -91,6 +115,7 @@ def fused_experts_decode_nvfp4_marlin(
     apply_router_weight_on_input: bool = False,
     act_alpha: float = 1.702,
     act_limit: float = 7.0,
+    misses: tuple | None = None,
 ) -> torch.Tensor:
     """Decode inline-NVFP4 MoE using the Marlin-style int32 wide-load GEMV."""
     return _fused_experts_decode_nvfp4(
@@ -98,7 +123,7 @@ def fused_experts_decode_nvfp4_marlin(
         hidden_states, gate_up_packed, gate_up_scale, gate_up_global,
         down_packed, down_scale, down_global,
         topk_weights, topk_ids, activation, apply_router_weight_on_input,
-        act_alpha, act_limit,
+        act_alpha, act_limit, misses=misses,
     )
 
 

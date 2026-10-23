@@ -56,6 +56,12 @@ _DEFAULT_CHUNK = 8 << 20
 
 # Hold the mmaps for the process lifetime; the offload cache reads from these banks forever.
 _LIVE_BUFFERS: list[mmap.mmap] = []
+# FREETOKEN_BANK_COARSE (default 1, ROCm): register the pinned banks coarse-grained (hipExtHostRegisterCoarseGrained):
+# the GPU's L2 may keep the lines a kernel reads from them (the banks never change once filled). A decode GEMV that reads
+# a missing expert from its bank (FREETOKEN_MOE_MISS_READS) then moves it at the copy kernel's speed (0.74 MB in 32.5
+# us against 58.8 fine-grained, 7900 XTX); the copy kernel reads either kind at the same speed
+_BANK_COARSE = os.environ.get("FREETOKEN_BANK_COARSE", "1") == "1"
+_HIP_HOST_REGISTER_FLAGS = 0x1 | 0x2 | 0x8  # Portable | Mapped | CoarseGrained (hip_runtime_api.h)
 
 def _env_born_pinned() -> bool | None:
     """``FREETOKEN_BANK_CUDA_ALLOC`` tri-state: unset -> ``None`` (default applies), else the parsed boolean."""
@@ -73,6 +79,17 @@ def born_pinned_default() -> bool:
     if env is not None:
         return env
     return False
+
+
+def _hip_register_coarse(addr: int, nbytes: int) -> None:
+    """hipHostRegister portable + mapped + coarse-grained (the extension's cudaHostRegister has no such flag)."""
+    from freetoken.kernel.host_mapped import _hip
+
+    lib = _hip()
+    lib.hipHostRegister.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint]
+    err = lib.hipHostRegister(ctypes.c_void_p(addr), nbytes, _HIP_HOST_REGISTER_FLAGS)
+    if err:
+        raise RuntimeError(f"hipHostRegister(coarse-grained) failed with HIP error {err}")
 
 
 class HostBank:
@@ -138,7 +155,10 @@ class HostBank:
         from freetoken.kernel.pinned import host_register
 
         try:
-            host_register(self.addr, len(self._buf))
+            if _BANK_COARSE and torch.version.hip is not None:
+                _hip_register_coarse(self.addr, len(self._buf))
+            else:
+                host_register(self.addr, len(self._buf))
         except RuntimeError as exc:
             raise PinFailed(f"cudaHostRegister failed for {len(self._buf) / 2**30:.1f} GiB") from exc
         self._pinned = True

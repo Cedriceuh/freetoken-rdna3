@@ -35,6 +35,9 @@ if TYPE_CHECKING:
 # gate applied in one kernel (models/qwen4_exp/gdn.py: the gated norm reads z in place); the same bits, fewer launches.
 # Off elsewhere: flashinfer's gemma_rmsnorm takes 2D inputs only, and the bits were checked on ROCm's Triton only
 _FEWER_COPIES = os.environ.get("FREETOKEN_FEWER_COPIES", "1" if torch.version.hip is not None else "0") == "1"
+# FREETOKEN_QSA_FUSED_GATE (default 1, with FREETOKEN_FEWER_COPIES): the output gate applied by the QSA backend, in the
+# attention's split merge when it has one (decode), instead of a launch of its own; the same ops, the same bits
+_FUSED_GATE = os.environ.get("FREETOKEN_QSA_FUSED_GATE", "1") != "0"
 
 
 @dataclass(frozen=True)
@@ -182,7 +185,8 @@ class Qwen4ExpAttention(BaseOP):
         qg = qg.view(-1, self.num_q, self.head_dim * 2)
         if _FEWER_COPIES:
             # the norms read q and k where the projection wrote them and write them contiguous (same rows, same
-            # warps: the bits of the copy-then-normalize-in-place form, two launches fewer)
+            # warps: the bits of the copy-then-normalize-in-place form, two launches fewer); the K/V store reads v
+            # there too (its own row stride)
             q = self.q_norm.forward_strided(qg[..., : self.head_dim])
             k = self.k_norm.forward_strided(k.view(-1, self.num_kv, self.head_dim))
             gate = qg[..., self.head_dim :]
@@ -192,12 +196,18 @@ class Qwen4ExpAttention(BaseOP):
             k = k.contiguous().view(-1, self.num_kv, self.head_dim)
             self.q_norm.forward_inplace(q)
             self.k_norm.forward_inplace(k)
-        v = v.contiguous()
+            v = v.contiguous()
         q, k = self.rotary.forward(
             batch.get_attn_positions(), q.view(-1, self.qo_attn_dim), k.view(-1, self.kv_attn_dim)
         )
         index = self.indexer.forward(x)
-        o = get_global_ctx().attn_backend.qsa_forward(
+        backend = get_global_ctx().attn_backend
+        if _FEWER_COPIES and _FUSED_GATE and getattr(backend, "takes_gate", False):
+            # FREETOKEN_QSA_FUSED_GATE: the backend applies the gate (in its split merge: a launch fewer)
+            gated = backend.qsa_forward(q.view(-1, self.num_q, self.head_dim), k, v, index, self.layer_id, batch,
+                                        kv_only=kv_only, gate=gate)
+            return None if kv_only else self.o_proj.forward(gated)
+        o = backend.qsa_forward(
             q.view(-1, self.num_q, self.head_dim), k, v, index, self.layer_id, batch, kv_only=kv_only
         )
         if kv_only:

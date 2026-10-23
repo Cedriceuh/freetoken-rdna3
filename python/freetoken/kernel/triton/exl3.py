@@ -24,6 +24,7 @@ import torch
 import triton
 import triton.language as tl
 
+from freetoken.kernel.triton.route_groups import _route_group_row, route_groups
 from freetoken.layers.quantization.exl3_codec import CB_3INST, CB_MCG, CB_MUL1
 
 
@@ -49,8 +50,11 @@ def _hadamard_pm1(device: torch.device) -> torch.Tensor:
 
 
 @triton.jit
-def _exl3_states(t_base, KT: tl.constexpr, NT: tl.constexpr, stride_a, stride_b, K: tl.constexpr, G: tl.constexpr):
-    """16-bit states of KT x NT tiles from ``t_base`` (int32 words), ``[KT, NT, 256]`` uint32 in encoded order."""
+def _exl3_states(t_base, KT: tl.constexpr, NT: tl.constexpr, stride_a, stride_b, K: tl.constexpr, G: tl.constexpr,
+                 d_base=None, WRITE: tl.constexpr = False):
+    """16-bit states of KT x NT tiles from ``t_base`` (int32 words), ``[KT, NT, 256]`` uint32 in encoded order.
+    ``WRITE``: the words loaded are also stored at the same offsets from ``d_base`` (the windows of a tile cover every
+    word of it for K <= 8: a tile read from host memory fills its cache slot on the way)."""
     W: tl.constexpr = 8 * K
     NG: tl.constexpr = 256 // G
     kt = tl.arange(0, KT)[:, None, None, None]
@@ -63,8 +67,14 @@ def _exl3_states(t_base, KT: tl.constexpr, NT: tl.constexpr, stride_a, stride_b,
     i2 = (b2 - 1) // 32
     s2 = ((i2 + 1) * 32 - b2).to(tl.uint32)
     tile = t_base + kt * stride_a + nt * stride_b
-    wa = tl.load(tile + (i0 % W)).to(tl.uint32, bitcast=True)
-    wb = tl.load(tile + (i2 % W)).to(tl.uint32, bitcast=True)
+    wa = tl.load(tile + (i0 % W))
+    wb = tl.load(tile + (i2 % W))
+    if WRITE:
+        dtile = d_base + kt * stride_a + nt * stride_b
+        tl.store(dtile + (i0 % W), wa)
+        tl.store(dtile + (i2 % W), wb)
+    wa = wa.to(tl.uint32, bitcast=True)
+    wb = wb.to(tl.uint32, bitcast=True)
     # low 32 bits of (wa:wb) >> s2, which hold all G windows; the double shift keeps s2 = 0 legal
     lo = (wb >> s2) | ((wa << 1) << (31 - s2))
     states = (lo >> ((G - 1 - iw) * K).to(tl.uint32)) & 0xFFFF
@@ -216,47 +226,143 @@ def exl3_dequant(trellis: torch.Tensor, codebook: int) -> torch.Tensor:
 
 
 @triton.jit
+def _gemv_routes(a_ptr, r0, r1, r2, r3, half, stride_ar, stride_ah, t_base, k_lo, k_hi, stride_ta, stride_tb,
+                 K: tl.constexpr, CB: tl.constexpr, G: tl.constexpr, KT: tl.constexpr, NT: tl.constexpr,
+                 DOT4: tl.constexpr, NM: tl.constexpr, d_base=None, WRITE: tl.constexpr = False):
+    """The K loop of NM routes of one slot (r0..r3): each tile decoded once, each route's products accumulated per
+    encoded position in its own tensor, as one route alone; reduced across lanes after the loop."""
+    a_rows = _encoded_rows(KT)
+    a0 = a_ptr + r0.to(tl.int64) * stride_ar + half * stride_ah
+    a1 = a_ptr + r1.to(tl.int64) * stride_ar + half * stride_ah
+    a2 = a_ptr + r2.to(tl.int64) * stride_ar + half * stride_ah
+    a3 = a_ptr + r3.to(tl.int64) * stride_ar + half * stride_ah
+    acc0 = tl.zeros((KT, NT, 8, 4, 2, 4), tl.float32)
+    acc1 = tl.zeros((KT, NT, 8, 4, 2, 4), tl.float32)
+    acc2 = tl.zeros((KT, NT, 8, 4, 2, 4), tl.float32)
+    acc3 = tl.zeros((KT, NT, 8, 4, 2, 4), tl.float32)
+    for ka0 in range(k_lo, k_hi, KT):
+        if WRITE:
+            s = _exl3_states(t_base + ka0 * stride_ta, KT, NT, stride_ta, stride_tb, K, G, d_base + ka0 * stride_ta,
+                             True)
+        else:
+            s = _exl3_states(t_base + ka0 * stride_ta, KT, NT, stride_ta, stride_tb, K, G)
+        w = tl.reshape(_exl3_codebook(s, CB, DOT4), (KT, NT, 8, 4, 2, 4))
+        x = tl.load(a0 + ka0 * 16 + a_rows).to(tl.float32)  # [KT, 4(tq), 4(i)]
+        acc0 += w * tl.reshape(x, (KT, 1, 1, 4, 1, 4))
+        if NM > 1:
+            x = tl.load(a1 + ka0 * 16 + a_rows).to(tl.float32)
+            acc1 += w * tl.reshape(x, (KT, 1, 1, 4, 1, 4))
+        if NM > 2:
+            x = tl.load(a2 + ka0 * 16 + a_rows).to(tl.float32)
+            acc2 += w * tl.reshape(x, (KT, 1, 1, 4, 1, 4))
+        if NM > 3:
+            x = tl.load(a3 + ka0 * 16 + a_rows).to(tl.float32)
+            acc3 += w * tl.reshape(x, (KT, 1, 1, 4, 1, 4))
+    return (tl.sum(tl.sum(tl.sum(acc0, axis=5), axis=3), axis=0), tl.sum(tl.sum(tl.sum(acc1, axis=5), axis=3), axis=0),
+            tl.sum(tl.sum(tl.sum(acc2, axis=5), axis=3), axis=0), tl.sum(tl.sum(tl.sum(acc3, axis=5), axis=3), axis=0))
+
+
+@triton.jit
+def _gemv_store_routes(a_ptr, r, r1, r2, r3, nm, half, stride_ar, stride_ah, t_base, k_lo, k_hi, stride_ta, stride_tb,
+                       c_base, stride_cr, K: tl.constexpr, CB: tl.constexpr, G: tl.constexpr, KT: tl.constexpr,
+                       NT: tl.constexpr, DOT4: tl.constexpr, GROUP: tl.constexpr, d_base=None,
+                       WRITE: tl.constexpr = False):
+    """The nm routes of a program (_gemv_routes at nm's static count), each stored to its row of c."""
+    if nm == 1:
+        y0, y1, y2, y3 = _gemv_routes(a_ptr, r, r1, r2, r3, half, stride_ar, stride_ah, t_base, k_lo, k_hi,
+                                      stride_ta, stride_tb, K, CB, G, KT, NT, DOT4, 1, d_base, WRITE)
+        tl.store(c_base + r.to(tl.int64) * stride_cr, y0)
+    if GROUP > 1:
+        if nm == 2:
+            y0, y1, y2, y3 = _gemv_routes(a_ptr, r, r1, r2, r3, half, stride_ar, stride_ah, t_base, k_lo, k_hi,
+                                          stride_ta, stride_tb, K, CB, G, KT, NT, DOT4, 2, d_base, WRITE)
+            tl.store(c_base + r.to(tl.int64) * stride_cr, y0)
+            tl.store(c_base + r1.to(tl.int64) * stride_cr, y1)
+    if GROUP > 2:
+        if nm == 3:
+            y0, y1, y2, y3 = _gemv_routes(a_ptr, r, r1, r2, r3, half, stride_ar, stride_ah, t_base, k_lo, k_hi,
+                                          stride_ta, stride_tb, K, CB, G, KT, NT, DOT4, 3, d_base, WRITE)
+            tl.store(c_base + r.to(tl.int64) * stride_cr, y0)
+            tl.store(c_base + r1.to(tl.int64) * stride_cr, y1)
+            tl.store(c_base + r2.to(tl.int64) * stride_cr, y2)
+        if nm == 4:
+            y0, y1, y2, y3 = _gemv_routes(a_ptr, r, r1, r2, r3, half, stride_ar, stride_ah, t_base, k_lo, k_hi,
+                                          stride_ta, stride_tb, K, CB, G, KT, NT, DOT4, 4, d_base, WRITE)
+            tl.store(c_base + r.to(tl.int64) * stride_cr, y0)
+            tl.store(c_base + r1.to(tl.int64) * stride_cr, y1)
+            tl.store(c_base + r2.to(tl.int64) * stride_cr, y2)
+            tl.store(c_base + r3.to(tl.int64) * stride_cr, y3)
+
+
+@triton.jit
 def _exl3_gemv_kernel(
-    a_ptr, t_ptr, slot_ptr, c_ptr,
+    a_ptr, t_ptr, slot_ptr, c_ptr, grp_ptr,
     KSPAN, HALF_TILES,
     stride_ar, stride_ah,
     stride_ts, stride_ta, stride_tb,
     stride_cs, stride_cr,
     K: tl.constexpr, CB: tl.constexpr, G: tl.constexpr, KT: tl.constexpr, NT: tl.constexpr, DOT4: tl.constexpr,
-    SKIP_INACTIVE: tl.constexpr,
+    SKIP_INACTIVE: tl.constexpr, GROUP: tl.constexpr = 1,
+    MISS: tl.constexpr = False, ev_ptr=None, src_ptr=None, num_ptr=None, hostp_ptr=None, BANK: tl.constexpr = 0,
+    MP: tl.constexpr = 1,
 ):
     """c[split, r, n] = sum over this split's k of a[r, half(n), k] * Wq[slot[r]][k, n], NT column tiles of one route.
 
     ``a`` holds the rotated inputs, one row per (route, half): a gate|up bank has two halves whose inputs differ
     (each projection has its own suh), any other bank one. ``SKIP_INACTIVE``: a slot of -1 (a route the CPU
-    computes, hybrid decode) writes zeros without decoding any trellis."""
+    computes, hybrid decode) writes zeros without decoding any trellis. ``GROUP`` > 1: ``grp[r]`` (route_groups)
+    holds the number of routes of r's slot this program takes (0: another program takes r) and their indices; the
+    tiles are decoded once for all of them, each route summed as alone (the same bits). ``MISS``: the expert cache's
+    copy plan of this step (``ev`` the slots it fills, ``src`` their experts' rows in the layer's host bank, ``num``
+    how many, ``hostp[BANK]`` the host bank's device address, ``MP`` >= num a power of two): a program whose slot is
+    being filled reads its tiles from host memory instead and writes them into the slot (the same words, so the
+    same sums), without waiting for a copy."""
     r = tl.program_id(0)
     nb0 = tl.program_id(1) * NT
     split = tl.program_id(2)
-    slot = tl.load(slot_ptr + r).to(tl.int64)
-    if SKIP_INACTIVE:
-        if slot < 0:
-            col = (nb0 + tl.arange(0, NT)[:, None, None]) * 16 + 8 * tl.arange(0, 2)[None, None, :] + \
-                tl.arange(0, 8)[None, :, None]
-            tl.store(c_ptr + split * stride_cs + r.to(tl.int64) * stride_cr + col, tl.zeros((NT, 8, 2), tl.float32))
+    r1, r2, r3 = r, r, r
+    nm = 1
+    if GROUP > 1:
+        nm = tl.load(grp_ptr + r * 4)
+        if nm == 0:
             return
-    half = nb0 // HALF_TILES
-    a_base = a_ptr + r.to(tl.int64) * stride_ar + half * stride_ah
-    t_base = t_ptr + slot * stride_ts + nb0 * stride_tb
-    a_rows = _encoded_rows(KT)
-    # products accumulate per encoded position; the cross-lane reduction runs once, after the K loop
-    acc = tl.zeros((KT, NT, 8, 4, 2, 4), tl.float32)
-    for ka0 in range(split * KSPAN, (split + 1) * KSPAN, KT):
-        s = _exl3_states(t_base + ka0 * stride_ta, KT, NT, stride_ta, stride_tb, K, G)
-        w = tl.reshape(_exl3_codebook(s, CB, DOT4), (KT, NT, 8, 4, 2, 4))
-        a = tl.load(a_base + ka0 * 16 + a_rows).to(tl.float32)  # [KT, 4(tq), 4(i)]
-        acc += w * tl.reshape(a, (KT, 1, 1, 4, 1, 4))
-    acc = tl.sum(tl.sum(tl.sum(acc, axis=5), axis=3), axis=0)
+        r1 = tl.load(grp_ptr + r * 4 + 1)
+        r2 = tl.load(grp_ptr + r * 4 + 2)
+        r3 = tl.load(grp_ptr + r * 4 + 3)
+    slot = tl.load(slot_ptr + r).to(tl.int64)
     nt = tl.arange(0, NT)[:, None, None]
     c0 = tl.arange(0, 8)[None, :, None]
     h = tl.arange(0, 2)[None, None, :]
     col = (nb0 + nt) * 16 + 8 * h + c0
-    tl.store(c_ptr + split * stride_cs + r.to(tl.int64) * stride_cr + col, acc)
+    c_base = c_ptr + split * stride_cs + col
+    if SKIP_INACTIVE:
+        if slot < 0:
+            zero = tl.zeros((NT, 8, 2), tl.float32)
+            tl.store(c_base + r.to(tl.int64) * stride_cr, zero)
+            if GROUP > 1:
+                if nm > 1:
+                    tl.store(c_base + r1.to(tl.int64) * stride_cr, zero)
+                if nm > 2:
+                    tl.store(c_base + r2.to(tl.int64) * stride_cr, zero)
+                if nm > 3:
+                    tl.store(c_base + r3.to(tl.int64) * stride_cr, zero)
+            return
+    half = nb0 // HALF_TILES
+    t_base = t_ptr + slot * stride_ts + nb0 * stride_tb
+    k_lo = split * KSPAN
+    if MISS:
+        mo = tl.arange(0, MP)
+        mmask = mo < tl.load(num_ptr).to(tl.int32)
+        hit = mmask & (tl.load(ev_ptr + mo, mask=mmask, other=-2).to(tl.int64) == slot) & (slot >= 0)
+        first = tl.min(tl.where(hit, mo, MP), axis=0)  # the plan's first entry for this slot
+        if first < MP:
+            row = tl.load(src_ptr + first).to(tl.int64)
+            h_base = tl.load(hostp_ptr + BANK).to(tl.pointer_type(tl.int32)) + row * stride_ts + nb0 * stride_tb
+            _gemv_store_routes(a_ptr, r, r1, r2, r3, nm, half, stride_ar, stride_ah, h_base, k_lo, k_lo + KSPAN,
+                               stride_ta, stride_tb, c_base, stride_cr, K, CB, G, KT, NT, DOT4, GROUP, t_base, True)
+            return
+    _gemv_store_routes(a_ptr, r, r1, r2, r3, nm, half, stride_ar, stride_ah, t_base, k_lo, k_lo + KSPAN, stride_ta,
+                       stride_tb, c_base, stride_cr, K, CB, G, KT, NT, DOT4, GROUP)
 
 
 # (KIN tiles, half N tiles) -> (KT, NT, split_k, warps), swept on the 7900 XT (rdna3/bench/exl3_gemv_bench.py); the
@@ -292,12 +398,20 @@ def exl3_gemv(
     split_k: int | None = None,
     num_warps: int | None = None,
     skip_inactive: bool = False,
+    group: int = 1,
+    groups: torch.Tensor | None = None,
+    misses: tuple | None = None,
+    bank: int = 0,
 ) -> torch.Tensor:
     """Per-route GEMV over a slot bank of EXL3 trellises, in the rotation domain.
 
     ``a``: ``[R, halves, KIN]`` rotated inputs; ``trellis_bank``: ``[S, KIN/16, N/16, 16*K]`` int16; ``slots``:
     ``[R]`` bank row per route. Returns ``[split_k, R, N]`` fp32 partial sums over K (the caller adds them);
-    with two halves, columns ``[0, N/2)`` read ``a[:, 0]`` and ``[N/2, N)`` read ``a[:, 1]``."""
+    with two halves, columns ``[0, N/2)`` read ``a[:, 0]`` and ``[N/2, N)`` read ``a[:, 1]``. ``group``: routes of
+    one slot a program (1, 2 or 4), the same bits; ``groups``: route_groups(slots, group), computed here if
+    None (one per layer serves both of its GEMVs). ``misses``: ``(slots filled, their host rows, count, host bank
+    addresses)`` of the expert cache's copy plan, ``bank`` this bank's index there: the slots being filled are read
+    from host memory and written on the way (the cache then skips copying this bank)."""
     R, halves, kin = a.shape
     S, A, B, words = trellis_bank.shape
     assert kin == A * 16 and B % halves == 0, (tuple(a.shape), tuple(trellis_bank.shape))
@@ -308,17 +422,22 @@ def exl3_gemv(
     KT, NT = kt or cfg[0], nt or cfg[1]
     split_k, num_warps = split_k or cfg[2], num_warps or cfg[3]
     assert A % (KT * split_k) == 0 and half_tiles % NT == 0, (A, KT, split_k, half_tiles, NT)
+    assert group in (1, 2, 4), group
+    if group > 1 and groups is None:
+        groups = route_groups(slots, group)
     if out is None:
         out = torch.empty((split_k, R, B * 16), dtype=torch.float32, device=a.device)
     a = a.contiguous()
     _exl3_gemv_kernel[(R, B // NT, split_k)](
-        a, t, slots, out,
+        a, t, slots, out, groups if group > 1 else slots,
         A // split_k, half_tiles,
         a.stride(0), a.stride(1),
         t.stride(0), t.stride(1), t.stride(2),
         out.stride(0), out.stride(1),
         K=K, CB=codebook, G=group_size(K), KT=KT, NT=NT, DOT4=_dot4(a.device), SKIP_INACTIVE=skip_inactive,
-        num_warps=num_warps,
+        GROUP=group, num_warps=num_warps,
+        **({} if misses is None else dict(MISS=True, ev_ptr=misses[0], src_ptr=misses[1], num_ptr=misses[2],
+                                         hostp_ptr=misses[3], BANK=bank, MP=triton.next_power_of_2(R))),
     )
     return out
 
@@ -635,17 +754,23 @@ def _exl3_out_kernel(
 
 @triton.jit
 def _exl3_rotate_in_vec_kernel(
-    x_ptr, s_ptr, slot_ptr, a_ptr,
+    x_ptr, s_ptr, slot_ptr, a_ptr, grp_ptr, R,
     stride_xt, stride_ss, stride_sh, stride_aq,
-    NH: tl.constexpr, TOP_K: tl.constexpr,
+    NH: tl.constexpr, TOP_K: tl.constexpr, BPP: tl.constexpr = 1, GROUP: tl.constexpr = 1, RP: tl.constexpr = 1,
 ):
+    # BPP 128-blocks a program, each the same _had128_vec on the same tile (the same bits for any BPP); GROUP > 1:
+    # a route's first program also writes its row of the GEMVs' route groups (route_groups, no launch of its own)
     q = tl.program_id(0)
     r = q // NH
+    if GROUP > 1:
+        if (q % NH == 0) & (tl.program_id(1) == 0):
+            _route_group_row(slot_ptr, grp_ptr, r, R, RP, GROUP)
     slot = tl.maximum(tl.load(slot_ptr + r).to(tl.int64), 0)  # -1: a CPU route, weight 0
-    cols = tl.program_id(1) * 128 + tl.arange(0, 128)
-    x = tl.load(x_ptr + (r // TOP_K).to(tl.int64) * stride_xt + cols).to(tl.float32)
-    s = tl.load(s_ptr + slot * stride_ss + (q % NH) * stride_sh + cols).to(tl.float32)
-    tl.store(a_ptr + q.to(tl.int64) * stride_aq + cols, _had128_vec(x * s).to(a_ptr.dtype.element_ty))
+    for bb in tl.static_range(BPP):
+        cols = (tl.program_id(1) * BPP + bb) * 128 + tl.arange(0, 128)
+        x = tl.load(x_ptr + (r // TOP_K).to(tl.int64) * stride_xt + cols).to(tl.float32)
+        s = tl.load(s_ptr + slot * stride_ss + (q % NH) * stride_sh + cols).to(tl.float32)
+        tl.store(a_ptr + q.to(tl.int64) * stride_aq + cols, _had128_vec(x * s).to(a_ptr.dtype.element_ty))
 
 
 @triton.jit
@@ -672,6 +797,18 @@ def _exl3_mid_vec_kernel(
 
 # up to this many rows rotate-in and mid run one program per (row, 128-block) instead of 16-row tl.dot tiles
 _VEC_ROWS = 256
+# FREETOKEN_EXL3_ROTATE_BLOCKS (default 5): from _ROTATE_GROUP_ROWS vectors up (a verify step's rows times the routes
+# and both halves), a decode rotate-in program takes this many 128-blocks instead of one: ~1,600 tiny programs at four
+# rows ran 14.7 us on the 7900 XTX, 9.4 with 5 blocks a program (28.3 -> 18.7 at eight rows; the XT 37.9 -> 20.3). The
+# same bits; fewer vectors keep one block a program (one row: 6.7 against 8.5 us). 1: one block a program
+_ROTATE_BLOCKS = int(os.environ.get("FREETOKEN_EXL3_ROTATE_BLOCKS", "5"))
+_ROTATE_GROUP_ROWS = 40
+# FREETOKEN_EXL3_VEC_WARPS (default 2): warps of a decode rotate-in or mid program (one vector's 128-block, or BPP of
+# them). 1, 2 and 4 give _had128_vec's reduction the same order (8 does not: checked on both cards); at 2 the 7900 XT's
+# mid step at four rows 10.7 -> 5.6 us, eight rows 14.6 -> 7.0, its rotate-in 11.9 -> 8.3 (five blocks a program)
+_VEC_WARPS = int(os.environ.get("FREETOKEN_EXL3_VEC_WARPS", "2"))
+if _VEC_WARPS not in (1, 2, 4):
+    raise ValueError(f"FREETOKEN_EXL3_VEC_WARPS must be 1, 2 or 4 (the warps that keep the bits), got {_VEC_WARPS}")
 # FREETOKEN_EXL3_MID_COLS (default 32): above _VEC_ROWS rows with an fp16 output (prefill), the mid step's rotations
 # run 32 columns of the Hadamard at a time (_exl3_mid_cols_kernel, 32 rows and 4 warps a program): the same bits as the
 # 64-row tile kernel, which spilled ~860 VGPRs (2.7 KB of scratch per lane; a dispatch waiting for that scratch once
@@ -683,9 +820,11 @@ if _MID_COLS not in (0, 16, 32, 64, 128):
 
 def exl3_rotate_in(x: torch.Tensor, suh_bank: torch.Tensor, slots: torch.Tensor, top_k: int, *,
                    dtype: torch.dtype = torch.float32, rows: int = 16, num_warps: int = 4,
-                   blocks: int | None = None, hoist: bool = True) -> torch.Tensor:
+                   blocks: int | None = None, hoist: bool = True, groups: torch.Tensor | None = None,
+                   group: int = 1) -> torch.Tensor:
     """``[R, halves, H]`` rotated expert inputs: ``H(x[r // top_k] * suh_bank[slots[r], half])``; ``suh_bank``
-    is ``[S, halves, H]``."""
+    is ``[S, halves, H]``. ``groups`` (``[R, 4]`` int32, with ``group`` > 1): also filled with
+    route_groups(slots, group), for the GEMVs that follow."""
     T, H = x.shape
     R = slots.numel()
     halves = suh_bank.shape[1]
@@ -693,11 +832,17 @@ def exl3_rotate_in(x: torch.Tensor, suh_bank: torch.Tensor, slots: torch.Tensor,
     out = torch.empty((R, halves, H), dtype=dtype, device=x.device)
     Q = R * halves
     if Q <= _VEC_ROWS:
-        _exl3_rotate_in_vec_kernel[(Q, H // 128)](
-            x, suh_bank, slots, out, x.stride(0), suh_bank.stride(0), suh_bank.stride(1), H,
-            NH=halves, TOP_K=top_k, num_warps=4,
+        bpp = _ROTATE_BLOCKS if Q >= _ROTATE_GROUP_ROWS and _ROTATE_BLOCKS > 1 and (H // 128) % _ROTATE_BLOCKS == 0 else 1
+        grouped = groups is not None and group > 1
+        _exl3_rotate_in_vec_kernel[(Q, H // 128 // bpp)](
+            x, suh_bank, slots, out, groups if grouped else slots, R, x.stride(0), suh_bank.stride(0),
+            suh_bank.stride(1), H,
+            NH=halves, TOP_K=top_k, BPP=bpp, GROUP=group if grouped else 1,
+            RP=triton.next_power_of_2(R) if grouped else 1, num_warps=_VEC_WARPS,
         )
         return out
+    if groups is not None and group > 1:
+        route_groups(slots, group, out=groups)
     nb = H // 128
     cb = blocks or nb
     assert nb % cb == 0, f"{nb} column blocks do not split into programs of {cb}"
@@ -721,7 +866,7 @@ def exl3_mid(c: torch.Tensor, slots: torch.Tensor, gate_up_svh: torch.Tensor, do
         _exl3_mid_vec_kernel[(R, inter // 128)](
             c, slots, gate_up_svh, down_suh, out,
             inter, c.stride(0), c.stride(1), gate_up_svh.stride(0), down_suh.stride(0), inter,
-            SPLITS=splits, num_warps=4,
+            SPLITS=splits, num_warps=_VEC_WARPS,
         )
         return out
     nb = inter // 128

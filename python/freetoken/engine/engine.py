@@ -1451,6 +1451,11 @@ class Engine:
         warm(self.device, k, width, start, config.tp_info.size, config.max_running_req, tuple(SPEC_MS))
         logger.info_rank0(f"sampling kernels for top_k {k} ready in {time.perf_counter() - t0:.1f} s")
 
+    def _ple_reads(self):
+        """The disk PLE table when it reads a decode step's rows ahead (FREETOKEN_PLE_DRAFT_READS), else None."""
+        table = getattr(self.model, "_ple_table", None)
+        return table if getattr(table, "ahead_kept", None) is not None else None
+
     def _candidates_ok(self, args: BatchSamplingArgs | None) -> bool:
         """Whether a decode step's choices need only each row's largest logits: no penalties, and every sampled row
         drawing from its top_k_max largest logits (spec_sample.sparse_ok); greedy rows need the first one."""
@@ -1598,6 +1603,12 @@ class Engine:
         tokens_cpu, n_acc_cpu = kept.to("cpu", non_blocking=True), kept_n.to("cpu", non_blocking=True)
         done = torch.cuda.Event()
         done.record(self.stream)
+        ple = self._ple_reads()
+        if ple is not None:
+            # FREETOKEN_PLE_DRAFT_READS: the next step's PLE rows read while the GPU drafts. Verify steps only: they never
+            # overlap the next step (a plain step can: the scheduler then fills the next one before this one's token
+            # is known, and a read waiting for it would serialize the overlap)
+            ple.ahead_kept(batch, tokens_cpu, n_acc_cpu, done)
         self._spec_timer.mark("verify")
         drafts = self._mtp_drafts(batch, tokens, n_acc=n_acc, args=args)
         self._mtp_tally_accept(kept_n, n_acc_cpu)
@@ -1769,6 +1780,9 @@ class Engine:
                                                keep=pick if m > 1 else None)
                 tok, q = self._pick_draft(self.model.lm_head.forward(head_in), batch.size, args, local)
                 drafts, qs = [tok], [q]
+            ple = self._ple_reads()
+            if ple is not None:
+                ple.ahead_draft(0, tok, batch.size, last=depth == 1)
             self._spec_timer.mark("mtp")
             # chained guesses: the head's own streams at the last kept row stand for the next position's, one row
             # per request at the last kept position + j
@@ -1786,6 +1800,8 @@ class Engine:
                     tok, q = self._pick_draft(self.model.lm_head.forward(head_in), batch.size, args, local)
                     drafts.append(tok)
                     qs.append(q)
+                if ple is not None:
+                    ple.ahead_draft(j, tok, batch.size, last=j == depth - 1)
             if depth > 1:
                 self._spec_timer.mark("chain")
             if qs[0] is not None and isinstance(qs[0], tuple):  # sparse: (ids, probs) [real, depth, K]

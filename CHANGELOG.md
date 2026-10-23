@@ -59,6 +59,20 @@ What each change measured, and how it was found: [docs/rdna3/journey.md](docs/rd
   (`FREETOKEN_SPEC_ROLLBACK_SKIP`): +0.5 % at one request, +0.6 % at four (greedy), the same answers.
 - The four above together, against the previous build (`xtx-xt-4x262k`, EXL3 3.05 bpw, two rounds): 94.7 -> 97.8 tok/s
   greedy at one request, 96.3 -> 103.1 at T 0.6; four requests +3.4 % greedy, +1.9 % at T 0.6; the same answers.
+- Decode on two cards: the next step's PLE rows read from the NVMe while the GPU drafts
+  (`FREETOKEN_PLE_DRAFT_READS`); v stored from the qkv projection's rows (no copy); two launches fewer per QSA layer
+  (`FREETOKEN_QSA_FUSED_WRITES`, `FREETOKEN_QSA_FUSED_GATE`); the EXL3 decode rotation and mid step at 2 warps, the
+  rotation five blocks a program (`FREETOKEN_EXL3_VEC_WARPS`, `FREETOKEN_EXL3_ROTATE_BLOCKS`); the router's bf16 GEMV
+  one weight-tile load for a verify step's rows (`FREETOKEN_GEMV_SHARED_TILES`); the SiLU inside NVFP4's gate | up
+  GEMV and the shared expert's at 3-4 rows (`FREETOKEN_NVFP4_ACT_IN_GEMV`, `FREETOKEN_INT8_ACT_PAIR4`); EXL3's decode
+  GEMV decoding an expert's trellis once for the routes of a step that share it (`FREETOKEN_EXL3_SHARED_ROUTES`); the
+  expert GEMVs reading the experts the cache is filling straight from host memory, the transfer overlapping the
+  cached experts' work (`FREETOKEN_MOE_MISS_READS`, with the banks registered coarse-grained: `FREETOKEN_BANK_COARSE`);
+  the sampling parameters copied only when they change. `xtx-xt-4x262k` against the previous build (two runs against
+  one): EXL3 3.05 bpw 98.2 -> 104.6 tok/s greedy at one request, 103.6 -> 112.0 at T 0.6, four requests 44.9 -> 51.0
+  each (greedy) and 43.6 -> 50.6 (T 0.6); NVFP4 98.2 -> 103.2, 101.0 -> 107.0, 37.6 -> 40.5 and 36.5 -> 39.4; the same
+  greedy and sampled answers; agent turns and EXL3's cold reads unchanged, NVFP4's cold reads 0.8 % longer (the
+  coarse-grained banks).
 - Lower prefill VRAM peaks (in-place hyper-connections, blocked GatedDeltaNet prefill), and kernels that spilled
   registers on RDNA3 run more warps (prompt reading +2.6 to +3.5 %).
 
@@ -85,6 +99,9 @@ What each change measured, and how it was found: [docs/rdna3/journey.md](docs/rd
   short of the card on ROCm (`FREETOKEN_VRAM_MARGIN_MIB`).
 - Out-of-memory retries of every prefill chunk past ~26k of context: expandable segments in the allocator.
 - One card without the MTP head: the PLE rows are filled before each launch (NVFP4 `xtx --no-mtp` 26.6 -> 38.3 tok/s).
+- Each stop of a server left 5 multiprocessing semaphores in `/dev/shm` (the host's, under `docker run --ipc=host`):
+  uvicorn re-raises the SIGTERM it stopped on, and a process dying of it runs no exit handler. The API server now
+  reaps its workers and lets multiprocessing clean up before it dies of the signal.
 - The JIT modules were rebuilt at every start (first request ~10 s, now 1.3-1.9 s); the batched-DMA probe raced its own
   fill; a rank held an all-reduce until the watchdog stopped the server (seen with a profiler slowing the host),
   with a dispatch of the EXL3 prefill's mid kernel at the head of its stopped queue, likely waiting for its 2.7 KB of

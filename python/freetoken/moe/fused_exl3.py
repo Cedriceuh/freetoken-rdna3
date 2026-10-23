@@ -37,6 +37,12 @@ _TAIL_MIN_TOKENS = 3072
 # FREETOKEN_HYBRID_SKIP_CPU_ROUTES=0: under --moe-strategy hybrid the decode GEMVs still decode the routes the CPU
 # computes (on slot 0, weight 0) instead of writing zeros for them without a read
 SKIP_CPU_ROUTES = os.environ.get("FREETOKEN_HYBRID_SKIP_CPU_ROUTES", "1") != "0"
+# FREETOKEN_EXL3_SHARED_ROUTES (default 4): a decode step of several rows (a verify step, several requests) gives the
+# routes that read one expert (a third of them at four rows of one request) one GEMV program, up to this many: each
+# trellis tile decoded once for all of them, the same sums. 1: one program a route
+SHARED_ROUTES = int(os.environ.get("FREETOKEN_EXL3_SHARED_ROUTES", "4"))
+if SHARED_ROUTES not in (1, 2, 4):
+    raise ValueError(f"FREETOKEN_EXL3_SHARED_ROUTES must be 1, 2 or 4, got {SHARED_ROUTES}")
 
 
 def fused_experts_exl3(
@@ -54,9 +60,12 @@ def fused_experts_exl3(
     is_prefill: bool,
     num_experts: int | None = None,
     slot_map: torch.Tensor | None = None,
+    misses: tuple | None = None,
 ) -> torch.Tensor:
     """``topk_ids`` index bank rows (cache slots in decode, the full-layer buffer's rows in prefill); a prefill with
-    ``slot_map`` keeps expert ids in ``topk_ids`` and reads each expert from its slot of the cache."""
+    ``slot_map`` keeps expert ids in ``topk_ids`` and reads each expert from its slot of the cache. ``misses``
+    (decode, OffloadMoeCache.miss_reads): the copy plan of the slots this step fills, which the GEMVs read from host
+    memory and fill themselves (the cache did not copy their gate | up and down rows)."""
     M, _ = hidden_states.shape
     if is_prefill and M > EXL3_PREFILL_BLOCK > 0:
         out = torch.empty_like(hidden_states)
@@ -98,11 +107,19 @@ def fused_experts_exl3(
                                block_m=block_m, out_dtype=hidden_states.dtype)
         moe_sum_reduce_triton(y.view(M, top_k, -1), out)
         return out
-    a1 = exl3_rotate_in(hidden_states, gate_up_suh, slots, top_k)
-    c1 = exl3_gemv(a1, gate_up, slots, codebook, skip_inactive=SKIP_CPU_ROUTES)
+    group = SHARED_ROUTES if M > 1 else 1  # one row's routes are distinct experts
+    groups = torch.empty((slots.numel(), 4), dtype=torch.int32, device=slots.device) if group > 1 else None
+    a1 = exl3_rotate_in(hidden_states, gate_up_suh, slots, top_k, groups=groups, group=group)
+    plan, bank = (None, {}) if misses is None else misses
+    if plan is not None:  # the host and slot rows share one layout: the kernel walks both with the slot strides
+        assert gate_up[0].numel() * gate_up.element_size() == bank["gate_up"][1] == gate_up.stride(0) * 2, bank
+        assert down[0].numel() * down.element_size() == bank["down"][1] == down.stride(0) * 2, bank
+    c1 = exl3_gemv(a1, gate_up, slots, codebook, skip_inactive=SKIP_CPU_ROUTES, group=group, groups=groups,
+                   misses=plan, bank=bank.get("gate_up", (0, 0))[0])
     a2 = exl3_mid(c1, slots, gate_up_svh, down_suh)
-    c2 = exl3_gemv(a2, down, slots, codebook, skip_inactive=SKIP_CPU_ROUTES)
+    c2 = exl3_gemv(a2, down, slots, codebook, skip_inactive=SKIP_CPU_ROUTES, group=group, groups=groups,
+                   misses=plan, bank=bank.get("down", (0, 0))[0])
     return exl3_out(c2, slots, down_svh, weights, out)
 
 
-__all__ = ["EXL3_PREFILL_BLOCK", "SKIP_CPU_ROUTES", "fused_experts_exl3"]
+__all__ = ["EXL3_PREFILL_BLOCK", "SHARED_ROUTES", "SKIP_CPU_ROUTES", "fused_experts_exl3"]

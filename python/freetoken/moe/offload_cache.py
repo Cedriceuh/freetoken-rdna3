@@ -29,6 +29,10 @@ _SMALL_BANK_FEAT_BYTES = 256 * 1024
 # event) instead of right after the plan (a sync that drained the GPU queue at every layer); the same copies into the
 # same slots
 _PREFETCH_DEFER = os.environ.get("FREETOKEN_PREFILL_PREFETCH_DEFER", "1") == "1"
+# FREETOKEN_MOE_MISS_READS (default 1): a decode expert kernel that reads the slots being filled from host memory itself
+# (decode_reads_misses: the EXL3 and NVFP4 Triton GEMVs) gets the step's copy plan, and the cache copies only the other
+# banks
+_MISS_READS = os.environ.get("FREETOKEN_MOE_MISS_READS", "1") == "1"
 
 # FREETOKEN_PREFILL_HIT_LOG=1: log each prefill chunk's hit-D2D share (expert rows gathered
 # from the cache instead of crossing PCIe).
@@ -1489,6 +1493,33 @@ class OffloadMoeCache:
 
     def wait_copy(self) -> None:
         torch.cuda.current_stream(self.device).wait_stream(self._copy_side_stream)
+
+    def miss_reads(self, layer_id: int, banks: tuple[str, ...]) -> tuple[tuple, dict[str, tuple[int, int]]] | None:
+        """For a decode kernel that reads the slots being filled from host memory itself
+        (``decode_reads_misses``): the copy plan it needs ``(slots filled, their rows in the layer's host bank, count,
+        host bank addresses)`` and each of ``banks``'s index in those addresses, or None where it cannot (no fused
+        copy plan, a layer without pinned host banks, or ``FREETOKEN_MOE_MISS_READS=0``); each bank as (index, row
+        bytes), the row stride of both its host bank and its slots."""
+        if not _MISS_READS or not self._copy_fused_ok or layer_id in self._unpinned_layers:
+            return None
+        index = {name: self.bank_schema.index(name) for name in banks if name in self.bank_schema}
+        if len(index) != len(banks):
+            return None
+        plan = (self.evict_slots, self.src_indices, self.num_indices, self._copy_src_ptrs[layer_id])
+        rows = self._row_bytes[self.layer_layout[layer_id]]
+        return plan, {name: (k, rows[k]) for name, k in index.items()}
+
+    def copy_missing_except(self, skip: tuple[int, ...]) -> None:
+        """``copy_missing`` of every bank but ``skip`` (bank indices), whose rows the decode kernel moves itself
+        (:meth:`miss_reads`): the same slots and rows, the small banks' copy only."""
+        from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
+
+        layer_id = self._pending_src_layer
+        assert layer_id is not None and not self._pending_whole_layer, "no decode misses staged (ensure_experts first)"
+        rest = tuple(k for k in range(len(self.bank_schema)) if k not in skip)
+        if rest:
+            fast_index_copy_multi_jit(*self._subset_copy_plan(layer_id, rest), self.evict_slots, self.src_indices,
+                                      self.num_indices, blocks_per_bank=self._copy_blocks_per_bank)
 
     def copy_missing(self) -> None:
         assert self.banks, "set_bank_sources must register the banks first"

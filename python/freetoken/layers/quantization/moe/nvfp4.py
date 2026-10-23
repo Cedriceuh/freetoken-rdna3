@@ -90,6 +90,8 @@ class TritonNvfp4MoEKernel(MoEKernel):
     name = "triton"
     cpu_format = "nvfp4"
     supports_prefill_slot_map = True
+    # the decode GEMVs read a slot being filled from host memory and fill it on the way (moe/fused_nvfp4.py)
+    decode_reads_misses = ("gate_up", "gate_up_scale", "down", "down_scale")
 
     @property
     def supports_inactive_slots(self) -> bool:  # hybrid decode: CPU routes skipped (FREETOKEN_HYBRID_SKIP_CPU_ROUTES)
@@ -142,7 +144,8 @@ class TritonNvfp4MoEKernel(MoEKernel):
         if is_prefill:
             return fused_experts_nvfp4(x, *banks, topk_weights, topk_ids, view.n, layer.activation, layer.apply_router_weight_on_input, alpha, limit,
                                        slot_map=view.slot_map)
-        return fused_experts_decode_nvfp4_marlin(x, *banks, topk_weights, topk_ids, layer.activation, layer.apply_router_weight_on_input, alpha, limit)
+        return fused_experts_decode_nvfp4_marlin(x, *banks, topk_weights, topk_ids, layer.activation, layer.apply_router_weight_on_input, alpha, limit,
+                                                 misses=view.misses)
 
 
 class W4a4Nvfp4MoEKernel(TritonNvfp4MoEKernel):

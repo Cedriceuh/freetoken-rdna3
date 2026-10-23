@@ -293,6 +293,24 @@ Line counts here are on top of the lines listed in the sections above.
 | `python/freetoken/kernel/host_allreduce.py`, `kernel/csrc/jit/host_allreduce.cuh` | 10/2, 51/14 | `FREETOKEN_HOST_ALLREDUCE_AHEAD`: a thread loads four of the peer's chunks before summing any, in 16-byte loads on uncached pages |
 | `python/freetoken/kernel/triton/spec_glue.py` | 14/4 | `FREETOKEN_SPEC_ROLLBACK_SKIP`: the rollback copy of a request that kept every row exits instead of writing the padding slot |
 
+## A decode step's waits and launches: the PLE rows ahead, wider programs, the missing experts read in the GEMVs (bit-exact)
+
+Line counts here are on top of the lines listed in the sections above.
+
+| File | Lines | Change |
+|---|---:|---|
+| `python/freetoken/models/qwen4_exp/ple_disk.py`, `engine/engine.py`, `tests/models/qwen4_exp/test_ple_disk.py` | 146/1, 16/0, 41/0 | `FREETOKEN_PLE_DRAFT_READS`: a thread reads the next decode step's PLE rows into the decode store's RAM cache as the verify step's kept tokens and each draft reach the host; the fill joins it |
+| `python/freetoken/kernel/csrc/jit/store.cu`, `kernel/store.py`, `kernel/aot.py`, `models/qwen4_exp/attention.py`, `tests/kernels/test_jit_index_store.py` | 16/8, 9/1, 3/3, 13/3, 19/0 | the K/V store takes k and v with their own row strides (v no longer copied contiguous); the JIT module renamed (its cache keys on the wrapper) |
+| `python/freetoken/kernel/triton/qsa/compress.py`, `qsa/attend.py`, `qsa/__init__.py`, `attention/qsa_sparse.py`, `tests/kernels/test_qsa_fused_writes.py`, `test_qsa_fused_gate.py`, `tests/models/qwen4_exp/common.py` | 182/1, 31/6, 2/1, 48/22, new, new, 2/2 | `FREETOKEN_QSA_FUSED_WRITES`: the index keys' and queries' norm and rope and the ring's store in one launch; `FREETOKEN_QSA_FUSED_GATE`: the output gate in the sparse attention's split merge |
+| `python/freetoken/kernel/triton/exl3.py`, `tests/kernels/test_exl3_rotate_blocks.py` | 185/40, new | `FREETOKEN_EXL3_ROTATE_BLOCKS`, `FREETOKEN_EXL3_VEC_WARPS`: the decode rotation five 128-blocks a program, it and the mid step at 2 warps |
+| `python/freetoken/kernel/triton/exl3.py`, `kernel/triton/route_groups.py`, `moe/fused_exl3.py`, `tests/kernels/test_exl3_shared_routes.py` | (above), new, 22/5, new | `FREETOKEN_EXL3_SHARED_ROUTES`: the decode GEMV gives the routes of one slot one program (up to four), each tile decoded once; the input rotation writes which program takes which routes |
+| `python/freetoken/moe/offload_cache.py`, `layers/moe.py`, `layers/quantization/moe/base.py`, `moe/exl3.py`, `moe/nvfp4.py`, `kernel/triton/nvfp4_fused_moe.py`, `kernel/nvfp4_moe.py`, `moe/fused_nvfp4.py`, `tests/kernels/test_exl3_miss_reads.py`, `test_nvfp4_miss_reads.py` | 31/0, 10/2, 3/0, 4/1, 4/1, 192/0, 70/1, 35/10, new, new | `FREETOKEN_MOE_MISS_READS`: the decode GEMVs read the slots the cache fills this step from the host bank (the step's copy plan) and write them on the way; the cache copies the other banks only. `FREETOKEN_NVFP4_ACT_IN_GEMV`: SiLU in NVFP4's gate \| up GEMV |
+| `python/freetoken/moe/host_banks.py` | 21/1 | `FREETOKEN_BANK_COARSE`: the pinned expert banks registered coarse-grained on ROCm |
+| `python/freetoken/kernel/triton/dense_gemv.py`, `kernel/triton/int8_gemv.py`, `tests/kernels/test_gemv_shared_tiles.py`, `tests/kernels/test_nvfp4_act_in_gemv.py`, `tests/layers/test_int8_weight_only.py` | 38/7, 27/2, new, new, 1/1 | `FREETOKEN_GEMV_SHARED_TILES`: the router's bf16 GEMV loads a tile once for a verify step's rows; `FREETOKEN_INT8_ACT_PAIR4`: the shared expert's gate \| up and SiLU in one launch at 3-4 rows |
+| `python/freetoken/engine/sample.py` | 21/9 | `FREETOKEN_SAMPLE_ARGS_REUSE`: the sampling parameters' device tensors reused while they do not change |
+| `python/freetoken/server/api_server.py`, `tests/server/test_sigterm_exit.py` | 29/1, new | on SIGTERM the API server reaps its workers and runs multiprocessing's cleanup before dying of the signal (no semaphores left in `/dev/shm`) |
+| `rdna3/tests/host_allreduce_check.py` | 27/1 | per-size timings of the host all-reduce in a CUDA graph |
+
 ## Tooling and documentation
 
 | File | Change |

@@ -291,6 +291,10 @@ def _gemv_int8_act_pair(a_ptr, w_ptr, scale_ptr, out_ptr, D, K, stride_wn, k_per
     accu0 = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
     accg1 = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
     accu1 = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
+    accg2 = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
+    accu2 = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
+    accg3 = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
+    accu3 = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
     for kk in range(0, k_per, BLOCK_K):
         offs_k = kk + tl.arange(0, BLOCK_K)
         k_mask = offs_k < K
@@ -304,9 +308,21 @@ def _gemv_int8_act_pair(a_ptr, w_ptr, scale_ptr, out_ptr, D, K, stride_wn, k_per
             a1 = tl.load(a_ptr + stride_am + offs_k, mask=k_mask, other=0.0).to(tl.float32)
             accg1 += wg * a1[None, :]
             accu1 += wu * a1[None, :]
+        if ROWS > 2:
+            a2 = tl.load(a_ptr + 2 * stride_am + offs_k, mask=k_mask, other=0.0).to(tl.float32)
+            accg2 += wg * a2[None, :]
+            accu2 += wu * a2[None, :]
+        if ROWS > 3:
+            a3 = tl.load(a_ptr + 3 * stride_am + offs_k, mask=k_mask, other=0.0).to(tl.float32)
+            accg3 += wg * a3[None, :]
+            accu3 += wu * a3[None, :]
     _act_pair_out(tl.sum(accg0, axis=1), tl.sum(accu0, axis=1), sg, su, out_ptr, offs_n, n_mask)
     if ROWS > 1:
         _act_pair_out(tl.sum(accg1, axis=1), tl.sum(accu1, axis=1), sg, su, out_ptr + stride_om, offs_n, n_mask)
+    if ROWS > 2:
+        _act_pair_out(tl.sum(accg2, axis=1), tl.sum(accu2, axis=1), sg, su, out_ptr + 2 * stride_om, offs_n, n_mask)
+    if ROWS > 3:
+        _act_pair_out(tl.sum(accg3, axis=1), tl.sum(accu3, axis=1), sg, su, out_ptr + 3 * stride_om, offs_n, n_mask)
 
 
 # FREETOKEN_INT8_ROWS_MAX (default 8): decode batches up to this many rows (concurrent requests) use the row-looped
@@ -314,6 +330,10 @@ def _gemv_int8_act_pair(a_ptr, w_ptr, scale_ptr, out_ptr, D, K, stride_wn, k_per
 ROWS_MAX = max(1, int(os.environ.get("FREETOKEN_INT8_ROWS_MAX", "8")))
 # FREETOKEN_INT8_ROW_GROUPS=1 (default): several rows of a K-blocked shape share each weight tile (_gemv_int8_row_group)
 _ROW_GROUPS = os.environ.get("FREETOKEN_INT8_ROW_GROUPS", "1") == "1"
+# FREETOKEN_INT8_ACT_PAIR4 (default 1): a K-blocked gate | up projection at 3-4 rows (a verify step) runs its GEMV and
+# silu_and_mul in one launch (_gemv_int8_act_pair, one column pair a program) instead of the row-group GEMV then the
+# activation; the same bits
+_ACT_PAIR4 = os.environ.get("FREETOKEN_INT8_ACT_PAIR4", "1") == "1"
 
 
 def gemv_int8(x: torch.Tensor, qweight: torch.Tensor, scale: torch.Tensor, *, silu_hc: int = 0,
@@ -390,13 +410,18 @@ def gemv_int8_act_mul(x: torch.Tensor, qweight: torch.Tensor, scale: torch.Tenso
     D = N // 2
     k_per = triton.cdiv(K, block_k) * block_k
     one_pass = k_per >= K and block_k >= K
-    if not one_pass and M > 2:
+    pair4 = _ACT_PAIR4 and not one_pass and 2 < M <= 4
+    if not one_pass and M > 2 and not pair4:
         # K-blocked shapes: the pair kernel shares tiles across 2 rows, the row-group GEMV across 4; past 2 rows the
         # two kernels in a row are as fast or faster (cold, 48 matrices: 288-352 wide, 3-6 rows within 1 us, 7-8 rows
         # +2 to +6 us)
         return None
+    if pair4:
+        # FREETOKEN_INT8_ACT_PAIR4: 3-4 rows of a K-blocked shape in one launch, one gate and one up column a program
+        # (BLOCK_N is the one tile size that keeps the sums), so its eight accumulators fit the registers
+        block_n = 1
     out = torch.empty((M, D), dtype=torch.bfloat16, device=x.device)
-    step = M if one_pass else 2
+    step = M if one_pass or pair4 else 2
     for r0 in range(0, M, step):
         rows = min(step, M - r0)
         _gemv_int8_act_pair[(triton.cdiv(D, block_n),)](

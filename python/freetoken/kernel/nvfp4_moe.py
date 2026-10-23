@@ -20,6 +20,7 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 from freetoken.kernel.backend import is_rocm
 from freetoken.kernel.triton.e4m3_compat import e4m3_kernel_view, e4m3_native
 from freetoken.kernel.triton.nvfp4_fused_moe import (
+    _decode_nvfp4_marlin_act_kernel,
     _decode_nvfp4_marlin_kernel,
     _decode_nvfp4_moe_kernel,
     _e2m1_lut,
@@ -121,10 +122,14 @@ def decode_gemm_marlin(
     topk_ids: torch.Tensor,
     mul_routed_weight: bool,
     a_row_is_route: bool,
+    misses: tuple | None = None,
+    banks: tuple[int, int] = (0, 0),
 ) -> None:
     """Marlin-style decode GEMV: int32 wide loads + deferred reduction
     (:func:`_decode_nvfp4_marlin_kernel`). ``packed`` is the uint8 ``[S, N, K//2]`` bank;
-    it is reinterpreted as int32 ``[S, N, K//8]`` (contiguous, K%8==0 for NVFP4)."""
+    it is reinterpreted as int32 ``[S, N, K//8]`` (contiguous, K%8==0 for NVFP4). ``misses``: the expert cache's
+    copy plan (OffloadMoeCache.miss_reads), ``banks`` the packed and scale banks' indices in its host addresses: a
+    slot being filled is read from host memory and written on the way."""
     M, top_k = topk_ids.shape
     N = packed.shape[1]
     K = packed.shape[2] * 2
@@ -168,6 +173,70 @@ def decode_gemm_marlin(
         compute_type=_tl_dtype(c.dtype),
         SKIP_INACTIVE=SKIP_CPU_ROUTES,
         num_warps=warps,
+        **_miss_args(misses, banks, total_routes),
+    )
+
+
+def _miss_args(misses: tuple | None, banks: tuple[int, int], routes: int) -> dict:
+    if misses is None:
+        return {}
+    return dict(MISS=True, ev_ptr=misses[0], src_ptr=misses[1], num_ptr=misses[2], hostp_ptr=misses[3],
+                BANK_P=banks[0], BANK_S=banks[1], MP=triton.next_power_of_2(routes))
+
+
+def decode_gemm_marlin_act(
+    a: torch.Tensor,
+    packed: torch.Tensor,
+    scale: torch.Tensor,
+    glob: torch.Tensor,
+    out: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    mul_routed_weight: bool,
+    misses: tuple | None = None,
+    banks: tuple[int, int] = (0, 0),
+) -> None:
+    """``decode_gemm_marlin`` of the gate | up bank (``packed [S, 2I, K // 2]``: gate rows, then up rows) and silu_and_mul
+    in one launch (:func:`_decode_nvfp4_marlin_act_kernel`): ``out [M * top_k, I]``, the bits of the two kernels, with
+    the gate | up GEMV's tiles. ``misses`` / ``banks``: as decode_gemm_marlin."""
+    M, top_k = topk_ids.shape
+    N = packed.shape[1]
+    I = N // 2
+    K = packed.shape[2] * 2
+    packed_i32 = packed.view(torch.int32)
+    scale = e4m3_kernel_view(scale)
+    deep_k = K >= _DECODE_MARLIN_DEEPK_THRESHOLD
+    block_n = _DECODE_MARLIN_DEEPK_BLOCK_N if deep_k else _DECODE_MARLIN_BLOCK_N
+    block_kw = _DECODE_MARLIN_DEEPK_BLOCK_KW if deep_k else _DECODE_MARLIN_BLOCK_KW
+    unroll = _DECODE_MARLIN_DEEPK_UNROLL if deep_k else _DECODE_MARLIN_UNROLL
+    warps = _DECODE_MARLIN_WARPS
+    tuned = _DECODE_TUNED.get((N, K)) if NVFP4_DECODE_TUNED else None
+    if tuned is not None:
+        block_n, block_kw, warps, unroll = tuned[0] if M == 1 else tuned[1]
+    a_wide = (
+        a.dtype in (torch.bfloat16, torch.float16)
+        and a.stride(1) == 1 and a.stride(0) % 8 == 0 and a.data_ptr() % 16 == 0
+    )
+    _decode_nvfp4_marlin_act_kernel[(M * top_k, triton.cdiv(I, block_n))](
+        a, packed_i32, scale, glob, out, topk_weights, topk_ids,
+        M * top_k, I, K,
+        a.stride(0), a.stride(1),
+        packed_i32.stride(0), packed_i32.stride(1), packed_i32.stride(2),
+        scale.stride(0), scale.stride(1), scale.stride(2),
+        glob.stride(0), glob.stride(1),
+        out.stride(0),
+        topk_weights.stride(0), topk_weights.stride(1),
+        topk_ids.stride(0), topk_ids.stride(1),
+        BLOCK_SIZE_N=block_n,
+        BLOCK_SIZE_KW=block_kw,
+        UNROLL=unroll,
+        TOP_K=top_k,
+        A_WIDE=a_wide,
+        MUL_ROUTED_WEIGHT=mul_routed_weight,
+        compute_type=_tl_dtype(out.dtype),
+        SKIP_INACTIVE=SKIP_CPU_ROUTES,
+        num_warps=warps,
+        **_miss_args(misses, banks, M * top_k),
     )
 
 

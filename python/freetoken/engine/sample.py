@@ -35,6 +35,11 @@ def _fast_topk_max() -> int:
     return 256 if is_rocm() else 0
 
 
+# FREETOKEN_SAMPLE_ARGS_REUSE (default 1): a decode step whose rows sample under the same parameters as the step
+# before reuses that step's device tensors of them instead of copying them again
+_REUSE_ARGS = os.environ.get("FREETOKEN_SAMPLE_ARGS_REUSE", "1") != "0"
+
+
 def make_device_tensor(data: List, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
     return torch.tensor(data, dtype=dtype, pin_memory=True).to(device, non_blocking=True)
 
@@ -104,15 +109,22 @@ class Sampler:
             1.0 if g else min(max(p.top_p, MIN_P), 1.0)
             for p, g in zip(params, is_greedy)
         ]
-        temperatures = make_device_tensor(ts, torch.float32, self.device)
-        top_k, top_p = None, None
-        if any(k != self.vocab_size for k in top_ks):
-            top_k = make_device_tensor(top_ks, torch.int32, self.device)
-        if any(p < 1.0 for p in top_ps):
-            top_p = make_device_tensor(top_ps, torch.float32, self.device)
-        greedy_mask = (
-            make_device_tensor(is_greedy, torch.bool, self.device) if any(is_greedy) else None
-        )
+        key = (tuple(ts), tuple(top_ks), tuple(top_ps), tuple(is_greedy))
+        if _REUSE_ARGS and self.__dict__.get("_last_key") == key:
+            # FREETOKEN_SAMPLE_ARGS_REUSE: the same requests decoding again: the same values on the device already
+            # (read-only downstream), four host-to-device copies fewer a step
+            temperatures, top_k, top_p, greedy_mask = self._last_tensors
+        else:
+            temperatures = make_device_tensor(ts, torch.float32, self.device)
+            top_k, top_p = None, None
+            if any(k != self.vocab_size for k in top_ks):
+                top_k = make_device_tensor(top_ks, torch.int32, self.device)
+            if any(p < 1.0 for p in top_ps):
+                top_p = make_device_tensor(top_ps, torch.float32, self.device)
+            greedy_mask = (
+                make_device_tensor(is_greedy, torch.bool, self.device) if any(is_greedy) else None
+            )
+            self._last_key, self._last_tensors = key, (temperatures, top_k, top_p, greedy_mask)
         # greedy rows carry top_k = vocab_size but are overwritten by argmax: leave them out of the max, or a
         # greedy request next to a small-k one would push the whole batch off the small-k path
         sampled_ks = [k for k, g in zip(top_ks, is_greedy) if not g]

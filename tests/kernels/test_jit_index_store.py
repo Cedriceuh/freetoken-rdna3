@@ -60,3 +60,22 @@ def test_store_jit_matches_torch_on_cold_and_warm_loads(index_dtype):
     untouched = torch.tensor([1, 2, 4, 6, 7], device="cuda")
     torch.testing.assert_close(k_cache[untouched], torch.zeros((5, 64), device="cuda"))
     torch.testing.assert_close(v_cache[untouched], torch.zeros((5, 64), device="cuda"))
+
+
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+def test_store_takes_k_and_v_with_their_own_row_strides(index_dtype):
+    """The attention's v is a column slice of the qkv projection's rows (FREETOKEN_FEWER_COPIES stores it from there):
+    the store reads k and v each with its own row stride and writes the bytes a contiguous copy would."""
+    rows, width = 5, 512
+    qkv = torch.randn((rows, 4 * width + 2 * width), dtype=torch.bfloat16, device="cuda")
+    k = torch.randn((rows, width), dtype=torch.bfloat16, device="cuda")  # the rope's output: contiguous
+    v = qkv[:, 4 * width + width :]
+    assert v.stride(0) != k.stride(0)
+    indices = torch.tensor([7, 2, 9, 0, 4], dtype=index_dtype, device="cuda")
+    k_cache = torch.zeros((12, width), dtype=torch.bfloat16, device="cuda")
+    v_cache = torch.zeros_like(k_cache)
+    store_cache(k_cache, v_cache, indices, k, v)
+    assert torch.equal(k_cache[indices], k)
+    assert torch.equal(v_cache[indices], v.contiguous())
+    untouched = torch.tensor([1, 3, 5, 6, 8, 10, 11], device="cuda")
+    assert not k_cache[untouched].any() and not v_cache[untouched].any()

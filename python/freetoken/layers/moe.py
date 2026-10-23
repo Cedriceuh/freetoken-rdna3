@@ -392,7 +392,13 @@ class OffloadMoELayer(MoELayer):
         ):
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
         cache.ensure_experts(self.layer_id, topk_ids)
-        cache.copy_missing()
+        # a kernel that reads the slots being filled from host memory itself: the cache copies only the other banks
+        reads = getattr(getattr(self.quant_method, "kernel", None), "decode_reads_misses", ())
+        misses = cache.miss_reads(self.layer_id, reads) if reads else None
+        if misses is not None:
+            cache.copy_missing_except(tuple(k for k, _ in misses[1].values()))
+        else:
+            cache.copy_missing()
         return self._expert_gemm(
             cache,
             hidden_states,
@@ -402,6 +408,7 @@ class OffloadMoELayer(MoELayer):
             n=None,
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
+            misses=misses,
         )
 
     def _decode_hybrid(
@@ -559,12 +566,13 @@ class OffloadMoELayer(MoELayer):
         alphas: tuple[torch.Tensor, torch.Tensor] | None,
         is_prefill: bool,
         slot_map: torch.Tensor | None = None,
+        misses: tuple | None = None,
     ) -> torch.Tensor:
         from freetoken.moe.legacy_format import canonical_role  # legacy_format imports this package
 
         view = ExpertView(
             {canonical_role(name): t for name, t in zip(cache.bank_schema, views)},
-            slots=None if n is not None else topk_ids, n=n, alphas=alphas, slot_map=slot_map,
+            slots=None if n is not None else topk_ids, n=n, alphas=alphas, slot_map=slot_map, misses=misses,
         )
         return self.quant_method.apply(
             hidden_states, topk_weights, topk_ids, view, layer=self, is_prefill=is_prefill

@@ -13,6 +13,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Sequence
 
+import numpy as np
 import safetensors
 import torch
 
@@ -67,6 +68,13 @@ _PREFILL_RANK0 = os.environ.get("FREETOKEN_PLE_PREFILL_RANK0", "1") == "1"
 # 160-byte rows (16 of them tags and stamps), 118 MiB with EXL3's. The bytes of the reads, so the same bits; 0 turns it
 # off
 _ROW_CACHE_ROWS = int(os.environ.get("FREETOKEN_PLE_ROW_CACHE_ROWS", str(1 << 20)))
+# FREETOKEN_PLE_DRAFT_READS (default 1): a decode step's PLE rows are read while the step before it drafts, on a thread
+# into a small RAM cache of the decode store: the first token's rows once the verify step's kept tokens reach the host,
+# each draft's once the MTP head has drawn it. The step's own fill then finds them there and reads from disk only what
+# they missed (mostly the last draft's rows), instead of one disk round for every row after the drafts. The bytes of
+# the reads, so the same bits
+_DRAFT_READS = os.environ.get("FREETOKEN_PLE_DRAFT_READS", "1") == "1"
+_DRAFT_CACHE_ROWS = 16384  # a few steps' rows (a step reads at most 256 positions x 16 heads, one request ~64)
 _SYNC_ENV = "FREETOKEN_PLE_SYNC"  # auto | wait | gate
 
 logger = init_logger(__name__)
@@ -239,6 +247,118 @@ def resolve_row_source(model_path: str) -> PleRowSource:
     return source_from_safetensors(folder)
 
 
+class _DraftReads:
+    """FREETOKEN_PLE_DRAFT_READS: the next decode step's PLE rows, read on one thread while the GPU drafts. Each job
+    waits for its tokens' event, hashes one position a request (its two tokens before as context) and reads the rows
+    into ``store``'s cache; the step's fill joins the jobs before it stages. The rows are only cached by id, so a
+    position guessed wrong (a request that leaves the batch) costs a read, never a wrong row."""
+
+    def __init__(self, store, token_bytes: int, max_positions: int, max_drafts: int = 8) -> None:
+        import queue
+
+        self._store = store
+        self._token_bytes = token_bytes
+        self._max = max_positions
+        self._jobs: "queue.Queue" = queue.Queue()
+        self._off = False  # set by a failed read: every later job is skipped
+        self._tails: list[list[int]] | None = None  # per request: its last two tokens, the next position's context
+        # set by kept() (a verify step), cleared by that step's last draft: a step's drafts reuse _tok and _events
+        # only after its own kept(), never while an earlier step's jobs may still read them (a prefill's drafts)
+        self._armed = False
+        # numpy, not torch: an in-place write needs no inference mode
+        self._win = np.zeros(3 * max_positions, dtype=np.int64)  # [prev2, prev1, token] per request
+        self._scratch = alloc_pinned_tensor(max_positions * token_bytes, dtype=torch.uint8)  # rows land here too
+        self._tok = alloc_pinned_tensor(max_drafts * max_positions, dtype=torch.int64)
+        self._events = [torch.cuda.Event() for _ in range(max_drafts)]
+        threading.Thread(target=self._run, name="ple-draft-read", daemon=True).start()
+
+    def _run(self) -> None:
+        with torch.inference_mode():  # as the engine thread (the mode is per thread)
+            while True:
+                job = self._jobs.get()
+                try:
+                    if not self._off:
+                        job()
+                except BaseException:  # only reads ahead: the fills go on reading their own rows; the thread must
+                    # outlive any failure, or the next join would wait forever
+                    self._off = True
+                    logger.exception("PLE draft reads failed; turned off (FREETOKEN_PLE_DRAFT_READS)")
+                finally:
+                    self._jobs.task_done()
+
+    @staticmethod
+    def _wait(event: torch.cuda.Event, spin: bool) -> None:
+        """Until ``event`` completed: HIP's synchronize spins a core for the whole wait, which is most of a step here;
+        the reads off the critical path poll it with sleeps instead (~60 us late at worst, before the drafts end)."""
+        if spin:
+            event.synchronize()
+            return
+        while not event.query():
+            time.sleep(5e-5)
+
+    def _read(self, tokens: list[int]) -> None:
+        """One position a request: request i's window is its tail and ``tokens[i]``; then one disk round."""
+        tails, win = self._tails, self._win
+        for i, tok in enumerate(tokens):
+            win[3 * i] = tails[i][0]
+            win[3 * i + 1] = tails[i][1]
+            win[3 * i + 2] = tok
+            tails[i] = [tails[i][1], tok]
+            self._store.stage(win.ctypes.data + 3 * i * 8, 1, self._scratch.data_ptr() + i * self._token_bytes)
+        self._store.flush(0)
+
+    def kept(self, runs: Sequence[torch.Tensor], tokens_cpu: torch.Tensor, n_acc_cpu: torch.Tensor | None,
+             event: torch.cuda.Event) -> None:
+        """After a decode step whose fill staged ``runs`` (the requests' two context ids, then the step's tokens):
+        read the first position of the next step, each request's last kept token, once ``event`` saw the kept tokens
+        (``tokens_cpu [reqs, m]`` or ``[reqs]``, ``n_acc_cpu [reqs]`` kept rows, None: one) reach the host."""
+        if len(runs) > self._max:
+            return  # this step's drafts stay unarmed: nothing read ahead
+        self._armed = True
+
+        def job() -> None:
+            self._wait(event, spin=False)
+            toks = tokens_cpu.view(len(runs), -1).tolist()
+            n_acc = [1] * len(runs) if n_acc_cpu is None else n_acc_cpu.tolist()
+            self._tails, last = [], []
+            for run, kept, n in zip(runs, toks, n_acc):
+                # the sequence after this step: the run's context and first token, the kept tokens
+                seq = run[:3].tolist() + kept[: n - 1]
+                self._tails.append(seq[-2:])
+                last.append(kept[n - 1])
+            self._read(last)
+
+        self._jobs.put(job)
+
+    def draft(self, j: int, tok: torch.Tensor, real: int, last: bool = True) -> None:
+        """Draft ``j`` of each request (``tok [>= real]`` on the GPU): read its rows once it reaches the host;
+        ``last``: the step's last draft, whose read the next fill waits for (its wait spins)."""
+        if not self._armed:
+            return
+        if last:
+            self._armed = False
+        if j >= len(self._events) or real > self._max:
+            return
+        dst = self._tok[j * self._max : j * self._max + real]
+        dst.copy_(tok[:real], non_blocking=True)
+        event = self._events[j]
+        event.record()
+
+        def job() -> None:
+            if self._tails is None or len(self._tails) != real:
+                return
+            self._wait(event, spin=last)
+            self._read(dst.tolist())
+
+        self._jobs.put(job)
+
+    def join(self) -> None:
+        """Every queued read done: the store is the caller's again."""
+        self._jobs.join()
+        self._tails = None  # the next step's positions start from its own kept tokens
+        self._armed = False
+
+
 class DiskRowTable:
     """``PLETableBackend`` whose rows are read from disk per fill (--ple-backend disk)."""
 
@@ -302,7 +422,7 @@ class DiskRowTable:
         self._rank0_reads = (_PREFILL_RANK0 and tp is not None and tp.size > 1 and torch.distributed.is_available()
                              and torch.distributed.is_initialized())
         self._is_rank0 = tp is None or tp.rank == 0
-        self._store = store()
+        self._store = store(_DRAFT_CACHE_ROWS if _DRAFT_READS else 0)
         # FREETOKEN_PLE_PREFILL_PREFETCH: a store of its own (its own io_uring ring) for the next chunk's rows, on the
         # ranks that read prefill rows
         self._prefetch_store = (store(_ROW_CACHE_ROWS) if _PREFILL_PREFETCH and (self._is_rank0 or not self._rank0_reads)
@@ -344,6 +464,8 @@ class DiskRowTable:
         self._flag.zero_()
         self._token_readback = alloc_pinned_tensor(max_graph_rows, dtype=torch.int32)
         self._readback_event = torch.cuda.Event()
+        self._ahead = _DraftReads(self._store, self._token_bytes, max_graph_rows) if _DRAFT_READS else None
+        self._last_fill: tuple[list, list[torch.Tensor]] | None = None  # (reqs, runs) of the last decode fill
         sync = "wait-sync" if self._wait_sync else "launch-gating"
         reads = ", prefill rows read by rank 0" if self._rank0_reads else ""
         pf = f"; prefill store: {self._prefetch_store.io_backend()}" if self._prefetch_store is not None else ""
@@ -353,6 +475,8 @@ class DiskRowTable:
 
     def fill(self, runs: Sequence[torch.Tensor], *, graph: bool) -> None:
         """Stage per-request token runs (two context ids, then the new tokens) in batch order."""
+        if self._ahead is not None:
+            self._ahead.join()  # the draft reads use this store; theirs are in its cache now
         if graph:
             self._graph_consumed.synchronize()
             pinned = self._graph_pinned
@@ -403,6 +527,7 @@ class DiskRowTable:
                                              dtype=torch.int64)
                                 for i, r in enumerate(reqs)]
                         self.fill(runs, graph=True)
+                        self._last_fill = (reqs, runs)
                         if _FILL_TIMING:
                             _fill_tally(m, t1 - t0, time.perf_counter() - t1)
                     except BaseException:
@@ -421,6 +546,7 @@ class DiskRowTable:
                                  dtype=torch.int64)
                     for i, r in enumerate(reqs)]
             self.fill(runs, graph=use_graph)
+            self._last_fill = (reqs, runs)
             if _FILL_TIMING:
                 _fill_tally(m, t1 - t0, time.perf_counter() - t1)
             return None
@@ -527,6 +653,25 @@ class DiskRowTable:
         if use_graph:
             # only after this step's fill: the next fill waits on this launch, not the fill on it
             self._graph_consumed.record(torch.cuda.current_stream(self._device))
+
+    def ahead_kept(self, batch: Batch, tokens_cpu: torch.Tensor, n_acc_cpu: torch.Tensor | None,
+                   event: torch.cuda.Event) -> None:
+        """FREETOKEN_PLE_DRAFT_READS, after a decode step's sampling: the next step's first position (each request's
+        last kept token) is read once ``event`` saw ``tokens_cpu`` reach the host (``n_acc_cpu``: kept rows, None:
+        one). Only for the batch the last fill staged, in its order."""
+        last, self._last_fill = self._last_fill, None
+        if self._ahead is None or last is None:
+            return
+        reqs, runs = last
+        if len(reqs) != batch.size or any(a is not b for a, b in zip(reqs, batch.reqs)):
+            return
+        self._ahead.kept(runs, tokens_cpu, n_acc_cpu, event)
+
+    def ahead_draft(self, j: int, tok: torch.Tensor, real: int, last: bool = True) -> None:
+        """FREETOKEN_PLE_DRAFT_READS: draft ``j`` of the next step (``tok`` on the GPU, ``real`` requests) is read
+        once it reaches the host; ``last``: the step's last draft."""
+        if self._ahead is not None:
+            self._ahead.draft(j, tok, real, last)
 
     # ---------------- device side (PLETableBackend protocol) ----------------
 

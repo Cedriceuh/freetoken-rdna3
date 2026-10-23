@@ -101,6 +101,9 @@ class ExpertView:
     # prefill through the slot cache (FREETOKEN_PREFILL_CACHED_MAX): expert id -> slot of this layer; the routes stay
     # expert ids (the same tiles as a full-layer prefill), the weights are read from each expert's slot
     slot_map: torch.Tensor | None = None
+    # decode: the expert cache's copy plan for the banks the kernel reads from host memory when their slot is being
+    # filled this step (OffloadMoeCache.miss_reads; a kernel declares them in ``decode_reads_misses``)
+    misses: tuple | None = None
 
 
 def fused_piece(pieces: dict[str, torch.Tensor], role: str) -> torch.Tensor:

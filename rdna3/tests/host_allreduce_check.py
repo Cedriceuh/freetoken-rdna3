@@ -4,7 +4,7 @@
 
 Two processes (rank r on HIP device r). Checks: bit-identical results to dist.all_reduce for bf16 / fp32 at
 decode-like and larger sizes, a misaligned view, 96 all-reduces captured in a CUDA graph and replayed; then the time
-per call of both paths for a 5 KB message (one decode hidden state). A desynchronized peer traps the kernel after
+per call of both paths for a 5 KB message (one decode hidden state), and in a CUDA graph for 1-16 decode rows. A desynchronized peer traps the kernel after
 FREETOKEN_HOST_ALLREDUCE_TIMEOUT_S, so run it under `timeout`.
 """
 from __future__ import annotations
@@ -99,6 +99,32 @@ def worker(rank: int, iters: int, port: int) -> None:
     t1.record()
     torch.cuda.synchronize()
     say(f"graph : {t0.elapsed_time(t1) * 1000 / (50 * 96):6.1f} us per all-reduce (96 per replay, incl. the copy)")
+    # 5. time per call in a CUDA graph by message size (decode rows of 2560 bf16), 64 calls per replay
+    for rows in (1, 2, 3, 4, 8, 16):
+        xs = torch.randn(64, rows * 2560, device="cuda", dtype=torch.bfloat16, generator=gen)
+        torch.cuda.synchronize()
+        dist.barrier(group=cpu)
+        gg = torch.cuda.CUDAGraph()
+        with torch.cuda.stream(s):
+            for i in range(64):
+                ar(xs[i])
+            torch.cuda.synchronize()
+            dist.barrier(group=cpu)
+            with torch.cuda.graph(gg, stream=s):
+                for i in range(64):
+                    ar(xs[i])
+        torch.cuda.synchronize()
+        dist.barrier(group=cpu)
+        for _ in range(5):
+            gg.replay()
+        torch.cuda.synchronize()
+        dist.barrier(group=cpu)
+        t0.record()
+        for _ in range(40):
+            gg.replay()
+        t1.record()
+        torch.cuda.synchronize()
+        say(f"graph : {t0.elapsed_time(t1) * 1000 / (40 * 64):6.2f} us per all-reduce of {rows * 5} KB")
     say("ALL OK" if ok_all else "FAILURES (see above)")
     dist.barrier(group=cpu)
     dist.destroy_process_group()

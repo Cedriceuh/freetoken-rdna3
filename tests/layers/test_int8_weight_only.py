@@ -154,7 +154,7 @@ def test_hc_mix_kernel_matches_gemv_then_gate_mix(hc):
 @pytest.mark.parametrize("d", [384, 256, 352, 288, 320])
 def test_act_mul_kernel_matches_gemv_then_silu_and_mul(d):
     """gemv_int8_act_mul (the shared expert's gate | up projection storing silu(gate) * up) gives the bits of gemv_int8
-    then the Triton silu_and_mul, 1 to 8 rows (None where the separate kernels run: K-blocked shapes past 2 rows), at
+    then the Triton silu_and_mul, 1 to 8 rows (None where the separate kernels run: K-blocked shapes past 4 rows), at
     each rank's slice width, over several random draws."""
     from freetoken.kernel.triton.activation import silu_and_mul
     from freetoken.kernel.triton.int8_gemv import gemv_int8, gemv_int8_act_mul
