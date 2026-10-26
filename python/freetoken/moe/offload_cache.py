@@ -246,6 +246,8 @@ class OffloadMoeCache:
         self._alloc_prefill_plan()
         self.src_indices = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
         self.num_indices = torch.zeros((1,), dtype=torch.int64, device=self.device)
+        # the one-launch admission + copy's handshake words (kernel/triton/ensure_copy.py), zero between launches
+        self._ensure_sync = torch.zeros((2,), dtype=torch.int32, device=self.device)
         # hybrid only: full missing count BEFORE the per-step fetch cap (num_indices holds
         # the capped count that copy_missing actually fetches). The difference is what the
         # CPU computes this step. Written by the hybrid ensure kernel.
@@ -1508,6 +1510,25 @@ class OffloadMoeCache:
         plan = (self.evict_slots, self.src_indices, self.num_indices, self._copy_src_ptrs[layer_id])
         rows = self._row_bytes[self.layer_layout[layer_id]]
         return plan, {name: (k, rows[k]) for name, k in index.items()}
+
+    def ensure_experts_copy_except(self, layer_id: int, expert_ids: torch.Tensor, skip: tuple[int, ...]) -> None:
+        """``ensure_experts`` then ``copy_missing_except(skip)``, in one launch where the sequential admission serves
+        the shape (FREETOKEN_MOE_ENSURE_COPY): the same slots, plan and copies."""
+        from freetoken.kernel.fast_index_copy import _skip_fast_index_copy_enabled
+        from freetoken.kernel.triton import ensure_copy
+
+        id_of_slot, usage = self.pool_state(layer_id)
+        if self.collect_stats or self.collect_decode_freq or not ensure_copy.supported(expert_ids, id_of_slot):
+            self.ensure_experts(layer_id, expert_ids)
+            self.copy_missing_except(skip)
+            return
+        self._pending_src_layer = layer_id
+        self._pending_whole_layer = False
+        rest = tuple(k for k in range(len(self.bank_schema)) if k not in skip)
+        plan = self._subset_copy_plan(layer_id, rest) if rest and not _skip_fast_index_copy_enabled() else None
+        ensure_copy.ensure_copy(expert_ids, self.slot_for_id.view(-1), id_of_slot, usage, self.step, self.src_indices,
+                                self.evict_slots, self.num_indices, layer_id * self.num_experts, plan,
+                                self._ensure_sync)
 
     def copy_missing_except(self, skip: tuple[int, ...]) -> None:
         """``copy_missing`` of every bank but ``skip`` (bank indices), whose rows the decode kernel moves itself

@@ -55,8 +55,10 @@ which pool fits in your RAM.
   and the wider table costs a few percent more). It reads prompts a little faster: the VRAM the K/V no longer takes goes to
   the expert cache (~11.3k experts per card instead of 9.8k on `xtx-xt`, earlier builds).
 - **Prefill goes first.** While a long prompt is read, the other requests barely decode: a 498k-token request decoded
-  at 6.3 tok/s while a 237k-token one was read. That is upstream's scheduling, the same on every profile
-  (`FREETOKEN_DECODE_INTERLEAVE` in [options.md](options.md#scheduling)).
+  at 6.3 tok/s while a 237k-token one was read. That is upstream's scheduling, the same on every profile.
+  `FREETOKEN_DECODE_INTERLEAVE=8` with `FREETOKEN_DECODE_INTERLEAVE_LONG=1` gives the decoding requests eight steps
+  after each 16k-token chunk of a long read, at ~3 % of the read's speed, without touching agent turns
+  ([options.md](options.md#scheduling)).
 
 ## `xtx-xt-4x262k`: four conversations of 262,144 tokens
 

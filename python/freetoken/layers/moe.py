@@ -391,13 +391,13 @@ class OffloadMoELayer(MoELayer):
             _HYBRID_MIN_REQS <= 1 or len(get_global_ctx().batch.reqs) >= _HYBRID_MIN_REQS
         ):
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
-        cache.ensure_experts(self.layer_id, topk_ids)
         # a kernel that reads the slots being filled from host memory itself: the cache copies only the other banks
         reads = getattr(getattr(self.quant_method, "kernel", None), "decode_reads_misses", ())
         misses = cache.miss_reads(self.layer_id, reads) if reads else None
         if misses is not None:
-            cache.copy_missing_except(tuple(k for k, _ in misses[1].values()))
+            cache.ensure_experts_copy_except(self.layer_id, topk_ids, tuple(k for k, _ in misses[1].values()))
         else:
+            cache.ensure_experts(self.layer_id, topk_ids)
             cache.copy_missing()
         return self._expert_gemm(
             cache,

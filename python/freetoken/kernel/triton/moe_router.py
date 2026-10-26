@@ -57,7 +57,17 @@ def _router_triton_kernel(
     # Row-tiled: each program handles BLOCK_M rows; all reductions run along the
     # expert (N) axis. Tiling rows keeps CTAs large enough to stay occupancy-bound
     # rather than launch-bound at small N (many tiny 1-warp CTAs otherwise).
-    pid = tl.program_id(0)
+    _router_body(tl.program_id(0), scores_ptr, out_weights_ptr, out_indices_ptr, num_token_non_padded_ptr, M,
+                 stride_sm, stride_sn, stride_wm, stride_wk, stride_im, stride_ik, N, K, BLOCK_M, BLOCK_N, BLOCK_K,
+                 RENORMALIZE, HAS_TOKEN_LIMIT, launch_pdl, KEYS)
+
+
+@triton.jit
+def _router_body(pid, scores_ptr, out_weights_ptr, out_indices_ptr, num_token_non_padded_ptr, M, stride_sm, stride_sn,
+                 stride_wm, stride_wk, stride_im, stride_ik, N: tl.constexpr, K: tl.constexpr, BLOCK_M: tl.constexpr,
+                 BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, RENORMALIZE: tl.constexpr,
+                 HAS_TOKEN_LIMIT: tl.constexpr, launch_pdl: tl.constexpr, KEYS: tl.constexpr):
+    """``_router_triton_kernel``'s program ``pid``, callable from a kernel that runs other work beside it."""
     offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
     mask_m = offs_m < M

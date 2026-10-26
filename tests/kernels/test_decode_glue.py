@@ -167,3 +167,21 @@ def test_spec_glue_kernels_match_torch(seed):
     assert torch.equal(out_loc, pt[tidx.to(torch.int64), cpos])
     if delta is not None:
         assert torch.equal(mrope, (cpos.to(torch.int32) + delta).unsqueeze(0).expand(3, -1).contiguous())
+
+
+@pytest.mark.parametrize("m", [2, 3, 4])
+@pytest.mark.parametrize("reqs", [2, 3, 4])
+def test_chain_meta_reads_a_strided_table_idx(m, reqs):
+    """The scheduler hands the chained guesses ``active_table_idx`` as a view of its per-row mapping, one row in m
+    (``mapping[::m]``): every request must address its own page-table row, not the mapping's r-th element."""
+    from freetoken.kernel.triton.spec_glue import chain_meta
+
+    dev = torch.device("cuda")
+    g = torch.Generator(device=dev).manual_seed(10 * m + reqs)
+    pt = torch.randint(0, 10 ** 6, (8, 300), generator=g, device=dev, dtype=torch.int32)
+    rows = torch.randperm(8, device=dev)[:reqs]
+    mapping = rows.repeat_interleave(m)  # [reqs * m] int64, as _make_input_tuple builds it
+    tidx = mapping.view(-1)[::m]
+    cpos = torch.randint(0, 300, (reqs,), generator=g, device=dev)
+    _, _, out_loc, _ = chain_meta(cpos, tidx, pt, None)
+    assert torch.equal(out_loc, pt[rows, cpos])

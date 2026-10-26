@@ -7,6 +7,10 @@ from freetoken.distributed import set_tp_info, try_get_tp_info
 from freetoken.layers.quantization import QuantKind
 
 
+# the attention backend these sizing tests name: flashinfer's is CUDA-only (the config check refuses it on ROCm)
+_ATTN_BACKEND = "triton" if torch.version.hip else "fi"
+
+
 def _init_tp():
     if try_get_tp_info() is None:
         set_tp_info(rank=0, size=1)
@@ -428,7 +432,7 @@ def test_adjust_config_converts_moe_cache_rate_to_cache_size(monkeypatch):
         model_path="/tmp/freetoken-test-model",
         tp_info=DistributedInfo(rank=0, size=1),
         dtype=torch.float16,
-        attention_backend="fi",
+        attention_backend=_ATTN_BACKEND,
         moe_cache_rate=0.3,
     )
     object.__setattr__(

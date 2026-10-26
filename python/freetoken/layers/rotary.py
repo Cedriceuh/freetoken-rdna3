@@ -142,6 +142,12 @@ class MRotaryEmbedding(RotaryEmbedding):
         except ImportError:
             self._kernel = None
 
+    def section_table(self, device: torch.device) -> torch.Tensor:
+        """The axis of each frequency slot, on ``device`` (as ``forward`` hands it to the kernel)."""
+        if self._section_table.device != device:
+            self._section_table = self._section_table.to(device)
+        return self._section_table
+
     def forward(
         self,
         positions: torch.Tensor,

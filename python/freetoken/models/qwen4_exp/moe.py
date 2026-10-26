@@ -124,7 +124,8 @@ class Qwen4ExpMoE(Qwen3_5MoE):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
-        router_logits = self.gate.forward(hidden_states)
+        both = self._router_shared(hidden_states)
+        router_logits = self.gate.forward(hidden_states) if both is None else both[0]
         cached = getattr(self.experts, "prefill_cached", None)  # offload experts only
         if cached is not None and get_global_ctx().batch.is_prefill:
             nxt = _BLOCKS.get(self.experts.layer_id + 1) if _PREDICT else None
@@ -149,7 +150,19 @@ class Qwen4ExpMoE(Qwen3_5MoE):
         block = _block_tokens(getattr(self.experts.quant_method, "kernel", None))
         blocks = (_AR_OVERLAP and self._comm is not None and get_global_ctx().batch.is_prefill and block > 0
                   and num_tokens > max(block, _cached_limit(self.experts)) and self._ranks_agree_on_blocks())
-        shared = self.shared_expert.forward(hidden_states)
+        topk = self._down_topk(both) if both is not None and not split and not split_pf else None
+        if topk is not None:  # FREETOKEN_ROUTER_SHARED: the down projection and the top-k in one launch
+            shared, topk = topk[0], topk[1:]
+        elif both is not None:
+            shared = self.shared_expert.down_proj.forward(both[1])
+        else:
+            shared = self.shared_expert.forward(hidden_states)
+
+        def experts() -> torch.Tensor:
+            if topk is not None:
+                return self.experts.routed_forward(hidden_states, *topk)
+            return self.experts.forward(hidden_states=hidden_states, router_logits=router_logits)
+
         if _FUSED_EPILOGUE and not split and self._epilogue_fusable():
             gate_w = self.shared_expert_gate.weight.view(-1)
             works = None
@@ -165,8 +178,7 @@ class Qwen4ExpMoE(Qwen3_5MoE):
                 prefill_hooks.BLOCK_DONE[0] = block_done
             fused_nvfp4.PER_EXPERT_OUTPUT[0] = True
             try:
-                routed = (self.experts.prefill_finish(hidden_states, *routing) if split_pf
-                          else self.experts.forward(hidden_states=hidden_states, router_logits=router_logits))
+                routed = self.experts.prefill_finish(hidden_states, *routing) if split_pf else experts()
             finally:
                 fused_nvfp4.PER_EXPERT_OUTPUT[0] = False
                 prefill_hooks.BLOCK_DONE[0] = None
@@ -185,11 +197,46 @@ class Qwen4ExpMoE(Qwen3_5MoE):
             elif split_pf:
                 routed = self.experts.prefill_finish(hidden_states, *routing)
             else:
-                routed = self.experts.forward(hidden_states=hidden_states, router_logits=router_logits)
+                routed = experts()
             out = shared_gate_mul_add(routed, shared, gate)
         if self._comm is not None:
             out = self._comm.all_reduce(out)
         return out.view(num_tokens, hidden_dim)
+
+    def _router_shared(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """FREETOKEN_ROUTER_SHARED, decode rows: the router's logits and the shared expert's activation from one launch
+        (kernel/triton/router_shared.py), where the router is the bf16 split-K GEMV and the shared expert's gate | up
+        the int8 GEMV with its activation; else None."""
+        from freetoken.kernel.triton import router_shared
+
+        if not router_shared.ENABLED or not x.is_cuda or x.shape[0] > 4 or get_global_ctx().batch.is_prefill:
+            return None
+        gate, gu = self.gate, self.shared_expert.gate_up_proj
+        counters = getattr(gate, "_gemv_counters", None)
+        act_ok = getattr(self.shared_expert, "_act_int8_ok", None)
+        if counters is None or gate.bias is not None or x.dtype is not torch.bfloat16 or not (act_ok and act_ok(x)):
+            return None
+        from freetoken.layers.quantization.linear.unquantized import _decode_gemv_config
+
+        cfg = _decode_gemv_config(gate.weight)
+        if cfg is None:
+            return None
+        return router_shared.router_and_shared_act(x, gate.weight, cfg, counters, gu.weight, gu.weight_scale)
+
+    def _down_topk(self, both: tuple[torch.Tensor, torch.Tensor]):
+        """FREETOKEN_ROUTER_SHARED after ``_router_shared``: (the shared expert's down projection, the routing weights,
+        the expert ids) from one launch, where the down projection is the int8 GEMV with its all-reduce deferred to
+        the block's; else None."""
+        from freetoken.kernel.triton.router_shared import shared_down_and_topk
+        from freetoken.layers.quantization.int8_weight_only import Int8WeightOnlyLinearMethod
+
+        down = self.shared_expert.down_proj
+        if (not isinstance(down.quant_method, Int8WeightOnlyLinearMethod) or down.bias is not None
+                or (down._tp_size > 1 and not down.defer_all_reduce)
+                or not hasattr(self.experts, "routed_forward")):
+            return None
+        return shared_down_and_topk(both[1], down.weight, down.weight_scale, both[0], self.experts.top_k,
+                                    self.experts.renormalize)
 
     def _ranks_agree_on_blocks(self) -> bool:
         """FREETOKEN_PREFILL_AR_OVERLAP: at two ranks only (a sum of two values does not depend on the blocks), and once

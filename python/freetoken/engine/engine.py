@@ -1695,8 +1695,11 @@ class Engine:
                                       args.top_p, args.top_k_max, cands=cands)
         if args.greedy_mask is not None:
             s_tok = torch.where(args.greedy_mask.to(torch.bool)[:real], tok[:real], s_tok)
-        tok = tok.clone()
-        tok[:real] = s_tok
+        if s_tok.shape == tok.shape and s_tok.dtype == tok.dtype:
+            tok = s_tok  # no padded row: the draws are the drafts, without the two copies below
+        else:
+            tok = tok.clone()
+            tok[:real] = s_tok
         if getattr(self, "_sync_sampled_tokens", False):
             torch.distributed.broadcast(tok, src=0)
         return tok, q

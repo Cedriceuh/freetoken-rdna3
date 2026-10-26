@@ -311,6 +311,20 @@ Line counts here are on top of the lines listed in the sections above.
 | `python/freetoken/server/api_server.py`, `tests/server/test_sigterm_exit.py` | 29/1, new | on SIGTERM the API server reaps its workers and runs multiprocessing's cleanup before dying of the signal (no semaphores left in `/dev/shm`) |
 | `rdna3/tests/host_allreduce_check.py` | 27/1 | per-size timings of the host all-reduce in a CUDA graph |
 
+## A decode step's launches, again: the inputs in one copy, the admission with its copy, the norms with the rope, the router with the shared expert (bit-exact)
+
+Line counts here are on top of the lines listed in the sections above.
+
+| File | Lines | Change |
+|---|---:|---|
+| `python/freetoken/engine/step_inputs.py`, `kernel/triton/step_inputs.py`, `scheduler/scheduler.py`, `engine/graph.py`, `attention/qsa_sparse.py`, `tests/kernels/test_step_inputs.py` | new, new, 34/2, 3/2, 9/0, new | `FREETOKEN_STEP_INPUTS`: a graph decode step's inputs staged in one pinned buffer, one copy and one kernel write the graph's input buffers and the QSA block table (the graph's `copy_from` and the QSA restage skipped); `FREETOKEN_DECODE_INTERLEAVE_LONG`: the interleaved decode steps only after a chunk that leaves prompt to read |
+| `python/freetoken/kernel/triton/ensure_copy.py`, `moe/offload_cache.py`, `layers/moe.py`, `tests/kernels/test_moe_ensure_copy.py` | new, 21/0, 2/2, new | `FREETOKEN_MOE_ENSURE_COPY`: flashlib's LRU admission and the small banks' copy in one launch |
+| `python/freetoken/kernel/triton/qk_norm_rope.py`, `models/qwen4_exp/attention.py`, `layers/rotary.py`, `layers/norm.py`, `tests/kernels/test_qk_norm_rope.py` | new, 20/4, 6/0, 1/0, new | `FREETOKEN_QK_NORM_ROPE`: the q / k norms and the rope in one launch |
+| `python/freetoken/kernel/triton/router_shared.py`, `kernel/triton/dense_gemv.py`, `kernel/triton/int8_gemv.py`, `kernel/triton/moe_router.py`, `models/qwen4_exp/moe.py`, `models/qwen3_5_moe/moe.py`, `tests/kernels/test_router_shared.py` | new, 11/2, 18/3, 11/1, 52/5, 15/7, new | `FREETOKEN_ROUTER_SHARED`: the router GEMV with the shared expert's gate \| up, the shared down projection with the router's top-k, one launch each (the kernels' program bodies callable) |
+| `python/freetoken/kernel/triton/spec_glue.py`, `tests/kernels/test_decode_glue.py` | 8/7, 18/0 | the chained guesses' page-table rows read with their stride (a second request's guesses wrote at the first one's rows) |
+| `python/freetoken/models/qwen4_exp/ple.py`, `scheduler/cache.py`, `engine/engine.py` | 9/4, 2/1, 5/2 | the decode PLE metadata reuses the GDN indptr, skips the placeholder restore and an unused arange; no copy of an unchanged free-page list; a draft's draws used as they are when no row is padded |
+| `tests/models/qwen4_exp/test_qsa_backend.py`, `test_qsa_kernels.py`, `tests/engine/test_cache_budget.py`, `tests/moe/test_offload.py` | 18/1, 5/2, 6/2, 5/1 | tests that failed on ROCm: the toy projections a row at a time, the top-k reference's ties toward the lowest column, the Triton backend named instead of flashinfer's |
+
 ## Tooling and documentation
 
 | File | Change |

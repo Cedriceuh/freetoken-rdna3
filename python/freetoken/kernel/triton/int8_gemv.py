@@ -101,8 +101,16 @@ def _gemv_splitk_int8(a_ptr, w_ptr, scale_ptr, out_ptr, part_ptr, N, K, stride_w
     ROWS > 1 (several decoding requests): the SAME per-row body runs for each activation row in turn (unrolled at
     compile time), so every request gets exactly the bits it would get alone; the weight tile the first row loaded is
     still in cache for the next rows, so the weights cross VRAM about once per launch."""
-    pid_n = tl.program_id(0)
-    pid_k = tl.program_id(1)
+    _gemv_splitk_int8_body(tl.program_id(0), tl.program_id(1), a_ptr, w_ptr, scale_ptr, out_ptr, part_ptr, N, K,
+                           stride_wn, stride_pk, k_per, SPLIT, BLOCK_N, BLOCK_K, ROWS, stride_am, stride_om, ONE_PASS,
+                           EPI_HC, EPI_COLS)
+
+
+@triton.jit
+def _gemv_splitk_int8_body(pid_n, pid_k, a_ptr, w_ptr, scale_ptr, out_ptr, part_ptr, N, K, stride_wn, stride_pk, k_per,
+                           SPLIT: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, ROWS: tl.constexpr,
+                           stride_am, stride_om, ONE_PASS: tl.constexpr, EPI_HC: tl.constexpr, EPI_COLS):
+    """``_gemv_splitk_int8``'s program (pid_n, pid_k), callable from a kernel that runs other work beside it."""
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     n_mask = offs_n < N
     k0 = pid_k * k_per
@@ -271,7 +279,14 @@ def _gemv_int8_act_pair(a_ptr, w_ptr, scale_ptr, out_ptr, D, K, stride_wn, k_per
     BLOCK_N gate columns and the BLOCK_N up columns D further with _gemv_splitk_int8's arithmetic (the same tile
     shapes, each weight tile loaded once for the program's rows: all of them when K fits one BLOCK_K, else up to 2), so
     every value gets the GEMV's bits; then silu(gate) * up as activation.py computes it. Output [ROWS, D]."""
-    pid_n = tl.program_id(0)
+    _act_pair_body(tl.program_id(0), a_ptr, w_ptr, scale_ptr, out_ptr, D, K, stride_wn, k_per, stride_am, stride_om,
+                   BLOCK_N, BLOCK_K, ROWS, ONE_PASS)
+
+
+@triton.jit
+def _act_pair_body(pid_n, a_ptr, w_ptr, scale_ptr, out_ptr, D, K, stride_wn, k_per, stride_am, stride_om,
+                   BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, ROWS: tl.constexpr, ONE_PASS: tl.constexpr):
+    """``_gemv_int8_act_pair``'s program ``pid_n``, callable from a kernel that runs other work beside it."""
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     n_mask = offs_n < D
     sg = tl.load(scale_ptr + offs_n, mask=n_mask, other=0.0)

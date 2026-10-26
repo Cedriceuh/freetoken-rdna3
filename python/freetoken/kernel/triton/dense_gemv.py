@@ -42,8 +42,17 @@ def _gemv_splitk_bf16(a_ptr, w_ptr, part_ptr, N, K, stride_wn, stride_pk, k_per,
                       LAST_REDUCES: tl.constexpr = False, SHARE_TILES: tl.constexpr = False):
     """ROWS > 1 (several decoding requests): the unchanged per-row body runs once per activation row (unrolled), so
     each request gets the bits it gets alone -- F.linear at M > 1 would pick another BLAS reduction order."""
-    pid_n = tl.program_id(0)
-    pid_k = tl.program_id(1)
+    _gemv_splitk_bf16_body(tl.program_id(0), tl.program_id(1), a_ptr, w_ptr, part_ptr, N, K, stride_wn, stride_pk,
+                           k_per, BLOCK_N, BLOCK_K, ROWS, stride_am, stride_pm, out_ptr, cnt_ptr, stride_om, SPLIT,
+                           LAST_REDUCES, SHARE_TILES)
+
+
+@triton.jit
+def _gemv_splitk_bf16_body(pid_n, pid_k, a_ptr, w_ptr, part_ptr, N, K, stride_wn, stride_pk, k_per,
+                           BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, ROWS: tl.constexpr, stride_am, stride_pm,
+                           out_ptr, cnt_ptr, stride_om, SPLIT: tl.constexpr, LAST_REDUCES: tl.constexpr,
+                           SHARE_TILES: tl.constexpr):
+    """``_gemv_splitk_bf16``'s program (pid_n, pid_k), callable from a kernel that runs other work beside it."""
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     n_mask = offs_n < N
     k0 = pid_k * k_per

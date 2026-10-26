@@ -240,13 +240,16 @@ TOPK_SHAPES = [(512, 512), (4096, 512)]
 
 
 def _torch_topk_blocks(logits, visible, width):
-    """The torch.topk fallback of ``qsa_sparse._top_blocks``, kept here as the reference."""
+    """The torch.topk fallback of ``qsa_sparse._top_blocks``, kept here as the reference, with ties broken toward the
+    lowest column as the kernel documents (a stable descending sort): torch.topk leaves the order of equal scores
+    unspecified, and on ROCm at 4096 columns it keeps others."""
     columns = logits.shape[1]
     out = torch.full((logits.shape[0], width), -1, dtype=torch.int32, device=logits.device)
     column = torch.arange(columns, device=logits.device)
     masked = logits.masked_fill(column.unsqueeze(0) >= visible.unsqueeze(1), -float("inf"))
     take = min(width, columns)
-    values, chosen = torch.topk(masked, take, dim=-1)
+    values, chosen = torch.sort(masked, dim=-1, descending=True, stable=True)
+    values, chosen = values[:, :take], chosen[:, :take]
     out[:, :take] = torch.where(values > -float("inf"), chosen.to(torch.int32), -1)
     return out
 

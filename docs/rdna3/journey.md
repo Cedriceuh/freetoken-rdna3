@@ -1739,7 +1739,91 @@ ones, the 3 and the 4 long ones).
   runs multiprocessing's exit handler and the resource tracker's cleanup, then dies of the signal (0 left, against 5
   for the image).
 
-## 39. Still open
+## 39. Fewer launches a decode step: the inputs, the cache admission, the norms, the router (2026-10-25 and 26)
+
+A kernel trace of the build of section 38 (`xtx-xt-4x262k`, EXL3 3.05 bpw, one request at T 0.6): a step 24.3 ms,
+1,558 kernels, 18.7 ms of them in kernels and 5.6 ms between them (~3.5 µs each); 37 kernels and 321 µs between the
+token-pool write that ends a step and the graph of the next one, 35 of them copies, casts and gathers. At one request
+the step is ~1,300 graph kernels of the 48 layers (a MoE layer launches 12), ~130 for the three drafts (each a decoder
+layer, the 390 µs LM head and its sampling), ~30 for the verify step's sampling and rollback and ~37 for the step's
+inputs. All measurements below on `xtx-xt-4x262k` with arms interleaved with the image of section 38: three greedy
+512-token answers (`speed`), 12 prompts x 1024 tokens at T 0.6 (`calib6`), two greedy 1024-token answers at once
+(`two`), four requests started 1.5 s apart (`fourst`); greedy and sampled answers compared with the image's.
+
+- **A step's inputs in one copy and one kernel** (`FREETOKEN_STEP_INPUTS`): section 38 dropped it as too invasive for
+  ~0.1-0.2 ms; measured, it pays. The scheduler writes each row's position and mrope positions, each request's
+  page-table row, GatedDeltaNet slot and K/V length, and the write tuple into one pinned buffer; one copy and one kernel
+  write the graph's input buffers (the token and the K/V slot each row reads, the QSA block table), the graph's own
+  copies and the QSA restage skipped. EXL3, two pairs: +0.8 % greedy, +0.7 % at T 0.6, +0.7 % at two requests, +1.2 %
+  at four.
+- **The cache admission and the copy of the small banks in one launch** (`FREETOKEN_MOE_ENSURE_COPY`): flashlib's LRU
+  admission (its code, so its slots and plan) in the first program; the others wait for its plan on a release /
+  acquire flag, then copy the missing experts' small banks (EXL3's rotation signs; the big banks are read by the GEMVs,
+  section 38). EXL3, two pairs: +0.7 % greedy, +0.5 % at T 0.6, four requests within the noise.
+- **The q / k norms and the rope in one launch** (`FREETOKEN_QK_NORM_ROPE`): one program per row and head, the norm as
+  the Triton norm kernel (same code, tile and warps), stored, then the head's first 64 dims rotated as the rope kernel
+  does. NVFP4, two pairs: +0.5 % greedy and at T 0.6, +0.4 % at two requests.
+- **Three constant ops fewer in the PLE layer's decode** (its indptr is the GatedDeltaNet's, the placeholder restore
+  only in prefill, an unused arange) and no copy of the free-page list when nothing was freed.
+- These four against two runs of the image, EXL3: one request 105.05 / 104.67 -> 106.90 / 107.20 tok/s (+2.1 %), T
+  0.6 112.00 / 111.75 -> 113.68 / 113.77 (+1.7 %), two requests 76.63 / 76.54 -> 78.58 / 78.50 (+2.5 %), four 51.32 /
+  51.37 -> 52.55 / 52.10 (+1.9 %); 22 greedy and 12 sampled answers identical. A trace of that build: 1,452 kernels a
+  step (1,558 before), 23.7 ms.
+- **Fixed: the chained drafts of a second request** wrote their MTP K/V at the first request's page-table row
+  (`chain_meta` read the strided per-request rows as contiguous; CHANGELOG). Only two requests chain drafts on this
+  profile (three and four verify two rows, no chain): `two` is part of the +2.6 % above.
+- **The router GEMV with the shared expert's gate | up, the shared expert's down projection with the router's top-k**
+  (`FREETOKEN_ROUTER_SHARED`): each pair reads the same input or nothing of each other, so one launch runs both
+  programs' unchanged bodies at one warp count. A first version ran them at 1-2 warps (the shapes it was tested on kept
+  their bits there) and changed the answers: EXL3's shared expert is 768 rows a rank, whose default tiles run at 4
+  warps, and its sums changed with them (found by computing both paths in the server, eager decode, and comparing every
+  layer's outputs). The launch now takes the shared expert's own warps (the router GEMV keeps its bits at 1, 2, 4 and
+  8). In a graph of 48 layers: 13.3 -> 9.5 µs a layer at one row, 14.1 -> 9.9 at two, 17.8 -> 13.6 at four.
+  `xtx-xt-4x262k`, two pairs: EXL3 one request +2.5 % greedy, +2.3 % at T 0.6, two and four requests +0.2 / +0.4 %;
+  NVFP4 +2.4 %, +2.3 %, +0.1 / +0.3 %; the same answers. The cost a microbenchmark gave (~4 µs a layer, ~0.8 % of a
+  step) understates it: the step loses two launches a layer and their waits.
+- **Long reads and the other requests** (`FREETOKEN_DECODE_INTERLEAVE_LONG`): section 17 dropped the interleaving for
+  the agent turns it delayed; it now follows only a chunk that leaves prompt to read. One request decoding while a
+  130k-token prompt is read cold (EXL3, one run each): without it the read 38.1 s and the decoding request stopped for
+  38.0 s; 8 steps a chunk 39.1 s (+2.7 %), stops of one chunk (4.9 s) at most; 32 steps 42.2 s (+10.8 %). Off by
+  default.
+- **Dropped: the GatedDeltaNet output norm inside the delta-rule kernel.** The head's last V block to finish (a counter)
+  normed the head's rows with the norm kernel's own program body (one warp, the same tile): the same bits (outputs,
+  normed rows and states, both cards), one launch fewer per GDN layer (36 a step), but EXL3 `xtx-xt-4x262k` 110.1 /
+  109.7 tok/s against 109.9 without it, 116.6 / 116.4 against 116.7 at T 0.6 (likely the last block normalizing every
+  row of its head alone, on one warp, after the others: not timed apart). Patch not kept.
+- **Tests that failed on ROCm, fixed in the tests**: the chunked-prefill comparisons of `test_qsa_backend.py` (the toy
+  layer's `F.linear` changes its sums with the row count: computed a row at a time, all three pass), the block top-k
+  case with ties (`torch.topk` keeps an unspecified order of equal values, the kernel the lowest column: the reference
+  now sorts stably) and three sizing tests that named flashinfer's backend.
+- **All of the above** (two runs against one of the image): EXL3 104.92 -> 109.68 / 109.92 tok/s greedy at one
+  request (+4.7 %), 112.04 -> 116.35 / 116.50 at T 0.6 (+3.9 %), two requests 76.56 -> 78.77 / 78.68 (+2.8 %), four
+  51.35 -> 52.74 / 52.57 (+2.5 %); NVFP4 103.00 -> 107.45 / 107.54 (+4.4 %), 106.82 -> 110.73 / 110.83 (+3.7 %), two
+  requests 74.10 -> 73.95 / 73.90 (unchanged, below), four 40.47 -> 40.74 / 40.75 (+0.7 %); the same greedy and
+  sampled answers.
+  A kernel trace of this build (EXL3, one request, T 0.6): 1,348 kernels a step, 22.8 ms (24.3 before). One card
+  (`xtx`, the launcher's 131,072-token context, one run each): EXL3 61.57 -> 63.27 tok/s greedy (+2.8 %), 62.43 ->
+  64.10 at T 0.6 (+2.7 %), agent turns 1.054 -> 1.053 s; the same answers. Twenty minutes of four agent-like
+  sessions on each checkpoint with the launchers' settings (tool outputs of 200-3000 tokens, 64-600-token answers
+  at T 0.6, one request in ten dropped mid-answer, contexts to 137k / 143k): 367 and 333 requests, no error; forty
+  minutes more on EXL3: 727 requests, contexts to 154k, no error.
+- **NVFP4 at two requests gains nothing** where EXL3 gains 2.8 %: each change turned off in turn (three runs of `two` an
+  arm) 72.2-72.4 tok/s, the image 72.3 twice, the build with all of them 72.4. Yet in a kernel trace of two sampled
+  requests the build's step is shorter (36.5 against 38.9 ms, 1,478 against 1,646 kernels). Sampled (three runs of
+  `two6` an arm) the build is slower: 65.4 / 65.7 tok/s against 67.3 / 67.8, with or without any one of the four launch
+  changes (65.3-65.7), and its drafts are kept less often (2.6-2.9 tokens a request step against 2.8-3.0 in the `[mtp]`
+  log). Put back for an experiment, the old chained-draft addressing (above) gave 66.7 / 67.8 against 65.5 / 66.5 for
+  the fixed one, its drafts kept more often (2.8-3.0 against 2.6-2.9). A possible reading: with the old addressing the
+  second request's chained guesses read the K/V the head's pass over the verify rows had written at those positions,
+  where now they read their own. Tried for every request (next item), it does not carry over. The fix stays (the old
+  addressing wrote into another request's slots); why NVFP4's two sampled requests lose ~2 % is open.
+- **Dropped: the chained guesses keeping the K/V of the head's pass over the verify rows.** Where a chained guess's
+  position is one of the step's verify rows, its K/V went to a junk slot and the guess read the pass's instead (EXL3,
+  two pairs): greedy drafts kept more often over the first 512 steps (2.53 -> 2.87 tokens a request step) but greedy
+  decode +0.5 % only, T 0.6 -2.2 % (116.7 / 116.9 -> 113.3 / 115.0), two sampled requests unchanged; greedy answers
+  identical. Not kept.
+
+## 40. Still open
 
 - In NVFP4 the model needs ~63 GiB of RAM for its experts alone (the engine keeps every expert in RAM). The EXL3 3.05
   bpw checkpoint needs 42.6 GiB and served under a 56 GiB container limit, but a real 64 GB machine is untested
@@ -1759,7 +1843,10 @@ ones, the 3 and the 4 long ones).
   ~32 that night, the 16 starts of a series after it were clean); one more at the first request of a start on
   2026-10-19 (on the XT, 1 of the night's 41 EXL3 starts, section 34), one on 2026-10-20 (NVFP4, the XTX, the first
   prefill, 1 in ~70 starts, section 36) and one on 2026-10-22 (EXL3, the XTX, the first request, 1 in ~20 starts,
-  section 38): cause not found; two hypotheses ruled out in section 38.
+  section 38): cause not found; two hypotheses ruled out in section 38. Not seen in ~80 starts on 2026-10-25 and 26
+  (section 39's build, both checkpoints), 31 of them in a row with the launcher's pools (19 EXL3, 12 NVFP4), a
+  7.5k-token first request and ROCm's debug agent loaded to name the faulting kernel
+  (`HSA_TOOLS_LIB=librocm-debug-agent.so.2`, in the image; it costs ~0.2 µs a kernel, so only for such a hunt).
 - Expert misses (section 20): the decode GEMVs now read them from host memory while computing the cached experts
   (section 38), so their PCIe time shows where it exceeds that work (a layer's GEMVs at one request, EXL3: 40.5 µs
   against 32.5 when the copy came first, the copy 34.6 -> 4.2 µs). Fewer of them is the lever left: a larger cache,
@@ -1793,12 +1880,18 @@ ones, the 3 and the 4 long ones).
   forward inside it (`FREETOKEN_SPEC_TIMING`, one run), then 1.4-1.5 ms launching the MTP head's KV pass (0.33 ms of GPU
   time). What holds it there (py-spy on rank 0, NVFP4, one run): 72 % of the scheduler thread's samples wait on the
   step's sampled tokens before the PLE fill, so the host is ahead of the GPU, not its limit.
-- A decode step at one request (EXL3 3.05 bpw, T 0.6, section 37) launches 1,625 kernels, ~3.5 µs apart under the
-  tracer; 133 are torch ops: ~36 small copies and index ops at the start of a step (the scheduler's positions and
-  mappings, the QSA metadata, the graph inputs, the sampling parameters: section 38), 15 in the PLE layer (its gate
-  in bf16 torch ops, whose sum order the fused sampling's approach would have to reproduce), ~40 around the verify
-  step and the drafts (most of them keeping `torch.topk`'s order). Sampling with a `top_k` above 64 keeps the torch
-  ops (ATen's sum order then changes with the row count).
+- NVFP4 decoding two requests: greedy as fast with section 39's changes as without them (72.3-72.4 tok/s), sampled ~2 %
+  slower after the chained-draft fix, the drafts kept less often (section 39); the chained guesses reading the K/V of
+  the head's pass over the verify rows instead did not help EXL3 (section 39). Not understood.
+- A decode step at one request (EXL3 3.05 bpw, T 0.6, section 39) launches 1,348 kernels (1,558 before it), ~3.5 µs
+  apart under the tracer (4.9 ms of a 22.8 ms traced step). Left of the small torch ops and copies: 7 of the 10 kernels
+  between a step's token writes and its first layer (among them the PLE rows' copy, the tokens read back for the PLE
+  store, the embedding lookup), 23 in the layers (most in the PLE layer: its gate in bf16 torch ops, whose sum order a
+  fused kernel would have to reproduce), 17 around the verify step and 17 in the drafts (most keeping `torch.topk`'s
+  order, the draws' random numbers, the drafts' copies to the host). Inside a layer every launch left reads what the one
+  before wrote: a MoE layer's ten (two of them two kernels' programs each), a GatedDeltaNet layer's eight; one launch
+  for such a chain would need a wait across the grid, and its parts run at different warps, which set their sums.
+  Sampling with a `top_k` above 64 keeps the torch ops (ATen's sum order then changes with the row count).
 - A cross-stream wait on the GPU leaves the decode graph replayed after it slow until the host synchronizes the other
   stream (section 33: the fix-up copy on a stream of its own, one request -5 %; joined on the GPU after each prefill,
   four requests a third slower); what in the HIP runtime keeps that state was not found. The shipped copies on the

@@ -28,6 +28,10 @@ What each change measured, and how it was found: [docs/rdna3/journey.md](docs/rd
   getting-started rewritten as a path for newcomers.
 - `rdna3/bench/depth_sweep.py`, `rdna3/bench/vision_tower_bench.py`, `rdna3/tests/shape_check.py --vision`, the
   banner's source (`docs/rdna3/assets/social-preview.html`).
+- `FREETOKEN_DECODE_INTERLEAVE_LONG` (off by default): with `FREETOKEN_DECODE_INTERLEAVE=N`, the requests decoding get N
+  steps only after a chunk that leaves prompt to read, so they keep moving through a long read while agent turns read in
+  one chunk are unchanged. EXL3 3.05 bpw, a 130k-token cold read beside a decoding request: 8 steps a chunk cost the
+  read 2.7 % and cut the decoding request's longest stop from 38 s to 4.9 s.
 
 ### Faster, the same bits
 
@@ -73,6 +77,14 @@ What each change measured, and how it was found: [docs/rdna3/journey.md](docs/rd
   each (greedy) and 43.6 -> 50.6 (T 0.6); NVFP4 98.2 -> 103.2, 101.0 -> 107.0, 37.6 -> 40.5 and 36.5 -> 39.4; the same
   greedy and sampled answers; agent turns and EXL3's cold reads unchanged, NVFP4's cold reads 0.8 % longer (the
   coarse-grained banks).
+- Decode, fewer launches a step: the step's inputs staged in one buffer and written into the graph by one copy and one
+  kernel (`FREETOKEN_STEP_INPUTS`); the expert cache's admission and its small copies in one launch
+  (`FREETOKEN_MOE_ENSURE_COPY`); the attention's q / k norms and rope in one (`FREETOKEN_QK_NORM_ROPE`); the router GEMV
+  with the shared expert's gate | up, the shared down projection with the router's top-k, one launch each
+  (`FREETOKEN_ROUTER_SHARED`). `xtx-xt-4x262k` against the previous build (two runs against one): EXL3 3.05 bpw 104.9 ->
+  109.8 tok/s greedy at one request, 112.0 -> 116.4 at T 0.6, two requests 76.6 -> 78.7, four 51.4 -> 52.7; NVFP4 103.0
+  -> 107.5, 106.8 -> 110.8, two requests unchanged, four 40.5 -> 40.7; one card (`xtx`, EXL3 3.05 bpw) 61.6 -> 63.3
+  and 62.4 -> 64.1; the same greedy and sampled answers.
 - Lower prefill VRAM peaks (in-place hyper-connections, blocked GatedDeltaNet prefill), and kernels that spilled
   registers on RDNA3 run more warps (prompt reading +2.6 to +3.5 %).
 
@@ -90,6 +102,15 @@ What each change measured, and how it was found: [docs/rdna3/journey.md](docs/rd
 
 ### Fixed
 
+- Two requests verifying drafts: the MTP head's chained guesses of every request but the first wrote their K/V at
+  another request's page-table row (the per-request row index, a strided view of the scheduler's row mapping, was read
+  as contiguous), so their next guesses read whatever K/V the head had left at those positions, and the other
+  request's head K/V was overwritten. The answers were unchanged (the verification is exact).
+  `tests/kernels/test_decode_glue.py` reproduces it. Measured after the fix, NVFP4's two sampled requests keep fewer
+  drafts and decode ~2 % slower than with the old addressing (open: [journey.md](docs/rdna3/journey.md) section 39).
+- The GPU checks and the CPU suite pass on ROCm: the chunked-prefill comparisons ran the toy layer's projections through
+  `F.linear`, whose sums change with the row count on ROCm; the block top-k case with ties relied on `torch.topk`'s
+  order of equal values, which is unspecified; three sizing tests named the CUDA-only flashinfer attention backend.
 - Long decode pauses (5-22 s, once 140 s): the kernel's memory compaction moved host memory the GPU driver maps. The
   engine locks its memory (`FREETOKEN_MLOCK`) and the host needs `vm.compact_unevictable_allowed=0`; the first request
   after an idle pause waits for the VRAM clock unless the `COMPUTE` power profile is set.

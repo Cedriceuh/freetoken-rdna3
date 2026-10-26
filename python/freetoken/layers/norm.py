@@ -99,6 +99,7 @@ class GemmaPlusOneRMSNorm(BaseOP):
         else:
             from freetoken.kernel.triton.norm import gemma_rmsnorm
 
+        self.triton = not is_flashinfer_installed()  # the Triton kernel (kernel/triton/norm.py) serves it
         self.eps = eps
         self.size = size
         self.weight = torch.empty(size)

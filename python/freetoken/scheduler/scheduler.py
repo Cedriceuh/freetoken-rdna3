@@ -45,6 +45,9 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 _DECODE_INTERLEAVE = int(os.environ.get("FREETOKEN_DECODE_INTERLEAVE", "0"))
+# FREETOKEN_DECODE_INTERLEAVE_LONG=1: the credit follows only a chunk that leaves prompt to read (a long read), so a
+# turn read in one chunk (an agent's tool output) never waits behind other requests' decode steps
+_INTERLEAVE_LONG = os.environ.get("FREETOKEN_DECODE_INTERLEAVE_LONG", "0") == "1"
 
 Indice2D: TypeAlias = Tuple[torch.Tensor, torch.Tensor]
 
@@ -67,6 +70,7 @@ ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
 class Scheduler(SchedulerIOMixin):
     def __init__(self, config: SchedulerConfig):
         self._decode_credit = 0
+        self._step_inputs = None  # engine/step_inputs.py, made at the first graph decode step
         from freetoken.engine import Engine
 
         self.engine = Engine(config)
@@ -870,6 +874,18 @@ class Scheduler(SchedulerIOMixin):
         self.cache_manager.allocate_paged(batch.reqs)
         for req in spec_reqs:
             req.device_len -= ahead - (m - 1)
+        staged = self._decode_step_inputs(batch)
+        if staged is not None:
+            # FREETOKEN_STEP_INPUTS: the same inputs staged in one buffer, written into the graph's by _forward's launch
+            slots = None
+            if self.engine.linear_state_pool is not None and self.cache_manager.is_hybrid:
+                pad = self.engine.linear_state_pool.padding_slot
+                slots = [r.linear_slot_idx if r.linear_slot_idx is not None else pad for r in batch.padded_reqs]
+            staged.stage_rows(batch, slots)
+            for req in spec_reqs:
+                req.device_len -= m - 1
+            return ForwardInput(batch=batch, sample_args=self.engine.sampler.prepare(batch), input_tuple=None,
+                                write_tuple=staged.stage_writes(batch))
         if batch.is_prefill:
             self._gather_multimodal(batch)
         batch.positions = _make_positions(batch, self.device)
@@ -914,6 +930,18 @@ class Scheduler(SchedulerIOMixin):
             write_tuple=write_mapping,
         )
 
+    def _decode_step_inputs(self, batch: Batch):
+        """The step-inputs staging (engine/step_inputs.py) when it serves this decode batch, else None."""
+        from freetoken.engine import step_inputs
+
+        if not step_inputs.ENABLED or not batch.is_decode or self.token_pool.stride(1) != 1:
+            return None
+        if self._step_inputs is None:
+            if not self.engine.graph_runner.graph_map:
+                return None
+            self._step_inputs = step_inputs.DecodeStepInputs(self.engine, self._model_is_mrope)
+        return self._step_inputs if self._step_inputs.applies(batch) else None
+
     def _gather_multimodal(self, batch: Batch) -> None:
         """Plan the chunk's encoder jobs, gather rows and scatter rows over the batch; the engine runs them before the LM forward."""
         jobs, plan, rows, block_ends = plan_mm_batch(batch.padded_reqs, self.engine.encoder_cache)
@@ -940,7 +968,8 @@ class Scheduler(SchedulerIOMixin):
             self._decode_credit = self._decode_credit - 1 if batch is not None else 0
         if batch is None:
             batch = self.prefill_manager.schedule_next_batch(self.prefill_budget)
-            if batch is not None and _DECODE_INTERLEAVE:
+            if batch is not None and _DECODE_INTERLEAVE and (
+                    not _INTERLEAVE_LONG or any(isinstance(r, ChunkedReq) for r in batch.reqs)):
                 self._decode_credit = _DECODE_INTERLEAVE
         if batch is None:
             batch = self.decode_manager.schedule_next_batch()
@@ -975,7 +1004,10 @@ class Scheduler(SchedulerIOMixin):
 
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
         batch, sample_args, input_mapping, output_mapping = forward_input
-        batch.input_ids = self.token_pool[input_mapping]
+        if input_mapping is None:  # staged (FREETOKEN_STEP_INPUTS)
+            self._step_inputs.launch(batch, self.token_pool)
+        else:
+            batch.input_ids = self.token_pool[input_mapping]
         if batch.is_decode and batch.spec_m > 1 and MTP_ENABLED:
             # a verify step advances its requests' live GDN states past cached_len until its kept rows are processed:
             # a request finishing in the drain of an earlier step meanwhile must not donate that state

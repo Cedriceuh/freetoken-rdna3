@@ -297,9 +297,10 @@ class GraphRunner:
 
     def replay(self, batch: Batch) -> torch.Tensor:
         assert self.can_use_cuda_graph(batch)
-        self.buffer.copy_from(batch)
         g = self.graph_map[(batch.padded_size, batch.spec_m)]
-        self.attn_backend.prepare_for_replay(batch)
+        if getattr(batch, "staged_inputs", None) is None:  # else the step-inputs kernel wrote them (step_inputs.py)
+            self.buffer.copy_from(batch)
+            self.attn_backend.prepare_for_replay(batch)
         g.replay()
         # a verify step views its logits per padded request ([padded_size, m, V]); a plain step keeps its real rows
         return self.buffer.logits[: (batch.padded_size if batch.spec_m > 1 else batch.size) * batch.spec_m]

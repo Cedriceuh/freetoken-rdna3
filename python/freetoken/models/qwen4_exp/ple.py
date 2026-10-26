@@ -347,17 +347,22 @@ def build_ple_metadata(
     )
     fla = getattr(batch, "fla_metadata", None)
     slots_dev = getattr(batch, "linear_table_idx", None)
-    # image rows hash as the placeholder token, never as the content pad ids
+    # image rows hash as the placeholder token, never as the content pad ids (a decode step's rows are sampled tokens
+    # and drafts, never pads)
     input_ids = batch.input_ids
-    if args.image_token_id is not None:
+    if args.image_token_id is not None and not batch.is_decode:
         input_ids = restore_placeholder(input_ids, args.image_token_id)
 
     if batch.is_decode and slots_dev is not None:
         slots = slots_dev.long()
         bs = slots.numel()
+        # the GatedDeltaNet metadata's indptr holds the same arange(bs + 1) * rows (the graph's static one)
+        cu = getattr(fla, "cu_seqlens", None)
+        if cu is None or cu.numel() != bs + 1 or cu.dtype != torch.int32:
+            cu = torch.arange(bs + 1, dtype=torch.int32, device=device) * rows_of(batch)
         return PLEMetadata(
             input_ids=input_ids,
-            cu_seqlens=torch.arange(bs + 1, dtype=torch.int32, device=device) * rows_of(batch),
+            cu_seqlens=cu,
             seq_lens=(rows_of(batch),) * bs,
             ngram_context=context_pool.index_select(0, slots).long(),
             state_slots=slots,
@@ -420,7 +425,7 @@ def commit_ngram_context(meta: PLEMetadata, fla, context_pool: torch.Tensor | No
         context_pool = _ngram_context_pool()
     ids = meta.input_ids.long()
     ctx_len = meta.ngram_context.shape[1]
-    steps = torch.arange(ctx_len, device=ids.device)
+    steps = None if meta.is_decode else torch.arange(ctx_len, device=ids.device)  # a decode step never reads it
     if meta.is_decode and meta.rows_per_req > 1:
         # m rows per request: the context after row j is window[:, j+1 : j+1+ctx_len]; spec_decode rolls back to it
         window = torch.cat([meta.ngram_context, ids.view(-1, meta.rows_per_req)], dim=1)

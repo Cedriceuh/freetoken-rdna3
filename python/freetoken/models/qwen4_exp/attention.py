@@ -24,6 +24,7 @@ from freetoken.distributed import get_tp_info
 from freetoken.layers import BaseOP, GemmaPlusOneRMSNorm, LinearColParallelMerged, LinearOProj, LinearReplicated
 from freetoken.layers.rotary import get_rope
 from freetoken.kernel.triton.attn_gate import sigmoid_gate_mul
+from freetoken.kernel.triton.qk_norm_rope import qk_norm_rope
 from freetoken.utils import div_even, nvtx_annotate
 
 if TYPE_CHECKING:
@@ -38,6 +39,8 @@ _FEWER_COPIES = os.environ.get("FREETOKEN_FEWER_COPIES", "1" if torch.version.hi
 # FREETOKEN_QSA_FUSED_GATE (default 1, with FREETOKEN_FEWER_COPIES): the output gate applied by the QSA backend, in the
 # attention's split merge when it has one (decode), instead of a launch of its own; the same ops, the same bits
 _FUSED_GATE = os.environ.get("FREETOKEN_QSA_FUSED_GATE", "1") != "0"
+# FREETOKEN_QK_NORM_ROPE: the q and k norms and the rope in one launch (kernel/triton/qk_norm_rope.py), the same bits
+_QK_NORM_ROPE = os.environ.get("FREETOKEN_QK_NORM_ROPE", "1") == "1"
 
 
 @dataclass(frozen=True)
@@ -176,6 +179,9 @@ class Qwen4ExpAttention(BaseOP):
             mrope_layout=rotary.mrope_layout,
         )
         self.indexer = Qwen4ExpIndexer(config, layer_id, prefix=f"{prefix}.indexer")
+        # the fused norms + rope reproduce the Triton gemma norm and the Triton mrope kernel
+        self._norm_rope_ok = (getattr(self.rotary, "_kernel", None) is not None and hasattr(self.rotary, "section_table")
+                              and self.q_norm.eps == self.k_norm.eps and self.q_norm.triton)
 
     @nvtx_annotate("QSA")
     def forward(self, x: torch.Tensor, batch: Batch, kv_only: bool = False) -> torch.Tensor | None:
@@ -183,7 +189,16 @@ class Qwen4ExpAttention(BaseOP):
         while several requests decode: later drafts read its KV, nothing reads its output)."""
         qg, k, v = self.qkv_proj.forward(x).split(self._qkv_split, dim=-1)
         qg = qg.view(-1, self.num_q, self.head_dim * 2)
-        if _FEWER_COPIES:
+        fused = None
+        if _FEWER_COPIES and _QK_NORM_ROPE and self._norm_rope_ok:
+            fused = qk_norm_rope(qg[..., : self.head_dim], k.view(-1, self.num_kv, self.head_dim), self.q_norm.weight,
+                                 self.k_norm.weight, self.q_norm.eps, True, batch.get_attn_positions(),
+                                 self.rotary._cos_sin_cache, self.rotary.section_table(qg.device))
+        if fused is not None:
+            q, k = fused
+            q, k = q.view(-1, self.qo_attn_dim), k.view(-1, self.kv_attn_dim)
+            gate = qg[..., self.head_dim :]
+        elif _FEWER_COPIES:
             # the norms read q and k where the projection wrote them and write them contiguous (same rows, same
             # warps: the bits of the copy-then-normalize-in-place form, two launches fewer); the K/V store reads v
             # there too (its own row stride)
@@ -197,9 +212,10 @@ class Qwen4ExpAttention(BaseOP):
             self.q_norm.forward_inplace(q)
             self.k_norm.forward_inplace(k)
             v = v.contiguous()
-        q, k = self.rotary.forward(
-            batch.get_attn_positions(), q.view(-1, self.qo_attn_dim), k.view(-1, self.kv_attn_dim)
-        )
+        if fused is None:
+            q, k = self.rotary.forward(
+                batch.get_attn_positions(), q.view(-1, self.qo_attn_dim), k.view(-1, self.kv_attn_dim)
+            )
         index = self.indexer.forward(x)
         backend = get_global_ctx().attn_backend
         if _FEWER_COPIES and _FUSED_GATE and getattr(backend, "takes_gate", False):

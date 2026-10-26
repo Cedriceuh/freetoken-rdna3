@@ -24,14 +24,11 @@ docker run --rm -w /opt/FreeToken --entrypoint python3 freetoken-rdna3:latest -m
 ```
 
 About 3 minutes (150 s on the reference machine with `--cpus 8`), no GPU needed, on the tree the image was built
-from: 1813 passed, 1555 skipped and 3 failures that fail the same way on upstream, from the environment (they need
-flashinfer, an NVIDIA-only package:
-`test_cache_budget.py::test_adjust_config_defaults_moe_cache_auto_for_auto_resolved_offload_backend`,
-`test_cache_budget.py::test_adjust_config_resolves_num_tokens_generic`,
-`test_offload.py::test_adjust_config_converts_moe_cache_rate_to_cache_size`).
+from: 1818 passed, no failure (the GPU tests skip). The whole suite in one process peaks above 12 GB of RAM: under a
+container memory limit, run it one `tests/` subdirectory at a time.
 
 To test source changes without rebuilding, mount your tree instead (`-v "$PWD":/src:ro -w /src -e
-PYTHONPATH=/src/python`); `test_swiglu_clamp.py::test_cpu_extension_supports_swiglu_clamp` then fails too, because the
+PYTHONPATH=/src/python`); `test_swiglu_clamp.py::test_cpu_extension_supports_swiglu_clamp` then fails, because the
 compiled CPU extension lives in the image's tree, not in yours; or build the extensions in your tree first (`python3
 setup.py build_ext --inplace` in the container, your tree mounted at `/opt/FreeToken`).
 

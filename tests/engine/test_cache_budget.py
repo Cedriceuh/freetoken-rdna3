@@ -11,6 +11,10 @@ from freetoken.engine.cache_budget import expert_bytes_per_slot, plan_cache_budg
 from freetoken.engine.engine import _pin_budget_bytes
 
 
+# the attention backend these sizing tests name: flashinfer's is CUDA-only (the config check refuses it on ROCm)
+_ATTN_BACKEND = "triton" if torch.version.hip else "fi"
+
+
 def test_moe_priority_fills_experts_up_to_total():
     # budget large enough to cache every expert; KV gets the remainder.
     # per_expert=100, cache_per_page=10, total=8 experts (L*E), E=4.
@@ -217,7 +221,7 @@ def test_adjust_config_resolves_num_tokens_generic():
         cuda_graph_bs = [1, 2]
         max_seq_len = 1024
         page_size = 1
-        attention_backend = "fi"
+        attention_backend = _ATTN_BACKEND
         num_page_override = None
         num_token_override = 5000
 
@@ -367,7 +371,7 @@ def _offload_engine_config(**overrides):
         model_path="/tmp/freetoken-test-model",
         tp_info=DistributedInfo(rank=0, size=1),
         dtype=torch.bfloat16,
-        attention_backend="fi",
+        attention_backend=_ATTN_BACKEND,
         **overrides,
     )
     object.__setattr__(

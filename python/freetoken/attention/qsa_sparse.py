@@ -252,11 +252,20 @@ class QSASparseAttnBackend(BaseAttnBackend):
         )
         self._graph["kvlen"][:bs].copy_(md.kv_len_cpu.to(self.device, non_blocking=True))
         self._graph["table_idx"][:bs].copy_(table_idx)
+        self.stage_static(md, bs, m)
+
+    def stage_static(self, md: QSASparseMetadata, bs: int, m: int = 1) -> None:
+        """Point the decode metadata at the static graph buffers (filled by ``_stage_decode``, or by the step-inputs
+        kernel of engine/step_inputs.py from ``static_targets``)."""
         md.block_table = self._graph["block_table"][:bs]
         md.seq_lens = self._graph["kvlen"][:bs]
         md.ring_slots = self._graph["table_idx"][:bs]
         md.token_to_req = self._graph[f"token_to_req{m}"][: bs * m]
         md.cu_seqlens = self._graph[f"cu_seqlens{m}"][: bs + 1]
+
+    def static_targets(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        """(block table, K/V lengths, ring slots, page size): the buffers ``_stage_decode`` fills."""
+        return self._graph["block_table"], self._graph["kvlen"], self._graph["table_idx"], self.page_size
 
     def _snapshot_decode(self, md: QSASparseMetadata, batch: Batch) -> None:
         """Eager decode (not graph-staged): this step's rows, once per forward. The live

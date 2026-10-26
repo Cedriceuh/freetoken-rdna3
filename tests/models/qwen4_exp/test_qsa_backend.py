@@ -130,9 +130,26 @@ def test_flashinfer_dense_matches_the_sparse_path():
     torch.testing.assert_close(got.float(), reference.float(), rtol=2e-2, atol=2e-2)
 
 
+@pytest.fixture
+def row_invariant_projections(monkeypatch):
+    """The toy layer's bf16 projections go to F.linear, whose BLAS pick -- hence the bits -- changes with the row count
+    on ROCm: a chunk's rows would not get the one-shot pass's bits before the attention runs. Computed a row at a time,
+    the test checks the QSA backend's chunked path itself."""
+    from freetoken.layers.quantization.linear import unquantized
+
+    apply = unquantized.TorchLinearKernel.apply
+
+    def per_row(self, layer, x):
+        if x.dim() == 2 and x.shape[0] > 1:
+            return torch.cat([apply(self, layer, x[i : i + 1]) for i in range(x.shape[0])])
+        return apply(self, layer, x)
+
+    monkeypatch.setattr(unquantized.TorchLinearKernel, "apply", per_row)
+
+
 @requires_cuda
 @pytest.mark.parametrize("cut", [1001, 4096, 4097], ids=["unaligned", "page-boundary", "boundary+1"])
-def test_chunked_prefill_matches_one_shot(cut: int):
+def test_chunked_prefill_matches_one_shot(cut: int, row_invariant_projections):
     """Cut points that are not multiples of index_ratio exercise the dual-source compress."""
     config = parsed_config()
     fixture = Fixture(config, num_pages=512)

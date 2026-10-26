@@ -689,7 +689,8 @@ class CacheManager:
             yield
         finally:
             del self._free
-            self.free_slots = torch.cat([self.free_slots] + lazy_free_list)
+            if lazy_free_list:  # a cat of the list alone would still copy it (one kernel a decode step)
+                self.free_slots = torch.cat([self.free_slots] + lazy_free_list)
 
     def _allocate(self, needed_pages: int) -> torch.Tensor:
         if needed_pages > (free_pages := len(self.free_slots)):

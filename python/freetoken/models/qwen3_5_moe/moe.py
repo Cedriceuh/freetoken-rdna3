@@ -49,18 +49,26 @@ class _SharedExpert(BaseOP):
         """Int8 decode rows: the gate | up GEMV applies silu_and_mul as it stores (FREETOKEN_SHARED_ACT_IN_GEMV), the
         same bits as the Triton activation after it, one kernel less; None otherwise (flashinfer's activation is
         another reference)."""
-        gu = self.gate_up_proj
-        if not (x.is_cuda and x.dim() == 2 and x.dtype is torch.bfloat16 and x.stride(-1) == 1 and gu.bias is None):
+        if not self._act_int8_ok(x):
             return None
+        from freetoken.kernel.triton.int8_gemv import gemv_int8_act_mul
+
+        gu = self.gate_up_proj
+        return gemv_int8_act_mul(x, gu.weight, gu.weight_scale)
+
+    def _act_int8_ok(self, x: torch.Tensor) -> bool:
+        """``_gate_up_act_int8`` applies to ``x``."""
+        gu = self.gate_up_proj
+        if not (_ACT_IN_GEMV and x.is_cuda and x.dim() == 2 and x.dtype is torch.bfloat16 and x.stride(-1) == 1
+                and gu.bias is None):
+            return False
         from freetoken.kernel.backend import is_flashinfer_installed
-        from freetoken.kernel.triton.int8_gemv import ROWS_MAX, gemv_int8_act_mul
+        from freetoken.kernel.triton.int8_gemv import ROWS_MAX
         from freetoken.layers.quantization.int8_weight_only import Int8WeightOnlyLinearMethod
 
         m = x.shape[0]
-        if (not isinstance(gu.quant_method, Int8WeightOnlyLinearMethod) or is_flashinfer_installed()
-                or not (m == 1 or (1 < m <= ROWS_MAX and x.is_contiguous()))):
-            return None
-        return gemv_int8_act_mul(x, gu.weight, gu.weight_scale)
+        return (isinstance(gu.quant_method, Int8WeightOnlyLinearMethod) and not is_flashinfer_installed()
+                and (m == 1 or (1 < m <= ROWS_MAX and x.is_contiguous())))
 
 
 class Qwen3_5DenseMLP(_SharedExpert):

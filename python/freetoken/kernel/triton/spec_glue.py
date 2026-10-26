@@ -133,14 +133,14 @@ def draft_rows(positions: torch.Tensor, n_acc: torch.Tensor, m: int, depth: int)
 
 
 @triton.jit
-def _chain_meta_kernel(pos, stride_pos, table_idx, page_table, stride_pt, pos32, seq_lens, out_loc, delta, mrope,
-                       reqs, HAS_MROPE: tl.constexpr):
+def _chain_meta_kernel(pos, stride_pos, table_idx, stride_t, page_table, stride_pt, pos32, seq_lens, out_loc, delta,
+                       mrope, reqs, HAS_MROPE: tl.constexpr):
     r = tl.program_id(0)
     p = tl.load(pos + r * stride_pos)
     p32 = p.to(tl.int32)
     tl.store(pos32 + r, p32)
     tl.store(seq_lens + r, p32 + 1)
-    row = tl.load(table_idx + r).to(tl.int64)
+    row = tl.load(table_idx + r * stride_t).to(tl.int64)
     tl.store(out_loc + r, tl.load(page_table + row * stride_pt + p))
     if HAS_MROPE:
         v = p32 + tl.load(delta + r)
@@ -149,7 +149,8 @@ def _chain_meta_kernel(pos, stride_pos, table_idx, page_table, stride_pt, pos32,
 
 
 def chain_meta(pos: torch.Tensor, table_idx: torch.Tensor, page_table: torch.Tensor, delta: torch.Tensor | None):
-    """``(pos32, seq_lens = pos32 + 1, out_loc = page_table[table_idx, pos], mrope [3, reqs] = pos32 + delta)``."""
+    """``(pos32, seq_lens = pos32 + 1, out_loc = page_table[table_idx, pos], mrope [3, reqs] = pos32 + delta)``;
+    ``table_idx`` may be strided (the scheduler's ``active_table_idx`` is its row mapping's ``[::m]`` view)."""
     reqs = pos.numel()
     dev = pos.device
     pos32 = torch.empty(reqs, dtype=torch.int32, device=dev)
@@ -157,9 +158,9 @@ def chain_meta(pos: torch.Tensor, table_idx: torch.Tensor, page_table: torch.Ten
     out_loc = torch.empty(reqs, dtype=page_table.dtype, device=dev)
     mrope = torch.empty(3, reqs, dtype=torch.int32, device=dev) if delta is not None else None
     assert page_table.stride(1) == 1
-    _chain_meta_kernel[(reqs,)](pos, pos.stride(0), table_idx, page_table, page_table.stride(0), pos32, seq_lens,
-                                out_loc, delta if delta is not None else pos32, mrope if mrope is not None else pos32,
-                                reqs, HAS_MROPE=delta is not None, num_warps=1)
+    _chain_meta_kernel[(reqs,)](pos, pos.stride(0), table_idx, table_idx.stride(0), page_table, page_table.stride(0),
+                                pos32, seq_lens, out_loc, delta if delta is not None else pos32,
+                                mrope if mrope is not None else pos32, reqs, HAS_MROPE=delta is not None, num_warps=1)
     return pos32, seq_lens, out_loc, mrope
 
 
