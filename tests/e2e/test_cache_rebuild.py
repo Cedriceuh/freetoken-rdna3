@@ -2,7 +2,8 @@
 
 Boots ``ft serve`` on a small checkpoint and drives POST /v1/cache/rebuild for real: the whole
 chain of HTTP route -> control message -> scheduler idle gate -> engine teardown -> pool resize
--> page-table refresh -> CUDA-graph re-capture, then checks the server still generates.
+-> page-table refresh -> CUDA-graph re-capture, then checks the server still generates. The same
+boot also drives /v1/cache/flush, which drops the prefix cache without touching the pools.
 
 This is the primary gate for the rebuild path. The destructive orchestration has no in-process
 seam worth stubbing -- what matters is that a rebuild lands on a live engine and the server keeps
@@ -15,12 +16,14 @@ Gated behind ``needs_weights``:
   FREETOKEN_REBUILD_TEST_MODEL  small local model dir (falls back to FREETOKEN_TEST_MODEL)
   FREETOKEN_REBUILD_MIN_FREE_GIB  free-GPU-memory gate (default 20)
   FREETOKEN_REBUILD_BOOT_TIMEOUT  seconds to wait for "serving" (default 300)
+  FREETOKEN_REBUILD_EXTRA_ARGS    additional ft serve flags (e.g. offloaded MoE)
 """
 
 from __future__ import annotations
 
 import json
 import os
+import shlex
 import socket
 import subprocess
 import sys
@@ -91,7 +94,7 @@ def _wait_until_serving(base: str, proc: subprocess.Popen, deadline: float) -> N
 
 
 def _generate(base: str) -> str:
-    """A short non-thinking completion — the point is that the engine still runs, not what it says."""
+    """A short completion; reasoning models may spend the whole budget in their thought channel."""
     code, body = _post(
         base,
         "/v1/chat/completions",
@@ -104,7 +107,8 @@ def _generate(base: str) -> str:
         },
     )
     assert code == 200, body
-    return str(body["choices"][0]["message"]["content"])
+    message = body["choices"][0]["message"]
+    return message.get("content") or message.get("reasoning_content") or ""
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="cache rebuild e2e needs CUDA")
@@ -112,7 +116,7 @@ def test_cache_rebuild_resizes_a_live_engine_and_keeps_serving(tmp_path):
     model_dir = _model_dir()
     if model_dir is None:
         pytest.skip("set FREETOKEN_REBUILD_TEST_MODEL to a small local model directory")
-    if not model_dir.is_dir():
+    if not model_dir.is_dir() and not model_dir.is_file():
         pytest.skip(f"model is not downloaded: {model_dir}")
 
     min_free = float(os.environ.get("FREETOKEN_REBUILD_MIN_FREE_GIB", "20"))
@@ -131,6 +135,8 @@ def test_cache_rebuild_resizes_a_live_engine_and_keeps_serving(tmp_path):
             "--host", "127.0.0.1",
             "--port", str(port),
             "--num-pages", str(BOOT_PAGES),
+            "--enable-cache-report",
+            *shlex.split(os.environ.get("FREETOKEN_REBUILD_EXTRA_ARGS", "")),
         ],
         stdout=log,
         stderr=subprocess.STDOUT,
@@ -143,6 +149,27 @@ def test_cache_rebuild_resizes_a_live_engine_and_keeps_serving(tmp_path):
         geometry = _get(base, "/v1/cache/status")["geometry"]
         assert geometry["num_pages"] == BOOT_PAGES
         assert _generate(base)  # a baseline generation, before anything is torn down
+
+        # 0. Flush the prefix cache. Long enough for a hybrid model to snapshot a reusable prefix.
+        chat = {
+            "model": "rebuild-test",
+            "messages": [{"role": "user", "content": "Summarize in one word: " + "the cache keeps every prompt it has seen. " * 40}],
+            "max_tokens": 16,
+            "temperature": 0.0,
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
+        code, cold = _post(base, "/v1/chat/completions", chat)
+        assert code == 200, cold
+        code, warm = _post(base, "/v1/chat/completions", chat)
+        assert code == 200, warm
+        assert warm["usage"]["prompt_tokens_details"]["cached_tokens"] > 0
+        code, reply = _post(base, "/v1/cache/flush", {})
+        assert (code, reply["status"]) == (200, "ok"), reply
+        code, flushed = _post(base, "/v1/chat/completions", chat)
+        assert code == 200, flushed
+        assert "prompt_tokens_details" not in flushed["usage"]  # nothing left to hit
+        # A cold run after the flush computes exactly what the cold run before it did.
+        assert flushed["choices"][0]["message"]["content"] == cold["choices"][0]["message"]["content"]
 
         # 1. Grow the KV pool. The reply carries the geometry the engine actually landed on.
         code, reply = _post(base, "/v1/cache/rebuild", {"num_pages": GROWN_PAGES})

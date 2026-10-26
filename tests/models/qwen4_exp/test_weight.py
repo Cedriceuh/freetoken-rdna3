@@ -395,6 +395,29 @@ def test_hash_constants_stay_int64(loaded):
         assert loaded[f"model.layers.0.ple.ple_embedding.{leaf}"].dtype is torch.int64
 
 
+def test_tensors_beside_the_index_load_too(tmp_path, loaded):
+    """exllamav3 checkpoints keep the n-gram hash constants (and the MTP head's mixer) in files their index does not
+    name: the loader's index-first shard list would skip them, iter_weights reads them as well."""
+    from safetensors import safe_open
+
+    torch.manual_seed(0)
+    raw = _raw_checkpoint()
+    leaves = ("layer_multipliers", "ngram_heads_offsets", "ngram_heads_vocab_sizes")
+    side = {n: raw.pop(n) for n in list(raw) if n.endswith(leaves)}
+    assert side
+    folder, _ = _write_checkpoint(tmp_path, raw, None)
+    weight_map = {}
+    for shard in sorted(tmp_path.glob("model-*.safetensors")):
+        with safe_open(str(shard), framework="pt") as f:
+            weight_map.update({k: shard.name for k in f.keys()})
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}))
+    save_file(side, str(tmp_path / "ngram_constants.safetensors"))
+    got = _load(folder)
+    for leaf in leaves:
+        key = f"model.layers.0.ple.ple_embedding.{leaf}"
+        assert torch.equal(got[key], loaded[key]), leaf
+
+
 def test_load_ple_table_concatenates_shards_in_index_order(checkpoint):
     folder, raw = checkpoint
     args = SimpleNamespace(split_ngram_parts=NGRAM_SHARDS, ngram_head_dim=NGRAM_DIM)

@@ -142,7 +142,8 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         moe_intermediate_size=768,
         expert_formats=("bf16",),
         aliases=("Qwen/Qwen3-30B-A3B-Thinking-2507",),
-        arch_aliases=("Qwen3VLMoeForConditionalGeneration", "Qwen3MoeGGUFForCausalLM"),  # Qwen3-VL-30B-A3B: same text tower
+        # Qwen3-VL-30B-A3B: same text tower
+        arch_aliases=("Qwen3VLMoeForConditionalGeneration", "Qwen3MoeGGUFForCausalLM", "Qwen3VLMoeGGUFForCausalLM"),
     ),
     AotModel(
         name="Qwen/Qwen3.5-35B-A3B",
@@ -326,6 +327,8 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
     AotModel(
         name="deepseek-ai/DeepSeek-V4-Flash",
         architecture="DeepseekV4ForCausalLM",
+        # llama.cpp deepseek4 GGUF (unsloth 0731 GGUF; text only)
+        arch_aliases=("DeepseekV4GGUFForCausalLM",),
         hidden_size=4096,
         kv_groups=(),  # MLA latent pool writes via torch scatter, not store_cache
         top_k=6,
@@ -344,6 +347,17 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         moe_intermediate_size=2304,
         expert_formats=("ds_fp4",),
     ),
+    AotModel(
+        name="RecursiveSI/flint",
+        architecture="FlintForCausalLM",
+        hidden_size=2048,
+        kv_groups=((4, 128),),
+        top_k=6,
+        moe_intermediate_size=512,
+        expert_formats=("bf16", *_NVFP4_FORMATS),
+        aliases=("FutureMLS-Lab/flint-nvfp4-coldgptq",),
+        arch_aliases=("FlintGGUFForCausalLM",),
+    ),
     # ---- dense checkpoints (store/index only, no expert banks) ----
     AotModel(
         name="Qwen/Qwen3.6-27B",
@@ -358,7 +372,7 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         architecture="Gemma4UnifiedForConditionalGeneration",
         hidden_size=3840,
         kv_groups=((1, 512), (8, 256)),
-        arch_aliases=("Gemma4UnifiedForCausalLM",),
+        arch_aliases=("Gemma4UnifiedForCausalLM", "Gemma4UnifiedGGUFForCausalLM"),
     ),
     AotModel(
         name="nvidia/Gemma-4-31B-IT-NVFP4",
@@ -393,7 +407,8 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         architecture="Qwen3ForCausalLM",
         hidden_size=4096,
         kv_groups=((8, 128),),
-        arch_aliases=("Qwen3VLForConditionalGeneration", "Qwen3GGUFForCausalLM"),  # Qwen3-VL-8B: same text tower
+        # Qwen3-VL: same text tower
+        arch_aliases=("Qwen3VLForConditionalGeneration", "Qwen3GGUFForCausalLM", "Qwen3VLGGUFForCausalLM"),
     ),
     AotModel(
         name="mistralai/Mistral-7B-Instruct-v0.3",

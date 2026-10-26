@@ -460,8 +460,9 @@ class DiskRowTable:
 
         self._wait_sync = probe_wait_sync(_sync_mode(), self._device)
         # one flag for all graphs: the readback event orders a fill after the previous graph, so signals never overlap
-        self._flag = alloc_pinned_tensor(1, dtype=torch.int64)
-        self._flag.zero_()
+        from freetoken.kernel.row_store import alloc_sync_flag
+
+        self._flag = alloc_sync_flag() if self._wait_sync else None
         self._token_readback = alloc_pinned_tensor(max_graph_rows, dtype=torch.int32)
         self._readback_event = torch.cuda.Event()
         self._ahead = _DraftReads(self._store, self._token_bytes, max_graph_rows) if _DRAFT_READS else None

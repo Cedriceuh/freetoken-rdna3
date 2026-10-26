@@ -107,6 +107,20 @@ _EXL3_PLE_CONSTANTS = {
 _EXL3_VISION_QKV = re.compile(r"^model\.visual\.blocks\.\d+\.attn\.[qkv]_proj\.")
 
 
+def _checkpoint_files(model_path: str) -> list[str]:
+    """The shards the index names, then the folder's other ``*.safetensors``: exllamav3 writes some tensors beside the
+    index (the n-gram hash constants in ``ngram_embedding.safetensors``, the MTP head's mixer, a vision patch), which
+    the index-only ``iter_weight_files`` would skip."""
+    files = iter_weight_files(model_path)
+    listed = {os.path.realpath(f) for f in files}
+    folder = download_hf_weight(model_path)
+    extra = sorted(
+        p for p in (os.path.join(folder, n) for n in os.listdir(folder))
+        if p.endswith(".safetensors") and not p.endswith("consolidated.safetensors") and os.path.realpath(p) not in listed
+    )
+    return [*files, *extra]
+
+
 def _is_exl3() -> bool:
     try:
         quant = get_quant_config()
@@ -508,7 +522,7 @@ def iter_weights(
             yield from emitted
 
     for file in tqdm(
-        iter_weight_files(model_path),
+        _checkpoint_files(model_path),
         desc="Loading weights",
         disable=not get_tp_info().is_primary(),
     ):
@@ -539,7 +553,7 @@ def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple
     """The vision tower alone, named as iter_weights names it."""
     if _is_exl3():
         raise NotImplementedError("the encoder-only reader does not decode EXL3 tensors; load the whole checkpoint")
-    for file in iter_weight_files(model_path):
+    for file in _checkpoint_files(model_path):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
             for raw_name in f.keys():
                 name = _rename(raw_name)

@@ -1,3 +1,4 @@
+#include <freetoken/pinned.h>
 #include <freetoken/tensor.h>
 #include <freetoken/utils.cuh>
 #include <freetoken/utils.h>
@@ -161,37 +162,6 @@ __always_inline __device__ void store_vec(void* __restrict__ dst, const Tp& vec)
 }
 
 
-
-// Pinned host memory is GPU-dereferenceable at its host VA only where UVA identity
-// holds (Linux). On Windows/WDDM, cudaHostRegister'd memory maps to a different device
-// address, so host-resident tensors are translated here -- the one point their pointer
-// enters kernel params. Cached once per process: FreeToken pins one CUDA device per
-// process (set at engine launch).
-inline bool host_ptr_identity() {
-    static const bool identity = [] {
-        int device = 0;
-        if (cudaGetDevice(&device) != cudaSuccess) {
-            return false;  // fail closed: translate (and surface errors), don't assume identity
-        }
-        int uva = 0, reg = 0;
-        cudaDeviceGetAttribute(&uva, cudaDevAttrUnifiedAddressing, device);
-        cudaDeviceGetAttribute(&reg, cudaDevAttrCanUseHostPointerForRegisteredMem, device);
-        return uva == 1 && reg == 1;
-    }();
-    return identity;
-}
-
-inline void* device_alias(void* ptr, DLDevice dev) {
-    if (dev.device_type == kDLCUDA || dev.device_type == kDLROCM || host_ptr_identity()) {
-        return ptr;
-    }
-    void* mapped = nullptr;
-    const auto err = cudaHostGetDevicePointer(&mapped, ptr, 0);
-    host::RuntimeCheck(err == cudaSuccess,
-        "fast_index_copy: host tensor must be pinned+mapped (cudaHostGetDevicePointer: ",
-        cudaGetErrorString(err), ")");
-    return mapped;
-}
 
 struct IndexKernelParams {
     void* __restrict__ dst;
@@ -507,13 +477,15 @@ struct FastIndexCopyKernel {
 // block b copies bank `b = blockIdx.x / kBlocksPerBank`, grid-striding over that
 // bank's (num_indices * feat/16) 16-byte units. Pointers + feature sizes are passed
 // as small device arrays (built once by the cache), so it stays CUDA-graph capturable.
+// With wait_flag set, each block first waits for *wait_flag >= 1, a flag in mapped host memory the CPU sets once the source rows are written.
 struct MultiIndexCopyParams {
     const int64_t* __restrict__ dst_ptrs;     // [B] device, each base addr of a bank slot cache
     const int64_t* __restrict__ src_ptrs;     // [B] device, each GPU-visible base addr of a bank host source
     const int64_t* __restrict__ feat_bytes;   // [B] device, per-row bytes (multiple of 16)
     const void* __restrict__ dst_indices;     // [L]
-    const void* __restrict__ src_indices;     // [L]
+    const void* __restrict__ src_indices;     // [L], or null: row i copies source row i
     const int64_t* __restrict__ valid_length; // [1] or null
+    const volatile int64_t* wait_flag;        // GPU-visible address, or null: no wait
     int64_t length;                           // max L
     int num_banks;
 };
@@ -522,6 +494,18 @@ template <typename IdType, std::size_t kNumThreads, std::size_t kBlocksPerBank>
 __global__ __launch_bounds__(kNumThreads) void fast_index_copy_multi(
     const __grid_constant__ MultiIndexCopyParams p
 ) {
+    if (p.wait_flag != nullptr) {
+        if (threadIdx.x == 0) {
+            while (*p.wait_flag < 1) {
+#if !FREETOKEN_USE_ROCM && __CUDA_ARCH__ >= 700
+                __nanosleep(100);
+#endif
+            }
+            // with the volatile read above, an acquire: the block reads the rows written before the flag
+            __threadfence_system();
+        }
+        __syncthreads();
+    }
     const int b = static_cast<int>(blockIdx.x / kBlocksPerBank);
     if (b >= p.num_banks) {
         return;
@@ -540,7 +524,7 @@ __global__ __launch_bounds__(kNumThreads) void fast_index_copy_multi(
         const int64_t row = u / units;
         const int64_t col = (u - row * units) << 4;  // byte offset within the row
         const int64_t pd = static_cast<int64_t>(di[row]);
-        const int64_t ps = static_cast<int64_t>(si[row]);
+        const int64_t ps = si ? static_cast<int64_t>(si[row]) : row;
         const uint4 v = *reinterpret_cast<const uint4*>(src + ps * feat + col);
         *reinterpret_cast<uint4*>(dst + pd * feat + col) = v;
     }
@@ -553,8 +537,9 @@ struct MultiIndexCopyKernel {
         tvm::ffi::TensorView src_ptrs,
         tvm::ffi::TensorView feat_bytes,
         tvm::ffi::TensorView dst_indices,
-        tvm::ffi::TensorView src_indices,
-        tvm::ffi::Optional<tvm::ffi::TensorView> num_indices
+        tvm::ffi::Optional<tvm::ffi::TensorView> src_indices,
+        tvm::ffi::Optional<tvm::ffi::TensorView> num_indices,
+        int64_t wait_flag
     ) {
         using namespace host;
         auto device = SymbolicDevice{};
@@ -567,7 +552,13 @@ struct MultiIndexCopyKernel {
         TensorMatcher({B}).with_dtype<int64_t>(ptr_dtype).with_device<kDLCUDA, kDLROCM>(device)
             .verify(dst_ptrs).verify(src_ptrs).verify(feat_bytes);
         TensorMatcher({L}).with_dtype<int32_t, int64_t>(indices_dtype).with_device<kDLCUDA, kDLROCM>(device)
-            .verify(dst_indices).verify(src_indices);
+            .verify(dst_indices);
+        const void* src_rows = nullptr;
+        if (src_indices.has_value()) {
+            TensorMatcher({L}).with_dtype<int32_t, int64_t>(indices_dtype).with_device<kDLCUDA, kDLROCM>(device)
+                .verify(src_indices.value());
+            src_rows = src_indices.value().data_ptr();
+        }
 
         const int64_t* valid_length = nullptr;
         if (num_indices.has_value()) {
@@ -582,8 +573,9 @@ struct MultiIndexCopyKernel {
             static_cast<const int64_t*>(src_ptrs.data_ptr()),
             static_cast<const int64_t*>(feat_bytes.data_ptr()),
             dst_indices.data_ptr(),
-            src_indices.data_ptr(),
+            src_rows,
             valid_length,
+            reinterpret_cast<const volatile int64_t*>(wait_flag),
             static_cast<int64_t>(L.unwrap()),
             num_banks,
         };

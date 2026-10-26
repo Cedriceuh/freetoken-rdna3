@@ -87,8 +87,8 @@ def _down_topk_kernel(da, dw, dscale, dout, DN, DK, d_stride_wn, d_k_per, d_stri
         _gemv_splitk_int8_body(pid, 0, da, dw, dscale, dout, dout, DN, DK, d_stride_wn, 0, d_k_per, 1, D_BLOCK_N,
                                D_BLOCK_K, ROWS, d_stride_am, d_stride_om, ONE_PASS, 0, 0)
     else:
-        _router_body(pid - D_PROGS, scores, tw, ti, scores, ROWS, s_stride_m, 1, w_stride_m, 1, i_stride_m, 1, E,
-                     TOPK, 1, BLOCK_E, BLOCK_TOPK, RENORMALIZE, False, False, KEYS)
+        _router_body(pid - D_PROGS, scores, scores, tw, ti, scores, ROWS, 1.0, s_stride_m, 1, w_stride_m, 1,
+                     i_stride_m, 1, E, TOPK, 1, BLOCK_E, BLOCK_TOPK, False, 1, 1, 1, RENORMALIZE, False, False, KEYS)
 
 
 def shared_down_and_topk(act: torch.Tensor, qweight: torch.Tensor, scale: torch.Tensor, logits: torch.Tensor,
