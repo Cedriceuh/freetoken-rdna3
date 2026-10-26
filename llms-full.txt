@@ -814,6 +814,7 @@ disagreements over ~8k sampled tokens in `check` mode). It is on the torch.distr
 |---|---|---|
 | `FREETOKEN_PLE_SYNC` | `auto` | How a captured decode step gets its PLE disk rows. `auto` probes the stream memops once at start: `wait-sync` (the step waits inside the graph for the host fill) where a captured wait holds three replays in a row (ROCm 10 on these cards); else `launch-gating` (the host fills before each launch). On one GPU without the MTP head (the scheduler then overlaps its decode steps) `auto` takes `launch-gating`: wait-sync costs ~11 ms a step there (NVFP4 `xtx --no-mtp`: 26.6 tok/s against 38.3). The log says which. `wait`: require memops, `gate`: never use them. Elsewhere wait-sync gives +1.6-4.3 % decode over launch-gating, bit-exact. |
 | `FREETOKEN_PLE_PREFILL_PREFETCH` | `1` | With `--ple-backend disk` (every profile): a thread reads a prefill's PLE rows from the checkpoint while the layers before the PLE layer launch (the lookup waits for them), and while a chunk of a longer prompt computes it reads the next chunk's rows into the other pinned buffer, instead of a read before each forward with the GPUs idle (~1.1 s for a 16k-token chunk on the reference NVMe). The same rows: **bit-exact** (`tests/models/qwen4_exp/test_ple_disk.py`). `xtx-xt-4x262k`: cold reads of 96-164k tokens ~14 % shorter (EXL3 3.05 bpw 164k 62.1 -> 53.4 s), agent turns 2-3 %; decode unchanged. `0`: the read before each forward. |
+| `FREETOKEN_PLE_FILL_THREAD` | `1` on ROCm, `0` elsewhere | Under wait-sync, a graph decode step's PLE fill runs on a thread started before the launch instead of after it, as upstream's HIP path does: a graph of more kernels than the hardware queue holds (between 8,192 and 16,384 on these cards; a decode step's graph launches ~1,350 at one request) blocks the launch call until its first packets have run, and those wait for the fill (`tests/models/qwen4_exp/test_ple_disk.py::test_wait_sync_large_graph` hangs without the thread). The same rows: **bit-exact**; on `xtx-xt-4x262k` (EXL3 3.05 bpw, two pairs) one request 110.13 / 110.15 tok/s against 110.27 / 110.15 without it, 116.90 / 117.07 at T 0.6 against 116.87 / 116.99, two and four requests the same. `0`: the fill after the launch. |
 | `FREETOKEN_PLE_DRAFT_READS` | `1` | With `--ple-backend disk`, decoding with the MTP head: the next step's PLE rows are read on a thread while the GPU drafts, into a 16,384-row RAM cache of the decode store (the first token's once the verify step's kept tokens reach the host, each draft's once the head has drawn it; the thread polls for them with short sleeps, HIP's event wait spinning a core for the whole wait, except for the last draft, whose read the fill waits for); the step's own fill then finds them there instead of reading every row from disk after the drafts. The bytes of the reads: **bit-exact** (`tests/models/qwen4_exp/test_ple_disk.py`). On `xtx-xt-4x262k` (EXL3 3.05 bpw, one request) the fill after the drafts 0.75 -> 0.17 ms, 99 % of its rows found in the cache; decode +0.7 % greedy, +0.5 % at T 0.6 (two pairs); four requests unchanged (the fill 1.1 -> 0.2 ms there too, but the host reaches each step after the GPU has finished the one before: its readback wait is ~0). `0`: the fill reads them all. |
 | `FREETOKEN_PLE_PREFILL_RANK0` | `1` | With `--ple-backend disk` at TP>1: only rank 0 reads a prefill's PLE rows from disk and broadcasts their bytes to the other ranks at the lookup (every rank stages every head, so the bytes are the same: **bit-exact**), instead of every rank reading the same rows at once from the same disk. Agent turns 4-7 % shorter on `xtx-xt-4x262k` (EXL3 3.05 bpw 0.466 -> 0.435 s, NVFP4 0.693 -> 0.662 s); decode and four requests unchanged. `0`: each rank reads its own. |
 | `FREETOKEN_ROW_STORE_RINGS` | `4` | The disk row store (`--ple-backend disk`, every profile): a fill of 256 rows or more splits over this many io_uring rings, one thread each. One thread drove 240-290k reads a second whatever its queue depth; the reference machine's NVMe (PCIe 3 x4) takes ~490k a second from four. A row that crosses a 4 KiB page is read as its two pages, apart: on that disk, reads spanning two 4 KiB units, even 2.5 % of a batch, halved the whole batch's rate. The same bytes: **bit-exact** (`tests/kernels/test_row_store.py`). 9,600 random rows (a 600-token turn's) 40-42 -> 21-26 ms; on `xtx-xt-4x262k` EXL3 3.05 bpw agent turns 0.525 -> 0.494 s, NVFP4's (PCIe-bound) ~1-2 % with the tail tiles. `1`: one ring. |
@@ -3562,7 +3563,46 @@ inputs. All measurements below on `xtx-xt-4x262k` with arms interleaved with the
   decode +0.5 % only, T 0.6 -2.2 % (116.7 / 116.9 -> 113.3 / 115.0), two sampled requests unchanged; greedy answers
   identical. Not kept.
 
-## 40. Still open
+## 40. Upstream up to ba31db2 (2026-10-26)
+
+27 commits merged (upstream's 0.2.0 and 0.2.1), the authors' kept; fourteen files conflicted, and two changes that
+merged without a conflict needed this tree's attention:
+
+- **The shards the index names, and the files beside it.** Upstream's loader now lists only the shards
+  `model.safetensors.index.json` names (`0bf7dbb`, for checkpoints that keep them in a subdirectory). The EXL3
+  checkpoints keep tensors in files the index does not name: 3.05 bpw the n-gram hash constants
+  (`ngram_embedding.safetensors`) and the MTP head's mixer, 4.05 bpw the hash constants and a vision patch. Loaded as
+  merged, the hash constants would not have reached the model (the loader test: `KeyError` on `layer_multipliers`).
+  qwen4_exp lists the index's shards, then the folder's other safetensors files.
+- **The PLE wait-sync on HIP.** Upstream added HIP's memops with a signal-memory flag and a capture probe (`32056cf`),
+  which this tree had by loading the memops at run time: upstream's are kept, this tree's check that a captured wait
+  holds three replays runs after its probe, and both profiles still pick wait-sync. Upstream fills a decode step's
+  rows on a worker thread on HIP, one row a request; this tree's fill (the verify rows, the draft reads) stayed, run
+  after the launch. Upstream's test of a 16,384-kernel graph behind an unsatisfied wait then hangs: the launch call
+  blocks once the hardware queue is full, before the host reaches the fill that would release it (8,192 kernels
+  still pass; a decode step's graph launches ~1,350 at one request). On a thread started before the launch
+  (`FREETOKEN_PLE_FILL_THREAD`, on by default on ROCm) it passes; the same answers, and on `xtx-xt-4x262k` (EXL3 3.05
+  bpw, two pairs) 110.13 / 110.15 tok/s greedy against 110.27 / 110.15 with the fill after the launch, 116.90 /
+  117.07 at T 0.6 against 116.87 / 116.99, two requests 79.67 / 79.76 against 79.69 / 79.71, four 53.2-53.3 in both
+  (the first four-request run after a start reads ~47 with either).
+- The hybrid ensure kernel took upstream's fetch cap, rounding modes and chunked scan of a large pool on top of its
+  vector route reads, with upstream's barrier between the route loads and stores; the router body that
+  `FREETOKEN_ROUTER_SHARED` reuses took the sigmoid and grouped routing, the softmax path unchanged; this tree's ROCm
+  batch copy (with its per-copy fallback) stays beside upstream's; the package keeps its ROCm classifier.
+
+Measured on `xtx-xt-4x262k` with a 300k-token pool, the merge's image against the build before (two runs against
+one): EXL3 3.05 bpw 109.25 / 110.08 tok/s greedy against 109.67, 116.17 / 116.82 at T 0.6 against 116.53; NVFP4
+107.48 / 108.13 against 107.81, 111.08 / 111.30 against 111.25; cold reads of 40k / 112k / 159k tokens the same
+(12.09 / 33.05 / 47.61 s against 12.12 / 33.03 / 47.60, EXL3; the first start of a new image compiles, its first 112k
+read 36.6 s); agent turns, two and four requests within their run-to-run spread. Answers: the same as the build before
+(EXL3 40 of 40 greedy and 12 of 12 sampled, NVFP4 36 of 36 and 12 of 12), and as the runs of section 39; in the second
+run of each, the two greedy requests started together came out otherwise, as they do between two runs of the same image
+(when each request starts sets its batches). GPU tests (43 files, each card): 1,478 passed, the one failure the
+large-graph test above, which passes with the fill thread; CPU suite 1,849 passed.
+Fifteen minutes of four agent-like sessions with the launcher's EXL3 settings: 243 requests to 124k tokens, no error.
+`/v1/cache/flush` (upstream's, `e0a7e23`) answers "unsupported" with two cards.
+
+## 41. Still open
 
 - In NVFP4 the model needs ~63 GiB of RAM for its experts alone (the engine keeps every expert in RAM). The EXL3 3.05
   bpw checkpoint needs 42.6 GiB and served under a 56 GiB container limit, but a real 64 GB machine is untested
@@ -4055,7 +4095,7 @@ docker run --rm -w /opt/FreeToken --entrypoint python3 freetoken-rdna3:latest -m
 ```
 
 About 3 minutes (150 s on the reference machine with `--cpus 8`), no GPU needed, on the tree the image was built
-from: 1818 passed, no failure (the GPU tests skip). The whole suite in one process peaks above 12 GB of RAM: under a
+from: 1849 passed, no failure (the GPU tests skip). The whole suite in one process peaks above 12 GB of RAM: under a
 container memory limit, run it one `tests/` subdirectory at a time.
 
 To test source changes without rebuilding, mount your tree instead (`-v "$PWD":/src:ro -w /src -e
@@ -4144,13 +4184,13 @@ How this repository relates to upstream FreeToken and how to keep it current. Fo
 
 ## What this tree is
 
-Upstream [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken) at `cc56b6b` ("feat(gguf): serve
-GLM-5.3-Flash GGUF checkpoints on glm5-next (#721)"), plus the changes listed file by file in
-[changes-from-upstream.md](changes-from-upstream.md). The history is upstream's own up to `0d652e7`, then this
-project's commits on top (the first one holds everything up to 0.1.0), a merge of upstream up
-to `ee9789f`, five upstream commits cherry-picked (`74a3877`, `9c635a1`, `7d6490c`, `9b68e00`, `b6193e8`, authors
-kept), a merge of the rest up to `9b68e00` and a merge up to `cc56b6b`. Once the `upstream` remote is set up (below),
-`git diff $(git merge-base HEAD upstream/main)` shows every change against the upstream version this tree is based on.
+Upstream [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken) at `ba31db2` ("chore(release): 0.2.1
+(#824)"), plus the changes listed file by file in [changes-from-upstream.md](changes-from-upstream.md). The history is
+upstream's own up to `0d652e7`, then this project's commits on top (the first one holds everything up to 0.1.0), a
+merge of upstream up to `ee9789f`, five upstream commits cherry-picked (`74a3877`, `9c635a1`, `7d6490c`, `9b68e00`,
+`b6193e8`, authors kept), a merge of the rest up to `9b68e00`, a merge up to `cc56b6b` and one up to `ba31db2`. Once
+the `upstream` remote is set up (below), `git diff $(git merge-base HEAD upstream/main)` shows every change against the
+upstream version this tree is based on.
 
 ## The stack on top of upstream (oldest first)
 
@@ -4165,7 +4205,7 @@ kept), a merge of the rest up to `9b68e00` and a merge up to `cc56b6b`. Once the
 | MTP head, EXL3 checkpoints, K/V in host RAM, short prefills through the expert cache, `--hybrid` on ROCm | this repository | upstream merges it |
 | `kernel/triton/moe_align.py` on ROCm, over upstream's staged align (`0bca88f`) | this repository (Triton 3.8 histogram fix) | upstream's align is checked on ROCm's Triton 3.8, or Triton fixes the histogram range |
 | hybrid publish / merge kernels over pinned flag words | this repository | upstream drops its copies around the doorbell on ROCm |
-| HIP stream memops for the PLE wait-sync (`row_store_ext.cpp`) | this repository | upstream's row store finds HIP's memops |
+| the PLE wait-sync's replayed-wait check; the decode fill's verify rows and draft reads on upstream's fill thread | this repository | upstream's HIP fill handles the verify rows (it reads one row a request) |
 | `LaunchKernel::with_attr` refuses `use_pdl=True` on ROCm | this repository | upstream refuses it too |
 | `Dockerfile.rdna3`, `rdna3/`, `docs/rdna3/` | this repository | never |
 
@@ -4191,6 +4231,15 @@ scales are fp32 (`0db5023`); with the rewritten GEMM, NVFP4 answers differ from 
 qwen4_exp dense reader is upstream's scheme-driven one (`163d1de`), with this tree's tensor-parallel sharding, EXL3
 reconstruction and MTP head on top; the expert-piece hook takes upstream's `layers` argument, and the TP slicing keeps
 the experts' static activation scales (`e4f69d9`) whole on every rank.
+
+At the merge of `ba31db2`: upstream's row store speaks HIP's memops with a signal-memory flag (`32056cf`), which this
+tree added by loading them at run time: that part left the stack; this tree's check that a captured wait holds three
+replays runs after upstream's probe, and its decode fill (the verify rows, the draft reads) runs on a thread started
+before the launch as upstream's does (upstream's HIP worker fills one row a request). Upstream's ROCm batch copy (`cc4aa08`) sits beside this tree's own module, which keeps its per-copy
+fallback. Upstream's loader lists only the shards the index names (`0bf7dbb`); qwen4_exp also reads the safetensors
+files beside the index, where the EXL3 checkpoints keep their n-gram hash constants, MTP mixer and vision patch. The
+hybrid ensure kernel took upstream's fetch cap, rounding modes and chunked scan, the router body upstream's sigmoid
+routing.
 
 ## Keeping current
 
@@ -4250,9 +4299,9 @@ Infinity Cache and promises gains that serving does not see.
 
 This repository is a modified version of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken) (Apache
 License 2.0), taken at `0d652e7` and merged with upstream up to `ee9789f`, then up to `9b68e00` (five of its commits
-cherry-picked first, then the rest merged), then up to `cc56b6b`. Every file changed or added relative to upstream is
-listed here with the reason. Line counts are `added/removed`, against the upstream commit a section or row names,
-`0d652e7` otherwise; `git diff cc56b6b` gives the current ones. Files the merge made
+cherry-picked first, then the rest merged), then up to `cc56b6b`, then up to `ba31db2`. Every file changed or added
+relative to upstream is listed here with the reason. Line counts are `added/removed`, against the upstream commit a
+section or row names, `0d652e7` otherwise; `git diff ba31db2` gives the current ones. Files the merge made
 identical to upstream again are gone from the tables ([maintaining.md](maintaining.md#the-stack-on-top-of-upstream-oldest-first)).
 Who wrote what: [credits.md](credits.md).
 
@@ -4313,7 +4362,7 @@ Who wrote what: [credits.md](credits.md).
 |---|---:|---|
 | `python/freetoken/moe/fused_nvfp4.py`, `kernel/nvfp4_moe.py` | 73/8, 23/1 against `cc56b6b` | tuned NVFP4 prefill / decode tiles for RDNA3 (opt-in, bit-exact); token-blocked prefill MoE. The decode tiles were swept again for upstream's marlin decode kernel (`7644984`) and live in `kernel/nvfp4_moe.py`, where upstream moved the launches (`ac6a15d`); the prefill tiles were swept again for upstream's rewritten prefill GEMM (`03c2c9c`) |
 | `python/freetoken/moe/offload_cache.py` | 16/2 | expert reuse during prefill on ROCm |
-| `python/freetoken/kernel/batch_memcpy.py`, `kernel/csrc/jit/batch_memcpy.cuh` | 55/0, 86/1 | `hipMemcpyBatchAsync` (HIP >= 7.1) with a per-copy fallback |
+| `python/freetoken/kernel/batch_memcpy.py`, `kernel/csrc/jit/batch_memcpy.cuh` | 61/8, 82/22 against `ba31db2` | `hipMemcpyBatchAsync` (HIP >= 7.1) with a per-copy fallback, in a module of its own name (a cached build from before ROCm support panics), a failed mode logged; upstream's ROCm batch copy (`cc4aa08`) has no fallback |
 
 ## Sampling
 
@@ -4370,7 +4419,7 @@ Line counts in this section and the next are relative to `d72e5cb` (0.1.0 plus i
 |---|---:|---|
 | `Dockerfile.rdna3` | 13/5 | ROCm 10.1 / PyTorch 2.14 base with its own Triton 3.8; pyproject's torchvision floor lowered to ROCm's pre-release (0.29.0a0) at install |
 | `python/freetoken/kernel/triton/moe_align.py`, `tests/kernels/test_moe_align.py`, `moe/fused.py` | 13/9, new, 10/12 against `9b68e00` | ROCm keeps this align over upstream's staged one (`0bca88f`, upstream's fix for the same bug); no comparison on `tl.histogram` counts: Triton 3.8's AMD range analysis gives them an empty range and folds such comparisons to false, which left the expert ids unwritten (up to 1024 routes) or every count at zero (more), and the expert GEMMs then read wild addresses |
-| `python/freetoken/kernel/csrc/row_store/row_store_ext.cpp`, `kernel/row_store.py`, `models/qwen4_exp/ple_disk.py` | 32/4, 40/1, 18/1 | HIP stream memops for the PLE wait-sync (upstream's probe looks for the CUDA driver's only); a captured wait must hold three replays with the PLE copy behind it (`FREETOKEN_PLE_SYNC`); on one GPU without the MTP head (overlapped decode steps) `auto` takes launch-gating, 44 % faster there |
+| `python/freetoken/kernel/row_store.py`, `models/qwen4_exp/ple_disk.py` | 39/2 against `ba31db2`, 18/1 | the PLE wait-sync on HIP: after upstream's probe (`32056cf`, which brought HIP's memops), a captured wait must hold three replays with the PLE copy behind it (`FREETOKEN_PLE_SYNC`); on one GPU without the MTP head (overlapped decode steps) `auto` takes launch-gating, 44 % faster there |
 | `tests/models/qwen4_exp/test_ple_disk.py` | 27/0 | `FREETOKEN_PLE_SYNC=auto` takes launch-gating on one GPU when the decode steps overlap (no MTP head) |
 | `python/freetoken/kernel/host_allreduce.py`, `kernel/csrc/jit/host_allreduce.cuh` | 20/5, 11/5 | the optional wait log (`FREETOKEN_HOST_ALLREDUCE_WAITLOG`), removed at a clean shutdown |
 | `python/freetoken/layers/moe.py`, `moe/offload_cache.py`, `models/qwen4_exp/moe.py` | 35/0, 20/0, 13/1 | the optional side-stream copy of the missing experts (`FREETOKEN_MOE_COPY_OVERLAP`) |
@@ -4483,7 +4532,6 @@ Line counts here are on top of the lines listed in the sections above.
 | `python/freetoken/layers/moe.py`, `layers/quantization/moe/base.py`, `exl3.py`, `nvfp4.py` | 56/5, 5/0, 2/0, 3/1 | `FREETOKEN_PREFILL_CACHED_MAX` (default 1280 for the layers of a model that predicts); `ExpertView.slot_map` for the EXL3 / NVFP4 Triton prefill |
 | `python/freetoken/moe/fused.py`, `moe/fused_exl3.py`, `moe/fused_nvfp4.py` | 7/0, 8/3, 9/3 | `blocks_to_slots`: the tiles of the expert-id alignment read their weights from the slots (the same tiles, the same bits) |
 | `python/freetoken/models/qwen4_exp/moe.py`, `models/qwen4_exp/mtp.py` | 18/0, 1/0 | layer L+1's router on layer L's MoE input, each token's top-10, as the prediction (`FREETOKEN_PREFILL_PREDICT`) |
-| `python/freetoken/kernel/batch_memcpy.py` | 4/0 | the probe's copy waits for its fill; a failed mode is logged |
 | `python/freetoken/kernel/triton/exl3.py`, `tests/kernels/test_exl3_mid_cols.py`, `tests/kernels/test_exl3_gemm_stages.py` | 79/7, 34/0, new | the prefill's mid step 32 Hadamard columns at a time (`FREETOKEN_EXL3_MID_COLS`): the tile kernel's bits without its 2.7 KB of scratch per lane, 1.7-3.3x faster; the prefill GEMMs with two pipeline stages (the same bits, checked against one stage) |
 | `Dockerfile.rdna3`, `rdna3/serve.sh` | 5/2, 2/0 | `TVM_FFI_CACHE_DIR` in the kernel-cache volume |
 | `python/freetoken/kernel/triton/qsa/stage.py`, `kvcache/qsa_pool.py`, `attention/qsa_sparse.py`, `tests/kernels/test_qsa_kv_host.py` | 66/1, 26/5, 2/1, 84/0 | host K/V: a prefill stages only the K/V rows of the tokens it selects (`FREETOKEN_QSA_STAGE_SELECTED`), marked by the attention kernel's mapping |
@@ -4572,6 +4620,18 @@ Line counts here are on top of the lines listed in the sections above.
 | `python/freetoken/kernel/triton/spec_glue.py`, `tests/kernels/test_decode_glue.py` | 8/7, 18/0 | the chained guesses' page-table rows read with their stride (a second request's guesses wrote at the first one's rows) |
 | `python/freetoken/models/qwen4_exp/ple.py`, `scheduler/cache.py`, `engine/engine.py` | 9/4, 2/1, 5/2 | the decode PLE metadata reuses the GDN indptr, skips the placeholder restore and an unused arange; no copy of an unchanged free-page list; a draft's draws used as they are when no row is padded |
 | `tests/models/qwen4_exp/test_qsa_backend.py`, `test_qsa_kernels.py`, `tests/engine/test_cache_budget.py`, `tests/moe/test_offload.py` | 18/1, 5/2, 6/2, 5/1 | tests that failed on ROCm: the toy projections a row at a time, the top-k reference's ties toward the lowest column, the Triton backend named instead of flashinfer's |
+
+## On upstream up to `ba31db2`
+
+Line counts here are each file's whole difference from `ba31db2` (the sections above included).
+
+| File | Lines | Change |
+|---|---:|---|
+| `python/freetoken/models/qwen4_exp/weight.py`, `tests/models/qwen4_exp/test_weight.py` | 414/21, 34/0 | qwen4_exp reads the safetensors files beside the index as well as the shards it names: upstream's loader takes the index's list alone (`0bf7dbb`), and the EXL3 checkpoints keep the n-gram hash constants, the MTP head's mixer (3.05 bpw) and a vision patch (4.05 bpw) in files the index does not name |
+| `python/freetoken/moe/offload_kernels.py` | 143/18 | the hybrid ensure kernel takes upstream's fetch cap, rounding modes (`FREETOKEN_HYBRID_FETCH_ROUND`) and memory scan of a pool past 8192 slots (`161ffa5`, `c5b5b72`) on this tree's vector route reads and hit stamps, with upstream's barrier between the route loads and stores (a warp could read a route already rewritten) |
+| `python/freetoken/kernel/triton/moe_router.py`, `kernel/triton/router_shared.py` | 70/15, 121/0 | the router body `FREETOKEN_ROUTER_SHARED` reuses takes upstream's sigmoid and grouped routing (`19a60a5`); the (value, id) keys stay on the softmax path, whose operations are unchanged |
+| `python/freetoken/kernel/row_store.py`, `models/qwen4_exp/ple_disk.py`, `tests/models/qwen4_exp/test_ple_disk.py` | 39/2, 435/96, 121/0 | upstream's HIP wait-sync (`32056cf`: HIP's memops, a signal-memory flag, a capture probe) with this tree's replayed-wait check after its probe; a graph decode step's fill runs on a thread started before the launch, as upstream's does on HIP, but with this tree's fill (upstream's reads one row a request: the verify rows and the draft reads need this tree's), `FREETOKEN_PLE_FILL_THREAD`; upstream's test of a 16,384-kernel graph behind the wait hangs with the fill after the launch |
+| `tests/moe/test_offload.py` | 6/1 | the Triton attention backend named on ROCm; upstream's pin-probe test also stubs the coarse-grained bank registration (`FREETOKEN_BANK_COARSE`) |
 
 ## Tooling and documentation
 

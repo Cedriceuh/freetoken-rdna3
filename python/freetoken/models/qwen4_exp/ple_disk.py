@@ -76,6 +76,10 @@ _ROW_CACHE_ROWS = int(os.environ.get("FREETOKEN_PLE_ROW_CACHE_ROWS", str(1 << 20
 _DRAFT_READS = os.environ.get("FREETOKEN_PLE_DRAFT_READS", "1") == "1"
 _DRAFT_CACHE_ROWS = 16384  # a few steps' rows (a step reads at most 256 positions x 16 heads, one request ~64)
 _SYNC_ENV = "FREETOKEN_PLE_SYNC"  # auto | wait | gate
+# FREETOKEN_PLE_FILL_THREAD (default 1 on HIP): under wait-sync a graph decode step's fill runs on a thread started
+# before the launch, as upstream's HIP path does: a graph larger than the hardware queue blocks hipGraphLaunch until
+# its first packets drain, and those wait for the fill (tests/models/qwen4_exp/test_ple_disk.py::test_wait_sync_large_graph)
+_FILL_THREAD = os.environ.get("FREETOKEN_PLE_FILL_THREAD", "1" if torch.version.hip is not None else "0") == "1"
 
 logger = init_logger(__name__)
 
@@ -467,6 +471,12 @@ class DiskRowTable:
         self._readback_event = torch.cuda.Event()
         self._ahead = _DraftReads(self._store, self._token_bytes, max_graph_rows) if _DRAFT_READS else None
         self._last_fill: tuple[list, list[torch.Tensor]] | None = None  # (reqs, runs) of the last decode fill
+        self._fill_worker = None
+        if self._wait_sync and _FILL_THREAD:
+            from concurrent.futures import ThreadPoolExecutor
+
+            self._fill_worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ple-fill")
+        self._failed = False
         sync = "wait-sync" if self._wait_sync else "launch-gating"
         reads = ", prefill rows read by rank 0" if self._rank0_reads else ""
         pf = f"; prefill store: {self._prefetch_store.io_backend()}" if self._prefetch_store is not None else ""
@@ -508,7 +518,10 @@ class DiskRowTable:
         return [self.image_token_id if t >= MM_PAD_SHIFT_VALUE else t for t in _context(ids, position, self.eos_token_id)]
 
     def host_fill_batch(self, batch: Batch, use_graph: bool):
-        """Stage this batch's rows; returns the post-dispatch fill callable under flag-sync, else None."""
+        """Stage this batch's rows; returns the post-dispatch fill callable under flag-sync (with the fill thread, the
+        wait for the fill it started), else None."""
+        if self._failed:
+            raise RuntimeError("a PLE disk fill failed during a launch; recreate the engine before dispatching again")
         eos = self.eos_token_id
         if batch.is_decode:
             reqs = list(batch.reqs)
@@ -518,15 +531,17 @@ class DiskRowTable:
                 self._token_readback[: bs * m].copy_(batch.input_ids, non_blocking=True)
                 self._readback_event.record(torch.cuda.current_stream(self._device))
 
+                contexts = [self._ple_context(r.input_ids, r.device_len - 1) for r in reqs]
+
+                @torch.inference_mode()
                 def _complete() -> None:
                     try:
                         t0 = time.perf_counter() if _FILL_TIMING else 0.0
                         self._readback_event.synchronize()
                         t1 = time.perf_counter() if _FILL_TIMING else 0.0
                         tokens = self._token_readback[: bs * m].to(torch.int64).tolist()
-                        runs = [torch.tensor([*self._ple_context(r.input_ids, r.device_len - 1), *tokens[i * m:(i + 1) * m]],
-                                             dtype=torch.int64)
-                                for i, r in enumerate(reqs)]
+                        runs = [torch.tensor([*contexts[i], *tokens[i * m:(i + 1) * m]], dtype=torch.int64)
+                                for i in range(len(reqs))]
                         self.fill(runs, graph=True)
                         self._last_fill = (reqs, runs)
                         if _FILL_TIMING:
@@ -538,6 +553,8 @@ class DiskRowTable:
                         signal(self._flag)
                         raise
 
+                if self._fill_worker is not None:
+                    return self._fill_worker.submit(_complete).result
                 return _complete
             # launch-gating: this D2H is the step's readback and orders the fill after sampling
             t0 = time.perf_counter() if _FILL_TIMING else 0.0
@@ -647,7 +664,19 @@ class DiskRowTable:
     def forward_host_ctx(self, batch: Batch, use_graph: bool):
         """Around one dispatch: stage on enter, run the deferred fill+signal on exit."""
         deferred = self.host_fill_batch(batch, use_graph)
-        yield
+        if self._fill_worker is not None and deferred is not None:
+            try:
+                yield
+            except BaseException:
+                # the fill already runs and signals a flag no WAIT may consume: refuse the next dispatch
+                self._failed = True
+                try:
+                    deferred()
+                except BaseException:  # noqa: BLE001 -- the launch's error is the one to surface
+                    pass
+                raise
+        else:
+            yield
         # no try/finally: a failed launch leaves no WAIT pending, so the fill must not run
         if deferred is not None:
             deferred()

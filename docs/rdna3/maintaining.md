@@ -4,13 +4,13 @@ How this repository relates to upstream FreeToken and how to keep it current. Fo
 
 ## What this tree is
 
-Upstream [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken) at `cc56b6b` ("feat(gguf): serve
-GLM-5.3-Flash GGUF checkpoints on glm5-next (#721)"), plus the changes listed file by file in
-[changes-from-upstream.md](changes-from-upstream.md). The history is upstream's own up to `0d652e7`, then this
-project's commits on top (the first one holds everything up to 0.1.0), a merge of upstream up
-to `ee9789f`, five upstream commits cherry-picked (`74a3877`, `9c635a1`, `7d6490c`, `9b68e00`, `b6193e8`, authors
-kept), a merge of the rest up to `9b68e00` and a merge up to `cc56b6b`. Once the `upstream` remote is set up (below),
-`git diff $(git merge-base HEAD upstream/main)` shows every change against the upstream version this tree is based on.
+Upstream [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken) at `ba31db2` ("chore(release): 0.2.1
+(#824)"), plus the changes listed file by file in [changes-from-upstream.md](changes-from-upstream.md). The history is
+upstream's own up to `0d652e7`, then this project's commits on top (the first one holds everything up to 0.1.0), a
+merge of upstream up to `ee9789f`, five upstream commits cherry-picked (`74a3877`, `9c635a1`, `7d6490c`, `9b68e00`,
+`b6193e8`, authors kept), a merge of the rest up to `9b68e00`, a merge up to `cc56b6b` and one up to `ba31db2`. Once
+the `upstream` remote is set up (below), `git diff $(git merge-base HEAD upstream/main)` shows every change against the
+upstream version this tree is based on.
 
 ## The stack on top of upstream (oldest first)
 
@@ -25,7 +25,7 @@ kept), a merge of the rest up to `9b68e00` and a merge up to `cc56b6b`. Once the
 | MTP head, EXL3 checkpoints, K/V in host RAM, short prefills through the expert cache, `--hybrid` on ROCm | this repository | upstream merges it |
 | `kernel/triton/moe_align.py` on ROCm, over upstream's staged align (`0bca88f`) | this repository (Triton 3.8 histogram fix) | upstream's align is checked on ROCm's Triton 3.8, or Triton fixes the histogram range |
 | hybrid publish / merge kernels over pinned flag words | this repository | upstream drops its copies around the doorbell on ROCm |
-| HIP stream memops for the PLE wait-sync (`row_store_ext.cpp`) | this repository | upstream's row store finds HIP's memops |
+| the PLE wait-sync's replayed-wait check; the decode fill's verify rows and draft reads on upstream's fill thread | this repository | upstream's HIP fill handles the verify rows (it reads one row a request) |
 | `LaunchKernel::with_attr` refuses `use_pdl=True` on ROCm | this repository | upstream refuses it too |
 | `Dockerfile.rdna3`, `rdna3/`, `docs/rdna3/` | this repository | never |
 
@@ -51,6 +51,15 @@ scales are fp32 (`0db5023`); with the rewritten GEMM, NVFP4 answers differ from 
 qwen4_exp dense reader is upstream's scheme-driven one (`163d1de`), with this tree's tensor-parallel sharding, EXL3
 reconstruction and MTP head on top; the expert-piece hook takes upstream's `layers` argument, and the TP slicing keeps
 the experts' static activation scales (`e4f69d9`) whole on every rank.
+
+At the merge of `ba31db2`: upstream's row store speaks HIP's memops with a signal-memory flag (`32056cf`), which this
+tree added by loading them at run time: that part left the stack; this tree's check that a captured wait holds three
+replays runs after upstream's probe, and its decode fill (the verify rows, the draft reads) runs on a thread started
+before the launch as upstream's does (upstream's HIP worker fills one row a request). Upstream's ROCm batch copy (`cc4aa08`) sits beside this tree's own module, which keeps its per-copy
+fallback. Upstream's loader lists only the shards the index names (`0bf7dbb`); qwen4_exp also reads the safetensors
+files beside the index, where the EXL3 checkpoints keep their n-gram hash constants, MTP mixer and vision patch. The
+hybrid ensure kernel took upstream's fetch cap, rounding modes and chunked scan, the router body upstream's sigmoid
+routing.
 
 ## Keeping current
 

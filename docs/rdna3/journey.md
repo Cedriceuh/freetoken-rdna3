@@ -1823,7 +1823,46 @@ inputs. All measurements below on `xtx-xt-4x262k` with arms interleaved with the
   decode +0.5 % only, T 0.6 -2.2 % (116.7 / 116.9 -> 113.3 / 115.0), two sampled requests unchanged; greedy answers
   identical. Not kept.
 
-## 40. Still open
+## 40. Upstream up to ba31db2 (2026-10-26)
+
+27 commits merged (upstream's 0.2.0 and 0.2.1), the authors' kept; fourteen files conflicted, and two changes that
+merged without a conflict needed this tree's attention:
+
+- **The shards the index names, and the files beside it.** Upstream's loader now lists only the shards
+  `model.safetensors.index.json` names (`0bf7dbb`, for checkpoints that keep them in a subdirectory). The EXL3
+  checkpoints keep tensors in files the index does not name: 3.05 bpw the n-gram hash constants
+  (`ngram_embedding.safetensors`) and the MTP head's mixer, 4.05 bpw the hash constants and a vision patch. Loaded as
+  merged, the hash constants would not have reached the model (the loader test: `KeyError` on `layer_multipliers`).
+  qwen4_exp lists the index's shards, then the folder's other safetensors files.
+- **The PLE wait-sync on HIP.** Upstream added HIP's memops with a signal-memory flag and a capture probe (`32056cf`),
+  which this tree had by loading the memops at run time: upstream's are kept, this tree's check that a captured wait
+  holds three replays runs after its probe, and both profiles still pick wait-sync. Upstream fills a decode step's
+  rows on a worker thread on HIP, one row a request; this tree's fill (the verify rows, the draft reads) stayed, run
+  after the launch. Upstream's test of a 16,384-kernel graph behind an unsatisfied wait then hangs: the launch call
+  blocks once the hardware queue is full, before the host reaches the fill that would release it (8,192 kernels
+  still pass; a decode step's graph launches ~1,350 at one request). On a thread started before the launch
+  (`FREETOKEN_PLE_FILL_THREAD`, on by default on ROCm) it passes; the same answers, and on `xtx-xt-4x262k` (EXL3 3.05
+  bpw, two pairs) 110.13 / 110.15 tok/s greedy against 110.27 / 110.15 with the fill after the launch, 116.90 /
+  117.07 at T 0.6 against 116.87 / 116.99, two requests 79.67 / 79.76 against 79.69 / 79.71, four 53.2-53.3 in both
+  (the first four-request run after a start reads ~47 with either).
+- The hybrid ensure kernel took upstream's fetch cap, rounding modes and chunked scan of a large pool on top of its
+  vector route reads, with upstream's barrier between the route loads and stores; the router body that
+  `FREETOKEN_ROUTER_SHARED` reuses took the sigmoid and grouped routing, the softmax path unchanged; this tree's ROCm
+  batch copy (with its per-copy fallback) stays beside upstream's; the package keeps its ROCm classifier.
+
+Measured on `xtx-xt-4x262k` with a 300k-token pool, the merge's image against the build before (two runs against
+one): EXL3 3.05 bpw 109.25 / 110.08 tok/s greedy against 109.67, 116.17 / 116.82 at T 0.6 against 116.53; NVFP4
+107.48 / 108.13 against 107.81, 111.08 / 111.30 against 111.25; cold reads of 40k / 112k / 159k tokens the same
+(12.09 / 33.05 / 47.61 s against 12.12 / 33.03 / 47.60, EXL3; the first start of a new image compiles, its first 112k
+read 36.6 s); agent turns, two and four requests within their run-to-run spread. Answers: the same as the build before
+(EXL3 40 of 40 greedy and 12 of 12 sampled, NVFP4 36 of 36 and 12 of 12), and as the runs of section 39; in the second
+run of each, the two greedy requests started together came out otherwise, as they do between two runs of the same image
+(when each request starts sets its batches). GPU tests (43 files, each card): 1,478 passed, the one failure the
+large-graph test above, which passes with the fill thread; CPU suite 1,849 passed.
+Fifteen minutes of four agent-like sessions with the launcher's EXL3 settings: 243 requests to 124k tokens, no error.
+`/v1/cache/flush` (upstream's, `e0a7e23`) answers "unsupported" with two cards.
+
+## 41. Still open
 
 - In NVFP4 the model needs ~63 GiB of RAM for its experts alone (the engine keeps every expert in RAM). The EXL3 3.05
   bpw checkpoint needs 42.6 GiB and served under a 56 GiB container limit, but a real 64 GB machine is untested

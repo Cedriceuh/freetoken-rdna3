@@ -2,9 +2,9 @@
 
 This repository is a modified version of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken) (Apache
 License 2.0), taken at `0d652e7` and merged with upstream up to `ee9789f`, then up to `9b68e00` (five of its commits
-cherry-picked first, then the rest merged), then up to `cc56b6b`. Every file changed or added relative to upstream is
-listed here with the reason. Line counts are `added/removed`, against the upstream commit a section or row names,
-`0d652e7` otherwise; `git diff cc56b6b` gives the current ones. Files the merge made
+cherry-picked first, then the rest merged), then up to `cc56b6b`, then up to `ba31db2`. Every file changed or added
+relative to upstream is listed here with the reason. Line counts are `added/removed`, against the upstream commit a
+section or row names, `0d652e7` otherwise; `git diff ba31db2` gives the current ones. Files the merge made
 identical to upstream again are gone from the tables ([maintaining.md](maintaining.md#the-stack-on-top-of-upstream-oldest-first)).
 Who wrote what: [credits.md](credits.md).
 
@@ -65,7 +65,7 @@ Who wrote what: [credits.md](credits.md).
 |---|---:|---|
 | `python/freetoken/moe/fused_nvfp4.py`, `kernel/nvfp4_moe.py` | 73/8, 23/1 against `cc56b6b` | tuned NVFP4 prefill / decode tiles for RDNA3 (opt-in, bit-exact); token-blocked prefill MoE. The decode tiles were swept again for upstream's marlin decode kernel (`7644984`) and live in `kernel/nvfp4_moe.py`, where upstream moved the launches (`ac6a15d`); the prefill tiles were swept again for upstream's rewritten prefill GEMM (`03c2c9c`) |
 | `python/freetoken/moe/offload_cache.py` | 16/2 | expert reuse during prefill on ROCm |
-| `python/freetoken/kernel/batch_memcpy.py`, `kernel/csrc/jit/batch_memcpy.cuh` | 55/0, 86/1 | `hipMemcpyBatchAsync` (HIP >= 7.1) with a per-copy fallback |
+| `python/freetoken/kernel/batch_memcpy.py`, `kernel/csrc/jit/batch_memcpy.cuh` | 61/8, 82/22 against `ba31db2` | `hipMemcpyBatchAsync` (HIP >= 7.1) with a per-copy fallback, in a module of its own name (a cached build from before ROCm support panics), a failed mode logged; upstream's ROCm batch copy (`cc4aa08`) has no fallback |
 
 ## Sampling
 
@@ -122,7 +122,7 @@ Line counts in this section and the next are relative to `d72e5cb` (0.1.0 plus i
 |---|---:|---|
 | `Dockerfile.rdna3` | 13/5 | ROCm 10.1 / PyTorch 2.14 base with its own Triton 3.8; pyproject's torchvision floor lowered to ROCm's pre-release (0.29.0a0) at install |
 | `python/freetoken/kernel/triton/moe_align.py`, `tests/kernels/test_moe_align.py`, `moe/fused.py` | 13/9, new, 10/12 against `9b68e00` | ROCm keeps this align over upstream's staged one (`0bca88f`, upstream's fix for the same bug); no comparison on `tl.histogram` counts: Triton 3.8's AMD range analysis gives them an empty range and folds such comparisons to false, which left the expert ids unwritten (up to 1024 routes) or every count at zero (more), and the expert GEMMs then read wild addresses |
-| `python/freetoken/kernel/csrc/row_store/row_store_ext.cpp`, `kernel/row_store.py`, `models/qwen4_exp/ple_disk.py` | 32/4, 40/1, 18/1 | HIP stream memops for the PLE wait-sync (upstream's probe looks for the CUDA driver's only); a captured wait must hold three replays with the PLE copy behind it (`FREETOKEN_PLE_SYNC`); on one GPU without the MTP head (overlapped decode steps) `auto` takes launch-gating, 44 % faster there |
+| `python/freetoken/kernel/row_store.py`, `models/qwen4_exp/ple_disk.py` | 39/2 against `ba31db2`, 18/1 | the PLE wait-sync on HIP: after upstream's probe (`32056cf`, which brought HIP's memops), a captured wait must hold three replays with the PLE copy behind it (`FREETOKEN_PLE_SYNC`); on one GPU without the MTP head (overlapped decode steps) `auto` takes launch-gating, 44 % faster there |
 | `tests/models/qwen4_exp/test_ple_disk.py` | 27/0 | `FREETOKEN_PLE_SYNC=auto` takes launch-gating on one GPU when the decode steps overlap (no MTP head) |
 | `python/freetoken/kernel/host_allreduce.py`, `kernel/csrc/jit/host_allreduce.cuh` | 20/5, 11/5 | the optional wait log (`FREETOKEN_HOST_ALLREDUCE_WAITLOG`), removed at a clean shutdown |
 | `python/freetoken/layers/moe.py`, `moe/offload_cache.py`, `models/qwen4_exp/moe.py` | 35/0, 20/0, 13/1 | the optional side-stream copy of the missing experts (`FREETOKEN_MOE_COPY_OVERLAP`) |
@@ -235,7 +235,6 @@ Line counts here are on top of the lines listed in the sections above.
 | `python/freetoken/layers/moe.py`, `layers/quantization/moe/base.py`, `exl3.py`, `nvfp4.py` | 56/5, 5/0, 2/0, 3/1 | `FREETOKEN_PREFILL_CACHED_MAX` (default 1280 for the layers of a model that predicts); `ExpertView.slot_map` for the EXL3 / NVFP4 Triton prefill |
 | `python/freetoken/moe/fused.py`, `moe/fused_exl3.py`, `moe/fused_nvfp4.py` | 7/0, 8/3, 9/3 | `blocks_to_slots`: the tiles of the expert-id alignment read their weights from the slots (the same tiles, the same bits) |
 | `python/freetoken/models/qwen4_exp/moe.py`, `models/qwen4_exp/mtp.py` | 18/0, 1/0 | layer L+1's router on layer L's MoE input, each token's top-10, as the prediction (`FREETOKEN_PREFILL_PREDICT`) |
-| `python/freetoken/kernel/batch_memcpy.py` | 4/0 | the probe's copy waits for its fill; a failed mode is logged |
 | `python/freetoken/kernel/triton/exl3.py`, `tests/kernels/test_exl3_mid_cols.py`, `tests/kernels/test_exl3_gemm_stages.py` | 79/7, 34/0, new | the prefill's mid step 32 Hadamard columns at a time (`FREETOKEN_EXL3_MID_COLS`): the tile kernel's bits without its 2.7 KB of scratch per lane, 1.7-3.3x faster; the prefill GEMMs with two pipeline stages (the same bits, checked against one stage) |
 | `Dockerfile.rdna3`, `rdna3/serve.sh` | 5/2, 2/0 | `TVM_FFI_CACHE_DIR` in the kernel-cache volume |
 | `python/freetoken/kernel/triton/qsa/stage.py`, `kvcache/qsa_pool.py`, `attention/qsa_sparse.py`, `tests/kernels/test_qsa_kv_host.py` | 66/1, 26/5, 2/1, 84/0 | host K/V: a prefill stages only the K/V rows of the tokens it selects (`FREETOKEN_QSA_STAGE_SELECTED`), marked by the attention kernel's mapping |
@@ -324,6 +323,18 @@ Line counts here are on top of the lines listed in the sections above.
 | `python/freetoken/kernel/triton/spec_glue.py`, `tests/kernels/test_decode_glue.py` | 8/7, 18/0 | the chained guesses' page-table rows read with their stride (a second request's guesses wrote at the first one's rows) |
 | `python/freetoken/models/qwen4_exp/ple.py`, `scheduler/cache.py`, `engine/engine.py` | 9/4, 2/1, 5/2 | the decode PLE metadata reuses the GDN indptr, skips the placeholder restore and an unused arange; no copy of an unchanged free-page list; a draft's draws used as they are when no row is padded |
 | `tests/models/qwen4_exp/test_qsa_backend.py`, `test_qsa_kernels.py`, `tests/engine/test_cache_budget.py`, `tests/moe/test_offload.py` | 18/1, 5/2, 6/2, 5/1 | tests that failed on ROCm: the toy projections a row at a time, the top-k reference's ties toward the lowest column, the Triton backend named instead of flashinfer's |
+
+## On upstream up to `ba31db2`
+
+Line counts here are each file's whole difference from `ba31db2` (the sections above included).
+
+| File | Lines | Change |
+|---|---:|---|
+| `python/freetoken/models/qwen4_exp/weight.py`, `tests/models/qwen4_exp/test_weight.py` | 414/21, 34/0 | qwen4_exp reads the safetensors files beside the index as well as the shards it names: upstream's loader takes the index's list alone (`0bf7dbb`), and the EXL3 checkpoints keep the n-gram hash constants, the MTP head's mixer (3.05 bpw) and a vision patch (4.05 bpw) in files the index does not name |
+| `python/freetoken/moe/offload_kernels.py` | 143/18 | the hybrid ensure kernel takes upstream's fetch cap, rounding modes (`FREETOKEN_HYBRID_FETCH_ROUND`) and memory scan of a pool past 8192 slots (`161ffa5`, `c5b5b72`) on this tree's vector route reads and hit stamps, with upstream's barrier between the route loads and stores (a warp could read a route already rewritten) |
+| `python/freetoken/kernel/triton/moe_router.py`, `kernel/triton/router_shared.py` | 70/15, 121/0 | the router body `FREETOKEN_ROUTER_SHARED` reuses takes upstream's sigmoid and grouped routing (`19a60a5`); the (value, id) keys stay on the softmax path, whose operations are unchanged |
+| `python/freetoken/kernel/row_store.py`, `models/qwen4_exp/ple_disk.py`, `tests/models/qwen4_exp/test_ple_disk.py` | 39/2, 435/96, 121/0 | upstream's HIP wait-sync (`32056cf`: HIP's memops, a signal-memory flag, a capture probe) with this tree's replayed-wait check after its probe; a graph decode step's fill runs on a thread started before the launch, as upstream's does on HIP, but with this tree's fill (upstream's reads one row a request: the verify rows and the draft reads need this tree's), `FREETOKEN_PLE_FILL_THREAD`; upstream's test of a 16,384-kernel graph behind the wait hangs with the fill after the launch |
+| `tests/moe/test_offload.py` | 6/1 | the Triton attention backend named on ROCm; upstream's pin-probe test also stubs the coarse-grained bank registration (`FREETOKEN_BANK_COARSE`) |
 
 ## Tooling and documentation
 

@@ -24,7 +24,7 @@ docker run --rm -w /opt/FreeToken --entrypoint python3 freetoken-rdna3:latest -m
 ```
 
 About 3 minutes (150 s on the reference machine with `--cpus 8`), no GPU needed, on the tree the image was built
-from: 1818 passed, no failure (the GPU tests skip). The whole suite in one process peaks above 12 GB of RAM: under a
+from: 1849 passed, no failure (the GPU tests skip). The whole suite in one process peaks above 12 GB of RAM: under a
 container memory limit, run it one `tests/` subdirectory at a time.
 
 To test source changes without rebuilding, mount your tree instead (`-v "$PWD":/src:ro -w /src -e

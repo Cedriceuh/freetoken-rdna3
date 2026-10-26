@@ -98,6 +98,13 @@ What each change measured, and how it was found: [docs/rdna3/journey.md](docs/rd
   prefill GEMM, with this tree's tiles swept again (NVFP4 answers differ from the build before, EXL3 ones do not; NVFP4
   cold reads -12 %); `--hf-overrides`, `--api-key`, presence / frequency penalties; GGUF experts through upstream's
   kernels; a system message in the middle of an Anthropic `/v1/messages` conversation stays in place.
+- Upstream FreeToken 0.2.1 merged (`ba31db2`), the authors' commits kept: among others GGUF checkpoints of DeepSeek-V4
+  and of Qwen3-VL (text), image input from an mmproj file for Qwen, Gemma-4, glm5-next and DeepSeek-V4 GGUFs,
+  `/v1/cache/flush` (one GPU), `--embed-weights host`, the hybrid mode's locked-layer fetch, HIP's memops for the PLE
+  wait-sync. On the two-card profiles the same answers and speeds as before; the EXL3 checkpoints still load their
+  tensors kept beside the index (n-gram hash constants, MTP mixer, vision patch), which upstream's loader now skips; a
+  decode step's PLE fill runs on a thread started before the launch (`FREETOKEN_PLE_FILL_THREAD`), so a graph larger
+  than the hardware queue no longer hangs behind its wait.
 - Opt-in, not bit-exact: `FREETOKEN_INT8_TP_TILES`. Measured and left off: `FREETOKEN_MOE_COPY_OVERLAP` (33 % slower).
 
 ### Fixed
