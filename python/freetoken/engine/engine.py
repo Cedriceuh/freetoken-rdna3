@@ -757,6 +757,13 @@ class Engine:
         if moved:
             logger.info_rank0(f"input embedding in mapped host memory (FREETOKEN_EMBED_HOST): {moved / 2**20:.0f} MiB "
                               "of VRAM a rank left to the pools")
+        if MTP_ENABLED and getattr(self.model, "mtp", None) is not None:
+            from freetoken.layers.draft_vocab import build_draft_head
+            from freetoken.utils import download_hf_weight
+
+            # FREETOKEN_DRAFT_VOCAB: it reads the int8 rows; before the post-weights memory snapshot
+            self._draft_head = build_draft_head(self.model.lm_head, download_hf_weight(config.model_path),
+                                                self.tp_cpu_group)
 
     def _load_weight_state_dict(self, config: EngineConfig, host_keys: frozenset[str]) -> Dict[str, torch.Tensor]:
         model_state = self.model.state_dict()
@@ -1752,24 +1759,39 @@ class Engine:
             qs.append(q[:m1])
         return torch.stack(qs)
 
-    def _pick_draft(self, logits: torch.Tensor, real: int, args: BatchSamplingArgs | None, local: bool = False
-                    ) -> tuple[torch.Tensor, torch.Tensor | tuple | None]:
+    def _draft_lm_head(self, args: BatchSamplingArgs | None):
+        """The head the decode drafts score with: FREETOKEN_DRAFT_VOCAB's reduced one, unless a sampled draft draws
+        from more than the largest logits (it then needs the whole vocabulary)."""
+        head = self.__dict__.get("_draft_head")
+        if head is None:
+            return self.model.lm_head
+        from freetoken.engine.spec_sample import sparse_ok
+        from freetoken.spec_decode import SPEC_SAMPLED_DRAFTS
+
+        sampled = args is not None and args.temperatures is not None and SPEC_SAMPLED_DRAFTS
+        return self.model.lm_head if sampled and not sparse_ok(args.top_k, args.top_k_max) else head
+
+    def _pick_draft(self, logits: torch.Tensor, real: int, args: BatchSamplingArgs | None, local: bool = False,
+                    head=None) -> tuple[torch.Tensor, torch.Tensor | tuple | None]:
         """Each row's draft from the head's ``logits``: its argmax, or for the sampled requests of ``args`` a draw
         under the request's sampling params, returned with that distribution ``q [real, V]`` (rank 0's draws).
         ``local``: ``logits`` is this rank's shard (FREETOKEN_SPARSE_LOGITS); q is then sparse when the draw needs
-        only the largest logits (``(ids, probs) [real, K]``)."""
+        only the largest logits (``(ids, probs) [real, K]``). ``head``: the reduced draft head (FREETOKEN_DRAFT_VOCAB),
+        whose columns are ids its candidates map back; None: the LM head."""
         from freetoken.spec_decode import SPEC_SAMPLED_DRAFTS
 
         from freetoken.engine.spec_sample import sparse_ok
 
         sampled = args is not None and args.temperatures is not None and SPEC_SAMPLED_DRAFTS
         cands = None
-        if local:
+        reduced = head is not None and head is not self.model.lm_head
+        head = head if reduced else self.model.lm_head
+        if local or reduced:
             # the draft head runs no penalties: only the sampling params decide
             if not sampled or sparse_ok(args.top_k, args.top_k_max):
                 k = args.top_k_max if sampled else 1
-                vals, ids, tok = self.model.lm_head.candidates(logits, k, real)  # draft_distribution's rows
-                cands = (vals[:real], ids[:real], self.model.lm_head.num_embeddings)
+                vals, ids, tok = head.candidates(logits, k, real)  # draft_distribution's rows
+                cands = (vals[:real], ids[:real], head.num_embeddings)
             else:
                 logits = self.model.lm_head.gather_full(logits)
         if cands is None:
@@ -1868,7 +1890,8 @@ class Engine:
                 # the MoE and the head on each request's last kept row only (one row per request)
                 head_in, streams = mtp.forward(streams, model.embed_tokens.forward(next_ids), batch,
                                                keep=pick if m > 1 else None)
-                tok, q = self._pick_draft(self.model.lm_head.forward(head_in), batch.size, args, local)
+                head = self._draft_lm_head(args)
+                tok, q = self._pick_draft(head.forward(head_in), batch.size, args, local, head=head)
                 drafts, qs = [tok], [q]
             ple = self._ple_reads()
             if ple is not None:
@@ -1887,7 +1910,7 @@ class Engine:
                 chain = self._chain_batch(batch, chain_pos[:, j] if chain_pos is not None else last + j, delta)
                 with self.ctx.forward_batch(chain):
                     head_in, streams = mtp.forward(streams, model.embed_tokens.forward(drafts[-1]), chain)
-                    tok, q = self._pick_draft(self.model.lm_head.forward(head_in), batch.size, args, local)
+                    tok, q = self._pick_draft(head.forward(head_in), batch.size, args, local, head=head)
                     drafts.append(tok)
                     qs.append(q)
                 if ple is not None:

@@ -336,6 +336,16 @@ Line counts here are each file's whole difference from `ba31db2` (the sections a
 | `python/freetoken/kernel/row_store.py`, `models/qwen4_exp/ple_disk.py`, `tests/models/qwen4_exp/test_ple_disk.py` | 39/2, 435/96, 121/0 | upstream's HIP wait-sync (`32056cf`: HIP's memops, a signal-memory flag, a capture probe) with this tree's replayed-wait check after its probe; a graph decode step's fill runs on a thread started before the launch, as upstream's does on HIP, but with this tree's fill (upstream's reads one row a request: the verify rows and the draft reads need this tree's), `FREETOKEN_PLE_FILL_THREAD`; upstream's test of a 16,384-kernel graph behind the wait hangs with the fill after the launch |
 | `tests/moe/test_offload.py` | 6/1 | the Triton attention backend named on ROCm; upstream's pin-probe test also stubs the coarse-grained bank registration (`FREETOKEN_BANK_COARSE`) |
 
+## The drafts over the Latin-script vocabulary, EXL3's codebook in fp16, a bounded stop (bit-exact)
+
+Line counts here are on top of the lines listed in the sections above.
+
+| File | Lines | Change |
+|---|---:|---|
+| `python/freetoken/layers/draft_vocab.py`, `kernel/triton/vocab_topk.py`, `engine/engine.py`, `tests/kernels/test_vocab_topk.py`, `tests/layers/test_draft_vocab.py` | new, 23/10, 31/8, 50/0, new | `FREETOKEN_DRAFT_VOCAB`: the MTP head's decode drafts scored over part of the vocabulary (`latin`: the Latin-script tokens and the added ones, from `tokenizer.json`), the rows split over the ranks as the LM head's and gathered once at start; the candidates' kernels map their columns to the token ids |
+| `python/freetoken/kernel/triton/exl3.py`, `tests/kernels/test_exl3_codebook.py` | 21/1, new | `FREETOKEN_EXL3_FAST_MUL1`: the `mul1` codebook's affine map as one fp16 fma on the byte sum's fp16 bits (the same value for each state, one ALU instruction fewer a weight in the decode GEMV); `FREETOKEN_EXL3_ALIGNBIT`: a trellis window's funnel shift as one `v_alignbit_b32` |
+| `python/freetoken/server/api_server.py`, `tests/server/test_sigterm_exit.py`, `tests/server/test_backend_death_exit.py` | 31/15, 62/0, 12/2 | `FREETOKEN_STOP_GRACE_S`: a stopping server cancels its open streams after 5 s (uvicorn waits for them without a limit by default); the exit of a server whose backend died releases its multiprocessing semaphores, as a stop does |
+
 ## Tooling and documentation
 
 | File | Change |

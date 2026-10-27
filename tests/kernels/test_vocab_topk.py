@@ -134,3 +134,53 @@ def test_sampling_from_candidates_draws_what_the_whole_rows_draw():
             got = spec_sample(None, drafts, temps, top_k, top_p, kmax, gen=g2, q=q_sparse,
                               cands=(rv.view(reqs, m, kmax), ri.view(reqs, m, kmax), vocab), fused=False)
             assert torch.equal(ref[0], got[0]) and torch.equal(ref[1], got[1])
+
+
+@pytest.mark.parametrize("tp,k,rows", [(1, 1, 4), (1, 20, 3), (2, 20, 8), (2, 1, 1), (2, 256, 2)])
+def test_mapped_columns_give_the_reduced_rows_top_k(tp, k, rows):
+    """FREETOKEN_DRAFT_VOCAB: columns of ascending, not contiguous, ids (``ids_map``) merge to torch.topk of the row
+    restricted to those ids, ties toward the lowest id (bf16 values: many equal), the ids the global ones."""
+    from freetoken.kernel.triton.vocab_topk import merge_candidates, pack_candidates
+
+    g = torch.Generator(device="cuda").manual_seed(tp * 100 + k)
+    vocab = 248320
+    keep = torch.cat([torch.arange(98304, device="cuda"), torch.arange(248044, 248077, device="cuda")])
+    full = (torch.randn(rows, vocab, generator=g, device="cuda") * 3).to(torch.bfloat16).float()
+    sub = full[:, keep]
+    bounds = [0, keep.numel()] if tp == 1 else [0, 54000, keep.numel()]
+    packed = [pack_candidates(sub[:, a:b].contiguous(), k, 0, b - a, ids_map=keep[a:b].to(torch.int32))
+              for a, b in zip(bounds, bounds[1:])]
+    vals, ids, amax = merge_candidates(torch.cat(packed), tp, k, rows)
+    ref_vals, ref_pos = torch.topk(sub, k, dim=-1)
+    assert torch.equal(vals, ref_vals)
+    assert torch.equal(ids, keep[ref_pos])
+    assert torch.equal(amax, keep[sub.argmax(-1)])
+
+
+def test_draft_head_scores_its_rows_with_the_lm_heads_int8_gemv(tmp_path):
+    """build_draft_head on one rank: the first n rows and the tokenizer's added ones, scored by the LM head's own int8
+    GEMV on those rows; its candidates are the global ids of the reduced row's top k."""
+    import json
+    from types import SimpleNamespace
+
+    from freetoken.distributed import set_tp_info
+    from freetoken.kernel.triton.int8_gemv import gemv_int8
+    from freetoken.layers.draft_vocab import build_draft_head
+
+    set_tp_info(0, 1)
+    g = torch.Generator(device="cuda").manual_seed(7)
+    vocab, dim, n = 4096, 256, 1000
+    (tmp_path / "tokenizer.json").write_text(json.dumps({"added_tokens": [{"id": 4090}, {"id": 4093}]}))
+    weight = torch.randint(-127, 128, (vocab, dim), generator=g, device="cuda", dtype=torch.int8)
+    scale = torch.rand(vocab, generator=g, device="cuda") * 0.01
+    lm_head = SimpleNamespace(weight=weight, weight_scale=scale, num_embeddings=vocab, tp_size=1, vocab_shards=None,
+                              vocab_range=(0, vocab), _comm=None)
+    head = build_draft_head(lm_head, str(tmp_path), None, n=n)
+    keep = torch.tensor([*range(n), 4090, 4093], device="cuda")
+    assert torch.equal(head.ids.long(), keep)
+    x = (torch.randn(2, dim, generator=g, device="cuda")).to(torch.bfloat16)
+    logits = head.forward(x)
+    assert torch.equal(logits, gemv_int8(x, weight[keep], scale[keep]))
+    vals, ids, amax = head.candidates(logits, 5, 2)
+    ref_vals, ref_pos = torch.topk(logits.float(), 5, dim=-1)
+    assert torch.equal(ids, keep[ref_pos]) and torch.equal(amax, keep[logits.float().argmax(-1)])

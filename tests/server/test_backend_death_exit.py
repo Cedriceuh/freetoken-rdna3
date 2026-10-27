@@ -38,7 +38,11 @@ _CHILD = textwrap.dedent(
     worker = mp.get_context("fork").Process(target=stubborn_worker, daemon=False)
     worker.start()
     api._GLOBAL_STATE = SimpleNamespace(backend_processes=[worker])
-    print(worker.pid, flush=True)
+    q = mp.get_context("spawn").Queue()  # named semaphores, as the server's ack queue holds (spawn: tracked, kept)
+    from multiprocessing import resource_tracker
+
+    print(worker.pid, resource_tracker._resource_tracker._pid, q._rlock._semlock.name, q._wlock._semlock.name,
+          q._sem._semlock.name, flush=True)
 
     app = FastAPI()
 
@@ -107,11 +111,17 @@ def test_backend_death_exits_nonzero_with_an_open_stream_and_a_stubborn_worker()
         [sys.executable, "-c", _CHILD, str(port)], stdout=subprocess.PIPE, text=True, env=dict(os.environ)
     )
     try:
-        worker_pid = int(child.stdout.readline())
+        worker_pid, tracker, *sems = child.stdout.readline().split()
+        worker_pid = int(worker_pid)
+        # the container's teardown kills the resource tracker with the main process: it cleans nothing up after it
+        os.kill(int(tracker), 9)
         threading.Thread(target=_hold_stream, args=(port, time.monotonic() + 60), daemon=True).start()
         # the old path (SIGTERM to itself) never returns here: uvicorn waits on the stream forever
         assert child.wait(timeout=60) == 1
         assert _dies_within(worker_pid, 5)
+        # the crash's exit unlinks the process's semaphores too (os._exit runs no exit handler)
+        left = [n for n in sems if os.path.exists(f"/dev/shm/sem.{n.lstrip('/')}")]
+        assert not left, left
     finally:
         if child.poll() is None:
             child.kill()

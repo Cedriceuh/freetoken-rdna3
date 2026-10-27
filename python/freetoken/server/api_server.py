@@ -102,6 +102,7 @@ def _exit_after_backend_death(grace_s: float) -> threading.Timer:
         processes = getattr(_GLOBAL_STATE, "backend_processes", None) or []
         _terminate_backend_workers(processes)
         _reap_backend_workers(processes)
+        _release_ipc()  # os._exit runs no exit handler: without it each crash left ~5 semaphores in the host's /dev/shm
         os._exit(1)
 
     timer = threading.Timer(grace_s, _stop)
@@ -124,20 +125,24 @@ def _reap_backend_workers(processes: List[Any], timeout: float = 5.0) -> None:
             continue
 
 
-def _exit_on_sigterm(signum, frame) -> None:
-    """The SIGTERM that uvicorn re-raises once its graceful stop is done (0.29+): dying of it ran no exit handler, so
-    multiprocessing's named semaphores (the ack queue's, and those the workers left) stayed in /dev/shm, the host's under
-    ``docker run --ipc=host`` (~5 a start). Reap the workers, run multiprocessing's exit handler, let its resource tracker
-    unlink what the workers left, then die of the signal (private multiprocessing API: a failure is only a leak, as
-    before)."""
+# FREETOKEN_STOP_GRACE_S (default 5): how long a stopping server lets its open streams run before it cancels them.
+# uvicorn's own default waits for them without a limit: a stop during a long answer outlived the supervisor's stop
+# timeout (systemd's SIGKILL then left the container stopping, and the restart's ``docker run`` failed on its name)
+_STOP_GRACE_S = float(os.environ.get("FREETOKEN_STOP_GRACE_S", "5"))
+
+
+def _stop_grace() -> dict:
+    """uvicorn's keyword for FREETOKEN_STOP_GRACE_S (0: no limit, uvicorn's own default)."""
+    return {"timeout_graceful_shutdown": _STOP_GRACE_S or None}
+
+
+def _release_ipc(timeout: float = 10.0) -> None:
+    """Run multiprocessing's exit handler and let its resource tracker unlink what the workers left: a process that
+    ends without them (a signal's default action, ``os._exit``) leaves its named semaphores (the ack queue's, and those
+    the workers left) in /dev/shm, the host's under ``docker run --ipc=host`` (~5 a start). Private multiprocessing
+    API: a failure is only a leak, as before."""
     import multiprocessing.util as mp_util
     from multiprocessing import resource_tracker
-
-    signal.signal(signum, signal.SIG_DFL)  # a second SIGTERM stops the process at once, as before
-    _SHUTTING_DOWN.set()  # the workers' exits are the stop's, not a crash (a SIGTERM before uvicorn took over)
-    processes = getattr(_GLOBAL_STATE, "backend_processes", None) or []
-    _terminate_backend_workers(processes)
-    _reap_backend_workers(processes)
 
     def cleanup() -> None:
         mp_util._exit_function()  # the atexit hook: unlinks this process's semaphores
@@ -146,7 +151,18 @@ def _exit_on_sigterm(signum, frame) -> None:
     # bounded: both wait for processes (a worker stuck in its GPU teardown, a stray one holding the tracker's pipe)
     done = threading.Thread(target=cleanup, name="freetoken-exit", daemon=True)
     done.start()
-    done.join(10.0)
+    done.join(timeout)
+
+
+def _exit_on_sigterm(signum, frame) -> None:
+    """The SIGTERM that uvicorn re-raises once its graceful stop is done (0.29+): dying of it ran no exit handler.
+    Reap the workers, release the IPC (``_release_ipc``), then die of the signal."""
+    signal.signal(signum, signal.SIG_DFL)  # a second SIGTERM stops the process at once, as before
+    _SHUTTING_DOWN.set()  # the workers' exits are the stop's, not a crash (a SIGTERM before uvicorn took over)
+    processes = getattr(_GLOBAL_STATE, "backend_processes", None) or []
+    _terminate_backend_workers(processes)
+    _reap_backend_workers(processes)
+    _release_ipc()
     os.kill(os.getpid(), signum)  # then die of it, as before: a supervisor sees the same stop
 
 
@@ -1025,7 +1041,7 @@ def _serve_and_run_shell(host: str, port: int, api_key: str | None) -> None:
     netloc = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
     origin = resolve_server_url(f"http://{netloc}").origin
 
-    server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, access_log=False))
+    server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, access_log=False, **_stop_grace()))
     thread = threading.Thread(target=server.run, name="freetoken-uvicorn", daemon=True)
     thread.start()
     _install_shell_stop_handlers()
@@ -1181,4 +1197,4 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
     # uvicorn stays on the main thread; ^C reaches the worker group. Its SIGTERM handler takes over while it runs and
     # puts this one back before re-raising the signal it stopped on
     signal.signal(signal.SIGTERM, _exit_on_sigterm)
-    uvicorn.run(app, host=host, port=port)
+    uvicorn.run(app, host=host, port=port, **_stop_grace())

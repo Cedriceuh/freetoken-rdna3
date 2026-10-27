@@ -20,14 +20,19 @@ import triton.language as tl
 
 
 @triton.jit
-def _pack_kernel(v_ptr, i_ptr, out_ptr, start, stride_v, stride_i, K: tl.constexpr, K_PAD: tl.constexpr):
+def _pack_kernel(v_ptr, i_ptr, out_ptr, start, map_ptr, stride_v, stride_i, K: tl.constexpr, K_PAD: tl.constexpr,
+                 MAP: tl.constexpr = False):
     row = tl.program_id(0).to(tl.int64)
     offs = tl.arange(0, K_PAD)
     mask = offs < K
     idx = tl.load(i_ptr + row * stride_i + offs, mask=mask, other=0)
     v = tl.load(v_ptr + row * stride_v + offs, mask=mask, other=0.0)
+    if MAP:
+        gid = tl.load(map_ptr + idx, mask=mask, other=0)
+    else:
+        gid = idx + start
     tl.store(out_ptr + row * (2 * K) + offs, v.to(tl.float32), mask=mask)
-    tl.store(out_ptr + row * (2 * K) + K + offs, (idx + start).to(tl.float32), mask=mask)
+    tl.store(out_ptr + row * (2 * K) + K + offs, gid.to(tl.float32), mask=mask)
 
 
 @triton.jit
@@ -58,7 +63,8 @@ def _block_topk_kernel(x_ptr, keys_ptr, stride_x, W, NB, K: tl.constexpr, K_PAD:
 
 
 @triton.jit
-def _rows_topk_kernel(keys_ptr, out_ptr, start, NB, K: tl.constexpr, K_PAD: tl.constexpr, C_PAD: tl.constexpr):
+def _rows_topk_kernel(keys_ptr, out_ptr, start, map_ptr, NB, K: tl.constexpr, K_PAD: tl.constexpr, C_PAD: tl.constexpr,
+                      MAP: tl.constexpr = False):
     """A row's K largest keys over its blocks, packed as ``[K values fp32 | K global ids as fp32]``."""
     row = tl.program_id(0).to(tl.int64)
     c = tl.arange(0, C_PAD)
@@ -72,8 +78,12 @@ def _rows_topk_kernel(keys_ptr, out_ptr, start, NB, K: tl.constexpr, K_PAD: tl.c
         vals = tl.where(o == i, tl.where(ordv >= 0, ordv, ordv ^ 0x7FFFFFFF).to(tl.float32, bitcast=True), vals)
         ids = tl.where(o == i, 0xFFFFFFFF - (best & 0xFFFFFFFF), ids)
         key = tl.where(key == best, -9223372036854775807 - 1, key)
+    if MAP:
+        gid = tl.load(map_ptr + ids, mask=o < K, other=0)
+    else:
+        gid = ids + start
     tl.store(out_ptr + row * (2 * K) + o, vals, mask=o < K)
-    tl.store(out_ptr + row * (2 * K) + K + o, (ids + start).to(tl.float32), mask=o < K)
+    tl.store(out_ptr + row * (2 * K) + K + o, gid.to(tl.float32), mask=o < K)
 
 
 # rows of at most this many candidates take the two kernels above instead of torch.topk: each pass is a max per
@@ -81,8 +91,10 @@ def _rows_topk_kernel(keys_ptr, out_ptr, start, NB, K: tl.constexpr, K_PAD: tl.c
 _KERNEL_TOPK_MAX = 64
 
 
-def pack_candidates(local: torch.Tensor, k: int, start: int, width: int) -> torch.Tensor:
-    """``[N, 2k]`` fp32: this rank's k largest logits of ``local[:, :width]`` then their global ids (``start`` + local).
+def pack_candidates(local: torch.Tensor, k: int, start: int, width: int,
+                    ids_map: torch.Tensor | None = None) -> torch.Tensor:
+    """``[N, 2k]`` fp32: this rank's k largest logits of ``local[:, :width]`` then their global ids (``start`` + local,
+    or ``ids_map[local]`` for columns of ascending, not contiguous, ids: FREETOKEN_DRAFT_VOCAB).
     Up to ``_KERNEL_TOPK_MAX``: two kernels, the k largest by (value, then the smaller index), the set torch.topk keeps
     (at the k-th value its gather takes the lowest indices) and the argmax first; the merge orders them."""
     assert width >= k, f"a vocabulary shard of {width} columns has no {k} candidates"
@@ -94,8 +106,9 @@ def pack_candidates(local: torch.Tensor, k: int, start: int, width: int) -> torc
         keys = torch.empty((local.shape[0], nb, k_pad), dtype=torch.int64, device=local.device)
         _block_topk_kernel[(local.shape[0], nb)](x, keys, x.stride(0), width, nb, K=k, K_PAD=k_pad, BLOCK=block,
                                                  num_warps=8)
-        _rows_topk_kernel[(local.shape[0],)](keys, out, start, nb, K=k, K_PAD=k_pad,
-                                             C_PAD=triton.next_power_of_2(nb * k_pad), num_warps=4)
+        _rows_topk_kernel[(local.shape[0],)](keys, out, start, ids_map if ids_map is not None else keys, nb, K=k,
+                                             K_PAD=k_pad, C_PAD=triton.next_power_of_2(nb * k_pad),
+                                             MAP=ids_map is not None, num_warps=4)
         return out
     if k == 1:
         idx = torch.argmax(x, dim=-1, keepdim=True)
@@ -103,8 +116,8 @@ def pack_candidates(local: torch.Tensor, k: int, start: int, width: int) -> torc
     else:
         vals, idx = torch.topk(x, k, dim=-1)
     _pack_kernel[(local.shape[0],)](
-        vals, idx, out, start, vals.stride(0), idx.stride(0), K=k, K_PAD=max(2, triton.next_power_of_2(k)),
-        num_warps=1,
+        vals, idx, out, start, ids_map if ids_map is not None else idx, vals.stride(0), idx.stride(0), K=k,
+        K_PAD=max(2, triton.next_power_of_2(k)), MAP=ids_map is not None, num_warps=1,
     )
     return out
 

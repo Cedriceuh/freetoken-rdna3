@@ -35,6 +35,15 @@ What each change measured, and how it was found: [docs/rdna3/journey.md](docs/rd
 
 ### Faster, the same bits
 
+- The MTP head's drafts score the Latin-script tokens only (`FREETOKEN_DRAFT_VOCAB=latin`, in the two-card
+  profiles): 143,589 of 248,320, 99.998-100 % of the tokens of the measured English, code and French answers; the
+  verify step keeps the whole head. `xtx-xt-4x262k`, one request: EXL3 3.05 bpw +1.7 % greedy, +1.3 % at T 0.6,
+  French +1.6 %; NVFP4 +0.8 to +1.2 %; the same answers, greedy and sampled.
+- EXL3's `mul1` codebook (the decode GEMVs, ALU-bound on its trellis): a weight's affine map as one packed fp16 fma
+  on the byte sum's fp16 bits, the same value for each of the 65,536 states, one instruction fewer a weight
+  (`FREETOKEN_EXL3_FAST_MUL1`), and a trellis window's shift in one instruction (`FREETOKEN_EXL3_ALIGNBIT`).
+  `xtx-xt-4x262k`, EXL3 3.05 bpw: +0.5 to +0.7 % at one, two and four requests, then +0.2 to +0.4 %; cold reads of
+  112k-159k tokens 0.6 % shorter; one card +0.3 %; the same answers.
 - Agent turns: a prompt of up to 1280 tokens on a cached conversation reads its routed experts through the expert
   cache, the next layer's predicted and copied ahead; the tokenizer reuses the previous prompt's tokens; with the K/V
   in RAM a prefill copies only the K/V rows it selects; the host no longer syncs at every layer, Triton launches take a
@@ -109,6 +118,13 @@ What each change measured, and how it was found: [docs/rdna3/journey.md](docs/rd
 
 ### Fixed
 
+- A server stopped during a long streamed answer waited for it to end (uvicorn's graceful stop has no limit by
+  default): a 6,000-token answer kept it 54 s, past a service manager's stop timeout, whose kill then left the
+  container stopping and made the next start fail on its name. It now cancels its open streams after
+  `FREETOKEN_STOP_GRACE_S` (5 s) and stops in 16-19 s. `tests/server/test_sigterm_exit.py` reproduces it.
+- A server whose backend died (a start out of memory, a killed rank) left ~5 multiprocessing semaphores in the host's
+  `/dev/shm` each time (`docker run --ipc=host`): its exit now releases them as a stop does
+  (`tests/server/test_backend_death_exit.py`).
 - Two requests verifying drafts: the MTP head's chained guesses of every request but the first wrote their K/V at
   another request's page-table row (the per-request row index, a strided view of the scheduler's row mapping, was read
   as contiguous), so their next guesses read whatever K/V the head had left at those positions, and the other

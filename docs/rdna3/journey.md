@@ -1862,7 +1862,125 @@ large-graph test above, which passes with the fill thread; CPU suite 1,849 passe
 Fifteen minutes of four agent-like sessions with the launcher's EXL3 settings: 243 requests to 124k tokens, no error.
 `/v1/cache/flush` (upstream's, `e0a7e23`) answers "unsupported" with two cards.
 
-## 41. Still open
+## 41. The drafts over the Latin-script vocabulary, EXL3's codebook in fp16, a stop that waits five seconds (2026-10-26 and 27)
+
+All measurements on `xtx-xt-4x262k` with a 300k-token pool unless named, arms interleaved, against the build of
+section 40: three greedy 512-token answers (`speed`), 12 prompts x 1024 tokens at T 0.6 (`calib6`), three greedy
+512-token answers in French (`fr`), two greedy answers at once (`two3`, three runs), four requests started 1.5 s apart.
+
+- **The drafts' LM head over part of the vocabulary** (`FREETOKEN_DRAFT_VOCAB`). Each of the three drafts of a
+  one-request step ran the whole LM head (248,320 rows, int8: 390 µs on the XTX, section 39), ~1.2 ms of a ~25 ms step.
+  The verify step keeps the whole head, so the greedy answers cannot change; a narrower draft head only costs the drafts
+  that would have been a token outside it. Byte-level BPE gives the first ids to the most frequent merges: the first
+  98,304 ids cover 99.9 % of the generated tokens of this repository's saved English and code answers (a frequency
+  ranking over 61 MB of Python and docs did no better), and gave EXL3 3.05 bpw 109.70 -> 112.09 / 111.26 tok/s greedy,
+  116.01 -> 118.06 / 118.72 at T 0.6, two requests 78.0 -> 80.1 / 80.0; but French answers 112.46 -> 107.45 / 106.67
+  (French words have ids from 160,000 to 230,000: the first 98,304 ids cover 93.3 % of a French answer's tokens). The
+  Latin-script tokens instead (ASCII, Latin-1, Latin Extended, punctuation, the symbols code and markdown use, a partial
+  UTF-8 character's bytes, the added tokens: 143,589 + 33 ids) cover 99.998 % of the English and code tokens and 100 %
+  of the French ones. Split over the ranks as the LM head is (78,979 / 64,619 rows), its rows copied from the rank that
+  holds them once at start: EXL3 109.46 / 109.83 -> 111.40 / 111.73 greedy (+1.7 %), 116.52 / 116.73 -> 117.50 / 118.79
+  at T 0.6 (+1.3 %), French 112.28 / 112.22 -> 113.96 / 114.06 (+1.6 %), two requests 78.83 -> 79.44 (+0.8 %), four the
+  same (one draft a step there); NVFP4 107.87 -> 108.71, 111.28 -> 112.62, French 115.44 -> 116.64, two and four
+  requests the same. The drafts' acceptance did not move, and every answer, greedy and sampled, was the same (EXL3 29 of
+  29 and 12 of 12 in both pairs, NVFP4 25 and 12). Computed at start from `tokenizer.json`
+  (`FREETOKEN_DRAFT_VOCAB=latin`, 143,589 + 33 ids), the same speeds and answers. On one card (`xtx`, a 131,072-token
+  context, two pairs) no gain: 63.55 / 63.42 -> 63.06 / 62.99 greedy, the same at T 0.6 and in French (the step waits on
+  the missing experts there, the drafts' head is a smaller part of it). On in the two-card profiles only; `xtx-xt` (the
+  K/V in VRAM, one pair): 105.63 -> 106.72 greedy, 112.94 -> 114.58 at T 0.6, French 108.05 -> 109.19, the same answers.
+  A kernel trace of the build (EXL3, one request, T 0.6): 21.85 ms a step, 1,348 kernels, 17.0 ms of them in kernels,
+  4.84 ms between them.
+- **One launch for a layer's chain: not tried.** In that trace a MoE block runs 13 launches, each reading what the one
+  before wrote, at workgroup sizes 128, 256, 32, 128, 32, 512, 64, 256, 64, 64, 128, 512 and 512 threads; one launch
+  runs one size, and a part run at other warps reduces in another order (section 39's router fusion lost its bits
+  that way). The one pair of equal size, the experts' weighted sum (Triton) and the host all-reduce (HIP), would need
+  the sum rewritten in HIP with Triton's rounding: left for later. The host all-reduces are 100 launches a step,
+  15.5 µs each on average (1.6 ms), against a floor of ~6 µs a call (section 38): what the rest is was not split.
+- **A stop during a long answer.** The service's stop timed out twice in the launcher's journal (systemd's 30 s,
+  2026-10-23 and 26): the server waits for every open stream before it stops (uvicorn's graceful stop has no limit),
+  and a SIGKILL'd `docker run` leaves its container stopping, so the restart of 2026-10-23 failed on the container's
+  name. Measured: a SIGTERM 10 s into a 6,000-token streamed answer stopped the container 53.9 s later, once the answer
+  had ended; with `FREETOKEN_STOP_GRACE_S=5` (the default now) 16.5 s, 19.1 s with the launcher's pool, the stream cut.
+- **Semaphores left by a crash.** `/dev/shm` held 50 multiprocessing semaphores, in groups of ~5 dated at the night's
+  failed starts (out of memory, traced servers): the exit of a server whose backend died ran no exit handler. It now
+  releases them as a stop does; a start that crashed at 00:08 (below) left none.
+- **More expert slots on the XTX: no room.** The VRAM in use under the launcher's EXL3 settings, 10 minutes of four
+  agent-like sessions then cold reads of 40k to 159k tokens, sampled every 0.25 s: the XTX peaked at 23,476 of 24,560
+  MiB (1,084 free, with an idle desktop, which takes 0.4-1.8 GiB more by day), the XT at 17,327 of 20,464. The expert
+  cache's size is the ranks' common one (11,677 slots, the XTX's; the XT alone would hold 12,984), and a step waits
+  for its slower rank: the XT's spare VRAM would not shorten it.
+- **EXL3's codebook: one instruction fewer a weight** (`FREETOKEN_EXL3_FAST_MUL1`). In that trace the EXL3 GEMVs
+  take 3.7 ms of the XTX's step (the gate | up call at four rows decodes up to ~79M weights in ~49 us). The compiled
+  loop (AMDGCN, per weight): the state's extraction, `v_mul_lo_u32` (the hash), `v_dot4_u32_u8` (the byte sum), `v_cvt_f32_u32`,
+  `v_fma_mixlo_f16` (the affine map in fp32, rounded to fp16) and `v_fma_mix_f32` per route. The map's product and sum
+  are exact in fp32, so one fp16 fma rounds it the same: the byte sum now lands on 0x6400 (the fp16 bits of 1024 +
+  the sum, as the CUDA kernels build it), and a `v_pk_fma_f16` with a `v_perm_b32` maps two weights (7.88 -> 6.88
+  VALU instructions a weight in that loop). All 65,536 states give the reference's value; the GEMVs, the tile
+  dequant and their outputs at K 3-6 are the same bits (50 outputs, both cards). Gate | up at four rows 60.4 -> 56.8
+  us, down 32.8 -> 30.5 (XTX; the XT 80.5 -> 74.6): an eighth fewer instructions, 6-7 % less time, so the decoding's
+  ALU work, not the bytes read, sets most of it. In serving (EXL3, two pairs): 111.43 / 111.19 -> 112.01 / 111.90
+  tok/s greedy, 118.84 / 118.26 -> 119.20 / 119.08 at T 0.6, French 113.93 / 113.38 -> 114.44 / 114.35, two requests
+  79.72 / 79.40 -> 80.13 / 80.14, four 52.66 / 52.59 -> 52.86 / 52.91; 29 greedy and 12 sampled answers identical. The
+  hash's 32-bit multiply split into two 16-bit ones made it slower: the compiler kept a `v_mul_lo_u32` (the shift
+  folded into the constant) and added two instructions.
+- **The trellis window in one instruction** (`FREETOKEN_EXL3_ALIGNBIT`). The 32 bits that hold a window's states
+  came out of two words as `(wb >> s) | ((wa << 1) << (31 - s))`, three instructions; `v_alignbit_b32` is that
+  funnel shift (s = 0 included): 6.88 -> 6.38 instructions a weight, the same 50 outputs on both cards, gate | up at
+  four rows 56.6 -> 53.9 us (XTX) and 75.4 -> 71.4 (XT). In serving (two pairs, on top of the codebook): 112.37 /
+  112.07 -> 112.38 / 112.52 greedy, 119.63 / 119.38 -> 119.58 / 119.79 at T 0.6, French 114.67 / 114.52 -> 114.78 /
+  114.93, two requests 80.22 / 80.14 -> 80.42 / 80.30, four 53.00 / 52.89 -> 53.20 / 53.12 (+0.2-0.4 %, near the
+  noise); the same answers.
+- **Both, against neither, elsewhere** (two pairs each): cold reads on `xtx-xt-4x262k` (the prefill's grouped GEMM
+  decodes its tiles through the same code) 112k tokens 32.72 / 32.70 -> 32.51 / 32.49 s, 159k 47.18 / 47.23 -> 46.91 /
+  46.95 s (-0.6 %), 40k 13.24 -> 13.20 / 13.18 s (the first arm's first read, 18.23 s, left out: the other three arms
+  13.2 s); one card (`xtx`, 131,072 tokens) 63.54 / 63.52 -> 63.72 / 63.75 tok/s greedy, 64.37 / 64.33 -> 64.52 /
+  64.56 at T 0.6 (+0.3 %); 16 greedy and 12 sampled answers identical.
+- **Dropped: the hash in 24-bit multiplies.** `v_mul_lo_u32` written as two `v_mul_u32_u24` and a `v_lshl_add_u32`
+  (the state has 16 bits, the same product modulo 2^32; inline assembly, the compiler keeping the 32-bit multiply
+  otherwise): two instructions more a weight, yet gate | up at four rows 54.7 -> 51.8 us on the XTX and 70.3 -> 63.5
+  on the XT, the same 50 outputs, so the 32-bit multiply takes several issue cycles. In serving nothing: 112.17 /
+  112.64 against 112.57 / 112.17 tok/s greedy, 119.30 / 119.90 against 119.77 / 119.60 at T 0.6, the pairs in
+  opposite directions. Not kept.
+- **Dropped: a fourth draft** (`FREETOKEN_SPEC_VERIFY_M=5`, its step costed 40 ms, the table's per-row increase
+  extrapolated; EXL3, two pairs against `M=4`): greedy 110.89 / 111.26 -> 111.09 / 111.42 tok/s, but T 0.6 118.08 /
+  118.54 -> 113.24 / 113.43 (-4.3 %), French 113.11 / 113.67 -> 110.85 / 110.81, two requests 79.21 / 79.51 -> 75.13 /
+  75.29 (-5.3 %). The single greedy answers stayed the same (19 of 19), the two-request ones did not (0 of 6: ten
+  rows a step, other kernel shapes likely; not looked into).
+- **Two requests: the depth holds.** The adaptive depth costs its rows with one request's step times. At two
+  requests (EXL3, `FREETOKEN_SPEC_TIMING`, GPU ms a step, head and chain included) 2 / 3 / 4 rows cost 23.5 / 29.1 /
+  35.3, in the same ratios (1 : 1.24 : 1.50 against the table's 1 : 1.21 : 1.40). Two rows each
+  (`FREETOKEN_SPEC_BS_DEEP=1`, two pairs) against the profile's deep rows: greedy 78.72 / 79.19 against 78.29 / 79.80
+  tok/s, T 0.6 78.07 / 78.88 against 79.89 / 77.54 (1.8 kept tokens a step against 2.4-2.9); the greedy answers
+  identical. Nothing to change.
+- **The second request's drafts are kept as often as the first's.** The kept tokens of every verify step logged per
+  request (a diagnostic patch, not kept), one prompt alone then twice at once, two prompts: greedy, the two requests
+  kept the same tokens step for step (NVFP4 2.876 a step each, EXL3 2.470); at T 0.6 the first request 2.726 and
+  the second 2.662 (NVFP4), 2.713 and 2.845 (EXL3), within the spread of the runs. Not where NVFP4's two sampled
+  requests lose their ~2 % (section 39).
+- **Alone or beside another request, the same answer; on a cached prefix, not always.** Greedy, 512 tokens, both
+  checkpoints: a prompt answered alone, twice at once, beside another prompt read 2 s before or after it gave one
+  text. The first read of a prompt (76 or 90 tokens) differed from the later ones, whose first 64 tokens come from
+  the prefix cache (12 or 26 read): both prompts on both checkpoints, each diverging at a near-equal choice (a newline
+  against a space, "if full" against "if over capacity") ~30-130 tokens into the answer; a short prefill on a cached
+  prefix rounds otherwise than the whole prompt's. The cache flush that would have read each case cold is refused at
+  TP > 1 (`/v1/cache/flush`: "unsupported"), so the cases after the first read compare cached reads.
+- **The rare start fault, once more.** One start of ~70 since the merge (EXL3, the merge's image, the night's tree)
+  died at the end of its start, after the graphs were captured and before the API was ready: `[gfxhub] page fault` on
+  the XTX, a write (RW 1) permission fault from a shader (TCP) at a host-range address, like the one of 2026-10-20.
+  The memory maps saved at ready came too late (rank 0 was already exiting), so the test servers then saved them
+  every 3 s during the start: the 30 starts in a row after that (the same image, tree and settings) were clean, and
+  15 more with the final tree, EXL3 and NVFP4 in turn, each with a ~3k-token first request: the fault not caught
+  again.
+- **The tests of this tree** (the image of section 40, the changed files mounted): the GPU list on each card 1,496
+  passed, the CPU suite 1,853 passed, no failure.
+- **The final tree under the launchers' settings** (EXL3 with the profile's pool, NVFP4 with 787,500 tokens): ten
+  minutes of four agent-like sessions then cold reads of 40k / 112k / 159k tokens: 164 and 160 requests (25 and 23
+  dropped mid-answer on purpose), contexts to 124k, no error, no degenerate answer, no GPU fault; cold reads EXL3
+  11.83 / 33.00 / 47.53 s, NVFP4 11.14 / 30.11 / 43.51 s; the VRAM in use at its peak (the idle desktop included) XTX
+  23,491 and 24,055 MiB of 24,560 (the allocator capped 512 MiB short of full), XT 17,808 and 19,836 of 20,464. The
+  Latin draft head takes 190 expert slots (EXL3, a 300k-token pool: 12,924 -> 12,734), inside the measured gains.
+
+## 42. Still open
 
 - In NVFP4 the model needs ~63 GiB of RAM for its experts alone (the engine keeps every expert in RAM). The EXL3 3.05
   bpw checkpoint needs 42.6 GiB and served under a 56 GiB container limit, but a real 64 GB machine is untested
@@ -1885,7 +2003,8 @@ Fifteen minutes of four agent-like sessions with the launcher's EXL3 settings: 2
   section 38): cause not found; two hypotheses ruled out in section 38. Not seen in ~80 starts on 2026-10-25 and 26
   (section 39's build, both checkpoints), 31 of them in a row with the launcher's pools (19 EXL3, 12 NVFP4), a
   7.5k-token first request and ROCm's debug agent loaded to name the faulting kernel
-  (`HSA_TOOLS_LIB=librocm-debug-agent.so.2`, in the image; it costs ~0.2 µs a kernel, so only for such a hunt).
+  (`HSA_TOOLS_LIB=librocm-debug-agent.so.2`, in the image; it costs ~0.2 µs a kernel, so only for such a hunt). One
+  more on 2026-10-27 (EXL3, the XTX, the end of a start, 1 in ~70, section 41), then 45 clean starts in a row.
 - Expert misses (section 20): the decode GEMVs now read them from host memory while computing the cached experts
   (section 38), so their PCIe time shows where it exceeds that work (a layer's GEMVs at one request, EXL3: 40.5 µs
   against 32.5 when the copy came first, the copy 34.6 -> 4.2 µs). Fewer of them is the lever left: a larger cache,

@@ -124,3 +124,65 @@ def test_sigterm_leaves_no_semaphore(tmp_path):
     code, _, left = _stop(tmp_path, kill_tracker=False)
     assert code == -signal.SIGTERM
     assert not left, left
+
+
+_STREAM_CHILD = textwrap.dedent(
+    """
+    import asyncio
+    import sys
+
+    import uvicorn
+    from fastapi import FastAPI
+    from fastapi.responses import StreamingResponse
+
+    import freetoken.server.api_server as api
+
+    app = FastAPI()
+
+
+    @app.get("/stream")
+    async def stream():
+        async def forever():  # an answer longer than any stop timeout
+            while True:
+                yield b"data: x\\n\\n"
+                await asyncio.sleep(0.05)
+
+        return StreamingResponse(forever(), media_type="text/event-stream")
+
+
+    if __name__ == "__main__":
+        uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), log_level="warning", **api._stop_grace())
+    """
+)
+
+
+@pytest.mark.parametrize("grace, stops", [("1", True), ("0", False)])
+def test_sigterm_during_a_stream_stops_within_the_grace(tmp_path, grace, stops):
+    """FREETOKEN_STOP_GRACE_S: a SIGTERM while a stream is open stops the server once the grace is over; with no limit
+    (0, uvicorn's own default) it waits for the stream, here forever (a supervisor's stop timeout then kills it)."""
+    script = tmp_path / "stream_child.py"
+    script.write_text(_STREAM_CHILD)
+    port = _free_port()
+    child = subprocess.Popen([sys.executable, str(script), str(port)], env=dict(os.environ, FREETOKEN_STOP_GRACE_S=grace),
+                             cwd=tmp_path)
+    client = socket.socket()
+    try:
+        assert _listening(port, time.monotonic() + 60)
+        client.connect(("127.0.0.1", port))
+        client.sendall(f"GET /stream HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n".encode())
+        client.settimeout(10)
+        got = b""
+        while b"data: x" not in got:  # the headers, then the stream's first chunk: it is open
+            got += client.recv(4096)
+        child.send_signal(signal.SIGTERM)
+        try:
+            child.wait(timeout=8)
+            stopped = True
+        except subprocess.TimeoutExpired:
+            stopped = False
+        assert stopped == stops
+    finally:
+        client.close()
+        if child.poll() is None:
+            child.kill()
+            child.wait()

@@ -27,6 +27,14 @@ import triton.language as tl
 from freetoken.kernel.triton.route_groups import _route_group_row, route_groups
 from freetoken.layers.quantization.exl3_codec import CB_3INST, CB_MCG, CB_MUL1
 
+# FREETOKEN_EXL3_FAST_MUL1 (default 1): the mul1 codebook's affine map as one packed fp16 fma on the fp16 bits the byte
+# sum gives, the same value for each of the 65536 states with one ALU instruction fewer a weight (RDNA3: the u32 -> f32
+# conversion and the fp32 fma to fp16 become half a v_pk_fma_f16 and half a v_perm); 0: the fp32 map, then fp16
+_FAST_MUL1 = tl.constexpr(os.environ.get("FREETOKEN_EXL3_FAST_MUL1", "1") == "1")
+# FREETOKEN_EXL3_ALIGNBIT (default 1 on ROCm): a trellis window's funnel shift as one v_alignbit_b32 instead of three
+# shifts (two fewer a window: 4 weights up to 5 bits, 2 above), the same words
+_ALIGNBIT = tl.constexpr(os.environ.get("FREETOKEN_EXL3_ALIGNBIT", "1") == "1" and torch.version.hip is not None)
+
 
 def group_size(K: int) -> int:
     return 4 if K <= 5 else 2
@@ -76,7 +84,11 @@ def _exl3_states(t_base, KT: tl.constexpr, NT: tl.constexpr, stride_a, stride_b,
     wa = wa.to(tl.uint32, bitcast=True)
     wb = wb.to(tl.uint32, bitcast=True)
     # low 32 bits of (wa:wb) >> s2, which hold all G windows; the double shift keeps s2 = 0 legal
-    lo = (wb >> s2) | ((wa << 1) << (31 - s2))
+    if _ALIGNBIT:  # the same funnel shift in one instruction (s2 < 32)
+        lo = tl.inline_asm_elementwise("v_alignbit_b32 $0, $1, $2, $3", "=v,v,v,v", [wa, wb, s2], dtype=tl.uint32,
+                                       is_pure=True, pack=1)
+    else:
+        lo = (wb >> s2) | ((wa << 1) << (31 - s2))
     states = (lo >> ((G - 1 - iw) * K).to(tl.uint32)) & 0xFFFF
     return tl.reshape(states, (KT, NT, 256))
 
@@ -102,6 +114,14 @@ def _exl3_codebook(s, CB: tl.constexpr, DOT4: tl.constexpr):
     in fp32 for these operands, so one cast to fp16 rounds like ``__hfma``."""
     if CB == 2:  # mul1
         x = s * 0x83DCD12D
+        if _FAST_MUL1:
+            # the byte sum lands on 0x6400, the fp16 bits of 1024 + bytesum, and one fp16 fma (two weights an
+            # instruction) rounds the exact h * a + b once, as the fp32 path below does
+            h = _byte_sum(x, tl.full(x.shape, 0x6400, tl.uint32), DOT4)
+            hf = (h & 0xFFFF).to(tl.uint16).to(tl.float16, bitcast=True)
+            a = tl.full(x.shape, 0x1EEE, tl.uint16).to(tl.float16, bitcast=True)
+            b = tl.full(x.shape, 0xC931, tl.uint16).to(tl.float16, bitcast=True)
+            return tl.fma(hf, a, b).to(tl.float32)
         h = _byte_sum(x, tl.full(x.shape, 1024, tl.uint32), DOT4).to(tl.float32)
         return (h * 0.00676727294921875 - 10.3828125).to(tl.float16).to(tl.float32)
     else:

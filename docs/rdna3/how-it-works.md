@@ -187,8 +187,9 @@ branch `3.05bpw_h5_ng5` (routed experts at 3 bits per weight, most other linears
 
 - **Routed experts stay EXL3**, in the host banks and in the GPU cache: 1.86 MB per expert against 2.76 MB in NVFP4.
   Triton kernels written for gfx1100 decode the trellis in registers (the byte sum of the `mul1` codebook is one
-  `v_dot4_u32_u8`): split-K GEMVs in decode, a grouped GEMM over expert-sorted tokens in prefill, and the Hadamard
-  rotations around them. Every expert has its own input scales, so the input is rotated once per routed expert.
+  `v_dot4_u32_u8`, its affine map one packed fp16 fma for two weights, a window of states one `v_alignbit_b32`):
+  split-K GEMVs in decode, a grouped GEMM over expert-sorted tokens in prefill, and the Hadamard rotations around
+  them. Every expert has its own input scales, so the input is rotated once per routed expert.
 - **Every other linear** (attention, GDN, shared expert, LM head, MTP head, vision tower) is decoded to bf16 on the
   GPU as it loads (a few seconds), then follows the usual path: `FREETOKEN_INT8_DENSE=1` converts it to int8 as for
   NVFP4 (the vision tower stays bf16, as it does with NVFP4). exllamav3 zero-pads a linear to 128-multiples (the

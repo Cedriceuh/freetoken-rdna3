@@ -235,7 +235,8 @@ its KV (now 2 rows each in `xtx-xt` and its K/V-in-RAM variants, [above](#severa
   prefill, the host-memory all-reduce and the tuned prefill tiles (swept again since, on upstream's rewritten prefill
   GEMM, whose NVFP4 answers differ). Added after the last scored build, and checked for exactness instead: the tuned
   decode tiles, up to 4 concurrent requests (a request's decode is identical alone or batched; prompts prefilled
-  together can differ at rounding level), the RAM tier, the sampler rework for requests without a small `top_k`, rank
+  together, or a prompt read again on its cached prefix, can differ at rounding level), the RAM tier, the sampler
+  rework for requests without a small `top_k`, rank
   0's token broadcast, the MTP head's drafts drawn under each request's sampling (exact speculative sampling) and three
   or four requests verifying 2 rows each on `xtx-xt-4x262k` (greedy answers unchanged). The one-card profiles were not
   run on it. A build on ROCm 10 with the MTP head (`xtx-xt`) scored 12 and 18 in two runs; the same build with the EXL3
