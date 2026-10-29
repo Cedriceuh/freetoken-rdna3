@@ -2,7 +2,7 @@
 <!-- Source of social-preview.png (1280x640, the README banner and the repository's social preview). Every figure comes
      from docs/rdna3/benchmarks.md: decode = the depth sweep's TG range (one request, MTP head on, greedy, from 9k
      tokens to the profile's maximum context; a bar's fill goes to the lowest step, its lighter part to the highest,
-     120 tok/s = the full track), PP = the same sweep's new blocks, RAM = memory locked while serving;
+     150 tok/s = the full track), PP = the same sweep's new blocks, RAM = memory locked while serving;
      update both together, then render (fonts: Ubuntu Sans, Ubuntu Sans Mono):
        google-chrome --headless=new --disable-gpu --hide-scrollbars --window-size=1280,640 \
          --screenshot=docs/rdna3/assets/social-preview.png docs/rdna3/assets/social-preview.html -->
@@ -72,9 +72,9 @@
       <div class="fmt">NVFP4</div>
       <div class="size">4-bit experts &nbsp;·&nbsp; 135 GB</div>
       <div class="rows mono">
-        <div class="k">XTX+XT</div><div class="track"><div class="ext" style="width: 80.2%"></div><div class="fill" style="width: 64.8%"></div></div><div class="v">78–96<small> tok/s</small></div><div class="sub">PP <b>1.9–2.2k</b> tok/s &nbsp;·&nbsp; RAM <b>82</b> GiB &nbsp;·&nbsp; max context <b>262k</b></div>
-        <div class="k">XTX</div><div class="track"><div class="ext" style="width: 36.4%"></div><div class="fill" style="width: 30.4%"></div></div><div class="v">36–44<small> tok/s</small></div><div class="sub">PP <b>1.5–1.7k</b> tok/s &nbsp;·&nbsp; RAM <b>73</b> GiB &nbsp;·&nbsp; max context <b>131k</b></div>
-        <div class="k">XT</div><div class="track"><div class="ext" style="width: 28.7%"></div><div class="fill" style="width: 24.1%"></div></div><div class="v">29–34<small> tok/s</small></div><div class="sub">PP <b>1.3–1.5k</b> tok/s &nbsp;·&nbsp; RAM <b>73</b> GiB &nbsp;·&nbsp; max context <b>131k</b></div>
+<div class="k">XTX+XT</div><div class="track"><div class="ext" style="width: 76.9%"></div><div class="fill" style="width: 61.5%"></div></div><div class="v">92–115<small> tok/s</small></div><div class="sub">PP <b>3.1–4.1k</b> tok/s &nbsp;·&nbsp; RAM <b>83</b> GiB &nbsp;·&nbsp; max context <b>262k</b></div>
+        <div class="k">XTX</div><div class="track"><div class="ext" style="width: 31.0%"></div><div class="fill" style="width: 25.4%"></div></div><div class="v">38–47<small> tok/s</small></div><div class="sub">PP <b>2.3–2.9k</b> tok/s &nbsp;·&nbsp; RAM <b>74</b> GiB &nbsp;·&nbsp; max context <b>131k</b></div>
+        <div class="k">XT</div><div class="track"><div class="ext" style="width: 23.9%"></div><div class="fill" style="width: 20.2%"></div></div><div class="v">30–36<small> tok/s</small></div><div class="sub">PP <b>2.2–2.6k</b> tok/s &nbsp;·&nbsp; RAM <b>74</b> GiB &nbsp;·&nbsp; max context <b>131k</b></div>
       </div>
       <div class="ref mono">RadixArk/Qwen3.8-Flash-Next-NVFP4</div>
     </div>
@@ -83,9 +83,9 @@
       <div class="fmt">EXL3 3.05 bpw</div>
       <div class="size">3-bit experts &nbsp;·&nbsp; 85 GB</div>
       <div class="rows mono">
-        <div class="k">XTX+XT</div><div class="track"><div class="ext" style="width: 97.7%"></div><div class="fill" style="width: 79.1%"></div></div><div class="v">95–117<small> tok/s</small></div><div class="sub">PP <b>1.9–2.3k</b> tok/s &nbsp;·&nbsp; RAM <b>60</b> GiB &nbsp;·&nbsp; max context <b>262k</b></div>
-        <div class="k">XTX</div><div class="track"><div class="ext" style="width: 48.5%"></div><div class="fill" style="width: 43.5%"></div></div><div class="v">52–58<small> tok/s</small></div><div class="sub">PP <b>1.7–1.8k</b> tok/s &nbsp;·&nbsp; RAM <b>51</b> GiB &nbsp;·&nbsp; max context <b>131k</b></div>
-        <div class="k">XT</div><div class="track"><div class="ext" style="width: 38.2%"></div><div class="fill" style="width: 34.2%"></div></div><div class="v">41–46<small> tok/s</small></div><div class="sub">PP <b>1.5–1.6k</b> tok/s &nbsp;·&nbsp; RAM <b>51</b> GiB &nbsp;·&nbsp; max context <b>131k</b></div>
+        <div class="k">XTX+XT</div><div class="track"><div class="ext" style="width: 96.3%"></div><div class="fill" style="width: 77.9%"></div></div><div class="v">117–145<small> tok/s</small></div><div class="sub">PP <b>3.5–3.8k</b> tok/s &nbsp;·&nbsp; RAM <b>62</b> GiB &nbsp;·&nbsp; max context <b>262k</b></div>
+        <div class="k">XTX</div><div class="track"><div class="ext" style="width: 46.4%"></div><div class="fill" style="width: 41.5%"></div></div><div class="v">62–70<small> tok/s</small></div><div class="sub">PP <b>2.4–2.7k</b> tok/s &nbsp;·&nbsp; RAM <b>53</b> GiB &nbsp;·&nbsp; max context <b>131k</b></div>
+        <div class="k">XT</div><div class="track"><div class="ext" style="width: 37.0%"></div><div class="fill" style="width: 32.9%"></div></div><div class="v">49–56<small> tok/s</small></div><div class="sub">PP <b>2.1–2.4k</b> tok/s &nbsp;·&nbsp; RAM <b>53</b> GiB &nbsp;·&nbsp; max context <b>131k</b></div>
       </div>
       <div class="ref mono">turboderp/Qwen3.8-Flash-Next-exl3</div>
     </div>
@@ -94,9 +94,9 @@
       <div class="fmt">EXL3 4.05 bpw</div>
       <div class="size">4-bit experts &nbsp;·&nbsp; 108 GB</div>
       <div class="rows mono">
-        <div class="k">XTX+XT</div><div class="track"><div class="ext" style="width: 78.3%"></div><div class="fill" style="width: 71.8%"></div></div><div class="v">86–94<small> tok/s</small></div><div class="sub">PP <b>2.0–2.3k</b> tok/s &nbsp;·&nbsp; RAM <b>75</b> GiB &nbsp;·&nbsp; max context <b>262k</b></div>
-        <div class="k">XTX</div><div class="track"><div class="ext" style="width: 39.1%"></div><div class="fill" style="width: 30.6%"></div></div><div class="v">37–47<small> tok/s</small></div><div class="sub">PP <b>1.6–1.8k</b> tok/s &nbsp;·&nbsp; RAM <b>66</b> GiB &nbsp;·&nbsp; max context <b>131k</b></div>
-        <div class="k">XT</div><div class="track"><div class="ext" style="width: 30.0%"></div><div class="fill" style="width: 24.5%"></div></div><div class="v">29–36<small> tok/s</small></div><div class="sub">PP <b>1.4–1.6k</b> tok/s &nbsp;·&nbsp; RAM <b>66</b> GiB &nbsp;·&nbsp; max context <b>131k</b></div>
+        <div class="k">XTX+XT</div><div class="track"><div class="ext" style="width: 74.9%"></div><div class="fill" style="width: 69.7%"></div></div><div class="v">105–112<small> tok/s</small></div><div class="sub">PP <b>3.2–3.7k</b> tok/s &nbsp;·&nbsp; RAM <b>76</b> GiB &nbsp;·&nbsp; max context <b>262k</b></div>
+        <div class="k">XTX</div><div class="track"><div class="ext" style="width: 37.5%"></div><div class="fill" style="width: 28.7%"></div></div><div class="v">43–56<small> tok/s</small></div><div class="sub">PP <b>2.3–2.7k</b> tok/s &nbsp;·&nbsp; RAM <b>67</b> GiB &nbsp;·&nbsp; max context <b>131k</b></div>
+        <div class="k">XT</div><div class="track"><div class="ext" style="width: 29.3%"></div><div class="fill" style="width: 23.3%"></div></div><div class="v">35–44<small> tok/s</small></div><div class="sub">PP <b>2.0–2.4k</b> tok/s &nbsp;·&nbsp; RAM <b>67</b> GiB &nbsp;·&nbsp; max context <b>131k</b></div>
       </div>
       <div class="ref mono">turboderp/Qwen3.8-Flash-Next-exl3</div>
     </div>

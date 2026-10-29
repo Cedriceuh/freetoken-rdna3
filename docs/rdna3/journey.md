@@ -2241,6 +2241,15 @@ Each part of a 16k-token chunk timed against what the card can do (events per la
   23,512 MiB (NVFP4) on the XT / XTX, host RAM in use up to 95,642 / 110,338 MiB. Four agent sessions (20-90k-token
   reads, tool outputs of 0.2-3k tokens, 64-600-token answers at T 0.6, one request in ten cut short) for 30 and 45
   minutes on EXL3 and 20 on NVFP4: 602, 925 and 348 requests, no error, no degenerate answer.
+- **The benchmarks re-measured** (2026-10-29, the build with all of the above; one server per row, the depth sweep to
+  the profile's maximum context): one request's greedy decode from 9k to 260k on `xtx-xt` NVFP4 78-96 -> 92-115 tok/s,
+  EXL3 3.05 bpw 95-117 -> 117-145, 4.05 bpw 86-94 -> 105-112; on one card `xtx` 36-44 -> 38-47 / 52-58 -> 62-70 / 37-47
+  -> 43-56 and `xt` 29-34 -> 30-36 / 41-46 -> 49-56 / 29-36 -> 35-44; reading a new block on `xtx-xt` 1910-2280 ->
+  3100-4150 tok/s, on one card 1350-1820 -> 2040-2890; the ~1k-token agent turn on `xtx-xt` 0.7-1.0 -> 0.44-0.69 s, on
+  one card 1.0-1.8 -> 0.79-1.40 s; RAM locked +1-2 GiB. These gains add up every build since the last measurement
+  (2026-10-16, sections 31 on), not this section alone. One `xt --no-mtp` server decoded its 15 answers at 24.6 tok/s
+  for five minutes, then its sweep as usual; started again, the build before and this one gave 34.5 and 34.4 (not
+  explained).
 - **Not kept.** EXL3's down product with 64-row tiles for each expert's full rows and 32-row tiles for the rest (as its
   gate | up product does), real routing, both cards: 5-7 % faster at 8 warps and 4 tile rows of K, the same bits, under
   1 % of a read. The NVFP4 tiles above. A thread issuing the copy-engine all-reduce (above). The EXL3 decode GEMV at
@@ -2262,17 +2271,20 @@ Each part of a 16k-token chunk timed against what the card can do (events per la
   for them (int8 or table GEMVs), but `test_qsa_spec_rows`' toy projections did, which made it fail on 3-4 rows;
   computed a row at a time they pass (the test now does so).
 - A rare GPU page fault (`[gfxhub] page fault`, permission fault, `sq_intr` errors): those while serving came with a
-  card within tens of MiB of full (section 21; the torch allocator is now capped 512 MiB short of that). One at start
-  on 2026-10-07, ~3 s after the CUDA graphs were captured, with 3.9 GiB free on the XTX (EXL3 3.05 bpw; 1 start in
-  ~32 that night, the 16 starts of a series after it were clean); one more at the first request of a start on
-  2026-10-19 (on the XT, 1 of the night's 41 EXL3 starts, section 34), one on 2026-10-20 (NVFP4, the XTX, the first
-  prefill, 1 in ~70 starts, section 36) and one on 2026-10-22 (EXL3, the XTX, the first request, 1 in ~20 starts,
-  section 38): cause not found; two hypotheses ruled out in section 38. Not seen in ~80 starts on 2026-10-25 and 26
-  (section 39's build, both checkpoints), 31 of them in a row with the launcher's pools (19 EXL3, 12 NVFP4), a
-  7.5k-token first request and ROCm's debug agent loaded to name the faulting kernel
-  (`HSA_TOOLS_LIB=librocm-debug-agent.so.2`, in the image; it costs ~0.2 µs a kernel, so only for such a hunt). One
-  more on 2026-10-27 (EXL3, the XTX, the end of a start, 1 in ~70, section 41), then 45 clean starts in a row, 60
-  more on 2026-10-28 (EXL3 and NVFP4 in turn, a ~3k-token first request), and none in the other starts of both nights.
+  card within tens of MiB of full (section 21; the torch allocator is now capped 512 MiB short of that). One at start on
+  2026-10-07, ~3 s after the CUDA graphs were captured, with 3.9 GiB free on the XTX (EXL3 3.05 bpw; 1 start in ~32 that
+  night, the 16 starts of a series after it were clean); one more at the first request of a start on 2026-10-19 (on the
+  XT, 1 of the night's 41 EXL3 starts, section 34), one on 2026-10-20 (NVFP4, the XTX, the first prefill, 1 in ~70
+  starts, section 36) and one on 2026-10-22 (EXL3, the XTX, the first request, 1 in ~20 starts, section 38): cause not
+  found; two hypotheses ruled out in section 38. Not seen in ~80 starts on 2026-10-25 and 26 (section 39's build, both
+  checkpoints), 31 of them in a row with the launcher's pools (19 EXL3, 12 NVFP4), a 7.5k-token first request and ROCm's
+  debug agent loaded to name the faulting kernel (`HSA_TOOLS_LIB=librocm-debug-agent.so.2`, in the image; it costs ~0.2
+  µs a kernel, so only for such a hunt). One more on 2026-10-27 (EXL3, the XTX, the end of a start, 1 in ~70, section
+  41), then 45 clean starts in a row, 60 more on 2026-10-28 (EXL3 and NVFP4 in turn, a ~3k-token first request), and
+  none in the other starts of both nights. One on 2026-10-29 while serving, not at a start (EXL3 3.05 bpw, `xtx-xt`, the
+  XT, a write: a 1k-token agent turn on 207k cached tokens in the depth sweep's first pass, after 16k-token chunks); the
+  next server passed the same point twice, its XT at most 18.2 GiB of 20, and none in the other 19 servers of that day's
+  benchmarks.
 - Expert misses (section 20): the decode GEMVs now read them from host memory while computing the cached experts
   (section 38), so their PCIe time shows where it exceeds that work (a layer's GEMVs at one request, EXL3: 40.5 µs
   against 32.5 when the copy came first, the copy 34.6 -> 4.2 µs). Fewer of them is the lever left: a larger cache,

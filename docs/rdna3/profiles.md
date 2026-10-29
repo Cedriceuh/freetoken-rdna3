@@ -7,9 +7,9 @@ names another (all three checkpoints: [README](../../README.md#which-checkpoint)
 
 | Profile | GPUs | Context | Decode, MTP head on (off) | Deep decode, greedy | Cold 8.3k prompt | Agent turn | At once |
 |---|---|---:|---:|---:|---:|---:|---:|
-| `xtx-xt` | RX 7900 XTX 24 GB + RX 7900 XT 20 GB | 262,144 | 88 (65.5) tok/s | 78-96 (58-65) tok/s | 3.8 s | 0.8-0.9 s | 4 requests |
-| `xtx` | RX 7900 XTX 24 GB | 131,072 | 46 (41) tok/s | 36-44 (32-38) tok/s | 5.6 s | 1.5-1.6 s | 1 request |
-| `xt` | RX 7900 XT 20 GB | 131,072 | 36 (34) tok/s | 29-34 (26-31) tok/s | 6.2 s | 1.6-1.8 s | 1 request |
+| `xtx-xt` | RX 7900 XTX 24 GB + RX 7900 XT 20 GB | 262,144 | 106.2 (73.1) tok/s | 92-115 (66-74) tok/s | 2.35 s | 0.56-0.66 s | 4 requests |
+| `xtx` | RX 7900 XTX 24 GB | 131,072 | 47.9 (42.2) tok/s | 38-47 (34-42) tok/s | 3.52 s | 1.19-1.28 s | 1 request |
+| `xt` | RX 7900 XT 20 GB | 131,072 | 37.7 (34.4) tok/s | 30-36 (28-33) tok/s | 3.80 s | 1.31-1.40 s | 1 request |
 | `xtx-xtx` *(untested)* | 2x RX 7900 XTX 24 GB | 262,144 | expected >= `xtx-xt` | – | – | – | 4 requests |
 | `xt-xt` *(untested)* | 2x RX 7900 XT 20 GB | 262,144 | expected a little below `xtx-xt` | – | – | – | 4 requests |
 | `gre` *(untested)* | RX 7900 GRE 16 GB | 65,536 | expected ~20 tok/s at best (head off) | – | – | – | 1 request |
@@ -18,12 +18,12 @@ names another (all three checkpoints: [README](../../README.md#which-checkpoint)
 
 "Decode" is one request's 512-token answers at the sampling `rdna3/serve.sh` gives (temperature 0.6; median of 12);
 "deep decode" is greedy decode at every context step from 9k to 260k on two cards and 124k on one; "agent turn" is the
-time to the first token when ~1k new tokens are added to a cached conversation, over the same steps (an earlier
-build). The two profiles with the K/V in RAM were measured with EXL3 3.05 bpw on earlier builds
-([long-context.md](long-context.md)). The profiles turn the MTP head on; `rdna3/serve.sh <profile> --no-mtp` turns it
-off (numbers in brackets). All numbers:
-[benchmarks.md](benchmarks.md). `--hybrid` (off by default) has the CPU compute part of the expert misses: NVFP4 decode +46 % on
-`xtx`, +51 % on `xt`, +2 % on `xtx-xt`, measured on an earlier build than this table ([cpu-experts.md](cpu-experts.md)).
+time to the first token when ~1k new tokens are added to a cached conversation, over the same steps. The two profiles
+with the K/V in RAM were measured with EXL3 3.05 bpw on earlier builds ([long-context.md](long-context.md)). The
+profiles turn the MTP head on; `rdna3/serve.sh <profile> --no-mtp` turns it off (numbers in brackets). All numbers:
+[benchmarks.md](benchmarks.md). `--hybrid` (off by default) has the CPU compute part of the expert misses: NVFP4 decode
++46 % on `xtx`, +51 % on `xt`, +2 % on `xtx-xt`, measured on an earlier build than this table
+([cpu-experts.md](cpu-experts.md)).
 
 ## File format
 
@@ -73,7 +73,7 @@ With several requests, each one's decode is computed row by row as if it were al
 batch can differ at rounding level. The 4-request setting, the tuned decode tiles and the RAM tier are checked for
 exactness, not on the agentic benchmark ([benchmarks.md](benchmarks.md#precision)).
 
-RAM: ~83 GiB while serving, all of it locked (82 measured with an earlier build: ~63 GiB of experts, 9.5 GiB for the RAM tier, the rest the two processes; this build adds 1.2 GiB, the input embedding and the PLE row cache); ~61 GiB with the EXL3 3.05 bpw checkpoint, ~76 GiB with 4.05 bpw.
+RAM: 83 GiB while serving, all of it locked (~63 GiB of experts, 9.5 GiB for the RAM tier, 1.2 GiB for the input embedding and the PLE row cache, the rest the two processes); 62 GiB with the EXL3 3.05 bpw checkpoint, 76 GiB with 4.05 bpw.
 
 With an EXL3 checkpoint
 ([how-it-works.md](how-it-works.md#exl3-checkpoints)) the same profile applies: the

@@ -15,8 +15,8 @@ give orders of magnitude; a section that mixes the two says so.
   with `--no-mtp`, with the host settings of
   [troubleshooting.md](troubleshooting.md#long-pauses-in-the-middle-of-a-run). The first server of each checkpoint and
   card count runs a second time once the image's kernel cache is warm, and that run is the one shown: in the first, the
-  kernels compile during the depth sweep's first pass (NVFP4 `xtx-xt` read its 16k step at 1416 tok/s, 2079 in the
-  second pass).
+  kernels compile during the depth sweep's first pass (NVFP4 `xtx-xt`: the agent turn at 16k took 2.97 s on the first
+  server, 0.63 s on the second).
 - **Decode, one request**: tokens/s of 512-token answers after the first token, thinking off: the median of 12 answers
   (6 prompts x 2: English and French prose, code, a recipe) at the sampling of a request that sets none (the
   checkpoint's top-k / top-p, temperature 0.6 from `rdna3/serve.sh`), and 3 greedy answers.
@@ -25,76 +25,76 @@ give orders of magnitude; a section that mixes the two says so.
   The first step is a cold ~8.8k-token read; each later step adds a 6-52k-token block the cache has not seen, like a
   large tool result (ten steps to 260k on two cards, seven to 124k on one). At each step: **TG** = greedy decode over
   256 tokens, **PP** = speed of reading that block, **agent turn** = time to the first token of a following ~1k-token
-  turn (an earlier build for this column: since the short-prefill changes, 200-250-token turns take 11-13 % less time to
-  their first token on another workload, [journey.md](journey.md#31-short-agent-turns-2026-10-17-and-18)). Median of two
-  passes, each with its own text. With the MTP head, TG follows how many of its guesses the text lets it keep (1.6-3.5
-  tokens per step): the spread between steps is the text, not noise.
+  turn. Median of two passes, each with its own text. With the MTP head, TG follows how many of its guesses the text
+  lets it keep (1.6-3.5 tokens per step): the spread between steps is the text, not noise.
 
 ## Summary
 
 | Profile | Decode, one request: sampled / greedy | TG, 9k to max depth | Cold 8.3k prompt (PP) | PP of a new block | Agent turn, 9k -> max | Max depth |
 |---|---:|---:|---:|---:|---:|---:|
-| `xtx-xt` | 88.2 / 86-90 tok/s | 78-96 tok/s | 3.8 s, ~2220 tok/s | 1910-2180 tok/s | 0.9 -> 0.9 s | 260k |
-| `xtx-xt --no-mtp` | 65.5 / 66-69 tok/s | 58-65 tok/s | 3.8 s, ~2200 tok/s | 1980-2170 tok/s | 0.9 -> 0.9 s | 260k |
-| `xtx` | 45.9 / 42-48 tok/s | 36-44 tok/s | 5.6 s, ~1500 tok/s | 1520-1670 tok/s | 1.5 -> 1.5 s | 124k |
-| `xtx --no-mtp` | 40.6 / 37-43 tok/s | 32-38 tok/s | 5.5 s, ~1520 tok/s | 1560-1680 tok/s | 1.5 -> 1.6 s | 124k |
-| `xt` | 35.8 / 33-38 tok/s | 29-34 tok/s | 6.2 s, ~1340 tok/s | 1350-1480 tok/s | 1.7 -> 1.7 s | 124k |
-| `xt --no-mtp` | 33.6 / 30-35 tok/s | 26-31 tok/s | 6.0 s, ~1380 tok/s | 1410-1510 tok/s | 1.6 -> 1.7 s | 124k |
-| `xtx-xt`, EXL3 3.05 bpw | 94.4 / 86-95 tok/s | 95-117 tok/s | 3.6 s, ~2340 tok/s | 1940-2280 tok/s | 0.7 -> 0.9 s | 260k |
-| `xtx-xt`, EXL3 4.05 bpw | 80.5 / 79-84 tok/s | 86-94 tok/s | 3.6 s, ~2330 tok/s | 1970-2270 tok/s | 0.8 -> 1.0 s | 260k |
-| `xtx`, EXL3 3.05 bpw | 55.8 / 56-61 tok/s | 52-58 tok/s | 5.0 s, ~1680 tok/s | 1700-1820 tok/s | 1.0 -> 1.2 s | 124k |
-| `xtx`, EXL3 4.05 bpw | 45.3 / 44-48 tok/s | 37-47 tok/s | 5.1 s, ~1630 tok/s | 1640-1820 tok/s | 1.3 -> 1.4 s | 124k |
-| `xt`, EXL3 3.05 bpw | 43.2 / 42-45 tok/s | 41-46 tok/s | 5.5 s, ~1500 tok/s | 1500-1600 tok/s | 1.2 -> 1.3 s | 124k |
-| `xt`, EXL3 4.05 bpw | 34.9 / 34-36 tok/s | 29-36 tok/s | 5.7 s, ~1450 tok/s | 1450-1620 tok/s | 1.5 -> 1.5 s | 124k |
+| `xtx-xt` | 106.2 / 98-103 tok/s | 92-115 tok/s | 2.35 s, ~3550 tok/s | 3100-4150 tok/s | 0.56 -> 0.66 s | 260k |
+| `xtx-xt --no-mtp` | 73.1 / 73-74 tok/s | 66-74 tok/s | 2.32 s, ~3590 tok/s | 3130-4130 tok/s | 0.58 -> 0.68 s | 260k |
+| `xtx` | 47.9 / 45-50 tok/s | 38-47 tok/s | 3.52 s, ~2370 tok/s | 2350-2890 tok/s | 1.23 -> 1.27 s | 124k |
+| `xtx --no-mtp` | 42.2 / 40-44 tok/s | 34-42 tok/s | 3.44 s, ~2420 tok/s | 2420-2900 tok/s | 1.21 -> 1.29 s | 124k |
+| `xt` | 37.7 / 35-39 tok/s | 30-36 tok/s | 3.80 s, ~2190 tok/s | 2160-2610 tok/s | 1.35 -> 1.39 s | 124k |
+| `xt --no-mtp` | 34.4 / 33-36 tok/s | 28-33 tok/s | 3.73 s, ~2240 tok/s | 2220-2620 tok/s | 1.33 -> 1.41 s | 124k |
+| `xtx-xt`, EXL3 3.05 bpw | 117.9 / 106-114 tok/s | 117-145 tok/s | 2.28 s, ~3650 tok/s | 3470-3770 tok/s | 0.44 -> 0.46 s | 260k |
+| `xtx-xt`, EXL3 4.05 bpw | 103.4 / 92-103 tok/s | 105-112 tok/s | 2.34 s, ~3560 tok/s | 3200-3750 tok/s | 0.57 -> 0.69 s | 260k |
+| `xtx`, EXL3 3.05 bpw | 65.9 / 67 tok/s | 62-70 tok/s | 3.57 s, ~2340 tok/s | 2370-2660 tok/s | 0.79 -> 0.91 s | 124k |
+| `xtx`, EXL3 4.05 bpw | 52.5 / 50-54 tok/s | 43-56 tok/s | 3.74 s, ~2230 tok/s | 2250-2680 tok/s | 1.14 -> 1.18 s | 124k |
+| `xt`, EXL3 3.05 bpw | 52.0 / 51-54 tok/s | 49-56 tok/s | 3.94 s, ~2120 tok/s | 2140-2400 tok/s | 0.91 -> 1.04 s | 124k |
+| `xt`, EXL3 4.05 bpw | 41.1 / 39-43 tok/s | 35-44 tok/s | 4.10 s, ~2030 tok/s | 2040-2410 tok/s | 1.27 -> 1.30 s | 124k |
 
 The EXL3 rows ([how-it-works.md](how-it-works.md#exl3-checkpoints)) were measured the same way, one server per row
 started by `rdna3/serve.sh` (on two cards it lowers `--memory-ratio` to 0.77 / 0.76 for EXL3), MTP head on, the same
-scripts: the 12 sampled and 3 greedy answers, `quick_bench.py` for the
-cold read, the depth sweep. The checkpoints answer differently, so the MTP head keeps a different share of its
-guesses: read the decode columns across checkpoints as an order of magnitude.
+scripts: the 12 sampled and 3 greedy answers, `quick_bench.py` for the cold read, the depth sweep. The checkpoints
+answer differently, so the MTP head keeps a different share of its guesses: read the decode columns across checkpoints
+as an order of magnitude. The `xt --no-mtp` decode answers come from a second server: the first decoded them at 24.6
+tok/s for five minutes, then ran its sweep as above (not explained; the build before and this one, each started again,
+gave 34.5 and 34.4).
 
-With the head, one request decodes 35 % faster on two cards at the sampling above (+35 to +60 % greedy along the
-sweep) and 6-13 % faster on one card (+9 to +16 % greedy); reading a block takes from 5 % longer (`xt`) to 1 % less. With more
-requests decoding than `FREETOKEN_SPEC_BS_MAX` (4 in `xtx-xt` and its K/V-in-RAM variants, 1 in the other profiles),
-the head only writes its KV: see the tables further down.
+With the head, one request decodes 45 % faster on two cards at the sampling above (+39 to +64 % greedy along the sweep)
+and 10-14 % faster on one card (+8 to +12 % greedy); reading a block takes from 0.5 % less to 3.6 % longer. With more
+requests decoding than `FREETOKEN_SPEC_BS_MAX` (4 in `xtx-xt` and its K/V-in-RAM variants, 1 in the other profiles), the
+head only writes its KV: see the tables further down.
 
-Without the head, decode loses 11 % from 9k to 260k on two cards and 16 % from 9k to 124k on one card (with it,
-the text of each step decides how many drafts are kept). Where the one-card drop
-comes from (`xtx`, one pass with `FT_STATS_EVERY=64 FT_MOE_STATS=1`, on an earlier build): the decode step takes ~27 ms
-of GPU time at 9-16k and ~33 ms from 25k to 124k, flat beyond 25k, while the expert cache misses ~2.2 then 3.0-3.6 of
-the 10 experts a layer reads: the longer context spreads the routing over more experts (the misses do not fall during
-an answer, so it is not the prefill evicting the cache), and attention itself adds little.
+Without the head, decode loses 11 % from 9k to 260k on two cards and 14-16 % from 9k to 124k on one card (with it, the
+text of each step decides how many drafts are kept). Where the one-card drop comes from (`xtx`, one pass with
+`FT_STATS_EVERY=64 FT_MOE_STATS=1`, on an earlier build): the decode step takes ~27 ms of GPU time at 9-16k and ~33 ms
+from 25k to 124k, flat beyond 25k, while the expert cache misses ~2.2 then 3.0-3.6 of the 10 experts a layer reads: the
+longer context spreads the routing over more experts (the misses do not fall during an answer, so it is not the prefill
+evicting the cache), and attention itself adds little.
 
 ## Depth sweep, `xtx-xt`
 
 | Depth | TG with the head / without | PP new, with / without | Agent turn, with / without |
 |---:|---:|---:|---:|
-| 8.8k | 88.2 / 64.8 | 2191 / 2172 | 0.88 / 0.89 s |
-| 16.0k | 91.6 / 64.7 | 2108 / 2093 | 0.90 / 0.90 s |
-| 25.0k | 96.3 / 61.8 | 2163 / 2146 | 0.93 / 0.93 s |
-| 40.0k | 88.6 / 58.2 | 2184 / 2169 | 0.80 / 0.94 s |
-| 60.0k | 94.1 / 59.0 | 2105 / 2160 | 0.87 / 0.89 s |
-| 86.9k | 83.8 / 59.3 | 2121 / 2170 | 0.85 / 0.87 s |
-| 122.9k | 92.7 / 59.2 | 2058 / 2125 | 0.86 / 0.86 s |
-| 164.9k | 80.1 / 58.2 | 2034 / 2093 | 0.87 / 0.87 s |
-| 206.9k | 77.7 / 57.5 | 1971 / 2032 | 0.90 / 0.91 s |
-| 259.8k | 86.7 / 57.7 | 1909 / 1975 | 0.90 / 0.89 s |
+| 8.8k | 105.4 / 73.6 | 3710 / 3733 | 0.56 / 0.58 s |
+| 16.0k | 115.3 / 71.3 | 3103 / 3132 | 0.63 / 0.82 s |
+| 25.0k | 106.9 / 66.6 | 3525 / 3604 | 0.62 / 0.64 s |
+| 40.0k | 101.7 / 66.6 | 4146 / 4127 | 0.60 / 0.61 s |
+| 60.0k | 108.1 / 67.0 | 3732 / 3715 | 0.61 / 0.63 s |
+| 86.9k | 99.1 / 67.7 | 4013 / 4064 | 0.64 / 0.61 s |
+| 122.9k | 106.4 / 67.4 | 3989 / 4049 | 0.61 / 0.79 s |
+| 164.9k | 92.2 / 66.4 | 3893 / 3967 | 0.62 / 0.64 s |
+| 206.9k | 95.1 / 67.0 | 3812 / 3894 | 0.65 / 0.69 s |
+| 259.8k | 108.1 / 65.8 | 3696 / 3835 | 0.66 / 0.68 s |
 
 Each sweep ran after the decode answers and `quick_bench.py` on the same server. The ~1k-token agent turn takes
-0.8-0.9 s at every depth: such a turn reads only its routed experts through the expert cache and reuses the previous
+0.56-0.66 s at every depth: such a turn reads only its routed experts through the expert cache and reuses the previous
 prompt's tokens ([how-it-works.md](how-it-works.md#short-chunks-agent-turns)).
 
 ## Depth sweep, one card
 
 | Depth | `xtx` TG with / without the head | `xtx` PP new | `xtx` turn | `xt` TG with / without | `xt` PP new | `xt` turn |
 |---:|---:|---:|---:|---:|---:|---:|
-| 8.8k | 43.7 / 38.0 | 1518 / 1557 | 1.50 / 1.54 s | 34.5 / 31.1 | 1356 / 1394 | 1.67 / 1.65 s |
-| 16.0k | 39.8 / 35.2 | 1597 / 1583 | 1.54 / 1.55 s | 32.1 / 29.2 | 1410 / 1414 | 1.73 / 1.72 s |
-| 25.0k | 38.4 / 33.4 | 1672 / 1652 | 1.58 / 1.59 s | 30.5 / 27.5 | 1483 / 1483 | 1.75 / 1.76 s |
-| 40.0k | 37.5 / 33.1 | 1649 / 1680 | 1.47 / 1.50 s | 29.5 / 27.1 | 1457 / 1508 | 1.65 / 1.66 s |
-| 60.0k | 38.1 / 32.9 | 1565 / 1611 | 1.51 / 1.55 s | 29.9 / 26.7 | 1397 / 1456 | 1.68 / 1.70 s |
-| 86.9k | 37.9 / 32.7 | 1517 / 1558 | 1.47 / 1.51 s | 29.8 / 26.4 | 1346 / 1408 | 1.64 / 1.67 s |
-| 123.9k | 36.5 / 31.9 | 1591 / 1641 | 1.51 / 1.55 s | 28.9 / 26.0 | 1406 / 1469 | 1.68 / 1.71 s |
+| 8.8k | 46.5 / 41.9 | 2386 / 2467 | 1.23 / 1.21 s | 35.8 / 33.0 | 2189 / 2241 | 1.35 / 1.33 s |
+| 16.0k | 44.8 / 39.9 | 2652 / 2676 | 1.28 / 1.27 s | 34.7 / 31.9 | 2510 / 2522 | 1.40 / 1.38 s |
+| 25.0k | 42.9 / 39.0 | 2887 / 2901 | 1.26 / 1.29 s | 33.5 / 31.1 | 2613 / 2622 | 1.38 / 1.42 s |
+| 40.0k | 41.4 / 36.9 | 2687 / 2764 | 1.27 / 1.27 s | 32.7 / 29.7 | 2492 / 2539 | 1.38 / 1.39 s |
+| 60.0k | 39.6 / 35.5 | 2345 / 2421 | 1.25 / 1.26 s | 31.0 / 28.6 | 2162 / 2215 | 1.36 / 1.39 s |
+| 86.9k | 38.1 / 34.0 | 2603 / 2701 | 1.19 / 1.21 s | 30.3 / 27.5 | 2368 / 2437 | 1.31 / 1.35 s |
+| 123.9k | 39.1 / 35.0 | 2515 / 2607 | 1.27 / 1.29 s | 31.1 / 28.5 | 2306 / 2372 | 1.39 / 1.41 s |
 
 PP is the same with and without the head within 5 %; one card reads 8k-token chunks (16k on two). Without the head
 the servers fill the PLE rows before each launch (`FREETOKEN_PLE_SYNC` in [options.md](options.md)).
@@ -105,31 +105,31 @@ Median of two passes, MTP head on:
 
 | Depth | `xtx-xt` 3.05 bpw TG / PP new / turn | `xtx-xt` 4.05 bpw TG / PP new / turn |
 |---:|---:|---:|
-| 8.8k | 97.0 / 2315 / 0.70 s | 87.1 / 2300 / 0.79 s |
-| 16.0k | 109.2 / 2221 / 0.72 s | 86.2 / 2181 / 0.83 s |
-| 25.0k | 114.3 / 2270 / 0.72 s | 92.5 / 2245 / 0.85 s |
-| 40.0k | 104.0 / 2284 / 0.71 s | 90.3 / 2272 / 0.88 s |
-| 60.0k | 114.5 / 1977 / 0.91 s | 94.0 / 2178 / 0.89 s |
-| 86.9k | 102.0 / 2063 / 0.71 s | 91.1 / 2205 / 0.90 s |
-| 122.9k | 117.2 / 2167 / 0.73 s | 92.9 / 2128 / 0.91 s |
-| 164.9k | 94.9 / 1973 / 0.92 s | 91.2 / 2105 / 0.94 s |
-| 206.9k | 98.5 / 1945 / 0.75 s | 90.0 / 2044 / 0.97 s |
-| 259.8k | 111.1 / 1986 / 0.94 s | 93.4 / 1967 / 0.97 s |
+| 8.8k | 116.8 / 3695 / 0.44 s | 105.9 / 3623 / 0.57 s |
+| 16.0k | 132.2 / 3513 / 0.46 s | 104.5 / 3196 / 0.61 s |
+| 25.0k | 139.3 / 3590 / 0.46 s | 112.4 / 3516 / 0.62 s |
+| 40.0k | 131.0 / 3768 / 0.45 s | 110.4 / 3747 / 0.64 s |
+| 60.0k | 144.5 / 3666 / 0.45 s | 112.3 / 3500 / 0.65 s |
+| 86.9k | 129.5 / 3734 / 0.45 s | 110.6 / 3714 / 0.66 s |
+| 122.9k | 142.2 / 3666 / 0.45 s | 110.9 / 3549 / 0.66 s |
+| 164.9k | 124.2 / 3636 / 0.46 s | 110.2 / 3628 / 0.67 s |
+| 206.9k | 126.6 / 3565 / 0.46 s | 109.0 / 3552 / 0.69 s |
+| 259.8k | 135.5 / 3471 / 0.46 s | 112.0 / 3441 / 0.69 s |
 
 | Depth | `xtx` 3.05 bpw | `xtx` 4.05 bpw | `xt` 3.05 bpw | `xt` 4.05 bpw |
 |---:|---:|---:|---:|---:|
-| 8.8k | 58.2 / 1715 / 1.02 s | 46.9 / 1642 / 1.31 s | 45.8 / 1514 / 1.18 s | 36.0 / 1471 / 1.48 s |
-| 16.0k | 57.2 / 1806 / 1.07 s | 44.0 / 1788 / 1.38 s | 45.5 / 1595 / 1.23 s | 34.1 / 1577 / 1.54 s |
-| 25.0k | 56.9 / 1821 / 1.11 s | 41.0 / 1819 / 1.42 s | 44.7 / 1519 / 1.28 s | 32.0 / 1616 / 1.58 s |
-| 40.0k | 54.1 / 1802 / 1.13 s | 38.8 / 1793 / 1.41 s | 42.9 / 1601 / 1.29 s | 30.5 / 1588 / 1.56 s |
-| 60.0k | 54.6 / 1760 / 1.14 s | 40.0 / 1689 / 1.45 s | 43.2 / 1552 / 1.30 s | 31.7 / 1509 / 1.61 s |
-| 86.9k | 54.3 / 1700 / 1.13 s | 37.6 / 1638 / 1.37 s | 42.9 / 1500 / 1.30 s | 29.9 / 1448 / 1.53 s |
-| 123.9k | 52.2 / 1740 / 1.18 s | 36.7 / 1718 / 1.36 s | 41.0 / 1534 / 1.34 s | 29.4 / 1509 / 1.53 s |
+| 8.8k | 69.6 / 2411 / 0.79 s | 56.2 / 2269 / 1.14 s | 55.5 / 2181 / 0.91 s | 43.9 / 2069 / 1.27 s |
+| 16.0k | 68.3 / 2589 / 0.83 s | 52.5 / 2595 / 1.22 s | 54.9 / 2331 / 0.96 s | 41.6 / 2332 / 1.34 s |
+| 25.0k | 67.9 / 2659 / 0.86 s | 48.4 / 2675 / 1.24 s | 54.8 / 2396 / 0.99 s | 38.6 / 2408 / 1.37 s |
+| 40.0k | 64.4 / 2605 / 0.88 s | 45.3 / 2597 / 1.23 s | 52.0 / 2337 / 1.01 s | 36.4 / 2334 / 1.35 s |
+| 60.0k | 64.7 / 2459 / 0.90 s | 46.8 / 2297 / 1.26 s | 52.1 / 2220 / 1.02 s | 37.7 / 2089 / 1.39 s |
+| 86.9k | 64.3 / 2369 / 0.89 s | 43.3 / 2252 / 1.19 s | 51.4 / 2139 / 1.02 s | 35.1 / 2044 / 1.32 s |
+| 123.9k | 62.2 / 2495 / 0.91 s | 43.0 / 2409 / 1.18 s | 49.4 / 2257 / 1.04 s | 35.0 / 2186 / 1.30 s |
 
-Each cell: TG (tok/s) / PP of the new block (tok/s) / agent turn. On two cards the agent turns take 0.70-0.94 s at
-3.05 bpw against 0.80-0.93 s with NVFP4: such a turn copies the routed experts the cache lacks
-([how-it-works.md](how-it-works.md#short-chunks-agent-turns)), and a 3.05 bpw expert weighs 1.86 MB against 2.76 MB (not measured
-apart).
+Each cell: TG (tok/s) / PP of the new block (tok/s) / agent turn. On two cards the agent turns take 0.44-0.46 s at 3.05
+bpw against 0.56-0.66 s with NVFP4: such a turn copies the routed experts the cache lacks
+([how-it-works.md](how-it-works.md#short-chunks-agent-turns)), and a 3.05 bpw expert weighs 1.86 MB against 2.76 MB (not
+measured apart).
 
 ## Agent turns on real code (`xtx-xt`)
 
@@ -346,18 +346,17 @@ VRAM is the driver's count (`mem_info_vram_used`) sampled twice a second over a 
 free per card while decoding is the prefill's working memory, which a deep 16k-token chunk uses almost entirely (56 MiB
 left on the XT). Host RAM is the kernel's `Mlocked` count after start.
 
-**Every profile and checkpoint** (one server each, `rdna3/serve.sh`): RAM is the growth of the kernel's `Mlocked`
-count from before the start to after it, and the expert cache the planned size, of 24,576 experts (the same on both
-cards: each rank plans on its own free memory, then both take the smaller plan), both from the servers of the summary
-above (`xtx-xt` at 262,144 tokens of context; an earlier build: a later one locks 1.2 GiB more RAM and caches 7 % more
-experts with NVFP4, 6,977 -> 7,464 slots); VRAM, from an earlier build, is the highest `mem_info_vram_used` sampled
-every 50 ms over an agent-like first turn (a title request decoding while a ~21k-token prompt is read), the decode
-answers, `quick_bench.py` and the depth sweep, the desktop's share included.
+**Every profile and checkpoint** (one server each, `rdna3/serve.sh`): RAM is the growth of the kernel's `Mlocked` count
+from before the start to after it, and the expert cache the planned size, of 24,576 experts (the same on both cards:
+each rank plans on its own free memory, then both take the smaller plan), both from the servers of the summary above
+(`xtx-xt` at 262,144 tokens of context); VRAM, from an earlier build, is the highest `mem_info_vram_used` sampled every
+50 ms over an agent-like first turn (a title request decoding while a ~21k-token prompt is read), the decode answers,
+`quick_bench.py` and the depth sweep, the desktop's share included.
 
 | | NVFP4 | EXL3 3.05 bpw | EXL3 4.05 bpw |
 |---|---:|---:|---:|
-| RAM locked, `xtx-xt` / `xtx` / `xt` | 82 / 73 / 73 GiB | 60 / 51 / 51 GiB | 75 / 66 / 66 GiB |
-| Expert cache, `xtx-xt` / `xtx` / `xt` | 6,990 / 3,567 / 2,328 | 9,800 / 4,902 / 3,057 | 7,217 / 3,686 / 2,298 |
+| RAM locked, `xtx-xt` / `xtx` / `xt` | 83 / 74 / 74 GiB | 62 / 53 / 53 GiB | 76 / 67 / 67 GiB |
+| Expert cache, `xtx-xt` / `xtx` / `xt` | 7,307 / 4,003 / 2,774 | 10,083 / 5,567 / 3,732 | 7,464 / 4,186 / 2,806 |
 | VRAM peak, `xtx-xt` (XTX / XT of 24,560 / 20,464 MiB) | 23,524 / 20,291 MiB | 24,284 / 19,228 MiB | 24,035 / 19,197 MiB |
 | VRAM peak, `xtx` / `xt` | 23,506 / 19,367 MiB | 22,943 / 19,072 MiB | 22,868 / 19,081 MiB |
 

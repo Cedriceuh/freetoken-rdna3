@@ -77,8 +77,8 @@ profiles: [which checkpoint](../../README.md#which-checkpoint)).
 |---|---:|---:|---:|
 | `rdna3/download.sh` name | `nvfp4` | `exl3-3.05` | `exl3-4.05` |
 | Download | 135 GB | 85 GB | 108 GB |
-| RAM locked: two cards; one card | ~83 GiB; ~74 GiB | ~61 GiB; ~52 GiB | ~76 GiB; ~67 GiB |
-| Decode, `xtx-xt` / `xtx` / `xt` | 78-96 / 36-44 / 29-34 tok/s | 95-117 / 52-58 / 41-46 tok/s | 86-94 / 37-47 / 29-36 tok/s |
+| RAM locked: two cards; one card | ~83 GiB; ~74 GiB | ~62 GiB; ~53 GiB | ~76 GiB; ~67 GiB |
+| Decode, `xtx-xt` / `xtx` / `xt` | 92-115 / 38-47 / 30-36 tok/s | 117-145 / 62-70 / 49-56 tok/s | 105-112 / 43-56 / 35-44 tok/s |
 
 EXL3 3.05 bpw is the smallest, needs the least RAM and decodes the fastest on every measured profile (its experts are
 smaller, so more stay in VRAM; the checkpoints also differ in how many of the MTP head's drafts are kept). On the

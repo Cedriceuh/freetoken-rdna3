@@ -224,7 +224,7 @@ branch `3.05bpw_h5_ng5` (routed experts at 3 bits per weight, most other linears
   weight reader (the CPU expert executor of `--hybrid` does read EXL3 experts: [cpu-experts.md](cpu-experts.md)). FTW conversion is untested. The vision tower reads the checkpoint's bf16
   `qkv` (image input checked with one image per branch).
 
-Measured with an earlier build (this one reads faster, caches more experts and locks 1.2 GiB more RAM: [CHANGELOG.md](../../CHANGELOG.md)), with the profiles' settings, MTP head on, one request (decode: greedy, from 9k tokens to the profile's maximum context;
+Measured with the profiles' settings, MTP head on, one request (decode: greedy, from 9k tokens to the profile's maximum context;
 RAM: locked while serving;
 [benchmarks.md](benchmarks.md#depth-sweep-exl3-checkpoints) has every step, the cold reads and the sampled decode):
 
@@ -232,11 +232,11 @@ RAM: locked while serving;
 |---|---:|---:|---:|
 | download | 135 GB | 85 GB | 108 GB |
 | experts in RAM (without the MTP head's) | 63.3 GiB | 42.6 GiB | 56.7 GiB |
-| decode, `xtx-xt` / `xtx` / `xt` | 78-96 / 36-44 / 29-34 tok/s | 95-117 / 52-58 / 41-46 tok/s | 86-94 / 37-47 / 29-36 tok/s |
-| reading a new block, `xtx-xt` | 1910-2180 tok/s | 1940-2280 tok/s | 1970-2270 tok/s |
-| agent turn, first token, `xtx-xt` | 0.8-0.9 s | 0.7-0.9 s | 0.8-1.0 s |
-| RAM locked, `xtx-xt` / one card | 82 / 73 GiB | 60 / 51 GiB | 75 / 66 GiB |
-| expert cache per card, `xtx-xt` | 7.0k | 9.8k | 7.2k |
+| decode, `xtx-xt` / `xtx` / `xt` | 92-115 / 38-47 / 30-36 tok/s | 117-145 / 62-70 / 49-56 tok/s | 105-112 / 43-56 / 35-44 tok/s |
+| reading a new block, `xtx-xt` | 3100-4150 tok/s | 3470-3770 tok/s | 3200-3750 tok/s |
+| agent turn, first token, `xtx-xt` | 0.56-0.66 s | 0.44-0.46 s | 0.57-0.69 s |
+| RAM locked, `xtx-xt` / one card | 83 / 74 GiB | 62 / 53 GiB | 76 / 67 GiB |
+| expert cache per card, `xtx-xt` | 7.3k | 10.1k | 7.5k |
 | agentic benchmark (29 bugs) | 12 and 18 (two runs) | 13 (one run) | 12 (one run) |
 
 The agentic benchmark scores come from earlier builds than the other rows. The checkpoints answer differently, so the MTP head

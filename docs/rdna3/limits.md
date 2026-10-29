@@ -18,16 +18,16 @@ So between 25 and 30 GiB left, a setup only fits with little else running; below
 desktop needs less (untested). `rdna3/serve.sh --check` does this arithmetic for your machine (with `--model DIR`,
 for your checkpoint) and gives the command for what fits; `serve.sh` warns at start when a server would not fit.
 
-What the server locks after its start, measured with an earlier build:
+What the server locks after its start (the growth of the kernel's `Mlocked` count):
 
 | | NVFP4 | EXL3 3.05 bpw | EXL3 4.05 bpw |
 |---|---:|---:|---:|
-| two cards, the K/V in VRAM (`xtx-xt`) | 82 GiB | 60 GiB | 75 GiB |
-| one card (`xtx`, `xt`) | 73 GiB | 51 GiB | 66 GiB |
+| two cards, the K/V in VRAM (`xtx-xt`) | 83 GiB | 62 GiB | 76 GiB |
+| one card (`xtx`, `xt`) | 74 GiB | 53 GiB | 67 GiB |
 
-Add 1.2 GiB to each: this build keeps the input embedding in RAM rather than VRAM (`FREETOKEN_EMBED_HOST`) and a RAM
-cache of the PLE rows prefills read (`FREETOKEN_PLE_ROW_CACHE_ROWS`): +1.18 GiB measured on `xtx-xt` with NVFP4, +1.19
-GiB on one card with EXL3 3.05 bpw.
+1.2 GiB of each is the input embedding kept in RAM rather than VRAM (`FREETOKEN_EMBED_HOST`) and a RAM cache of the PLE
+rows prefills read (`FREETOKEN_PLE_ROW_CACHE_ROWS`): +1.18 GiB measured on `xtx-xt` with NVFP4, +1.19 GiB on one card
+with EXL3 3.05 bpw.
 
 Where it goes: the experts first (the engine keeps **every** expert in pinned RAM, each rank its own share of each one,
 and the GPUs cache the most used ones: ~63 GiB in NVFP4, ~43 GiB in EXL3 3.05 bpw), then the RAM tier that keeps

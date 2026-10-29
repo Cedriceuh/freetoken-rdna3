@@ -95,7 +95,7 @@ the other terms: [glossary](docs/rdna3/README.md#terms-used-in-these-pages).
 | `rdna3/download.sh` | `nvfp4` | `exl3-3.05` | `exl3-4.05` |
 | Hugging Face | [RadixArk/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4) | [turboderp/Qwen3.8-Flash-Next-exl3](https://huggingface.co/turboderp/Qwen3.8-Flash-Next-exl3) | [turboderp/Qwen3.8-Flash-Next-exl3](https://huggingface.co/turboderp/Qwen3.8-Flash-Next-exl3) |
 | Download | 135 GB | 85 GB | 108 GB |
-| RAM locked: two cards; one card | ~83 GiB; ~74 GiB | ~61 GiB; ~52 GiB | ~76 GiB; ~67 GiB |
+| RAM locked: two cards; one card | ~83 GiB; ~74 GiB | ~62 GiB; ~53 GiB | ~76 GiB; ~67 GiB |
 
 EXL3 3.05 bpw is the smallest and decodes the fastest on every measured profile ([speed](#speed)): its experts are smaller, so more of
 them stay in VRAM (the checkpoints also differ in how many of the MTP head's drafts are kept). On the
@@ -110,20 +110,19 @@ profile's maximum context with blocks the server has never seen, like large tool
 
 | Decode (TG) | NVFP4 | EXL3 3.05 bpw | EXL3 4.05 bpw |
 |---|---:|---:|---:|
-| `xtx-xt`: RX 7900 XTX + XT, 9k to 260k tokens | 78-96 tok/s | 95-117 tok/s | 86-94 tok/s |
-| `xtx`: one RX 7900 XTX, 9k to 124k tokens | 36-44 tok/s | 52-58 tok/s | 37-47 tok/s |
-| `xt`: one RX 7900 XT, 9k to 124k tokens | 29-34 tok/s | 41-46 tok/s | 29-36 tok/s |
+| `xtx-xt`: RX 7900 XTX + XT, 9k to 260k tokens | 92-115 tok/s | 117-145 tok/s | 105-112 tok/s |
+| `xtx`: one RX 7900 XTX, 9k to 124k tokens | 38-47 tok/s | 62-70 tok/s | 43-56 tok/s |
+| `xt`: one RX 7900 XT, 9k to 124k tokens | 30-36 tok/s | 49-56 tok/s | 35-44 tok/s |
 
 | Reading a new 6-52k-token block (PP); agent turn, time to first token | NVFP4 | EXL3 3.05 bpw | EXL3 4.05 bpw |
 |---|---:|---:|---:|
-| `xtx-xt`, 9k to 260k tokens | 1910-2180 tok/s; 0.8-0.9 s | 1940-2280 tok/s; 0.7-0.9 s | 1970-2270 tok/s; 0.8-1.0 s |
-| `xtx`, 9k to 124k tokens | 1520-1670 tok/s; 1.5-1.6 s | 1700-1820 tok/s; 1.0-1.2 s | 1640-1820 tok/s; 1.3-1.5 s |
-| `xt`, 9k to 124k tokens | 1350-1480 tok/s; 1.6-1.8 s | 1500-1600 tok/s; 1.2-1.3 s | 1450-1620 tok/s; 1.5-1.6 s |
+| `xtx-xt`, 9k to 260k tokens | 3100-4150 tok/s; 0.56-0.66 s | 3470-3770 tok/s; 0.44-0.46 s | 3200-3750 tok/s; 0.57-0.69 s |
+| `xtx`, 9k to 124k tokens | 2350-2890 tok/s; 1.19-1.28 s | 2370-2660 tok/s; 0.79-0.91 s | 2250-2680 tok/s; 1.14-1.26 s |
+| `xt`, 9k to 124k tokens | 2160-2610 tok/s; 1.31-1.40 s | 2140-2400 tok/s; 0.91-1.04 s | 2040-2410 tok/s; 1.27-1.39 s |
 
-An "agent turn" is ~1k new tokens (a tool result) added to a conversation the server already holds (that column comes
-from an earlier build, before the latest short-prefill changes).
-Requests running at once share the GPUs: on `xtx-xt-4x262k`, four agents at 257-260k tokens decode at 29.6-31.6 tok/s
-each, one alone at 95.1 (EXL3 3.05 bpw, one pass on an earlier build than the tables above). All the numbers:
+An "agent turn" is ~1k new tokens (a tool result) added to a conversation the server already holds. Requests running at
+once share the GPUs: on `xtx-xt-4x262k`, four agents at 257-260k tokens decode at 29.6-31.6 tok/s each, one alone at
+95.1 (EXL3 3.05 bpw, one pass on an earlier build than the tables above). All the numbers:
 [benchmarks](docs/rdna3/benchmarks.md).
 
 ## Documentation
