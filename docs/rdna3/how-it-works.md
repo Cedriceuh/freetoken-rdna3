@@ -60,6 +60,13 @@ kernel copies, signals, waits and adds (fp32, rounded to bf16 exactly as RCCL do
 two MoE all-reduces of a layer (routed and shared experts) are merged into one (+2.7 % decode): that change reorders
 sums and was validated on the agentic benchmark.
 
+A prefill's large all-reduces (20 MiB and up: a block of a long chunk) go through shared host memory too, moved by the
+copy engines: each rank copies its message there in 8 MiB pieces and flags each one, the other copies it back and adds
+it to its own, both PCIe directions at once. ~1.5x faster than RCCL's (40 MiB in 2.7 ms instead of 3.9) and no CU held
+while the bytes cross PCIe; the same additions, so the same bits. There is no peer-to-peer between the cards here, and
+each exposes only 256 MiB of its VRAM to the PCIe bus (Resizable BAR off), where ROCm's peer access needs the whole
+VRAM exposed; whether enabling it would give peer access on this machine is untested.
+
 ## The expert cache
 
 Upstream's LRU cache over the GPU memory left after weights and KV (`--moe-cache-auto`). Policies were compared on
@@ -87,8 +94,9 @@ A prefill chunk runs every token through every layer, so a long chunk streams al
   ~1.1 s per 16k-token chunk with the GPUs idle). The rows read before stay in a RAM cache, since an agent session's
   n-grams recur across its turns.
 - **Kernels shaped for RDNA3**, all with the same bits: the QSA indexer scores 16 query rows a program, a long expert
-  block runs its full tiles in one launch and its remaining rows in smaller tiles in a second, and kernels that
-  spilled registers run more warps.
+  block runs its full tiles in one launch and its remaining rows in smaller tiles in a second, kernels that spilled
+  registers run more warps, and the sparse attention looks each next tile's selected rows up (indices, then pages)
+  while the current tile computes, 30-41 % faster.
 - **The input embedding lives in RAM**, a row per token read across PCIe, and its VRAM goes to the expert cache.
 
 The PLE reads on a thread, the all-reduce overlap and the indexer's 16 rows together made fully cold reads ~25 %
@@ -96,8 +104,8 @@ shorter ([journey.md](journey.md#33-short-turns-the-host-waiting-at-every-layer-
 
 ### Short chunks: agent turns
 
-A short chunk (up to 1280 tokens on Qwen3.8-Flash-Next, typically an agent's tool result) routes to only part of the
-experts, so it does not stream whole layers:
+A short chunk (up to 1280 tokens on Qwen3.8-Flash-Next, 2400 with NVFP4 experts, typically an agent's tool result)
+routes to only part of the experts, so it does not stream whole layers:
 
 - **It reads its routed experts through the expert cache**, and only the missing ones cross PCIe. The next layer's
   experts are predicted by that layer's router applied to this layer's input, and copied while this one computes;

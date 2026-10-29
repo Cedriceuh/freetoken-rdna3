@@ -73,21 +73,35 @@ class PyNCCLDistributedImpl(DistributedImpl):
 
 @dataclass
 class HostStagedDistributedImpl(DistributedImpl):
-    """Small all-reduces through shared host memory (kernel/host_allreduce.py), the rest on
-    ``fallback``. The choice depends only on dtype / size / layout, identical on both ranks."""
+    """Small all-reduces through shared host memory (kernel/host_allreduce.py), large ones through it by the copy
+    engines when ``big`` is set (kernel/dma_allreduce.py), the rest on ``fallback``. The choice depends only on dtype /
+    size / layout, identical on both ranks."""
 
     ar: object
     fallback: DistributedImpl
+    big: object | None = None
+
+    def _big(self, x: torch.Tensor) -> bool:
+        if self.big is None or not self.big.supports(x):
+            return False
+        from freetoken.moe import prefill_hooks
+
+        prefill_hooks.ASYNC_AR[0] = True  # the compute stream waits for the copy streams on the GPU
+        return True
 
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
         if self.ar.supports(x):
             return self.ar(x)
+        if self._big(x):
+            return self.big(x)
         return self.fallback.all_reduce(x)
 
     def all_reduce_async(self, x: torch.Tensor):
         if self.ar.supports(x):
             self.ar(x)
             return None
+        if self._big(x):
+            return self.big.all_reduce_async(x)
         return self.fallback.all_reduce_async(x)
 
     def all_gather(self, x: torch.Tensor) -> torch.Tensor:
@@ -139,8 +153,11 @@ def enable_host_allreduce(tp_info: DistributedInfo, tp_cpu_group: torch.distribu
         init_logger(__name__).warning("FREETOKEN_HOST_ALLREDUCE=1 ignored: ROCm (hipHostRegister) only")
         return False
     ar = host_allreduce.HostAllReduce(tp_info.rank, tp_info.size, tp_cpu_group)
+    from freetoken.kernel import dma_allreduce
+
+    big = dma_allreduce.DmaAllReduce(tp_info.rank, tp_info.size, tp_cpu_group) if dma_allreduce.enabled() else None
     fallback = DistributedCommunicator.plugins[-1]
-    DistributedCommunicator.plugins.append(HostStagedDistributedImpl(ar, fallback))
+    DistributedCommunicator.plugins.append(HostStagedDistributedImpl(ar, fallback, big))
     return True
 
 
@@ -149,7 +166,7 @@ def destroy_distributed() -> None:
     Destroy all the distributed communication plugins.
     """
     for plugin in DistributedCommunicator.plugins:
-        ar = getattr(plugin, "ar", None)
-        if ar is not None and hasattr(ar, "close"):
-            ar.close()  # unregister before the mapping can be garbage-collected
+        for ar in (getattr(plugin, "ar", None), getattr(plugin, "big", None)):
+            if ar is not None and hasattr(ar, "close"):
+                ar.close()  # unregister before the mapping can be garbage-collected
     DistributedCommunicator.plugins = []

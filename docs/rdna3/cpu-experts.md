@@ -87,10 +87,10 @@ How the fractions were chosen (decode tok/s; measured on older builds than the f
   precise: against an fp64 reference at the model's sizes, one MoE output computed on the CPU is off by 2.3e-3
   (relative), on the GPU by 3.9e-3 (bf16 between its steps), split between them by 3.3-4.0e-3
   ([journey.md](journey.md#27-agent-turns-short-prefills-through-the-expert-cache-2026-10-14)).
-- **Answers that move with the expert cache.** Prefill chunks of up to 1280 tokens (agent turns) read their routed
-  experts through the cache here too (`FREETOKEN_PREFILL_CACHED_MAX`), which moves the answers as the cache's contents
-  do. Time to the first token of a 132-337-token turn at 25k, that path off -> on: NVFP4 `xtx-xt` 1.19-1.24 -> 0.78-0.89
-  s, EXL3 3.05 `xtx` 1.50-1.52 -> 1.05-1.18, NVFP4 `xtx` 2.32-2.34 -> 1.63-1.80.
+- **Answers that move with the expert cache.** Prefill chunks of up to 1280 tokens (2400 with NVFP4 experts; agent
+  turns) read their routed experts through the cache here too (`FREETOKEN_PREFILL_CACHED_MAX`), which moves the answers
+  as the cache's contents do. Time to the first token of a 132-337-token turn at 25k, that path off -> on: NVFP4
+  `xtx-xt` 1.19-1.24 -> 0.78-0.89 s, EXL3 3.05 `xtx` 1.50-1.52 -> 1.05-1.18, NVFP4 `xtx` 2.32-2.34 -> 1.63-1.80.
 - **Not reproducible.** Two runs of one image (`xtx`, NVFP4, the same settings, greedy) gave the same answers on only 7
   of 14 prompts: `--hybrid` is not reproducible from one run to the next (the cause was not looked for).
 - **Long prompts** read at the usual speed (a long prefill streams whole layers to the GPU, as without `--hybrid`): a

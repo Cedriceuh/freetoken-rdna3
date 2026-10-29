@@ -347,6 +347,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
             k_scale=self.kvcache.k_scale(layer_id) if int8 else None,
             v_scale=self.kvcache.v_scale(layer_id) if int8 else None,
             decode=md.is_decode,
+            kv_host=md.is_decode and getattr(self.kvcache, "kv_on_host", False),
             gate=gate,
         )
 

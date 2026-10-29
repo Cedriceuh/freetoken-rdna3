@@ -90,6 +90,9 @@ class TritonNvfp4MoEKernel(MoEKernel):
     name = "triton"
     cpu_format = "nvfp4"
     supports_prefill_slot_map = True
+    # its experts weigh more than EXL3 3.05 bpw's, so a full-layer stream costs more: chunks of 1.3-2.4k tokens are
+    # 13-19 % shorter through the slot cache on xtx-xt-4x262k (docs/rdna3/options.md, FREETOKEN_PREFILL_CACHED_MAX)
+    prefill_cached_max = 2400
     # the decode GEMVs read a slot being filled from host memory and fill it on the way (moe/fused_nvfp4.py)
     decode_reads_misses = ("gate_up", "gate_up_scale", "down", "down_scale")
 

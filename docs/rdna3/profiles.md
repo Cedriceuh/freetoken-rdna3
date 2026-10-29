@@ -50,6 +50,7 @@ A comment may follow a value on the same line. Copy a file to make your own prof
 | `FREETOKEN_TP_ALLOW_IMBALANCE` | `1` | plan memory on the smaller card (upstream refuses ranks whose free memory differs by more than 2 GiB) |
 | `FREETOKEN_INT8_DENSE` | `1` | dense layers in int8 (weights only, routers stay bf16): +28 % decode, frees ~2.4 GiB per card for the expert cache; lossy, agent-validated |
 | `FREETOKEN_HOST_ALLREDUCE` | `1` | small all-reduces through shared host memory instead of RCCL's proxies (no GPU peer-to-peer here): +2.5-4.8 % decode, bit-exact |
+| `FREETOKEN_DMA_ALLREDUCE` | `1` | a prefill's all-reduces of 20 MiB or more through shared host memory too, moved by the copy engines instead of RCCL's kernels: ~1.5x faster alone, no CU held meanwhile, bit-exact ([options.md](options.md#two-or-more-gpus)) |
 | `FREETOKEN_NVFP4_PREFILL_TUNED` / `_DECODE_TUNED` | `1` | expert GEMM tiles swept on these cards for this model (the decode ones for this split's shapes): one prefill MoE block of 1600-2560 tokens 2.8-3.0x faster than the tiles before, long prompts -11 % on an earlier build, the down decode GEMV x1.06-1.19 in the kernel sweep, bit-exact against the default tiles |
 | `FREETOKEN_NVFP4_PREFILL_BLOCK` | `8192` | the NVFP4 prefill MoE 8192 tokens at a time instead of 4096: cold reads +7.9 % (arms alternated, an earlier build), the same bits; 16384 left the XT 0.65 GiB of VRAM at the peak of a 255k-token read ([options.md](options.md)) |
 | `FREETOKEN_HOST_KV` | `1` | conversations evicted from the GPUs go to RAM (9.5 GiB locked) and come back in ~2 s; exact |
@@ -61,9 +62,9 @@ A comment may follow a value on the same line. Copy a file to make your own prof
 | `--ple-backend disk` | | the 51 GB n-gram embedding tables are read from the checkpoint files on demand |
 | `--max-running-requests 4 --cuda-graph-max-bs 4` | | up to 4 requests decoded together (1 / 2 / 3 / 4 greedy answers sent at once finish in 3.6 / 5.9 / 8.4-8.6 / 10.1 s) |
 | `--default-temperature 0.6` | | added by `rdna3/serve.sh` to every profile: requests that send no temperature get 0.6 instead of the checkpoint's 1.0 (`-- --default-temperature T` changes it) |
-| `--max-prefill-length 16384` | | 16k-token prompt chunks: each chunk streams every expert once (chunks of up to 1280 tokens read only their routed experts through the cache), so bigger chunks read long prompts faster (an 8.4k prompt in 4.3 s instead of 5.5 s with 4k chunks, in the A/B that chose them) |
+| `--max-prefill-length 16384` | | 16k-token prompt chunks: each chunk streams every expert once (chunks of up to 1280 tokens, 2400 with NVFP4 experts, read only their routed experts through the cache), so bigger chunks read long prompts faster (an 8.4k prompt in 4.3 s instead of 5.5 s with 4k chunks, in the A/B that chose them) |
 | `--memory-ratio 0.80` | | VRAM budget; 0.80 leaves the headroom 16k chunks need on the 20 GB card |
-| `--moe-prefill-hit-d2d` | | in a chunk that streams whole layers (over 1280 tokens), experts already cached on the GPU are copied on the GPU instead of crossing PCIe again |
+| `--moe-prefill-hit-d2d` | | in a chunk that streams whole layers (over 1280 tokens, 2400 with NVFP4 experts), experts already cached on the GPU are copied on the GPU instead of crossing PCIe again |
 | `--disable-pynccl` | | ROCm uses RCCL through torch.distributed |
 | `--tool-call-parser qwen3_coder --reasoning-parser qwen3` | | tool calls and thinking in the model's format |
 | context | 262,144 | the model's native maximum; a longer prompt is refused (`context_length_exceeded`). A 259,728-token prompt reads in 121.9 / 116.7 / 117.4 s (NVFP4 / EXL3 3.05 / 4.05 bpw) and is answered at 75.8 / 71.3 / 68.1 tok/s. The K/V of the last 12k tokens (250,000 -> 262,144) costs 134-152 expert slots per card (1.5-1.9 %) and 0.2-1.7 % of agent-turn decode, the same answers: `--ctx 250000` takes them back if you never need the full context |

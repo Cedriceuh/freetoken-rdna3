@@ -287,3 +287,25 @@ def test_path_is_decided_once_per_forward_for_every_layer(monkeypatch):
     assert decide(layer(0), 200) and decide(layer(47), 200) and decide(layer(48), 1)
     all_ok[0] = False  # a CPU or unpinned layer anywhere: no layer takes it
     assert not decide(layer(0), 200) and not decide(layer(48), 1)
+
+
+def test_threshold_is_the_expert_kernels_own_unless_set(monkeypatch):
+    """Unset, the threshold is the expert kernel's ``prefill_cached_max`` (NVFP4's 2400) or PREFILL_CACHED_DEFAULT
+    (EXL3's); FREETOKEN_PREFILL_CACHED_MAX overrides both; a layer whose model predicts nothing takes 0."""
+    from types import SimpleNamespace
+
+    from freetoken.layers import moe
+    from freetoken.layers.quantization.moe.exl3 import TritonExl3MoEKernel
+    from freetoken.layers.quantization.moe.nvfp4 import TritonNvfp4MoEKernel
+
+    def experts(kernel, predicts=True):
+        return SimpleNamespace(prefill_cached_default=predicts, quant_method=SimpleNamespace(kernel=kernel))
+
+    monkeypatch.setattr(moe, "_PREFILL_CACHED_SET", None)
+    assert moe.prefill_cached_limit(experts(TritonNvfp4MoEKernel)) == 2400
+    assert moe.prefill_cached_limit(experts(TritonExl3MoEKernel)) == moe.PREFILL_CACHED_DEFAULT == 1280
+    assert moe.prefill_cached_limit(experts(TritonNvfp4MoEKernel, predicts=False)) == 0
+    assert moe.prefill_cached_limit(SimpleNamespace(prefill_cached_default=True)) == 1280  # no quant method
+    monkeypatch.setattr(moe, "_PREFILL_CACHED_SET", 900)
+    assert moe.prefill_cached_limit(experts(TritonNvfp4MoEKernel)) == 900
+    assert moe.prefill_cached_limit(experts(TritonExl3MoEKernel, predicts=False)) == 900

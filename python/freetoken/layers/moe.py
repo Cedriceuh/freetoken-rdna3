@@ -37,6 +37,18 @@ _PREFILL_CACHED_SET = int(_PREFILL_CACHED_ENV) if _PREFILL_CACHED_ENV is not Non
 PREFILL_CACHED_DEFAULT = 1280
 
 
+def prefill_cached_limit(experts) -> int:
+    """The longest prefill chunk ``experts`` (a MoE layer) may read through the slot cache: FREETOKEN_PREFILL_CACHED_MAX
+    when set; else, for the layers whose model predicts the next layer's experts, the expert kernel's own
+    ``prefill_cached_max`` or PREFILL_CACHED_DEFAULT; else 0. The same on every rank (the setting and the kernel)."""
+    if _PREFILL_CACHED_SET is not None:
+        return _PREFILL_CACHED_SET
+    if not getattr(experts, "prefill_cached_default", False):
+        return 0
+    own = getattr(getattr(getattr(experts, "quant_method", None), "kernel", None), "prefill_cached_max", None)
+    return PREFILL_CACHED_DEFAULT if own is None else own
+
+
 class MoELayer(BaseOP):
     """Resident routed experts.
 
@@ -278,8 +290,7 @@ class OffloadMoELayer(MoELayer):
         if cache is None:
             return False
         if self.layer_id == 0:
-            limit = (_PREFILL_CACHED_SET if _PREFILL_CACHED_SET is not None
-                     else PREFILL_CACHED_DEFAULT if self.prefill_cached_default else 0)
+            limit = prefill_cached_limit(self)
             cache.prefill_chunk_cached = (0 < num_tokens <= limit and self.quant_method is not None
                                           and self.quant_method.kernel.supports_prefill_slot_map
                                           and cache.prefill_cached_all_ok())

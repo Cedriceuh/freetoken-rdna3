@@ -165,6 +165,9 @@ class MoEKernel(ABC):
     supports_inactive_slots: ClassVar[bool] = False
     # Whether a prefill ``apply`` honours ``ExpertView.slot_map`` (the routed experts read from the slot cache).
     supports_prefill_slot_map: ClassVar[bool] = False
+    # The longest prefill chunk that reads its routed experts from the slot cache when FREETOKEN_PREFILL_CACHED_MAX is
+    # unset (None: layers/moe.py's PREFILL_CACHED_DEFAULT): past it, streaming every missing expert costs less.
+    prefill_cached_max: ClassVar[int | None] = None
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
         return None

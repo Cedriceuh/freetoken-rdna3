@@ -54,11 +54,9 @@ def _block_tokens(kernel) -> int:
 def _cached_limit(experts) -> int:
     """The longest chunk the slot-cache path may take (FREETOKEN_PREFILL_CACHED_MAX), from the setting alone: whether a
     chunk takes it also depends on each rank's cache, so a longer one surely takes the full-layer path on every rank."""
-    from freetoken.layers import moe as layers_moe
+    from freetoken.layers.moe import prefill_cached_limit
 
-    if layers_moe._PREFILL_CACHED_SET is not None:
-        return layers_moe._PREFILL_CACHED_SET
-    return layers_moe.PREFILL_CACHED_DEFAULT if getattr(experts, "prefill_cached_default", False) else 0
+    return prefill_cached_limit(experts)
 
 
 def _min_votes(cache) -> int:

@@ -16,6 +16,53 @@ import triton.language as tl
 # warps none spills: the same bits (each lane's sums keep their order), the kernel ~40 % faster at 1k-16k rows, and no
 # per-queue scratch (~60 MiB a queue on a 7900 XT) that the HIP runtime takes outside the torch allocator
 _MIN_WARPS = int(os.environ.get("FREETOKEN_QSA_MIN_WARPS", "4")) if torch.version.hip is not None else 0
+_ROCM = torch.version.hip is not None
+# FREETOKEN_QSA_PREFILL_STAGES / _WARPS / _PREFETCH (default 1 / 4 / 1 on ROCm; elsewhere 2 stages, the profile's warps,
+# 0): the one-split prefill profile (more than 512 rows). One pipeline stage, as a second doubles the K / V tiles' LDS
+# (2 x 16 KB at head_dim 256, 32-token tiles) and halves the workgroups a CU holds; and each tile looks up the next
+# tile's selected rows (the index, then the page) while its own K / V load and compute, instead of waiting on three
+# dependent loads in a row. Each lane's loads and sums keep their order: the same bits. On selections dumped from a
+# 96k-token read, 7900 XTX and XT: 30-41 % faster from 600 to 16k rows than 2 stages and 4 warps without the lookahead
+_PREFILL_STAGES = int(os.environ.get("FREETOKEN_QSA_PREFILL_STAGES", "1" if _ROCM else "2"))
+_PREFILL_WARPS = int(os.environ.get("FREETOKEN_QSA_PREFILL_WARPS", "4" if _ROCM else "0"))
+_PREFILL_PREFETCH = os.environ.get("FREETOKEN_QSA_PREFILL_PREFETCH", "1" if _ROCM else "0") == "1"
+# FREETOKEN_QSA_DECODE_HOST_STAGES (default 1 on ROCm, 2 elsewhere): pipeline stages of the decode profile when the
+# K / V pages are host memory mapped into the GPU (FREETOKEN_QSA_KV_HOST): each lane's loads and sums unchanged, the
+# same bits. EXL3 3.05 bpw and NVFP4 on xtx-xt-4x262k, one request: +1.7-2.1 % decode at short context, +3-3.8 % at
+# 75-89k
+_DECODE_HOST_STAGES = int(os.environ.get("FREETOKEN_QSA_DECODE_HOST_STAGES", "1" if _ROCM else "2"))
+
+
+@triton.jit
+def _tile_rows(indices_ptr, block_table_ptr, row, stride_indices_row, stride_table_req, request, safe_request,
+               num_requests, num_cache_blocks, tile, column_offsets, TOPK: tl.constexpr, PAGE_SIZE: tl.constexpr,
+               PAGE_TABLE_WIDTH: tl.constexpr, BLOCK_N: tl.constexpr):
+    """A tile's selected rows: (physical page, offset in the page, valid) of each of its BLOCK_N columns."""
+    columns = tile * BLOCK_N + column_offsets
+    logical_token = tl.load(
+        indices_ptr + row * stride_indices_row + columns,
+        mask=columns < TOPK,
+        other=-1,
+    )
+    safe_token = tl.maximum(logical_token, 0)
+    logical_page = safe_token // PAGE_SIZE
+    page_offset = safe_token % PAGE_SIZE
+    valid = (
+        (request >= 0)
+        & (request < num_requests)
+        & (logical_token >= 0)
+        & (logical_page < PAGE_TABLE_WIDTH)
+    )
+    physical_page = tl.load(
+        block_table_ptr
+        + safe_request.to(tl.int64) * stride_table_req
+        + tl.minimum(logical_page, PAGE_TABLE_WIDTH - 1),
+        mask=valid,
+        other=-1,
+    )
+    valid &= (physical_page >= 0) & (physical_page < num_cache_blocks)
+    # physical_page * block stride can overflow int32 for large caches.
+    return tl.maximum(physical_page, 0).to(tl.int64), page_offset, valid
 
 
 @triton.jit
@@ -59,6 +106,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     KV_INT8: tl.constexpr,
+    PREFETCH_ROWS: tl.constexpr = False,
 ) -> None:
     # row * stride can overflow int32 for large row counts.
     row = tl.program_id(0).to(tl.int64)
@@ -92,32 +140,27 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     # Dynamic bounds avoid padded main-loop iterations for uneven splits.
     split_tile_start = split_id * NUM_TILES // NUM_SPLITS
     split_tile_end = (split_id + 1) * NUM_TILES // NUM_SPLITS
+    if PREFETCH_ROWS:
+        next_page, next_offset, next_valid = _tile_rows(
+            indices_ptr, block_table_ptr, row, stride_indices_row, stride_table_req, request, safe_request,
+            num_requests, num_cache_blocks, split_tile_start, column_offsets, TOPK, PAGE_SIZE, PAGE_TABLE_WIDTH,
+            BLOCK_N,
+        )
     for tile in range(split_tile_start, split_tile_end):
-        columns = tile * BLOCK_N + column_offsets
-        logical_token = tl.load(
-            indices_ptr + row * stride_indices_row + columns,
-            mask=columns < TOPK,
-            other=-1,
-        )
-        safe_token = tl.maximum(logical_token, 0)
-        logical_page = safe_token // PAGE_SIZE
-        page_offset = safe_token % PAGE_SIZE
-        valid = (
-            (request >= 0)
-            & (request < num_requests)
-            & (logical_token >= 0)
-            & (logical_page < PAGE_TABLE_WIDTH)
-        )
-        physical_page = tl.load(
-            block_table_ptr
-            + safe_request.to(tl.int64) * stride_table_req
-            + tl.minimum(logical_page, PAGE_TABLE_WIDTH - 1),
-            mask=valid,
-            other=-1,
-        )
-        valid &= (physical_page >= 0) & (physical_page < num_cache_blocks)
-        # physical_page * block stride can overflow int32 for large caches.
-        safe_page = tl.maximum(physical_page, 0).to(tl.int64)
+        if PREFETCH_ROWS:
+            # this tile's rows were looked up during the previous one; look up the next tile's now (the last
+            # iteration repeats its own, unused), so a tile waits for its K / V loads only
+            safe_page, page_offset, valid = next_page, next_offset, next_valid
+            next_page, next_offset, next_valid = _tile_rows(
+                indices_ptr, block_table_ptr, row, stride_indices_row, stride_table_req, request, safe_request,
+                num_requests, num_cache_blocks, tl.minimum(tile + 1, split_tile_end - 1), column_offsets, TOPK,
+                PAGE_SIZE, PAGE_TABLE_WIDTH, BLOCK_N,
+            )
+        else:
+            safe_page, page_offset, valid = _tile_rows(
+                indices_ptr, block_table_ptr, row, stride_indices_row, stride_table_req, request, safe_request,
+                num_requests, num_cache_blocks, tile, column_offsets, TOPK, PAGE_SIZE, PAGE_TABLE_WIDTH, BLOCK_N,
+            )
         keys = tl.load(
             k_cache_ptr
             + safe_page[None, :] * stride_k_block
@@ -278,6 +321,7 @@ def qsa_sparse_paged_attention(
     v_scale: torch.Tensor | None = None,
     decode: bool = False,
     gate: torch.Tensor | None = None,
+    kv_host: bool = False,
 ) -> torch.Tensor:
     """Run sparse GQA directly over paged BF16 K/V caches, or int8 ones with ``[pages, page_size, kv_heads]``
     fp32 scales (``k_scale`` / ``v_scale``, see kvcache/qsa_pool.py FREETOKEN_QSA_KV_INT8).
@@ -287,7 +331,10 @@ def qsa_sparse_paged_attention(
 
     ``decode``: pick the tile profile as for one query row, whatever the row count, so each decode row gets the
     bits it would get alone (the split count changes the merge order). Up to 4 rows per rank this is the profile
-    the row count picks anyway; it matters for spec_decode verify steps of several requests."""
+    the row count picks anyway; it matters for spec_decode verify steps of several requests.
+
+    ``kv_host``: ``k_cache`` / ``v_cache`` are host memory mapped into the GPU (``FREETOKEN_QSA_KV_HOST``); a decode
+    call then runs ``FREETOKEN_QSA_DECODE_HOST_STAGES`` pipeline stages."""
 
     if q.ndim != 3 or k_cache.ndim != 4 or v_cache.shape != k_cache.shape:
         raise ValueError("QSA sparse attention received invalid Q/K/V shapes")
@@ -337,6 +384,9 @@ def qsa_sparse_paged_attention(
     else:
         block_n, target_splits, partial_warps = 64, 1, 2
     partial_warps = max(partial_warps, _MIN_WARPS)
+    wide = base_programs > 512  # the one-split prefill profile
+    if wide and _PREFILL_WARPS > 0:
+        partial_warps = _PREFILL_WARPS
 
     # RDNA (gfx11 / gfx12) has 64 KiB of LDS per workgroup; the profile above was
     # tuned on GB300. The K tile [head_dim, BLOCK_N] and the V tile [BLOCK_N, head_dim] alone
@@ -422,8 +472,9 @@ def qsa_sparse_paged_attention(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         KV_INT8=kv_int8,
+        PREFETCH_ROWS=wide and _PREFILL_PREFETCH,
         num_warps=partial_warps,
-        num_stages=2,
+        num_stages=_PREFILL_STAGES if wide else _DECODE_HOST_STAGES if decode and kv_host else 2,
     )
     if gate is not None:
         assert gate.shape == q.shape and gate.dtype == q.dtype == torch.bfloat16 and gate.stride(2) == 1

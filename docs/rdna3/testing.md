@@ -57,6 +57,7 @@ docker run --rm --device=/dev/kfd --device=/dev/dri --security-opt seccomp=uncon
 | `exl3_moe_check.py` | the EXL3 routed-expert path (rotations + products) against a dense reference: decode, prefill, a 384 / 256 two-rank split, prefill token blocks bit-identical to one pass, a CUDA-graph replay; its torch reference decodes on the CPU with as many threads as the container's `--cpus` quota (with torch's default oversubscribing it, a CPU decode of the same tiles came out different now and then) |
 | `moe_block_check.py` | the token-blocked NVFP4 prefill MoE returns exactly what the one-shot call returns |
 | `host_allreduce_check.py` (2 GPUs: `HIP_VISIBLE_DEVICES=0,1`) | the host-memory all-reduce against RCCL |
+| `dma_allreduce_check.py` (2 GPUs: `HIP_VISIBLE_DEVICES=0,1`) | the copy-engine all-reduce of large messages against RCCL (bits, two in flight, timings, beside GEMMs) |
 | `host_kv_check.py` | the RAM-tier copies (device -> RAM -> device) are exact |
 | `qsa_kv_int8_check.py` | the int8 attention KV (off, not recommended) against bf16 and an fp32 reference |
 | `run_sampling_tests.sh <module>` + `sampling_test.py` | sampling kernels in four modes, each killed after 90 s (hang detector). Runs on the host and starts its own containers (image: `FREETOKEN_IMAGE`, default `freetoken-rdna3:latest`) |

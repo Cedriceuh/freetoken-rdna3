@@ -17,6 +17,13 @@ import triton.language as tl
 # (_qsa_mqa_paged_rows_kernel), the same bits; 3.9-4.3x faster at a 16k-token chunk 150k deep. 0: one row a program
 _SCORE_ROWS = os.environ.get("FREETOKEN_QSA_SCORE_ROWS", "1") == "1"
 _ROWS_MIN = 64  # decode and short rows keep the one-row kernel
+# FREETOKEN_QSA_SCORE_ROWS_STAGES / _TILES (default 1 / 16 on ROCm, 2 / 8 elsewhere): that kernel's pipeline stages and
+# 64-column tiles a program. One stage keeps two programs' K tiles in the LDS one held, and 16 tiles load the 16 rows'
+# queries once for twice the columns; the same K order and head sums: the same bits. 7900 XTX / XT, 30k-200k deep,
+# synthetic queries: a 128 MiB block of scores 26-29 % / 19-22 % faster (in serving, a 210k-token read 0.6 % shorter)
+_ROCM = torch.version.hip is not None
+_ROWS_STAGES = int(os.environ.get("FREETOKEN_QSA_SCORE_ROWS_STAGES", "1" if _ROCM else "2"))
+_ROWS_TILES = int(os.environ.get("FREETOKEN_QSA_SCORE_ROWS_TILES", "16" if _ROCM else "8"))
 
 
 @triton.jit
@@ -263,13 +270,14 @@ def qsa_mqa_paged(
     BLOCK_D = max(16, triton.next_power_of_2(q.shape[2]))
     MAX_N = max(16, triton.next_power_of_2(q.shape[1]))
     if one_request and _SCORE_ROWS and q.shape[1] == 4 and q.shape[0] >= _ROWS_MIN:
-        _qsa_mqa_paged_rows_kernel[(triton.cdiv(q.shape[0], 16), triton.cdiv(columns, BLOCK_N * 8))](
+        _qsa_mqa_paged_rows_kernel[(triton.cdiv(q.shape[0], 16), triton.cdiv(columns, BLOCK_N * _ROWS_TILES))](
             q, k_cache, page_table, token_to_req, query_positions, sequence_lengths, visible_blocks, logits,
             q.stride(0), q.stride(1), q.stride(2), k_cache.stride(0), k_cache.stride(1), k_cache.stride(3),
             page_table.stride(0), page_table.stride(1), logits.stride(0),
             q.shape[0], columns, k_cache.shape[0], page_table.shape[0], float(score_divisor),
             PAGE_SIZE=k_cache.shape[1], PAGE_TABLE_WIDTH=page_table.shape[1], NUM_HEADS=q.shape[1], HEAD_DIM=q.shape[2],
-            BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D, ROWS=16, TILES_PER_PROG=8, STAGES=2, COMPRESS_RATIO=compress_ratio,
+            BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D, ROWS=16, TILES_PER_PROG=_ROWS_TILES, STAGES=_ROWS_STAGES,
+            COMPRESS_RATIO=compress_ratio,
             num_warps=8,
         )
         return logits, visible_blocks

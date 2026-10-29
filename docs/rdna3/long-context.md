@@ -126,7 +126,9 @@ prefix is reused). The pool is shared: up to four requests run at once, together
   decode and verify kernels read the ~2051 tokens each row selects in place, across PCIe. On ROCm it is allocated
   non-coherent, so the GPU's L2 can keep the lines the verify rows of a request share (90 % of their tokens): 2.4x
   faster in the attention kernel, but only 0-2.4 % in serving, where the MoE weights going through the same L2
-  probably evict them (not measured). The index tiers stay in VRAM.
+  probably evict them (not measured). The index tiers stay in VRAM. Over these rows the decode attention runs one
+  pipeline stage instead of two (`FREETOKEN_QSA_DECODE_HOST_STAGES`): +1.7-2.1 % decode at short context and +3-3.8 %
+  at 75-89k for one request, the same answers.
 - **A prefill** first copies to a VRAM buffer the K/V rows its tokens select, one layer at a time
   (`FREETOKEN_QSA_STAGE_SELECTED`, 28 GB/s), instead of reading each row across PCIe.
 - **The answers are bit-identical** to the K/V in VRAM (the same text at 29k and 118k).
