@@ -98,7 +98,7 @@ def convert_model(root: Any) -> tuple[int, int]:
                 and getattr(op, "tied_embedding", None) is None)
 
     def walk(op: Any, path: str) -> None:
-        nonlocal converted, freed
+        nonlocal converted, freed, on_gpu
         if id(op) in seen:
             return
         seen.add(id(op))
@@ -118,6 +118,7 @@ def convert_model(root: Any) -> tuple[int, int]:
             op.weight_scale = scale.to(device)
             op.quant_method = Int8WeightOnlyLinearMethod()
             converted += 1
+            on_gpu = on_gpu or device.type == "cuda"
         for key, value in vars(op).items():
             if isinstance(value, BaseOP):
                 walk(value, f"{path}.{key}")
@@ -127,6 +128,7 @@ def convert_model(root: Any) -> tuple[int, int]:
                         walk(item, f"{path}.{key}.{i}")
 
     names: list[str] = []
+    on_gpu = False
     before = torch.cuda.mem_get_info()[0] if torch.cuda.is_available() else 0
     walk(root, "")
     if torch.cuda.is_available():
@@ -136,6 +138,15 @@ def convert_model(root: Any) -> tuple[int, int]:
     kinds = sorted({".".join(p.split(".")[-2:]) for p in names})
     logger.info_rank0(f"INT8 weight-only: {converted} dense linears converted, {freed / 2**30:.2f} GiB freed per rank; "
                       f"kinds: {', '.join(kinds)} (kept bf16: {', '.join(skip)})")
+    if on_gpu:
+        from freetoken.kernel.triton import int8_gemv
+
+        if int8_gemv._EXACT_HIP:
+            from freetoken.kernel.int8_gemv_exact import _module
+
+            _module()  # built and loaded now, not inside the first captured graph
+            logger.info_rank0("INT8 weight-only: decode GEMVs at 1-8 rows by the HIP kernels with the same sums "
+                              "(FREETOKEN_INT8_EXACT_GEMV)")
     return converted, freed
 
 

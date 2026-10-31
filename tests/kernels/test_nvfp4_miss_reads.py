@@ -1,8 +1,9 @@
 """FREETOKEN_MOE_MISS_READS on NVFP4: the decode marlin GEMVs (gate | up with and without the SiLU, down) read the
 packed and scale rows of the slots the expert cache fills this step from the layer's pinned host banks and write them
-into the slots on the way. The outputs are those of copying the rows first and reading the slots, and the slots end
-up holding the copied rows; at the per-rank shapes, the shipped and tuned tiles, CPU routes (-1) among the routes, 0
-to all slots missing."""
+into the slots on the way (tile by tile, or the program's rows first, FREETOKEN_NVFP4_MISS_BULK, then with the global
+scales' rows too, FREETOKEN_NVFP4_MISS_GLOBALS). The outputs are those of copying the rows first and reading the
+slots, and the slots end up holding the copied rows; at the per-rank shapes, the shipped and tuned tiles, CPU routes
+(-1) among the routes, 0 to all slots missing."""
 
 import pytest
 import torch
@@ -31,11 +32,13 @@ def _plan(ids, n_miss, E, g, dev):
 @pytest.mark.parametrize("shape", [(704, 2560), (576, 2560), (2560, 352), (2560, 288)])
 @pytest.mark.parametrize("rows", [1, 2, 4, 8])
 @pytest.mark.parametrize("tuned", [False, True])
-def test_marlin_reading_misses_from_host_matches_copy_then_gemv(monkeypatch, shape, rows, tuned):
+@pytest.mark.parametrize("bulk, globals_", [(False, False), (True, False), (True, True)])
+def test_marlin_reading_misses_from_host_matches_copy_then_gemv(monkeypatch, shape, rows, tuned, bulk, globals_):
     import freetoken.kernel.nvfp4_moe as nm
     from freetoken.kernel.pinned import device_ptr
 
     monkeypatch.setattr(nm, "NVFP4_DECODE_TUNED", tuned)
+    monkeypatch.setattr(nm, "MISS_BULK", bulk)
     N, K = shape
     dev, S, E, top_k = "cuda", 24, 40, 10
     g = torch.Generator(device=dev).manual_seed(N + K + rows + tuned)
@@ -44,7 +47,10 @@ def test_marlin_reading_misses_from_host_matches_copy_then_gemv(monkeypatch, sha
     glob = torch.rand(S, N, device=dev, generator=g) * 1e-3
     h_packed = _host(torch.randint(0, 256, (E, N, K // 2), device=dev, generator=g, dtype=torch.int32).to(torch.uint8))
     h_scale = _host(torch.randint(0, 0x7E, (E, N, K // 16), device=dev, generator=g, dtype=torch.int32).to(torch.uint8))
-    ptrs = torch.tensor([0, device_ptr(h_packed), 0, device_ptr(h_scale)], dtype=torch.int64, device=dev)
+    h_glob = _host(torch.rand(E, N, device=dev, generator=g) * 1e-3)
+    ptrs = torch.tensor([device_ptr(h_glob), device_ptr(h_packed), 0, device_ptr(h_scale)], dtype=torch.int64,
+                        device=dev)
+    banks = (1, 3, 0) if globals_ else (1, 3)  # with FREETOKEN_NVFP4_MISS_GLOBALS the global scales' bank too
     route_rows = N == 2560  # the down GEMV: one activation row a route
     for cpu_routes in (False, True):
         ids = torch.stack([torch.randperm(S, device=dev, generator=g)[:top_k] for _ in range(rows)]).int()
@@ -55,24 +61,27 @@ def test_marlin_reading_misses_from_host_matches_copy_then_gemv(monkeypatch, sha
         n_used = ids[ids >= 0].unique().numel()
         for n_miss in sorted({0, 1, n_used // 2, n_used}):
             ev, src, num, k = _plan(ids.view(-1), n_miss, E, g, dev)
-            rp, rs = packed.clone(), scale.clone()
+            rp, rs, rg = packed.clone(), scale.clone(), glob.clone()
             rp[ev[:k].long()] = h_packed[src[:k].cpu().long()].to(dev)
             rs[ev[:k].long()] = h_scale[src[:k].cpu().long()].to(dev)
+            if globals_:
+                rg[ev[:k].long()] = h_glob[src[:k].cpu().long()].to(dev)
             want = torch.empty((rows, top_k, N), device=dev, dtype=torch.bfloat16)
-            nm.decode_gemm_marlin(a, rp, rs, glob, want, w, ids, True, route_rows)
-            gp, gs = packed.clone(), scale.clone()
+            nm.decode_gemm_marlin(a, rp, rs, rg, want, w, ids, True, route_rows)
+            gp, gs, gg = packed.clone(), scale.clone(), (glob.clone() if globals_ else rg)
             got = torch.full_like(want, 7.0)
-            nm.decode_gemm_marlin(a, gp, gs, glob, got, w, ids, True, route_rows, misses=(ev, src, num, ptrs),
-                                  banks=(1, 3))
+            nm.decode_gemm_marlin(a, gp, gs, gg, got, w, ids, True, route_rows, misses=(ev, src, num, ptrs),
+                                  banks=banks)
             assert torch.equal(got.view(torch.int16), want.view(torch.int16)), (n_miss, cpu_routes)
-            assert torch.equal(gp, rp) and torch.equal(gs, rs), (n_miss, cpu_routes)
+            assert torch.equal(gp, rp) and torch.equal(gs, rs) and torch.equal(gg, rg), (n_miss, cpu_routes)
             if route_rows:
                 continue
             act_want = torch.empty((rows * top_k, N // 2), device=dev, dtype=torch.bfloat16)
-            nm.decode_gemm_marlin_act(a, rp, rs, glob, act_want, w, ids, False)
-            gp, gs = packed.clone(), scale.clone()
+            nm.decode_gemm_marlin_act(a, rp, rs, rg, act_want, w, ids, False)
+            gp, gs, gg = packed.clone(), scale.clone(), (glob.clone() if globals_ else rg)
             act_got = torch.full_like(act_want, 7.0)
-            nm.decode_gemm_marlin_act(a, gp, gs, glob, act_got, w, ids, False, misses=(ev, src, num, ptrs),
-                                      banks=(1, 3))
+            nm.decode_gemm_marlin_act(a, gp, gs, gg, act_got, w, ids, False, misses=(ev, src, num, ptrs),
+                                      banks=banks)
             assert torch.equal(act_got.view(torch.int16), act_want.view(torch.int16)), (n_miss, cpu_routes)
-            assert torch.equal(gp, rp) and torch.equal(gs, rs), (n_miss, cpu_routes)
+            assert torch.equal(gp, rp) and torch.equal(gs, rs) and torch.equal(gg, rg), (n_miss, cpu_routes)
+

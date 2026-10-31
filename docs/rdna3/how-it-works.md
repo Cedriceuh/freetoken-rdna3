@@ -36,7 +36,10 @@ accumulator, one reduction, fused scale). Half the bytes per token, and ~2.4 GiB
 This is lossy (8-bit weights): no measurable loss on the scored benchmark, and it was in the builds validated on the
 agentic one. The allocator is compacted after the conversion, or the freed memory stays fragmented and is lost.
 Several concurrent requests run the same per-row kernel once per row, so a request's decode gets the same bits alone
-or batched.
+or batched. Four of these GEMVs at 1-8 rows (the GDN projections, attention qkv and output, the hyper-connections' down
+and up projections) run as HIP kernels that add in the Triton kernels' order: an int8 weight times a bf16 activation is
+exact in fp32, so the same order gives the same bits, with fewer instructions a row (`FREETOKEN_INT8_EXACT_GEMV`,
++5-6 % decode at one request).
 
 ## Two unequal cards: uneven tensor parallelism (+4 %)
 
@@ -70,9 +73,15 @@ VRAM exposed; whether enabling it would give peer access on this machine is unte
 ## The expert cache
 
 Upstream's LRU cache over the GPU memory left after weights and KV (`--moe-cache-auto`). Policies were compared on
-real traces: LFU = LRU, and even the offline optimum (Belady) only halves the misses; capacity, not policy, is the
-lever, which is why every freed megabyte goes to the cache. Expert GEMM tiles were re-swept for this model on these
-cards, changing only tiles that keep the summation order (bit-exact).
+real traces: LFU = LRU, and even the offline optimum (Belady) only halves the misses; capacity is the main lever,
+which is why every freed megabyte goes to the cache. Expert GEMM tiles were re-swept for this model on these
+cards, changing only tiles that keep the summation order (bit-exact). In decode the expert GEMVs read a missing
+expert from its pinned host bank themselves while the cached ones compute (`FREETOKEN_MOE_MISS_READS`), each program
+copying its rows into the slot in contiguous spans first (`FREETOKEN_NVFP4_MISS_BULK`:
+NVFP4 decode +4 % with the launcher's pool). The admission picks all its victims in one pass, the oldest slot of each
+of 128 stripes of the pool (`FREETOKEN_MOE_ENSURE_STRIPES`), and stamps the experts a step finds in place ten steps
+ahead, so that an expert used again outlives one used once (`FREETOKEN_MOE_HIT_BONUS`): 6-8 % fewer misses at four
+requests in replays of recorded steps, NVFP4 +4 % a request there.
 
 ## Prefill
 

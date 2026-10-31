@@ -123,7 +123,7 @@ def decode_gemm_marlin(
     mul_routed_weight: bool,
     a_row_is_route: bool,
     misses: tuple | None = None,
-    banks: tuple[int, int] = (0, 0),
+    banks: tuple[int, ...] = (0, 0),
 ) -> None:
     """Marlin-style decode GEMV: int32 wide loads + deferred reduction
     (:func:`_decode_nvfp4_marlin_kernel`). ``packed`` is the uint8 ``[S, N, K//2]`` bank;
@@ -173,15 +173,41 @@ def decode_gemm_marlin(
         compute_type=_tl_dtype(c.dtype),
         SKIP_INACTIVE=SKIP_CPU_ROUTES,
         num_warps=warps,
-        **_miss_args(misses, banks, total_routes),
+        **_miss_args(misses, banks, total_routes, packed_i32, scale, block_n, N, glob),
     )
 
 
-def _miss_args(misses: tuple | None, banks: tuple[int, int], routes: int) -> dict:
+# FREETOKEN_NVFP4_MISS_BULK (default 1): a decode GEMV program whose slot is being filled copies its rows from host
+# memory into the slot in contiguous spans first, then reads them from the slot (_fill_rows), instead of reading the
+# host bank tile by tile: the same values, so the same bits; one missing expert costs the gate | up GEMV at four rows
+# ~7 us instead of ~29 (7900 XTX, coarse-grained banks)
+MISS_BULK = os.environ.get("FREETOKEN_NVFP4_MISS_BULK", "1") == "1"
+# FREETOKEN_NVFP4_MISS_GLOBALS (default 1, with the above): the bulk copy takes the global scales' rows too, so that the
+# cache's admission copies nothing for NVFP4 (its copier programs waited on PCIe one round trip a miss)
+MISS_GLOBALS = MISS_BULK and os.environ.get("FREETOKEN_NVFP4_MISS_GLOBALS", "1") == "1"
+
+
+def _miss_args(misses: tuple | None, banks: tuple[int, ...], routes: int, packed: torch.Tensor | None = None,
+               scale: torch.Tensor | None = None, block_n: int = 1, rows: int = 0,
+               glob: torch.Tensor | None = None) -> dict:
+    """``banks``: the packed and scale banks' indices in the plan's host addresses, and the global scales' when the
+    GEMV fills those too (MISS_GLOBALS; the bulk path only)."""
     if misses is None:
         return {}
-    return dict(MISS=True, ev_ptr=misses[0], src_ptr=misses[1], num_ptr=misses[2], hostp_ptr=misses[3],
-                BANK_P=banks[0], BANK_S=banks[1], MP=triton.next_power_of_2(routes))
+    # whole rows are contiguous spans of the slot and of the host bank (they share one layout)
+    bulk = (MISS_BULK and packed is not None and packed.stride(2) == 1 and packed.stride(1) == packed.shape[2]
+            and scale.stride(2) == 1 and scale.stride(1) == scale.shape[2])
+    # the scale spans in 4-byte words: every program's span starts and ends on a word (``rows`` the GEMV's output rows,
+    # block_n of them a program; the slots multiples of 4 bytes)
+    words = (bulk and scale.stride(0) % 4 == 0
+             and (scale.stride(1) % 4 == 0 or (block_n * scale.stride(1) % 4 == 0 and rows % block_n == 0)))
+    extra = {}
+    if len(banks) > 2:  # the global scales' rows: whole slot rows, filled in the bulk copy
+        assert bulk and glob is not None and glob.stride(1) == 1, "the global scales are filled by the bulk path only"
+        extra = dict(MISS_G=True, BANK_G=banks[2])
+    return dict(MISS=not bulk, MISS_BULK=bulk, MISS_BULK_W=words, ev_ptr=misses[0], src_ptr=misses[1],
+                num_ptr=misses[2], hostp_ptr=misses[3], BANK_P=banks[0], BANK_S=banks[1],
+                MP=triton.next_power_of_2(routes), **extra)
 
 
 def decode_gemm_marlin_act(
@@ -194,7 +220,7 @@ def decode_gemm_marlin_act(
     topk_ids: torch.Tensor,
     mul_routed_weight: bool,
     misses: tuple | None = None,
-    banks: tuple[int, int] = (0, 0),
+    banks: tuple[int, ...] = (0, 0),
 ) -> None:
     """``decode_gemm_marlin`` of the gate | up bank (``packed [S, 2I, K // 2]``: gate rows, then up rows) and silu_and_mul
     in one launch (:func:`_decode_nvfp4_marlin_act_kernel`): ``out [M * top_k, I]``, the bits of the two kernels, with
@@ -236,7 +262,7 @@ def decode_gemm_marlin_act(
         compute_type=_tl_dtype(out.dtype),
         SKIP_INACTIVE=SKIP_CPU_ROUTES,
         num_warps=warps,
-        **_miss_args(misses, banks, M * top_k),
+        **_miss_args(misses, banks, M * top_k, packed_i32, scale, block_n, I, glob),
     )
 
 

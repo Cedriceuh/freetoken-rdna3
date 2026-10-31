@@ -70,10 +70,13 @@ def _fused_experts_decode_nvfp4(
         assert gemm_fn is _decode_gemm_marlin, "only the marlin GEMVs read missing slots from host memory"
         plan, bank = misses
         for t, role in ((gate_up_packed, "gate_up"), (gate_up_scale, "gate_up_scale"), (down_packed, "down"),
-                        (down_scale, "down_scale")):  # host and slot rows share one layout
-            assert t[0].numel() * t.element_size() == bank[role][1] == t.stride(0) * t.element_size(), (role, bank)
-        gu_miss = {"misses": plan, "banks": (bank["gate_up"][0], bank["gate_up_scale"][0])}
-        dn_miss = {"misses": plan, "banks": (bank["down"][0], bank["down_scale"][0])}
+                        (down_scale, "down_scale"), (gate_up_global, "gate_up_global"), (down_global, "down_global")):
+            if role in bank:  # host and slot rows share one layout
+                assert t[0].numel() * t.element_size() == bank[role][1] == t.stride(0) * t.element_size(), (role, bank)
+        # the global scales' banks too when the GEMVs fill them (nvfp4_moe.MISS_GLOBALS: the kernel declares them)
+        gu_miss = {"misses": plan, "banks": tuple(bank[r][0] for r in ("gate_up", "gate_up_scale", "gate_up_global")
+                                                  if r in bank)}
+        dn_miss = {"misses": plan, "banks": tuple(bank[r][0] for r in ("down", "down_scale", "down_global") if r in bank)}
     if (_ACT_IN_GEMV and gemm_fn is _decode_gemm_marlin and activation == "silu" and dt == torch.bfloat16
             and not is_flashinfer_installed()):
         # FREETOKEN_NVFP4_ACT_IN_GEMV: the gate | up GEMV and silu_and_mul in one launch, the bits of the Triton

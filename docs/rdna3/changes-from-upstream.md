@@ -356,6 +356,25 @@ Line counts here are on top of the lines listed in the sections above.
 | `python/freetoken/kernel/triton/qsa/attend.py`, `attention/qsa_sparse.py`, `tests/kernels/test_prefill_warps.py` | 78/27, 1/0, 53/2 | the sparse attention's prefill profile (over 512 rows) on ROCm: one pipeline stage, 4 warps, each tile looking up the next tile's selected rows while it computes (`FREETOKEN_QSA_PREFILL_STAGES` / `_WARPS` / `_PREFETCH`); the decode profile over host K/V at one stage (`FREETOKEN_QSA_DECODE_HOST_STAGES`) |
 | `python/freetoken/kernel/triton/qsa/score.py` | 10/2 | the 16-row scoring kernel at one stage and 16 tiles a program on ROCm (`FREETOKEN_QSA_SCORE_ROWS_STAGES` / `_TILES`) |
 
+## The int8 decode GEMVs in HIP with the Triton kernels' sums (bit-exact)
+
+Line counts here are on top of the lines listed in the sections above.
+
+| File | Lines | Change |
+|---|---:|---|
+| `python/freetoken/kernel/csrc/jit/int8_gemv_exact.cuh`, `kernel/int8_gemv_exact.py`, `kernel/triton/int8_gemv.py`, `layers/quantization/int8_weight_only.py`, `tests/kernels/test_int8_gemv_exact.py` | new, new, 29/0, 12/1, new | `FREETOKEN_INT8_EXACT_GEMV` (on by default on ROCm): four int8 decode GEMV tiles at 1-8 rows (the GDN projections and the attention output from 2 rows and the draft head at one, attention qkv, the hyper-connections' down projection with `hc_silu`, their up projection with the stream mix) as HIP kernels adding in the Triton kernels' order, the module built at load |
+
+## Missing experts read whole, the cache's admission (bit-exact)
+
+Line counts here are on top of the lines listed in the sections above.
+
+| File | Lines | Change |
+|---|---:|---|
+| `python/freetoken/kernel/triton/nvfp4_fused_moe.py`, `kernel/nvfp4_moe.py`, `moe/fused_nvfp4.py`, `layers/quantization/moe/nvfp4.py`, `tests/kernels/test_nvfp4_miss_reads.py` | 66/2, 33/7, 7/4, 9/2, 25/16 | `FREETOKEN_NVFP4_MISS_BULK`: a decode GEMV program whose slot is being filled copies its rows from the host bank into the slot in contiguous spans (the scales as 4-byte words), then reads the slot; `FREETOKEN_NVFP4_MISS_GLOBALS`: the global scales' rows too, the cache's admission copying nothing for NVFP4; the tests both ways |
+| `python/freetoken/kernel/triton/exl3.py`, `moe/fused_exl3.py`, `tests/kernels/test_exl3_miss_reads.py` | 37/6, 5/2, 14/6 | `FREETOKEN_EXL3_MISS_BULK`: the same for the trellis GEMVs from two rows a step, a K row of a program's tiles at a time; the tests both ways |
+| `python/freetoken/kernel/triton/ensure_copy.py`, `tests/kernels/test_moe_ensure_copy.py` | 102/31, 88/3 | `FREETOKEN_MOE_ENSURE_COPIERS`: the admission's copier programs in slices of the misses; `FREETOKEN_MOE_ENSURE_STRIPES`: the victims in one pass, each miss the oldest slot of its stripe of the pool; `FREETOKEN_MOE_HIT_BONUS`: the slots a call finds stamped 480 calls ahead (Phase 1 of flashlib's `lru_ensure` copied with that stamp); the tests: exact against flashlib with neither, a consistent cache and each stripe's oldest victim with them |
+| `python/freetoken/moe/offload_kernels.py`, `tests/moe/test_prefill_cached.py` | 5/3, 47/0 | the short-prefill planner and the hybrid admission take only the slots stamped by their own call as theirs (they took any stamp at or past the clock: with the hit bonus a prefill could run short of victims and give away a slot it routes); the test plans a prefill over slots all stamped ahead |
+
 ## Tooling and documentation
 
 | File | Change |

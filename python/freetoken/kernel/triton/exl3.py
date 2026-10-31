@@ -34,6 +34,10 @@ _FAST_MUL1 = tl.constexpr(os.environ.get("FREETOKEN_EXL3_FAST_MUL1", "1") == "1"
 # FREETOKEN_EXL3_ALIGNBIT (default 1 on ROCm): a trellis window's funnel shift as one v_alignbit_b32 instead of three
 # shifts (two fewer a window: 4 weights up to 5 bits, 2 above), the same words
 _ALIGNBIT = tl.constexpr(os.environ.get("FREETOKEN_EXL3_ALIGNBIT", "1") == "1" and torch.version.hip is not None)
+# FREETOKEN_EXL3_MISS_BULK (default 1): a decode GEMV program of two or more rows whose slot is being filled copies its
+# tiles from host memory into the slot in whole K rows first, then decodes them from the slot (_fill_tiles), instead
+# of reading the host bank window by window: the same words, so the same bits
+_MISS_BULK = os.environ.get("FREETOKEN_EXL3_MISS_BULK", "1") == "1"
 
 
 def group_size(K: int) -> int:
@@ -324,7 +328,7 @@ def _exl3_gemv_kernel(
     K: tl.constexpr, CB: tl.constexpr, G: tl.constexpr, KT: tl.constexpr, NT: tl.constexpr, DOT4: tl.constexpr,
     SKIP_INACTIVE: tl.constexpr, GROUP: tl.constexpr = 1,
     MISS: tl.constexpr = False, ev_ptr=None, src_ptr=None, num_ptr=None, hostp_ptr=None, BANK: tl.constexpr = 0,
-    MP: tl.constexpr = 1,
+    MP: tl.constexpr = 1, MISS_BULK: tl.constexpr = False, FILL_W: tl.constexpr = 1, FILL_SEG: tl.constexpr = 1,
 ):
     """c[split, r, n] = sum over this split's k of a[r, half(n), k] * Wq[slot[r]][k, n], NT column tiles of one route.
 
@@ -378,11 +382,30 @@ def _exl3_gemv_kernel(
         if first < MP:
             row = tl.load(src_ptr + first).to(tl.int64)
             h_base = tl.load(hostp_ptr + BANK).to(tl.pointer_type(tl.int32)) + row * stride_ts + nb0 * stride_tb
-            _gemv_store_routes(a_ptr, r, r1, r2, r3, nm, half, stride_ar, stride_ah, h_base, k_lo, k_lo + KSPAN,
-                               stride_ta, stride_tb, c_base, stride_cr, K, CB, G, KT, NT, DOT4, GROUP, t_base, True)
-            return
+            if MISS_BULK:  # the program's tiles copied into the slot first, then read from it as a cached slot's
+                _fill_tiles(h_base + k_lo * stride_ta, t_base + k_lo * stride_ta, KSPAN, stride_ta, NT * 8 * K, FILL_W,
+                            FILL_SEG)
+                tl.debug_barrier()
+            else:
+                _gemv_store_routes(a_ptr, r, r1, r2, r3, nm, half, stride_ar, stride_ah, h_base, k_lo, k_lo + KSPAN,
+                                   stride_ta, stride_tb, c_base, stride_cr, K, CB, G, KT, NT, DOT4, GROUP, t_base,
+                                   True)
+                return
     _gemv_store_routes(a_ptr, r, r1, r2, r3, nm, half, stride_ar, stride_ah, t_base, k_lo, k_lo + KSPAN, stride_ta,
                        stride_tb, c_base, stride_cr, K, CB, G, KT, NT, DOT4, GROUP)
+
+
+@triton.jit
+def _fill_tiles(src, dst, nseg, seg_stride, SEG_LEN: tl.constexpr, W: tl.constexpr, SEG: tl.constexpr):
+    """FREETOKEN_EXL3_MISS_BULK: a program's tiles from ``src`` (host memory) to ``dst`` (the slot), ``nseg`` K rows of
+    ``SEG_LEN`` contiguous int32 words (its NT tiles), ``seg_stride`` apart, in wide reads of whole rows (W >= SEG_LEN,
+    a power of two), SEG rows at a time, instead of the tile loop's two words a lane a window."""
+    w = tl.arange(0, W)[None, :]
+    sg = tl.arange(0, SEG)[:, None]
+    for s0 in range(0, nseg, SEG):
+        m = (s0 + sg < nseg) & (w < SEG_LEN)
+        off = (s0 + sg) * seg_stride + w
+        tl.store(dst + off, tl.load(src + off, mask=m), mask=m)
 
 
 # (KIN tiles, half N tiles) -> (KT, NT, split_k, warps), swept on the 7900 XT (rdna3/bench/exl3_gemv_bench.py); the
@@ -422,6 +445,7 @@ def exl3_gemv(
     groups: torch.Tensor | None = None,
     misses: tuple | None = None,
     bank: int = 0,
+    miss_bulk: bool = True,
 ) -> torch.Tensor:
     """Per-route GEMV over a slot bank of EXL3 trellises, in the rotation domain.
 
@@ -431,7 +455,8 @@ def exl3_gemv(
     one slot a program (1, 2 or 4), the same bits; ``groups``: route_groups(slots, group), computed here if
     None (one per layer serves both of its GEMVs). ``misses``: ``(slots filled, their host rows, count, host bank
     addresses)`` of the expert cache's copy plan, ``bank`` this bank's index there: the slots being filled are read
-    from host memory and written on the way (the cache then skips copying this bank)."""
+    from host memory and written on the way (the cache then skips copying this bank). ``miss_bulk``: False keeps
+    the window-by-window reads of FREETOKEN_EXL3_MISS_BULK=0."""
     R, halves, kin = a.shape
     S, A, B, words = trellis_bank.shape
     assert kin == A * 16 and B % halves == 0, (tuple(a.shape), tuple(trellis_bank.shape))
@@ -448,6 +473,8 @@ def exl3_gemv(
     if out is None:
         out = torch.empty((split_k, R, B * 16), dtype=torch.float32, device=a.device)
     a = a.contiguous()
+    bulk = _MISS_BULK and miss_bulk and t.stride(2) == words // 2 and t.stride(3) == 1
+    fill_w = triton.next_power_of_2(NT * words // 2)
     _exl3_gemv_kernel[(R, B // NT, split_k)](
         a, t, slots, out, groups if group > 1 else slots,
         A // split_k, half_tiles,
@@ -457,7 +484,11 @@ def exl3_gemv(
         K=K, CB=codebook, G=group_size(K), KT=KT, NT=NT, DOT4=_dot4(a.device), SKIP_INACTIVE=skip_inactive,
         GROUP=group, num_warps=num_warps,
         **({} if misses is None else dict(MISS=True, ev_ptr=misses[0], src_ptr=misses[1], num_ptr=misses[2],
-                                         hostp_ptr=misses[3], BANK=bank, MP=triton.next_power_of_2(R))),
+                                         hostp_ptr=misses[3], BANK=bank, MP=triton.next_power_of_2(R),
+                                         MISS_BULK=bulk, FILL_W=fill_w,
+                                         # 16 words a thread: more would cost the GEMV loop registers
+                                         FILL_SEG=max(1, min(triton.next_power_of_2(A // split_k),
+                                                             512 * num_warps // fill_w)))),
     )
     return out
 

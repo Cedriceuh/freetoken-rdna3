@@ -57,6 +57,14 @@ if os.environ.get("FREETOKEN_INT8_TP_TILES", "0") == "1":
     })
 
 
+# FREETOKEN_INT8_EXACT_GEMV (default 1 on ROCm): HIP kernels with these kernels' sums at 1-8 rows
+# (kernel/int8_gemv_exact.py, the same bits): the one-pass (2, 4096, 1, 4) tile from 2 rows (the GDN projections, the
+# attention output; at one row only the draft head's tens of thousands of rows, the small shapes no faster there), the
+# (4, 4096, 1, 8) one (attention qkv), the K-blocked (1, 2048, 1, 8) one (the HC down projection, with its hc_silu
+# epilogue) and gemv_int8_hc_mix
+_EXACT_HIP = os.environ.get("FREETOKEN_INT8_EXACT_GEMV", "1" if torch.version.hip is not None else "0") == "1"
+
+
 # shapes that take another shape's tiles (``share_config``): an uneven LM head's shards (FREETOKEN_LMHEAD_SPLIT) take
 # the even head's, so its K order and its bits
 _SHARED: dict[tuple[int, int], tuple[int, int]] = {}
@@ -351,6 +359,12 @@ _ROW_GROUPS = os.environ.get("FREETOKEN_INT8_ROW_GROUPS", "1") == "1"
 _ACT_PAIR4 = os.environ.get("FREETOKEN_INT8_ACT_PAIR4", "1") == "1"
 
 
+def _exact_operands(x: torch.Tensor, qweight: torch.Tensor) -> bool:
+    """The HIP kernels' 16-byte loads: unit inner strides, rows and bases 16-byte aligned."""
+    return (x.stride(-1) == 1 and x.stride(0) % 8 == 0 and x.data_ptr() % 16 == 0 and qweight.stride(1) == 1
+            and qweight.stride(0) % 16 == 0 and qweight.data_ptr() % 16 == 0)
+
+
 def gemv_int8(x: torch.Tensor, qweight: torch.Tensor, scale: torch.Tensor, *, silu_hc: int = 0,
               silu_cols: int = 0) -> torch.Tensor:
     """``x`` [M, K] bf16 (M <= ROWS_MAX, unit inner stride), ``qweight`` [N, K] int8, ``scale`` [N] fp32 -> [M, N]
@@ -360,6 +374,16 @@ def gemv_int8(x: torch.Tensor, qweight: torch.Tensor, scale: torch.Tensor, *, si
     M = x.shape[0] if x.dim() == 2 else 1
     x2 = x.reshape(M, K) if x.dim() != 2 else x
     block_n, block_k, split, warps = _config(N, K)
+    cfg = (block_n, block_k, split, warps)
+    if _EXACT_HIP and 1 <= M <= 8 and _exact_operands(x2, qweight):
+        from freetoken.kernel import int8_gemv_exact as ex
+
+        if cfg == (2, 4096, 1, 4) and (M >= 2 or N >= 32768) and not silu_hc and K <= 4096 and K % 16 == 0:
+            return ex.gemv_int8_exact(x2, qweight, scale)
+        if cfg == (4, 4096, 1, 8) and not silu_hc and K <= 4096 and K % 16 == 0:
+            return ex.gemv_int8_exact_n4w8(x2, qweight, scale)
+        if cfg == (1, 2048, 1, 8) and K % 8 == 0:
+            return ex.gemv_int8_exact_k2048(x2, qweight, scale, silu_hc, silu_cols)
     k_per = triton.cdiv(triton.cdiv(K, split), block_k) * block_k
     out = torch.empty((M, N), dtype=torch.bfloat16, device=x.device)
     one_pass = split == 1 and k_per >= K and block_k >= K
@@ -405,6 +429,11 @@ def gemv_int8_hc_mix(x: torch.Tensor, qweight: torch.Tensor, scale: torch.Tensor
     cfg = _config(N, K)
     if cfg[0] != 1 or cfg[2] != 1 or cfg[3] != 1 or cfg[1] < K or N % hc or M > min(ROWS_MAX, 8) or rn.stride(1) != 1:
         return None
+    if (_EXACT_HIP and hc == 4 and 1 <= M <= 8 and cfg[1] == 512 and K % 16 == 0 and _exact_operands(x, qweight)
+            and rn.stride(0) % 8 == 0):
+        from freetoken.kernel.int8_gemv_exact import gemv_int8_hc_mix_exact
+
+        return gemv_int8_hc_mix_exact(x, qweight, scale, rn)
     HD = N // hc
     out = torch.empty((M, HD), dtype=torch.bfloat16, device=x.device)
     _gemv_int8_hc_mix[(HD,)](x, qweight, scale, rn, out, K, HD, qweight.stride(0), x.stride(0), rn.stride(0),

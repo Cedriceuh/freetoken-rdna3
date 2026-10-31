@@ -114,11 +114,14 @@ def fused_experts_exl3(
     if plan is not None:  # the host and slot rows share one layout: the kernel walks both with the slot strides
         assert gate_up[0].numel() * gate_up.element_size() == bank["gate_up"][1] == gate_up.stride(0) * 2, bank
         assert down[0].numel() * down.element_size() == bank["down"][1] == down.stride(0) * 2, bank
+    # a missing slot's tiles copied whole first from two rows on (FREETOKEN_EXL3_MISS_BULK; one row's GEMV hides the
+    # window-by-window reads behind its decoding better)
+    bulk = M > 1
     c1 = exl3_gemv(a1, gate_up, slots, codebook, skip_inactive=SKIP_CPU_ROUTES, group=group, groups=groups,
-                   misses=plan, bank=bank.get("gate_up", (0, 0))[0])
+                   misses=plan, bank=bank.get("gate_up", (0, 0))[0], miss_bulk=bulk)
     a2 = exl3_mid(c1, slots, gate_up_svh, down_suh)
     c2 = exl3_gemv(a2, down, slots, codebook, skip_inactive=SKIP_CPU_ROUTES, group=group, groups=groups,
-                   misses=plan, bank=bank.get("down", (0, 0))[0])
+                   misses=plan, bank=bank.get("down", (0, 0))[0], miss_bulk=bulk)
     return exl3_out(c2, slots, down_svh, weights, out)
 
 

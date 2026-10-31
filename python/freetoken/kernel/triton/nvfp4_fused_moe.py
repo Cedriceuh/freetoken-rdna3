@@ -190,6 +190,9 @@ def _decode_nvfp4_marlin_kernel(
     MISS: tl.constexpr = False,  # FREETOKEN_MOE_MISS_READS: the cache's copy plan (see _miss_row)
     ev_ptr=None, src_ptr=None, num_ptr=None, hostp_ptr=None,
     BANK_P: tl.constexpr = 0, BANK_S: tl.constexpr = 0, MP: tl.constexpr = 1,
+    MISS_BULK: tl.constexpr = False,  # FREETOKEN_NVFP4_MISS_BULK: see _fill_rows
+    MISS_BULK_W: tl.constexpr = False,  # its scale spans in 4-byte words (_fill_bytes)
+    MISS_G: tl.constexpr = False, BANK_G: tl.constexpr = 0,  # with it, the global scales too (host bank BANK_G)
 ):
     """Marlin-style NVFP4 decode GEMV: wide int32 weight loads + deferred reduction.
 
@@ -236,7 +239,20 @@ def _decode_nvfp4_marlin_kernel(
 
     p_base = packed_ptr + slot * stride_pe + offs_n[:, None] * stride_pn
     s_base = scale_ptr + slot * stride_se + offs_n[:, None] * stride_sn
-    if MISS:
+    if MISS_BULK:
+        row = _miss_row(ev_ptr, src_ptr, num_ptr, slot, MP)
+        if row >= 0:  # the program's rows copied into the slot first, then read from it as a cached slot's
+            n0 = n_block_id * BLOCK_SIZE_N
+            nr = tl.minimum(BLOCK_SIZE_N, N - n0)
+            _fill_rows(tl.load(hostp_ptr + BANK_P).to(packed_ptr.dtype) + row * stride_pe + n0 * stride_pn,
+                       packed_ptr + slot * stride_pe + n0 * stride_pn, nr * stride_pn)
+            _fill_bytes(tl.load(hostp_ptr + BANK_S).to(scale_ptr.dtype) + row * stride_se + n0 * stride_sn,
+                        scale_ptr + slot * stride_se + n0 * stride_sn, nr * stride_sn, MISS_BULK_W)
+            if MISS_G:
+                _fill_rows(tl.load(hostp_ptr + BANK_G).to(global_ptr.dtype) + row * stride_ge + n0,
+                           global_ptr + slot * stride_ge + n0, nr)
+            tl.debug_barrier()
+    elif MISS:
         row = _miss_row(ev_ptr, src_ptr, num_ptr, slot, MP)
         if row >= 0:
             # the slot is being filled this step: its rows from the host bank, written into the slot on the way
@@ -336,6 +352,28 @@ def _miss_row(ev_ptr, src_ptr, num_ptr, slot, MP: tl.constexpr):
 
 
 @triton.jit
+def _fill_bytes(src, dst, n, WORDS: tl.constexpr):
+    """_fill_rows of ``n`` bytes (e4m3 scales): in 4-byte words where ``WORDS`` (spans 4-byte aligned, ``n`` a multiple
+    of 4), as a byte a lane is one PCIe read a byte."""
+    if WORDS:
+        _fill_rows(src.to(tl.pointer_type(tl.int32), bitcast=True), dst.to(tl.pointer_type(tl.int32), bitcast=True),
+                   n // 4)
+    else:
+        _fill_rows(src, dst, n)
+
+
+@triton.jit
+def _fill_rows(src, dst, n, CHUNK: tl.constexpr = 1024):
+    """FREETOKEN_NVFP4_MISS_BULK: ``n`` contiguous elements from ``src`` (host memory) to ``dst`` (the slot), a
+    program's whole rows at once, where the tile loop reads a slot being filled in 64- or 128-byte pieces of each row,
+    one tile after the other."""
+    o = tl.arange(0, CHUNK)
+    for off in range(0, n, CHUNK):
+        m = off + o < n
+        tl.store(dst + off + o, tl.load(src + off + o, mask=m), mask=m)
+
+
+@triton.jit
 def _marlin_partial(p_base, s_base, n_mask, a_base, stride_ak, stride_pkw, stride_sblk, K_WORDS,
                     BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_KW: tl.constexpr, UNROLL: tl.constexpr,
                     A_WIDE: tl.constexpr, A_BF16: tl.constexpr, dp_base=None, ds_base=None,
@@ -428,6 +466,9 @@ def _decode_nvfp4_marlin_act_kernel(
     MISS: tl.constexpr = False,  # FREETOKEN_MOE_MISS_READS: the cache's copy plan (see _miss_row)
     ev_ptr=None, src_ptr=None, num_ptr=None, hostp_ptr=None,
     BANK_P: tl.constexpr = 0, BANK_S: tl.constexpr = 0, MP: tl.constexpr = 1,
+    MISS_BULK: tl.constexpr = False,  # FREETOKEN_NVFP4_MISS_BULK: see _fill_rows
+    MISS_BULK_W: tl.constexpr = False,  # its scale spans in 4-byte words (_fill_bytes)
+    MISS_G: tl.constexpr = False, BANK_G: tl.constexpr = 0,  # with it, the global scales too (host bank BANK_G)
 ):
     """FREETOKEN_NVFP4_ACT_IN_GEMV: the gate | up GEMV of _decode_nvfp4_marlin_kernel and silu_and_mul in one kernel. A
     program computes BLOCK_SIZE_N gate columns and the BLOCK_SIZE_N up columns I further, each with the GEMV's own K
@@ -455,7 +496,30 @@ def _decode_nvfp4_marlin_act_kernel(
     pu_base = packed_ptr + slot * stride_pe + up_n[:, None] * stride_pn
     su_base = scale_ptr + slot * stride_se + up_n[:, None] * stride_sn
     A_BF16 = a_ptr.dtype.element_ty == tl.bfloat16
-    if MISS:
+    if MISS_BULK:
+        row = _miss_row(ev_ptr, src_ptr, num_ptr, slot, MP)
+        if row >= 0:  # the program's gate and up rows copied into the slot first (_fill_rows)
+            n0 = n_block_id * BLOCK_SIZE_N
+            nr = tl.minimum(BLOCK_SIZE_N, I - n0)
+            hp = tl.load(hostp_ptr + BANK_P).to(packed_ptr.dtype) + row * stride_pe
+            hs = tl.load(hostp_ptr + BANK_S).to(scale_ptr.dtype) + row * stride_se
+            dp = packed_ptr + slot * stride_pe
+            ds = scale_ptr + slot * stride_se
+            _fill_rows(hp + n0 * stride_pn, dp + n0 * stride_pn, nr * stride_pn)
+            _fill_rows(hp + (I + n0) * stride_pn, dp + (I + n0) * stride_pn, nr * stride_pn)
+            _fill_bytes(hs + n0 * stride_sn, ds + n0 * stride_sn, nr * stride_sn, MISS_BULK_W)
+            _fill_bytes(hs + (I + n0) * stride_sn, ds + (I + n0) * stride_sn, nr * stride_sn, MISS_BULK_W)
+            if MISS_G:
+                hg = tl.load(hostp_ptr + BANK_G).to(global_ptr.dtype) + row * stride_ge
+                dg = global_ptr + slot * stride_ge
+                _fill_rows(hg + n0, dg + n0, nr)
+                _fill_rows(hg + I + n0, dg + I + n0, nr)
+            tl.debug_barrier()
+        pg = _marlin_partial(pg_base, sg_base, n_mask, a_base, stride_ak, stride_pkw, stride_sblk, K_WORDS,
+                             BLOCK_SIZE_N, BLOCK_SIZE_KW, UNROLL, A_WIDE, A_BF16)
+        pu = _marlin_partial(pu_base, su_base, n_mask, a_base, stride_ak, stride_pkw, stride_sblk, K_WORDS,
+                             BLOCK_SIZE_N, BLOCK_SIZE_KW, UNROLL, A_WIDE, A_BF16)
+    elif MISS:
         row = _miss_row(ev_ptr, src_ptr, num_ptr, slot, MP)
         if row >= 0:
             # the slot is being filled this step: its rows from the host bank, written into the slot on the way

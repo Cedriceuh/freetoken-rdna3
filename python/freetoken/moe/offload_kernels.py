@@ -406,8 +406,9 @@ def _ensure_experts_hybrid_kernel(
         if SMALL:
             c_mask = off_k < cache_size
             u_reg = tl.load(usage_ptr + off_k, mask=c_mask, other=9223372036854775807).to(tl.int64)
-            # a slot stamped this step holds an active expert of this layer (a hit): never a victim
-            u_reg = tl.where((u_reg >= step) | (~c_mask), 9223372036854775807, u_reg)
+            # a slot stamped this step holds an active expert of this layer (a hit): never a victim; a later stamp
+            # (the decode admission's FREETOKEN_MOE_HIT_BONUS) is an ordinary slot that ranks last
+            u_reg = tl.where((u_reg == step) | (~c_mask), 9223372036854775807, u_reg)
         for i in tl.range(num_fetch):
             if SMALL:
                 victim = tl.argmin(u_reg, axis=0).to(tl.int32)
@@ -557,7 +558,8 @@ def _prefill_keys_kernel(masks_ptr, slot_of_id_ptr, usage_ptr, step_ptr, keys_pt
         c = c0 + tl.arange(0, BLOCK_C)
         cm = c < C
         u = tl.load(usage_ptr + c, mask=cm, other=0)
-        k = tl.where(u >= step, 0x7FFFFFFFFFFFFFFF, (u << SLOT_BITS) | c.to(tl.int64))
+        # this call's marks only: a slot stamped ahead of the clock (FREETOKEN_MOE_HIT_BONUS) stays a candidate
+        k = tl.where(u == step, 0x7FFFFFFFFFFFFFFF, (u << SLOT_BITS) | c.to(tl.int64))
         tl.store(keys_ptr + c, k, mask=cm)
 
 

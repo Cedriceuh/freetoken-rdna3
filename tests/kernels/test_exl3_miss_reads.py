@@ -1,8 +1,8 @@
 """FREETOKEN_MOE_MISS_READS on EXL3: the decode GEMVs read the slots the expert cache is filling this step from the
-layer's pinned host bank and write them into the slots on the way. The outputs are those of copying the rows first
-and reading the slots (the same words, the same sums), and the slots end up holding the rows the copy would have
-written; at the per-rank shapes, one or several routes a program, CPU routes (-1) among them, 0 to all slots
-missing."""
+layer's pinned host bank and write them into the slots on the way (window by window, or a program's tiles first,
+FREETOKEN_EXL3_MISS_BULK). The outputs are those of copying the rows first and reading the slots (the same words, the
+same sums), and the slots end up holding the rows the copy would have written; at the per-rank shapes, one or several
+routes a program, CPU routes (-1) among them, 0 to all slots missing."""
 
 import pytest
 import torch
@@ -28,9 +28,13 @@ def _plan(slots, n_miss, E, g, dev):
 @pytest.mark.parametrize("shape", SHAPES)
 @pytest.mark.parametrize("K", [2, 3, 4])
 @pytest.mark.parametrize("tokens", [1, 2, 4, 8])
-def test_gemv_reading_misses_from_host_matches_copy_then_gemv(shape, K, tokens):
+@pytest.mark.parametrize("bulk", [False, True])
+def test_gemv_reading_misses_from_host_matches_copy_then_gemv(monkeypatch, shape, K, tokens, bulk):
+    import freetoken.kernel.triton.exl3 as x3
     from freetoken.kernel.pinned import alloc_pinned_tensor, device_ptr
     from freetoken.kernel.triton.exl3 import exl3_gemv
+
+    monkeypatch.setattr(x3, "_MISS_BULK", bulk)
     from freetoken.kernel.triton.route_groups import route_groups
     from freetoken.layers.quantization import exl3_codec as ex
 
@@ -63,8 +67,12 @@ def test_gemv_reading_misses_from_host_matches_copy_then_gemv(shape, K, tokens):
 
 
 @pytest.mark.parametrize("tokens", [1, 2, 4, 8])
-def test_decode_moe_reading_misses_keeps_the_bits_and_fills_the_slots(tokens):
+@pytest.mark.parametrize("bulk", [False, True])
+def test_decode_moe_reading_misses_keeps_the_bits_and_fills_the_slots(monkeypatch, tokens, bulk):
+    import freetoken.kernel.triton.exl3 as x3
     import freetoken.moe.fused_exl3 as F
+
+    monkeypatch.setattr(x3, "_MISS_BULK", bulk)
     from freetoken.kernel.pinned import alloc_pinned_tensor, device_ptr
     from freetoken.layers.quantization import exl3_codec as ex
 

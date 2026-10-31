@@ -130,6 +130,53 @@ def test_ensure_prefill_routed_keeps_hits_and_evicts_lru():
 
 
 @cuda
+def test_prefill_plan_after_hit_bonus_stamps():
+    """The decode admission stamps its hits ahead of the clock (FREETOKEN_MOE_HIT_BONUS): a short prefill's plan must
+    still take its victims among those slots, the least recently stamped first, and keep its own hit in place, even
+    when every other slot carries such a stamp."""
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    dev = torch.device("cuda")
+    L, E, S = 3, 8, 16
+    g = torch.Generator().manual_seed(5)
+    sources = {
+        "gate_up": [torch.randn(E, 32, 8, generator=g).bfloat16().pin_memory() for _ in range(L)],
+        "down": [torch.randn(E, 8, 16, generator=g).bfloat16().pin_memory() for _ in range(L)],
+    }
+    cache = OffloadMoeCache(num_layers=L, num_experts=E, cache_size=S, device=dev, prefill_overlap=False)
+    cache.set_bank_sources(sources)
+    cache.reset()
+    assert cache.prefill_cached_ok(1)
+    cache.step.fill_(10)
+
+    def seed(layer, expert, slot, usage):
+        cache.slot_for_id[layer, expert] = slot
+        cache.id_of_slot[slot] = layer * E + expert
+        cache.usage[slot] = usage
+        for name, per_layer in sources.items():
+            cache.bank_caches[name][slot].copy_(per_layer[layer][expert])
+
+    seed(1, 3, 5, 600)  # the routed hit, stamped ahead too
+    others = [(layer, e) for layer in (0, 2) for e in range(E)][:S - 1]
+    for slot, (layer, expert) in zip([s for s in range(S) if s != 5], others):
+        seed(layer, expert, slot, 500 - slot)  # every other slot ahead of the clock, the last slots oldest
+    routed = [0, 1, 2, 3, 4, 6]
+    row = cache.ensure_prefill_routed(1, torch.tensor(routed, dtype=torch.int32, device=dev).view(-1, 1))
+    torch.cuda.synchronize()
+    assert int(row[3]) == 5
+    for e in routed:
+        s = int(row[e])
+        assert s >= 0 and int(cache.id_of_slot[s]) == E + e
+        for name, per_layer in sources.items():
+            assert torch.equal(cache.bank_caches[name][s].cpu(), per_layer[1][e])
+    assert sorted(int(row[e]) for e in routed if e != 3) == [11, 12, 13, 14, 15]
+    for s in range(S):
+        i = int(cache.id_of_slot[s])
+        if i >= 0:
+            assert int(cache.slot_for_id.view(-1)[i]) == s
+
+
+@cuda
 def test_prefill_split_copy_matches_sources():
     """The hit/miss-split prefetch of a full layer into the double buffer (the small banks as whole layers, the misses of
     the big ones through the batched copy engine): every buffer row equals its source, including an expert left in a
