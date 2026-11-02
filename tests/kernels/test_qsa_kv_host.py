@@ -118,3 +118,191 @@ def test_stage_selected_falls_back_to_whole_pages() -> None:
     hit = torch.zeros(pages, dtype=torch.bool, device="cuda")
     hit[want.long()] = True
     assert torch.equal(dk[hit], k[hit]) and torch.equal(dv[hit], v[hit]) and not dk[~hit].any()
+
+
+def _decode_cache_case(seed: int, requests: int = 3, cap: int = 8192):
+    """Host-mapped K/V over a shuffled page pool, two decoding requests in table rows 0 and 2 (the attention's block
+    table: the batch's rows of ``table``), and one layer's decode cache (attend.py DecodeCache) for ``requests`` table
+    rows, its ``cap`` slots shared by them."""
+    from freetoken.kernel.host_mapped import host_mapped_empty
+    from freetoken.kernel.triton.qsa.attend import DecodeCache
+
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    dev = torch.device("cuda", torch.cuda.current_device())
+    pages, ps, width = 900, 64, 400
+    k, v = (host_mapped_empty((pages, ps, 1, 256), torch.bfloat16, dev) for _ in range(2))
+    k.copy_(torch.randn(pages, ps, 1, 256, generator=g).bfloat16())
+    v.copy_(torch.randn(pages, ps, 1, 256, generator=g).bfloat16())
+    perm = torch.randperm(pages, generator=g).to(torch.int32)
+    table = torch.full((requests + 1, width), -1, dtype=torch.int32)
+    table[0, :400] = perm[:400]
+    table[2, :400] = perm[400:800]
+    tokens = width * ps
+    dc = DecodeCache(
+        k=torch.zeros(cap, 256, dtype=torch.bfloat16, device=dev),
+        v=torch.zeros(cap, 256, dtype=torch.bfloat16, device=dev),
+        tag=torch.full((cap,), -1, dtype=torch.int64, device=dev),
+        stamp=torch.randint(-9, 9, (requests, tokens), dtype=torch.int32, device=dev),  # a prefill's leftovers
+        slot=torch.randint(-9, cap + 9, (requests, tokens), dtype=torch.int32, device=dev),
+        hand=torch.zeros(1, dtype=torch.int32, device=dev), cnt=torch.zeros(1, dtype=torch.int32, device=dev),
+        ctl=torch.zeros(2, dtype=torch.int32, device=dev),
+        seq_lens=torch.zeros(2, dtype=torch.int32, device=dev),
+        ring=torch.tensor([0, 2], dtype=torch.int32, device=dev))
+    return g, dev, k, v, table.to(dev), perm, dc
+
+
+def _decode_selection(g, lens, base, rows):
+    """Each request's rows: its groups of 4 tokens (some replaced row to row) sorted, then its last 3 tokens."""
+    out = []
+    for r, L in enumerate(lens):
+        for i in range(rows):
+            grp = base[r].clone()
+            k = torch.rand(grp.shape[0], generator=g) < 0.25 * (i > 0)
+            grp[k] = torch.randint(0, (L - 3) // 4, (int(k.sum()),), generator=g)
+            grp = torch.sort(grp).values
+            out.append(torch.cat([(grp[:, None] * 4 + torch.arange(4)).view(-1), torch.arange(L - 3, L)]))
+    return torch.stack(out).to(torch.int32)
+
+
+@pytest.mark.parametrize("seed", [0, 1])
+def test_decode_cache_same_bits_over_calls(seed: int) -> None:
+    """FREETOKEN_QSA_DECODE_CACHE: 24 decode calls of two requests (3 rows each, overlapping selections), the newest
+    tokens' K/V rewritten every call (rejected drafts), request slot 2 and its pages handed to another request at
+    call 12 with the prefill's invalidation: every output has the uncached kernel's bits, and without the
+    invalidation it would not."""
+    from freetoken.kernel.triton.qsa import qsa_sparse_paged_attention
+
+    g, dev, k, v, table, perm, dc = _decode_cache_case(seed)
+    rows, ps = 3, k.shape[1]
+    lens = [20000, 23000]
+    base = [torch.randperm(4900, generator=g)[:512] for _ in lens]
+    t2r = torch.repeat_interleave(torch.arange(2, dtype=torch.int32), rows).to(dev)
+    stale = None
+    filled = 0
+    for call in range(24):
+        if call == 12:  # another request takes table row 2 and the same pages (freed, given again): its prefill
+            # writes its own K/V there and invalidates the cache
+            pages = perm[400:800].long()
+            k[pages] = torch.randn(400, *k.shape[1:], generator=g).bfloat16().to(dev)
+            v[pages] = torch.randn(400, *v.shape[1:], generator=g).bfloat16().to(dev)
+            lens[1] = 21000
+            stale = (dc.tag.clone(),)
+            dc.tag.fill_(-1)
+        for r, L in enumerate(lens):  # this call's newest rows: rewritten, as a rejected draft's would be
+            for t in range(L - 6, L):
+                page = int(table[int(dc.ring[r]), t // ps])
+                k[page, t % ps] = torch.randn(1, 256, generator=g).bfloat16().to(dev)
+                v[page, t % ps] = torch.randn(1, 256, generator=g).bfloat16().to(dev)
+        for r in range(2):
+            swap = torch.rand(512, generator=g) < 0.3
+            base[r][swap] = torch.randint(0, (lens[r] - 3) // 4, (int(swap.sum()),), generator=g)
+        idx = _decode_selection(g, lens, base, rows).to(dev)
+        q = torch.randn(idx.shape[0], 12, 256, generator=g).bfloat16().to(dev)
+        dc.seq_lens.copy_(torch.tensor(lens, dtype=torch.int32))
+        bt = table[dc.ring.long()]
+        want = qsa_sparse_paged_attention(q, k, v, idx, bt, t2r, decode=True, kv_host=True)
+        if call == 12:  # the same call without the invalidation reads the old owner's rows
+            saved = [t.clone() for t in (dc.k, dc.v, dc.stamp, dc.slot, dc.hand, dc.cnt, dc.ctl)]
+            dc.tag.copy_(stale[0])
+            bad = qsa_sparse_paged_attention(q, k, v, idx, bt, t2r, decode=True, kv_host=True, dcache=dc)
+            assert not torch.equal(bad, want)
+            for t, s in zip((dc.k, dc.v, dc.stamp, dc.slot, dc.hand, dc.cnt, dc.ctl), saved):
+                t.copy_(s)
+            dc.tag.fill_(-1)
+        got = qsa_sparse_paged_attention(q, k, v, idx, bt, t2r, decode=True, kv_host=True, dcache=dc)
+        assert torch.equal(got, want), f"call {call}"
+        assert int(dc.ctl[0]) == call + 1 and int(dc.ctl[1]) == 0 and not dc.cnt.any()
+        filled = max(filled, int((dc.tag >= 0).sum()))
+        lens = [L + int(torch.randint(1, 4, (1,), generator=g)) for L in lens]
+    assert filled > 6000  # the cache held more than both requests' last selections
+
+
+def test_decode_cache_in_a_graph_same_bits() -> None:
+    """The fill and the cached attention captured once and replayed over changing selections and lengths (as a decode
+    graph is): the uncached kernel's bits every replay; a capacity close to a call's tokens, so slots are reused
+    within a few calls and some tokens find none."""
+    from freetoken.kernel.triton.qsa import qsa_sparse_paged_attention
+
+    g, dev, k, v, table, perm, dc = _decode_cache_case(5, cap=4000)
+    table = table[dc.ring.long()]
+    rows = 2
+    lens = [15000, 17000]
+    base = [torch.randperm(3700, generator=g)[:512] for _ in lens]
+    t2r = torch.repeat_interleave(torch.arange(2, dtype=torch.int32), rows).to(dev)
+    idx = _decode_selection(g, lens, base, rows).to(dev)
+    q = torch.randn(idx.shape[0], 12, 256, generator=g).bfloat16().to(dev)
+    out = torch.empty_like(q)
+    dc.seq_lens.copy_(torch.tensor(lens, dtype=torch.int32))
+
+    def step():
+        out.copy_(qsa_sparse_paged_attention(q, k, v, idx, table, t2r, decode=True, kv_host=True, dcache=dc))
+
+    step()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s), torch.cuda.graph(graph, stream=s):
+        step()
+    torch.cuda.current_stream().wait_stream(s)
+    for call in range(12):
+        for r in range(2):
+            swap = torch.rand(512, generator=g) < 0.3
+            base[r][swap] = torch.randint(0, (lens[r] - 3) // 4, (int(swap.sum()),), generator=g)
+        lens = [L + 2 for L in lens]
+        idx.copy_(_decode_selection(g, lens, base, rows).to(dev))
+        q.copy_(torch.randn(q.shape, generator=g).bfloat16().to(dev))
+        dc.seq_lens.copy_(torch.tensor(lens, dtype=torch.int32))
+        graph.replay()
+        want = qsa_sparse_paged_attention(q, k, v, idx, table, t2r, decode=True, kv_host=True)
+        assert torch.equal(out, want), f"replay {call}"
+
+
+def test_decode_cache_with_a_slab_past_2gb() -> None:
+    """K/V views of one storage past 2 GB (as the host slab of every layer is) next to the cache's own buffers: the
+    kernels compile (no pointer-range hint on the slab, one on the cache) and give the uncached bits."""
+    from freetoken.kernel.triton.qsa import qsa_sparse_paged_attention
+
+    g, dev, k0, v0, table, perm, dc = _decode_cache_case(7)
+    n = k0.numel()
+    slab = torch.empty((1 << 31) // 2 + 2 * n, dtype=torch.bfloat16, device=dev)
+    k, v = slab[:n].view(k0.shape), slab[n: 2 * n].view(v0.shape)
+    k.copy_(k0)
+    v.copy_(v0)
+    table = table[dc.ring.long()]
+    lens = [15000, 17000]
+    base = [torch.randperm(3700, generator=g)[:512] for _ in lens]
+    t2r = torch.repeat_interleave(torch.arange(2, dtype=torch.int32), 2).to(dev)
+    dc.seq_lens.copy_(torch.tensor(lens, dtype=torch.int32))
+    for call in range(3):
+        idx = _decode_selection(g, lens, base, 2).to(dev)
+        q = torch.randn(idx.shape[0], 12, 256, generator=g).bfloat16().to(dev)
+        want = qsa_sparse_paged_attention(q, k, v, idx, table, t2r, decode=True, kv_host=True)
+        got = qsa_sparse_paged_attention(q, k, v, idx, table, t2r, decode=True, kv_host=True, dcache=dc)
+        assert torch.equal(got, want), f"call {call}"
+
+
+def test_decode_cache_after_a_page_repointed() -> None:
+    """The prefix cache can point a decoding request's pages at the tree's copy of the same tokens (no prefill in
+    between): the cache must then read the new pages, not keep the rows it read from the old ones."""
+    from freetoken.kernel.triton.qsa import qsa_sparse_paged_attention
+
+    g, dev, k, v, table, perm, dc = _decode_cache_case(11)
+    rows = 2
+    lens = [15000, 17000]
+    base = [torch.randperm(3700, generator=g)[:512] for _ in lens]
+    t2r = torch.repeat_interleave(torch.arange(2, dtype=torch.int32), rows).to(dev)
+    dc.seq_lens.copy_(torch.tensor(lens, dtype=torch.int32))
+    idx = _decode_selection(g, lens, base, rows).to(dev)
+    q = torch.randn(idx.shape[0], 12, 256, generator=g).bfloat16().to(dev)
+    bt = table[dc.ring.long()]
+    qsa_sparse_paged_attention(q, k, v, idx, bt, t2r, decode=True, kv_host=True, dcache=dc)  # fills the cache
+    # request 0's first 100 logical pages now point at unused pages holding other K/V (perm[800:] are free)
+    spare = perm[800:900]
+    table[0, :100] = spare
+    k[spare.long()] = torch.randn(100, *k.shape[1:], generator=g).bfloat16().to(dev)
+    v[spare.long()] = torch.randn(100, *v.shape[1:], generator=g).bfloat16().to(dev)
+    bt = table[dc.ring.long()]
+    want = qsa_sparse_paged_attention(q, k, v, idx, bt, t2r, decode=True, kv_host=True)
+    got = qsa_sparse_paged_attention(q, k, v, idx, bt, t2r, decode=True, kv_host=True, dcache=dc)
+    assert torch.equal(got, want)

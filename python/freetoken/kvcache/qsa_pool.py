@@ -159,6 +159,41 @@ class QSAKVCache(MHAKVCache):
     def kv_on_host(self) -> bool:
         return self._staging is not None
 
+    def decode_cache(self, layer_ids: Sequence[int], tokens: int, cap_max: int, min_cap: int) -> dict | None:
+        """FREETOKEN_QSA_DECODE_CACHE: each layer's decode K/V cache (kernel/triton/qsa/attend.py DecodeCache, without
+        its per-call lengths and slots) for the real request slots, carved out of the prefill staging buffer (a decode
+        never stages: no VRAM of its own beyond the tags). ``tokens``: a request's K/V capacity; as many slots a layer
+        as fit, at most ``cap_max``, shared by the requests; None when fewer than ``min_cap`` fit."""
+        if self._staging is None or self._kv_int8:
+            return None
+        flat = self._staging.view(-1)
+        layers, requests = len(layer_ids), self._num_req_slots - 1  # the last table row is the dummy request's
+        row = self._staging.shape[3] * self._staging.shape[4]
+        per = flat.numel() // layers - 4 * requests * tokens  # bf16 elements: the two int32 maps, then the rows
+        cap = min(cap_max, max(per, 0) // (2 * row))
+        if cap < min_cap:
+            return None
+        self._dc_tag = torch.full((layers, cap), -1, dtype=torch.int64, device=self._device)
+        assert requests * tokens < 1 << 31  # the key's 32 bits in a slot's tag
+        hand = torch.zeros((2, layers, 1), dtype=torch.int32, device=self._device)  # the hands, the counts
+        ctl = torch.zeros((layers, 2), dtype=torch.int32, device=self._device)
+        out, o = {}, 0
+        for i, lid in enumerate(layer_ids):
+            n = cap * row
+            k = flat[o: o + n].view(cap, row)
+            v = flat[o + n: o + 2 * n].view(cap, row)
+            o += 2 * n
+            maps = flat[o: o + 4 * requests * tokens].view(torch.int32).view(2, requests, tokens)
+            o += 4 * requests * tokens
+            out[lid] = (k, v, self._dc_tag[i], maps[0], maps[1], hand[0, i], hand[1, i], ctl[i])
+        assert o <= flat.numel()
+        return out
+
+    def decode_cache_invalidate(self) -> None:
+        """Before a prefill: it stages over the decode cache's rows and maps, and a request slot may change owner."""
+        if getattr(self, "_dc_tag", None) is not None:
+            self._dc_tag.fill_(-1)
+
     def staged_kv(self, layer_id: int, pages: torch.Tensor, indices: torch.Tensor | None = None,
                   token_to_req: torch.Tensor | None = None,
                   block_table: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
@@ -241,6 +276,7 @@ class QSAKVCache(MHAKVCache):
         self._rope_positions = None
         self._kv_scale = None
         self._staging = None
+        self._dc_tag = None  # the backend carves the decode cache anew from the new staging buffer
         super().rebuild(num_pages)
         self._alloc_kv_scales()
         self._zero_kv_slabs()

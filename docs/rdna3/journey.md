@@ -2068,7 +2068,7 @@ measured against this build on `xtx-xt-4x262k` with a 300k-token pool, EXL3 3.05
   copies take 0.72-0.79 s whatever the length and every layer's copy ends before the compute stream reaches its wait
   (the same clock for both streams); a read takes 0.72 s at 1.6-1.7k tokens, as long as its copies, then 0.84 s at
   2.2k and 1.18-1.22 s at 3.5-4k. Reading each layer's experts once for a whole read would not shorten it.
-- **A long read's chunk on both cards** (section 46 has rank 0's parts in NVFP4). The same read, one 16k-token chunk
+- **A long read's chunk on both cards** (section 47 has rank 0's parts in NVFP4). The same read, one 16k-token chunk
   at 16-96k of context (XTX / XT): routed experts 1.79 / 1.56 s, after which the XT waits 0.35 s for the XTX's
   all-reduces (the XTX 0.16 s); the sparse attention kernel 0.69 / 0.77 s over the 12 attention layers (each query row
   gathers its 2048 selected keys and values), after which the XTX waits ~0.1 s more in the output projection's
@@ -2501,7 +2501,79 @@ cache's missing experts. `xtx-xt-4x262k` with `--vision` as the launcher passes 
   slices of every missing expert), and the XT waiting 7.6 ms a step in the all-reduces (XTX 2.2): as with NVFP4, the
   XTX's PCIe link sets the pace.
 
-## 46. Still open
+## 46. The decode's K/V rows kept in VRAM, the indexer's top-k at 16 warps (2026-11-01 and 02)
+
+With the K/V in RAM (`xtx-xt-4x262k`), a long conversation's decode reads the K/V rows its sparse attention selects
+across PCIe at every step. This section keeps the rows read lately in VRAM (`FREETOKEN_QSA_DECODE_CACHE`, on by default
+with the K/V in RAM; bit-exact).
+
+- **What it costs first.** A cold kernel (12 layers with their own selections, a 192k history, one request) reads host
+  K/V at 18-24 GB/s of distinct rows, 88-151 µs a call against 18-33 µs with the same rows in VRAM: PCIe-bound. (The 20
+  µs an earlier microbenchmark gave were the L2 keeping the rows between replays.) In serving at 192k (NVFP4, one
+  request, 48 traced steps): 2.35 ms of a 28.2 ms step, 158 µs a call over 14.9 calls a step (the MTP head's included).
+- **What a step selects.** The selections of one 170k-token decode (NVFP4, greedy, 3.36 rows a step) recorded per layer:
+  the verify rows select 1.4-2.2k tokens besides row 0's (3,866 distinct a call), and row 0 shares 62-77 % of its tokens
+  with the previous step's rows. Replayed against VRAM policies: the previous step's rows kept -> 45 % of a call's
+  tokens still from the host; a least-recently-used set of 8k / 16k / 32k tokens a layer -> 29 / 19 / 12 %; the last 64k
+  positions -> 46 % (no locality worth a window).
+- **Versions.** (1) The attention's first rows writing next step's copy: -22 % a call (the rows still read the same
+  tokens across PCIe each). (2) A copy kernel first, each token once a request, into one of two buffers: -42 % a call in
+  a microbenchmark; in serving (one pair) nothing on the answer after the read, +2.9 % on the next turn. (3) A
+  clock-hand cache per request, 13k slots, the copy taking only the tokens no slot holds: -44 % a call; in serving at
+  192k the attention 2.35 -> 0.6 ms a step plus 0.7 ms of copy (traced), +4 % decode with both checkpoints (two pairs).
+  (4) The slots shared by the requests (~52k a layer with the 787,500-token pool): 343 tokens a call from the host
+  instead of 1,053, the copy 0.32 ms a step. With the copy also fused into the selection's expansion kernel (a launch
+  fewer a layer), (4) was as fast as (3) at long context and 0.5 % slower at short context: the fusion not kept.
+- **Kept**: (4) with the copy as its own launch; traced at 192k (NVFP4, 48 steps), the attention 0.52-0.61 ms a step and
+  the copy 0.31-0.32 ms (2.35 ms without the cache). Two pairs each, the same answers: one request at 192k, NVFP4
+  115.8-116.0 -> 122.1-122.2 tok/s mid-answer (+5.5 %), the next turn 114.4-114.7 -> 119.4-119.5 (+4.3 %); EXL3 3.05
+  124.8-125.1 -> 132.4 (+6.0 %), 120.0-120.1 -> 125.3-125.4 (+4.4 %); short prompts -0.4 % with both (likely the extra
+  launch, not measured apart). Two agents at 113k: NVFP4 65.4-65.5 -> 69.2 tok/s each (+5.7 %), EXL3 81.2 -> 87.0 (+7.1
+  %, one pair); three agents NVFP4 47.0 / 50.5 -> 53.7 / 54.0, EXL3 59.9 -> 63.4 (one pair). Three agents' answers
+  change from run to run without the cache as with it (four runs a side on one server: NVFP4 two runs off the others'
+  answers without, none with; EXL3 three different sets of answers without, two with): the prompts prefilled together
+  differ with the timing (how-it-works.md); one or two agents' answers are identical across all arms.
+- **Both together against neither** (two pairs each, the same answers, another 192k document): NVFP4 116.4 ->
+  124.4-124.9 tok/s mid-answer (+7.1 %), the next turn 109.5-109.6 -> 114.7-115.0 (+4.9 %); EXL3 3.05 112.7 ->
+  120.8-121.0 (+7.3 %), the next turn 102.8 -> 106.3-106.6 (+3.6 %, a short answer); short prompts -0.1 % (NVFP4) and
+  +0.1 % (EXL3). Four agents at 113k (one server a side, two passes, answers changing between runs): NVFP4 39.1 / 39.7
+  -> 44.4 / 44.5 tok/s each (+12.9 %, most of it the slowest request of each pass: 30.0 and 31.3 -> 42.2 and 42.9), EXL3
+  49.4 / 50.1 -> 53.8 / 54.2 (+8.7 %). Soaks of 20 minutes, three agent sessions (20-60k reads, tool turns, one request
+  in ten cut short): NVFP4 563 requests, EXL3 582, no error or degenerate answer, the cards' VRAM peaks within ~0.4 GiB
+  of an earlier build's soaks without the cache; 40 minutes with four sessions (NVFP4): 1,106 requests, none failed. On
+  `xtx-xt-1m` (EXL3 3.05, ~46k slots a layer, two pairs, the same answers): the next turn at 192k 111.8-111.9 ->
+  119.4-119.6 tok/s mid-answer (+6.9 %); the answer after the read 112.9 / 129.5 -> 139.0 (the arms without the cache
+  varied, with it not); short prompts +0.3 %. With the 525,000-token pool (two NVFP4 agents, ~32k slots a layer, one
+  pair, the same answers): 131.5 -> 140.8 tok/s mid-answer (+7.1 %), the next turn 120.4 -> 127.5 (+5.9 %), short
+  prompts +0.1 %. Without the MTP head (`--no-mtp`: one row a call, overlapped scheduling; NVFP4, one pair, the same
+  answers): 70.9 -> 75.1 tok/s (+6.0 %), the next turn 67.8 -> 72.0 (+6.2 %), short prompts +0.4-0.6 %.
+- **Reviewed** (an independent reading of the code, nothing run): no way found for the attention to read a row that is
+  not the request's current one in the normal paths (a prefill always runs before a request slot changes owner and
+  clears the tags; prefill and decode never share a forward; the margin covers the verify and draft rows). Two findings,
+  fixed: with overlapped scheduling the prefix cache can point a decoding request's pages at the tree's copy of the same
+  tokens without a prefill in between, so a slot's tag now holds the physical page too and such a token is read across
+  PCIe again (a test: it failed before); and a runtime rebuild of the pool (no MTP head) replaced the staging buffer
+  under the cache, which is now carved anew (not tested: no rebuild was run).
+- **Not kept: the next tile's lookups ahead** in the cached attention (index, page, slot, tag while the tile loads): 58
+  -> 81 µs a call on the XTX, 70 -> 91 on the XT (more registers spilled).
+- **The cache load as the host load's fallback** (`tl.load(cache, other=tl.load(host))`) makes the cache load wait for
+  the host one: two independent loads and a select are 14-15 % faster in the attention, though they spill more.
+- **A trap.** One load through pointers selected between the host slab (a storage past 2 GB: no 32-bit range hint) and
+  the cache (with the hint) fails AMD's pointer canonicalization at compile time ("'tt.addptr' op failed to verify that
+  result type matches ptr type"): the tests, with small allocations, passed, and the server failed at graph capture. A
+  test now builds the slab past 2 GB.
+- **The indexer's top-k at 16 warps for a decode step** (`FREETOKEN_QSA_TOPK_DECODE_WARPS`), now the largest part of the
+  context's cost in a decode step (0.77-0.82 ms at 192k): its split and merge programs at 16 warps instead of 8 for up
+  to 16 rows. An exact selection, so the same winners whatever the launch. 4 rows, 20-65k live columns: 32.3-34.4 ->
+  25.4-27.8 µs a call on the XTX, 38.3-41.0 -> 30.3-34.4 on the XT; at 1024 rows 16 warps are ~6 % slower, so a prefill
+  keeps 8. In serving at 192k, the same answers: NVFP4 130.4-130.7 -> 132.3 tok/s mid-answer (+1.3 %, two pairs), EXL3
+  126.1 -> 127.6 (+1.2 %, one pair); short prompts +0.1-0.2 %. Also tried: a merge at 4 warps and 4096-column chunks
+  (slower), 4-, 6- or 8-bit digits (no better), a 32-warp split with an 8-warp merge (27.2-29.8 µs on the XTX, 31.6-34.6
+  on the XT: close; not taken further).
+- **Starts.** 2 of the ~85 server starts of the night failed while loading the weights (an illegal address, `sq_intr`
+  errors on one card), before any attention ran, one of them with the cache off: the rare start fault of section 47.
+
+## 47. Still open
 
 - In NVFP4 the model needs ~63 GiB of RAM for its experts alone (the engine keeps every expert in RAM). The EXL3 3.05
   bpw checkpoint needs 42.6 GiB and served under a 56 GiB container limit, but a real 64 GB machine is untested
@@ -2542,6 +2614,11 @@ cache's missing experts. `xtx-xt-4x262k` with `--vision` as the launcher passes 
   not tried. On one card `--hybrid` computes part of them on the CPU (section 24). More VRAM for the cache: a
   desktop-aware plan for the card that drives
   the display (the ~145-179 Triton kernels a card loads are all in use, section 31).
+- A decode step at long context (NVFP4, one request, 192k, section 46's traces): the sparse attention ~0.9 ms with the
+  decode cache, its rows' lookups (index, page, slot, tag) one after the other before the K/V loads; the indexer's
+  top-k 0.77-0.82 ms at 8 warps (~20 % less at 16) and its scoring 0.37-0.45 ms, both growing with the context. With
+  ~52k slots a call reads ~9 % of its tokens across PCIe (343 of 3,866 on the recorded selections); the attention's
+  lookups are likely most of the call now (an inference from the copy's and the attention's times, not broken down).
 - On two cards `serve.sh` lowers `--memory-ratio` to 0.77 / 0.76 for EXL3 (3.05 bpw at 0.77 measured in section 21; 4.05
   bpw at 0.76 not measured again).
 - Short agent turns (section 27): about half of a 130-row turn at 25k is the routed experts the cache lacks crossing

@@ -63,6 +63,12 @@ _PLAN_KERNEL = os.environ.get("FREETOKEN_QSA_PLAN_KERNEL", "1") != "0"
 # norm+rope and the pending-ring store in one launch (qsa_index_writes) instead of three: the same code on the same
 # tiles, the same bits; two launches fewer per QSA layer
 _FUSED_WRITES = os.environ.get("FREETOKEN_QSA_FUSED_WRITES", "1") != "0"
+# FREETOKEN_QSA_DECODE_CACHE (default 1; host K/V only, FREETOKEN_QSA_KV_HOST): each layer keeps in VRAM slots the K/V
+# rows its decode calls selected lately; a call first copies from the host the rows no slot holds (each token once a
+# request), then the attention reads them from their slots: the same values, the same bits. The slots live in the
+# prefill staging buffer; every prefill clears their tags
+_DECODE_CACHE = os.environ.get("FREETOKEN_QSA_DECODE_CACHE", "1") != "0"
+_DECODE_CACHE_SLOTS = int(os.environ.get("FREETOKEN_QSA_DECODE_CACHE_SLOTS", "65536"))
 
 
 def _resolve_block_topk() -> Callable | None:
@@ -158,6 +164,29 @@ class QSASparseAttnBackend(BaseAttnBackend):
         # decode staging (static buffers under CUDA graphs; eager decode snapshots per step)
         self._graph: dict[str, torch.Tensor] = {}
         self.capture_bs: List[int] = []
+        self._dcache = None
+        self._dcache_layers = group.layer_ids
+        self._dcache_wanted = _DECODE_CACHE and getattr(self.kvcache, "kv_on_host", False)
+        self._dcache_carve = self._dcache_wanted
+        self._carve_decode_cache()
+
+    def _carve_decode_cache(self) -> None:
+        """FREETOKEN_QSA_DECODE_CACHE's slots and maps, out of the pool's current staging buffer (again after a
+        runtime rebuild of the pool, which replaces that buffer and may widen the page table)."""
+        from freetoken.kernel.triton.qsa.attend import _DC_MARGIN
+        from freetoken.spec_decode import SPEC_M
+
+        carve, self._dcache_carve = self._dcache_carve, False
+        if not carve:
+            return
+        if SPEC_M >= _DC_MARGIN:  # a step's own rows (verify, rejected drafts) must stay out of the cache
+            logger.info_rank0(f"QSA decode cache: off ({SPEC_M} verify rows reach its {_DC_MARGIN}-token margin)")
+            return
+        tokens = self._block_base_view().shape[1] * self.page_size
+        self._dcache = self.kvcache.decode_cache(self._dcache_layers, tokens, _DECODE_CACHE_SLOTS,
+                                                 SPEC_M * self.select_width)
+        logger.info_rank0("QSA decode cache: " + ("off (the staging buffer is too small)" if self._dcache is None
+                          else f"{next(iter(self._dcache.values()))[0].shape[0]} tokens a layer"))
 
     @staticmethod
     def _qsa_group(config: ModelConfig):
@@ -325,9 +354,13 @@ class QSASparseAttnBackend(BaseAttnBackend):
         q_index = self._update_index_cache(index, md, slot, queries=not kv_only)
         if kv_only:  # the K/V and the index keys are written: nothing reads this pass's output
             return None
-        indices = self._select(index, md, slot, q_index)
         int8 = self.kvcache.kv_int8
         k_cache, v_cache = self.kvcache.k_cache(layer_id), self.kvcache.v_cache(layer_id)
+        indices = self._select(index, md, slot, q_index)
+        if self._dcache_carve:
+            self._carve_decode_cache()
+        if not md.is_decode and self._dcache is not None and (slot == 0 or md.stage_pages is None):
+            self.kvcache.decode_cache_invalidate()
         if not md.is_decode and getattr(self.kvcache, "kv_on_host", False):
             # host K/V (FREETOKEN_QSA_KV_HOST): a prefill's rows select most of the history, so the layer's pages in
             # use come to VRAM once (whole 32 KB pages at PCIe speed) instead of every row reading across PCIe
@@ -349,7 +382,15 @@ class QSASparseAttnBackend(BaseAttnBackend):
             decode=md.is_decode,
             kv_host=md.is_decode and getattr(self.kvcache, "kv_on_host", False),
             gate=gate,
+            dcache=self._decode_cache(layer_id, md) if md.is_decode and self._dcache is not None else None,
         )
+
+    def _decode_cache(self, layer_id: int, md: QSASparseMetadata):
+        from freetoken.kernel.triton.qsa.attend import DecodeCache
+
+        k, v, tag, stamp, slot, hand, cnt, ctl = self._dcache[layer_id]
+        return DecodeCache(k=k, v=v, tag=tag, stamp=stamp, slot=slot, hand=hand, cnt=cnt, ctl=ctl,
+                           seq_lens=md.seq_lens, ring=md.ring_slots)
 
     def _plan_index_writes(self, md: QSASparseMetadata, batch: Batch) -> None:
         """Per-token slab row and ring row for this forward; the other QSA layers reuse it
@@ -617,6 +658,8 @@ class QSASparseAttnBackend(BaseAttnBackend):
     def reset_capture(self) -> None:
         super().reset_capture()
         self._graph = {}
+        if self._dcache_wanted:  # a runtime rebuild follows: carve the decode cache anew from the new pool
+            self._dcache, self._dcache_carve = None, True
 
 
 __all__ = ["QSASparseAttnBackend", "QSASparseMetadata"]

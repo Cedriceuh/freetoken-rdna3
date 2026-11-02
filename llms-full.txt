@@ -620,11 +620,12 @@ share is no longer bounded by VRAM. What differs:
 | `MEMORY` | `104g` | `104g` | the container's RAM limit (`110g` in `xtx-xt`) |
 
 Measured with EXL3 3.05 bpw (~77 GiB of RAM locked by `xtx-xt-4x262k`, ~75 GiB by `xtx-xt-1m`), and NVFP4 on
-`xtx-xt-4x262k` with three contexts: four do not fit with NVFP4 on 128 GB, so start it with
-`rdna3/serve.sh xtx-xt-4x262k --model DIR -- --kv-reserve-tokens 787500` (three conversations, 94 GiB locked after the
-start), or `525000` (two) to keep room. A request alone decodes a few percent slower than on `xtx-xt` (the kernels read
-the K/V across PCIe) and reads prompts a little faster (more expert slots). Which one to pick, what they cost and their
-measurements: [long-context.md](long-context.md); how to count your RAM: [limits.md](limits.md#how-much-ram-do-i-need).
+`xtx-xt-4x262k` with three contexts: four do not fit with NVFP4 on 128 GB, so start it with `rdna3/serve.sh
+xtx-xt-4x262k --model DIR -- --kv-reserve-tokens 787500` (three conversations, 94 GiB locked after the start), or
+`525000` (two) to keep room. A request alone decoded a few percent slower than on `xtx-xt` on an earlier build, before
+the decode cache (the kernels read the K/V across PCIe), and reads prompts a little faster (more expert slots). Which
+one to pick, what they cost and their measurements: [long-context.md](long-context.md); how to count your RAM:
+[limits.md](limits.md#how-much-ram-do-i-need).
 
 ## `xtx` and `xt`: one card
 
@@ -853,8 +854,11 @@ disagreements over ~8k sampled tokens in `check` mode). It is on the torch.distr
 | `FREETOKEN_QSA_SCORE_ROWS_STAGES` / `_TILES` | `1` / `16` on ROCm, `2` / `8` elsewhere | That 16-row scoring kernel's pipeline stages and 64-column tiles a program: the same K order and head sums, **bit-exact** (`tests/kernels/test_qsa_score_rows.py`). A 128 MiB block of scores 26-29 % faster on the 7900 XTX, 19-22 % on the XT (synthetic, 30k-200k deep); in serving the scores are ~half of a deep chunk's selection, and a 210k-token read took 51.7 s instead of 52.05 (NVFP4, `xtx-xt-4x262k`, the same answer). |
 | `FREETOKEN_QSA_KV_INT8` | unset | **Not recommended.** `1`: int8 KV cache for the attention (QSA) layers, 3.19 -> 1.71 GiB per card. Short benchmarks and 227k-token needle tests looked fine, but the agentic benchmark fell from 12-14 to 8-9 bugs fixed and the agent stopped exploring early. |
 | `FREETOKEN_QSA_STAGE_SELECTED` | `1` | With `FREETOKEN_QSA_KV_HOST=1`, a prefill copies to VRAM only the K/V rows of the tokens it selects (marked per layer by the attention kernel's own mapping) instead of every page in use: the attention reads the same rows, so the same bits (`tests/kernels/test_qsa_kv_host.py`). A 220-row turn at 224k selects 11-21 % of the history's tokens. EXL3 3.05 `xtx-xt-4x262k` at 224k of context: turns of 142-360 tokens 0.57-0.70 -> 0.49-0.62 s, 1.0-1.1k 0.90-0.98 -> 0.84-0.89 s, the same answers; unchanged at 25k. `0`: every page in use. |
-| `FREETOKEN_QSA_KV_HOST` | unset | `1` in `xtx-xt-1m` and `xtx-xt-4x262k`. `1`: the attention K/V slab in pinned, device-mapped host memory instead of VRAM, so the pool the requests share is bounded by RAM, not VRAM ([long-context.md](long-context.md)). Decode and verify read the selected tokens across PCIe; a prefill first copies the rows its tokens select to VRAM (`FREETOKEN_QSA_STAGE_SELECTED`). Bit-identical answers. On ROCm the memory is allocated non-coherent, so L2 keeps what the verify rows share. Decode a few percent slower than with the K/V in VRAM (EXL3 3.05 bpw at 118k: 86.6 tok/s with a 262k page table, 84.2 with a 1M one, 90.6 in VRAM), more expert slots. The pool stays at `--kv-reserve-tokens` (a page past it would pin ~0.9 MB of RAM for ~0.1 MB of VRAM); `FREETOKEN_HOST_KV=1` is ignored with it (a warning) and `FREETOKEN_QSA_KV_INT8=1` refused. |
+| `FREETOKEN_QSA_KV_HOST` | unset | `1` in `xtx-xt-1m` and `xtx-xt-4x262k`. `1`: the attention K/V slab in pinned, device-mapped host memory instead of VRAM, so the pool the requests share is bounded by RAM, not VRAM ([long-context.md](long-context.md)). Decode and verify read the selected tokens across PCIe, the ones read lately from VRAM (`FREETOKEN_QSA_DECODE_CACHE`); a prefill first copies the rows its tokens select to VRAM (`FREETOKEN_QSA_STAGE_SELECTED`). Bit-identical answers. On ROCm the memory is allocated non-coherent, so L2 keeps what the verify rows share. Decode a few percent slower than with the K/V in VRAM on an earlier build without the decode cache (EXL3 3.05 bpw at 118k: 86.6 tok/s with a 262k page table, 84.2 with a 1M one, 90.6 in VRAM), more expert slots. The pool stays at `--kv-reserve-tokens` (a page past it would pin ~0.9 MB of RAM for ~0.1 MB of VRAM); `FREETOKEN_HOST_KV=1` is ignored with it (a warning) and `FREETOKEN_QSA_KV_INT8=1` refused. |
 | `FREETOKEN_QSA_DECODE_HOST_STAGES` | `1` on ROCm, `2` elsewhere | With `FREETOKEN_QSA_KV_HOST`, the decode steps' sparse attention reads its selected K/V rows across PCIe: one pipeline stage instead of two (each lane's loads and sums unchanged: **bit-exact**, `tests/kernels/test_prefill_warps.py`; VRAM K/V keep two). `xtx-xt-4x262k`, two pairs, the same answers: one request EXL3 3.05 bpw +1.7-2.1 % at short context and +3.4-3.8 % at 75-89k, NVFP4 +2.0-2.1 % and +3.0-3.2 %; four requests at once ~+1 %. |
+| `FREETOKEN_QSA_DECODE_CACHE` | `1` | With `FREETOKEN_QSA_KV_HOST=1` (the K/V in RAM), each layer keeps in VRAM the K/V rows the decode steps' sparse attention selected lately, and the attention reads them there instead of across PCIe: at 170k a step's verify rows select ~3,900 distinct tokens a layer, most of them selected at the steps before (~340 a call left for PCIe). Before the attention a kernel copies the rows no slot holds yet (each token once a request) into the slots a clock hand reuses, skipping those the step reads; a layer's slots are shared by the requests and carved out of the prefill staging buffer, which a decode does not use (no VRAM taken from the expert cache), and every prefill clears them; a slot's tag names the request, the token and the physical page it was read from. The same values: **bit-exact** (`tests/kernels/test_qsa_kv_host.py`). `xtx-xt-4x262k`: one request at 192k (two pairs, the same answers) NVFP4 +5.5 % decode (mid-answer) and +4.3 % on the next turn, EXL3 +6.0 % / +4.4 %; two agents at 113k (the same answers) NVFP4 +5.7 % (two pairs), EXL3 +7.1 % (one pair); three agents NVFP4 +7-14 % (two pairs), EXL3 +5.7 % (one pair); four agents (with `FREETOKEN_QSA_TOPK_DECODE_WARPS`, one server a side, two passes) NVFP4 +12.9 % (most of it the slowest request), EXL3 +8.7 %; three or four agents' answers change from run to run with and without it; short prompts -0.4 % (likely the copy kernel's launch, not measured apart). `0`: every selected row read across PCIe. |
+| `FREETOKEN_QSA_DECODE_CACHE_SLOTS` | `65536` | The decode cache's slots a layer at most; fewer when the staging buffer is smaller (the start log prints the count: ~52k with `--kv-reserve-tokens 787500`, 65,536 with the EXL3 4x262k pool). |
+| `FREETOKEN_QSA_TOPK_DECODE_WARPS` | `16` | The indexer's top-k (512 blocks among the page table's 65k columns) of up to 16 rows, a decode step's, at this many warps a program (its split and merge kernels); more rows keep 8 (16 is ~6 % slower at a 1024-row prefill chunk). An exact selection: the same winners, **bit-exact**. A decode call, 4 rows, 20-65k live columns: 32.3-34.4 -> 25.4-27.8 µs on the XTX, 38.3-41.0 -> 30.3-34.4 µs on the XT; `xtx-xt-4x262k` at 192k, the same answers: NVFP4 +1.3 % decode (two pairs), EXL3 +1.2 % (one pair), short prompts +0.1-0.2 %. `0`: 8 warps. |
 | `FREETOKEN_ROPE_MAX_POSITION` | unset | `1048576` in `xtx-xt-1m`. `N`: the plain rope's table runs to N positions instead of `max_position_embeddings` (262,144), so one request can go past the positions the model was trained on. Below 262,144 the table is the same, so shorter contexts get the same bits. With `1048576` the model kept its retrieval and its next-token loss flat to 988k tokens ([long-context.md](long-context.md#quality-past-262144-tokens)). |
 
 ## Speculative decoding with the MTP head (Qwen3.8-Flash-Next)
@@ -3841,7 +3845,7 @@ measured against this build on `xtx-xt-4x262k` with a 300k-token pool, EXL3 3.05
   copies take 0.72-0.79 s whatever the length and every layer's copy ends before the compute stream reaches its wait
   (the same clock for both streams); a read takes 0.72 s at 1.6-1.7k tokens, as long as its copies, then 0.84 s at
   2.2k and 1.18-1.22 s at 3.5-4k. Reading each layer's experts once for a whole read would not shorten it.
-- **A long read's chunk on both cards** (section 46 has rank 0's parts in NVFP4). The same read, one 16k-token chunk
+- **A long read's chunk on both cards** (section 47 has rank 0's parts in NVFP4). The same read, one 16k-token chunk
   at 16-96k of context (XTX / XT): routed experts 1.79 / 1.56 s, after which the XT waits 0.35 s for the XTX's
   all-reduces (the XTX 0.16 s); the sparse attention kernel 0.69 / 0.77 s over the 12 attention layers (each query row
   gathers its 2048 selected keys and values), after which the XTX waits ~0.1 s more in the output projection's
@@ -4274,7 +4278,79 @@ cache's missing experts. `xtx-xt-4x262k` with `--vision` as the launcher passes 
   slices of every missing expert), and the XT waiting 7.6 ms a step in the all-reduces (XTX 2.2): as with NVFP4, the
   XTX's PCIe link sets the pace.
 
-## 46. Still open
+## 46. The decode's K/V rows kept in VRAM, the indexer's top-k at 16 warps (2026-11-01 and 02)
+
+With the K/V in RAM (`xtx-xt-4x262k`), a long conversation's decode reads the K/V rows its sparse attention selects
+across PCIe at every step. This section keeps the rows read lately in VRAM (`FREETOKEN_QSA_DECODE_CACHE`, on by default
+with the K/V in RAM; bit-exact).
+
+- **What it costs first.** A cold kernel (12 layers with their own selections, a 192k history, one request) reads host
+  K/V at 18-24 GB/s of distinct rows, 88-151 µs a call against 18-33 µs with the same rows in VRAM: PCIe-bound. (The 20
+  µs an earlier microbenchmark gave were the L2 keeping the rows between replays.) In serving at 192k (NVFP4, one
+  request, 48 traced steps): 2.35 ms of a 28.2 ms step, 158 µs a call over 14.9 calls a step (the MTP head's included).
+- **What a step selects.** The selections of one 170k-token decode (NVFP4, greedy, 3.36 rows a step) recorded per layer:
+  the verify rows select 1.4-2.2k tokens besides row 0's (3,866 distinct a call), and row 0 shares 62-77 % of its tokens
+  with the previous step's rows. Replayed against VRAM policies: the previous step's rows kept -> 45 % of a call's
+  tokens still from the host; a least-recently-used set of 8k / 16k / 32k tokens a layer -> 29 / 19 / 12 %; the last 64k
+  positions -> 46 % (no locality worth a window).
+- **Versions.** (1) The attention's first rows writing next step's copy: -22 % a call (the rows still read the same
+  tokens across PCIe each). (2) A copy kernel first, each token once a request, into one of two buffers: -42 % a call in
+  a microbenchmark; in serving (one pair) nothing on the answer after the read, +2.9 % on the next turn. (3) A
+  clock-hand cache per request, 13k slots, the copy taking only the tokens no slot holds: -44 % a call; in serving at
+  192k the attention 2.35 -> 0.6 ms a step plus 0.7 ms of copy (traced), +4 % decode with both checkpoints (two pairs).
+  (4) The slots shared by the requests (~52k a layer with the 787,500-token pool): 343 tokens a call from the host
+  instead of 1,053, the copy 0.32 ms a step. With the copy also fused into the selection's expansion kernel (a launch
+  fewer a layer), (4) was as fast as (3) at long context and 0.5 % slower at short context: the fusion not kept.
+- **Kept**: (4) with the copy as its own launch; traced at 192k (NVFP4, 48 steps), the attention 0.52-0.61 ms a step and
+  the copy 0.31-0.32 ms (2.35 ms without the cache). Two pairs each, the same answers: one request at 192k, NVFP4
+  115.8-116.0 -> 122.1-122.2 tok/s mid-answer (+5.5 %), the next turn 114.4-114.7 -> 119.4-119.5 (+4.3 %); EXL3 3.05
+  124.8-125.1 -> 132.4 (+6.0 %), 120.0-120.1 -> 125.3-125.4 (+4.4 %); short prompts -0.4 % with both (likely the extra
+  launch, not measured apart). Two agents at 113k: NVFP4 65.4-65.5 -> 69.2 tok/s each (+5.7 %), EXL3 81.2 -> 87.0 (+7.1
+  %, one pair); three agents NVFP4 47.0 / 50.5 -> 53.7 / 54.0, EXL3 59.9 -> 63.4 (one pair). Three agents' answers
+  change from run to run without the cache as with it (four runs a side on one server: NVFP4 two runs off the others'
+  answers without, none with; EXL3 three different sets of answers without, two with): the prompts prefilled together
+  differ with the timing (how-it-works.md); one or two agents' answers are identical across all arms.
+- **Both together against neither** (two pairs each, the same answers, another 192k document): NVFP4 116.4 ->
+  124.4-124.9 tok/s mid-answer (+7.1 %), the next turn 109.5-109.6 -> 114.7-115.0 (+4.9 %); EXL3 3.05 112.7 ->
+  120.8-121.0 (+7.3 %), the next turn 102.8 -> 106.3-106.6 (+3.6 %, a short answer); short prompts -0.1 % (NVFP4) and
+  +0.1 % (EXL3). Four agents at 113k (one server a side, two passes, answers changing between runs): NVFP4 39.1 / 39.7
+  -> 44.4 / 44.5 tok/s each (+12.9 %, most of it the slowest request of each pass: 30.0 and 31.3 -> 42.2 and 42.9), EXL3
+  49.4 / 50.1 -> 53.8 / 54.2 (+8.7 %). Soaks of 20 minutes, three agent sessions (20-60k reads, tool turns, one request
+  in ten cut short): NVFP4 563 requests, EXL3 582, no error or degenerate answer, the cards' VRAM peaks within ~0.4 GiB
+  of an earlier build's soaks without the cache; 40 minutes with four sessions (NVFP4): 1,106 requests, none failed. On
+  `xtx-xt-1m` (EXL3 3.05, ~46k slots a layer, two pairs, the same answers): the next turn at 192k 111.8-111.9 ->
+  119.4-119.6 tok/s mid-answer (+6.9 %); the answer after the read 112.9 / 129.5 -> 139.0 (the arms without the cache
+  varied, with it not); short prompts +0.3 %. With the 525,000-token pool (two NVFP4 agents, ~32k slots a layer, one
+  pair, the same answers): 131.5 -> 140.8 tok/s mid-answer (+7.1 %), the next turn 120.4 -> 127.5 (+5.9 %), short
+  prompts +0.1 %. Without the MTP head (`--no-mtp`: one row a call, overlapped scheduling; NVFP4, one pair, the same
+  answers): 70.9 -> 75.1 tok/s (+6.0 %), the next turn 67.8 -> 72.0 (+6.2 %), short prompts +0.4-0.6 %.
+- **Reviewed** (an independent reading of the code, nothing run): no way found for the attention to read a row that is
+  not the request's current one in the normal paths (a prefill always runs before a request slot changes owner and
+  clears the tags; prefill and decode never share a forward; the margin covers the verify and draft rows). Two findings,
+  fixed: with overlapped scheduling the prefix cache can point a decoding request's pages at the tree's copy of the same
+  tokens without a prefill in between, so a slot's tag now holds the physical page too and such a token is read across
+  PCIe again (a test: it failed before); and a runtime rebuild of the pool (no MTP head) replaced the staging buffer
+  under the cache, which is now carved anew (not tested: no rebuild was run).
+- **Not kept: the next tile's lookups ahead** in the cached attention (index, page, slot, tag while the tile loads): 58
+  -> 81 µs a call on the XTX, 70 -> 91 on the XT (more registers spilled).
+- **The cache load as the host load's fallback** (`tl.load(cache, other=tl.load(host))`) makes the cache load wait for
+  the host one: two independent loads and a select are 14-15 % faster in the attention, though they spill more.
+- **A trap.** One load through pointers selected between the host slab (a storage past 2 GB: no 32-bit range hint) and
+  the cache (with the hint) fails AMD's pointer canonicalization at compile time ("'tt.addptr' op failed to verify that
+  result type matches ptr type"): the tests, with small allocations, passed, and the server failed at graph capture. A
+  test now builds the slab past 2 GB.
+- **The indexer's top-k at 16 warps for a decode step** (`FREETOKEN_QSA_TOPK_DECODE_WARPS`), now the largest part of the
+  context's cost in a decode step (0.77-0.82 ms at 192k): its split and merge programs at 16 warps instead of 8 for up
+  to 16 rows. An exact selection, so the same winners whatever the launch. 4 rows, 20-65k live columns: 32.3-34.4 ->
+  25.4-27.8 µs a call on the XTX, 38.3-41.0 -> 30.3-34.4 on the XT; at 1024 rows 16 warps are ~6 % slower, so a prefill
+  keeps 8. In serving at 192k, the same answers: NVFP4 130.4-130.7 -> 132.3 tok/s mid-answer (+1.3 %, two pairs), EXL3
+  126.1 -> 127.6 (+1.2 %, one pair); short prompts +0.1-0.2 %. Also tried: a merge at 4 warps and 4096-column chunks
+  (slower), 4-, 6- or 8-bit digits (no better), a 32-warp split with an 8-warp merge (27.2-29.8 µs on the XTX, 31.6-34.6
+  on the XT: close; not taken further).
+- **Starts.** 2 of the ~85 server starts of the night failed while loading the weights (an illegal address, `sq_intr`
+  errors on one card), before any attention ran, one of them with the cache off: the rare start fault of section 47.
+
+## 47. Still open
 
 - In NVFP4 the model needs ~63 GiB of RAM for its experts alone (the engine keeps every expert in RAM). The EXL3 3.05
   bpw checkpoint needs 42.6 GiB and served under a 56 GiB container limit, but a real 64 GB machine is untested
@@ -4315,6 +4391,11 @@ cache's missing experts. `xtx-xt-4x262k` with `--vision` as the launcher passes 
   not tried. On one card `--hybrid` computes part of them on the CPU (section 24). More VRAM for the cache: a
   desktop-aware plan for the card that drives
   the display (the ~145-179 Triton kernels a card loads are all in use, section 31).
+- A decode step at long context (NVFP4, one request, 192k, section 46's traces): the sparse attention ~0.9 ms with the
+  decode cache, its rows' lookups (index, page, slot, tag) one after the other before the K/V loads; the indexer's
+  top-k 0.77-0.82 ms at 8 warps (~20 % less at 16) and its scoring 0.37-0.45 ms, both growing with the context. With
+  ~52k slots a call reads ~9 % of its tokens across PCIe (343 of 3,866 on the recorded selections); the attention's
+  lookups are likely most of the call now (an inference from the copy's and the attention's times, not broken down).
 - On two cards `serve.sh` lowers `--memory-ratio` to 0.77 / 0.76 for EXL3 (3.05 bpw at 0.77 measured in section 21; 4.05
   bpw at 0.76 not measured again).
 - Short agent turns (section 27): about half of a 130-row turn at 25k is the routed experts the cache lacks crossing
@@ -5381,6 +5462,16 @@ Line counts here are on top of the lines listed in the sections above.
 | `python/freetoken/kernel/triton/ensure_copy.py`, `tests/kernels/test_moe_ensure_copy.py` | 102/31, 88/3 | `FREETOKEN_MOE_ENSURE_COPIERS`: the admission's copier programs in slices of the misses; `FREETOKEN_MOE_ENSURE_STRIPES`: the victims in one pass, each miss the oldest slot of its stripe of the pool; `FREETOKEN_MOE_HIT_BONUS`: the slots a call finds stamped 480 calls ahead (Phase 1 of flashlib's `lru_ensure` copied with that stamp); the tests: exact against flashlib with neither, a consistent cache and each stripe's oldest victim with them |
 | `python/freetoken/moe/offload_kernels.py`, `tests/moe/test_prefill_cached.py` | 5/3, 47/0 | the short-prefill planner and the hybrid admission take only the slots stamped by their own call as theirs (they took any stamp at or past the clock: with the hit bonus a prefill could run short of victims and give away a slot it routes); the test plans a prefill over slots all stamped ahead |
 
+## The decode's K/V rows kept in VRAM, the indexer's top-k at 16 warps (bit-exact)
+
+Line counts here are on top of the lines listed in the sections above.
+
+| File | Lines | Change |
+|---|---:|---|
+| `python/freetoken/kernel/triton/qsa/attend.py`, `kvcache/qsa_pool.py`, `attention/qsa_sparse.py`, `tests/kernels/test_qsa_kv_host.py` | 205/25, 36/0, 44/1, 188/0 | `FREETOKEN_QSA_DECODE_CACHE` (on with `FREETOKEN_QSA_KV_HOST`): a decode call's sparse attention first copies into VRAM slots the K/V rows of the tokens it selects that no slot holds yet (each token once a request, slots of a layer shared by the requests and reused by a clock hand, skipping those the call reads), then reads a token from its slot when the slot's tag names it and the physical page its table points to, else across PCIe; the slots and maps carved out of the prefill staging buffer, the tags cleared by every prefill, carved anew after a runtime rebuild of the pool; the tests: the uncached bits over calls, a request slot handed over, a CUDA graph, a slab past 2 GB, a page the table points elsewhere |
+| `python/freetoken/kernel/triton/qsa/topk.py` | 11/3 | `FREETOKEN_QSA_TOPK_DECODE_WARPS`: the split path's programs at 16 warps for up to 16 rows |
+| `tests/kernels/test_vocab_topk.py` | 3/2 | the draft head's test sets the TP info only when no earlier test of the session did (it failed in a whole-suite run) |
+
 ## Tooling and documentation
 
 | File | Change |
@@ -5450,10 +5541,11 @@ which pool fits in your RAM.
   of memory. `xtx-xt-1m` is untested with NVFP4. How to count for your machine:
   [limits.md](limits.md#how-much-ram-do-i-need).
 - **The RAM tier is off** (`FREETOKEN_HOST_KV=0`): the pool already lives in RAM.
-- **Speed.** A request alone decodes a few percent slower than with the K/V in VRAM: at 118k, EXL3 3.05 bpw, 90.6
-  tok/s in VRAM, 86.6 on the host with a 262k page table, 84.2 with the 1M one (the kernels read the K/V across PCIe,
-  and the wider table costs a few percent more). It reads prompts a little faster: the VRAM the K/V no longer takes goes to
-  the expert cache (~11.3k experts per card instead of 9.8k on `xtx-xt`, earlier builds).
+- **Speed.** On an earlier build, before the decode cache, a request alone decoded a few percent slower than with the
+  K/V in VRAM: at 118k, EXL3 3.05 bpw, 90.6 tok/s in VRAM, 86.6 on the host with a 262k page table, 84.2 with the 1M one
+  (the kernels read the K/V across PCIe, and the wider table costs a few percent more); not measured again. It reads
+  prompts a little faster: the VRAM the K/V no longer takes goes to the expert cache (~11.3k experts per card instead of
+  9.8k on `xtx-xt`, earlier builds).
 - **Prefill goes first.** While a long prompt is read, the other requests barely decode: a 498k-token request decoded
   at 6.3 tok/s while a 237k-token one was read. That is upstream's scheduling, the same on every profile.
   `FREETOKEN_DECODE_INTERLEAVE=8` with `FREETOKEN_DECODE_INTERLEAVE_LONG=1` gives the decoding requests eight steps
@@ -5522,13 +5614,18 @@ prefix is reused). The pool is shared: up to four requests run at once, together
 
 ## How the K/V lives in RAM
 
-- **The slab** is pinned, device-mapped host memory handed to torch as a GPU tensor (`kernel/host_mapped.py`). The
-  decode and verify kernels read the ~2051 tokens each row selects in place, across PCIe. On ROCm it is allocated
-  non-coherent, so the GPU's L2 can keep the lines the verify rows of a request share (90 % of their tokens): 2.4x
-  faster in the attention kernel, but only 0-2.4 % in serving, where the MoE weights going through the same L2
-  probably evict them (not measured). The index tiers stay in VRAM. Over these rows the decode attention runs one
-  pipeline stage instead of two (`FREETOKEN_QSA_DECODE_HOST_STAGES`): +1.7-2.1 % decode at short context and +3-3.8 %
-  at 75-89k for one request, the same answers.
+- **The slab** is pinned, device-mapped host memory handed to torch as a GPU tensor (`kernel/host_mapped.py`). Each
+  verify row of a decode step selects ~2051 tokens; together a step's rows select ~3,900 distinct tokens a layer at
+  170k (one request, 3.4 rows a step), read at 18-24 GB/s across PCIe: ~160 µs a call, 2.35 ms of a 28 ms step at
+  192k. On ROCm the slab is allocated non-coherent, so the GPU's L2 can keep the lines the rows share. The index tiers
+  stay in VRAM. Over these rows the decode attention runs one pipeline stage instead of two
+  (`FREETOKEN_QSA_DECODE_HOST_STAGES`).
+- **A decode keeps the rows it read in VRAM** (`FREETOKEN_QSA_DECODE_CACHE`): most tokens a step selects were
+  selected at the steps before, so each layer keeps the K/V rows of the tokens selected lately (32-65k tokens a layer
+  by the pool's size, ~52k with `--kv-reserve-tokens 787500`, in the prefill staging buffer below, which a decode does
+  not use) and only the others cross PCIe: ~340 a call instead of ~3,900 at 170k. The same values, the same answers.
+  At 192k the step's sparse attention takes ~0.9 ms instead of 2.35 (the copy included); decode +5.5 % (NVFP4) and
+  +6 % (EXL3), the next turn +4.3-4.4 %, two agents at 113k +5.7 % / +7 %.
 - **A prefill** first copies to a VRAM buffer the K/V rows its tokens select, one layer at a time
   (`FREETOKEN_QSA_STAGE_SELECTED`, 28 GB/s), instead of reading each row across PCIe.
 - **The answers are bit-identical** to the K/V in VRAM (the same text at 29k and 118k).

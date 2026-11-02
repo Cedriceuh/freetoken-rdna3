@@ -100,11 +100,12 @@ share is no longer bounded by VRAM. What differs:
 | `MEMORY` | `104g` | `104g` | the container's RAM limit (`110g` in `xtx-xt`) |
 
 Measured with EXL3 3.05 bpw (~77 GiB of RAM locked by `xtx-xt-4x262k`, ~75 GiB by `xtx-xt-1m`), and NVFP4 on
-`xtx-xt-4x262k` with three contexts: four do not fit with NVFP4 on 128 GB, so start it with
-`rdna3/serve.sh xtx-xt-4x262k --model DIR -- --kv-reserve-tokens 787500` (three conversations, 94 GiB locked after the
-start), or `525000` (two) to keep room. A request alone decodes a few percent slower than on `xtx-xt` (the kernels read
-the K/V across PCIe) and reads prompts a little faster (more expert slots). Which one to pick, what they cost and their
-measurements: [long-context.md](long-context.md); how to count your RAM: [limits.md](limits.md#how-much-ram-do-i-need).
+`xtx-xt-4x262k` with three contexts: four do not fit with NVFP4 on 128 GB, so start it with `rdna3/serve.sh
+xtx-xt-4x262k --model DIR -- --kv-reserve-tokens 787500` (three conversations, 94 GiB locked after the start), or
+`525000` (two) to keep room. A request alone decoded a few percent slower than on `xtx-xt` on an earlier build, before
+the decode cache (the kernels read the K/V across PCIe), and reads prompts a little faster (more expert slots). Which
+one to pick, what they cost and their measurements: [long-context.md](long-context.md); how to count your RAM:
+[limits.md](limits.md#how-much-ram-do-i-need).
 
 ## `xtx` and `xt`: one card
 

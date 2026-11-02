@@ -163,11 +163,12 @@ def test_draft_head_scores_its_rows_with_the_lm_heads_int8_gemv(tmp_path):
     import json
     from types import SimpleNamespace
 
-    from freetoken.distributed import set_tp_info
+    from freetoken.distributed.info import set_tp_info, try_get_tp_info
     from freetoken.kernel.triton.int8_gemv import gemv_int8
     from freetoken.layers.draft_vocab import build_draft_head
 
-    set_tp_info(0, 1)
+    if try_get_tp_info() is None:  # an earlier test of the session may have set it
+        set_tp_info(0, 1)
     g = torch.Generator(device="cuda").manual_seed(7)
     vocab, dim, n = 4096, 256, 1000
     (tmp_path / "tokenizer.json").write_text(json.dumps({"added_tokens": [{"id": 4090}, {"id": 4093}]}))

@@ -375,6 +375,16 @@ Line counts here are on top of the lines listed in the sections above.
 | `python/freetoken/kernel/triton/ensure_copy.py`, `tests/kernels/test_moe_ensure_copy.py` | 102/31, 88/3 | `FREETOKEN_MOE_ENSURE_COPIERS`: the admission's copier programs in slices of the misses; `FREETOKEN_MOE_ENSURE_STRIPES`: the victims in one pass, each miss the oldest slot of its stripe of the pool; `FREETOKEN_MOE_HIT_BONUS`: the slots a call finds stamped 480 calls ahead (Phase 1 of flashlib's `lru_ensure` copied with that stamp); the tests: exact against flashlib with neither, a consistent cache and each stripe's oldest victim with them |
 | `python/freetoken/moe/offload_kernels.py`, `tests/moe/test_prefill_cached.py` | 5/3, 47/0 | the short-prefill planner and the hybrid admission take only the slots stamped by their own call as theirs (they took any stamp at or past the clock: with the hit bonus a prefill could run short of victims and give away a slot it routes); the test plans a prefill over slots all stamped ahead |
 
+## The decode's K/V rows kept in VRAM, the indexer's top-k at 16 warps (bit-exact)
+
+Line counts here are on top of the lines listed in the sections above.
+
+| File | Lines | Change |
+|---|---:|---|
+| `python/freetoken/kernel/triton/qsa/attend.py`, `kvcache/qsa_pool.py`, `attention/qsa_sparse.py`, `tests/kernels/test_qsa_kv_host.py` | 205/25, 36/0, 44/1, 188/0 | `FREETOKEN_QSA_DECODE_CACHE` (on with `FREETOKEN_QSA_KV_HOST`): a decode call's sparse attention first copies into VRAM slots the K/V rows of the tokens it selects that no slot holds yet (each token once a request, slots of a layer shared by the requests and reused by a clock hand, skipping those the call reads), then reads a token from its slot when the slot's tag names it and the physical page its table points to, else across PCIe; the slots and maps carved out of the prefill staging buffer, the tags cleared by every prefill, carved anew after a runtime rebuild of the pool; the tests: the uncached bits over calls, a request slot handed over, a CUDA graph, a slab past 2 GB, a page the table points elsewhere |
+| `python/freetoken/kernel/triton/qsa/topk.py` | 11/3 | `FREETOKEN_QSA_TOPK_DECODE_WARPS`: the split path's programs at 16 warps for up to 16 rows |
+| `tests/kernels/test_vocab_topk.py` | 3/2 | the draft head's test sets the TP info only when no earlier test of the session did (it failed in a whole-suite run) |
+
 ## Tooling and documentation
 
 | File | Change |

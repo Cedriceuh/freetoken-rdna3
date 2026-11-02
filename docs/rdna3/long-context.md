@@ -50,10 +50,11 @@ which pool fits in your RAM.
   of memory. `xtx-xt-1m` is untested with NVFP4. How to count for your machine:
   [limits.md](limits.md#how-much-ram-do-i-need).
 - **The RAM tier is off** (`FREETOKEN_HOST_KV=0`): the pool already lives in RAM.
-- **Speed.** A request alone decodes a few percent slower than with the K/V in VRAM: at 118k, EXL3 3.05 bpw, 90.6
-  tok/s in VRAM, 86.6 on the host with a 262k page table, 84.2 with the 1M one (the kernels read the K/V across PCIe,
-  and the wider table costs a few percent more). It reads prompts a little faster: the VRAM the K/V no longer takes goes to
-  the expert cache (~11.3k experts per card instead of 9.8k on `xtx-xt`, earlier builds).
+- **Speed.** On an earlier build, before the decode cache, a request alone decoded a few percent slower than with the
+  K/V in VRAM: at 118k, EXL3 3.05 bpw, 90.6 tok/s in VRAM, 86.6 on the host with a 262k page table, 84.2 with the 1M one
+  (the kernels read the K/V across PCIe, and the wider table costs a few percent more); not measured again. It reads
+  prompts a little faster: the VRAM the K/V no longer takes goes to the expert cache (~11.3k experts per card instead of
+  9.8k on `xtx-xt`, earlier builds).
 - **Prefill goes first.** While a long prompt is read, the other requests barely decode: a 498k-token request decoded
   at 6.3 tok/s while a 237k-token one was read. That is upstream's scheduling, the same on every profile.
   `FREETOKEN_DECODE_INTERLEAVE=8` with `FREETOKEN_DECODE_INTERLEAVE_LONG=1` gives the decoding requests eight steps
@@ -122,13 +123,18 @@ prefix is reused). The pool is shared: up to four requests run at once, together
 
 ## How the K/V lives in RAM
 
-- **The slab** is pinned, device-mapped host memory handed to torch as a GPU tensor (`kernel/host_mapped.py`). The
-  decode and verify kernels read the ~2051 tokens each row selects in place, across PCIe. On ROCm it is allocated
-  non-coherent, so the GPU's L2 can keep the lines the verify rows of a request share (90 % of their tokens): 2.4x
-  faster in the attention kernel, but only 0-2.4 % in serving, where the MoE weights going through the same L2
-  probably evict them (not measured). The index tiers stay in VRAM. Over these rows the decode attention runs one
-  pipeline stage instead of two (`FREETOKEN_QSA_DECODE_HOST_STAGES`): +1.7-2.1 % decode at short context and +3-3.8 %
-  at 75-89k for one request, the same answers.
+- **The slab** is pinned, device-mapped host memory handed to torch as a GPU tensor (`kernel/host_mapped.py`). Each
+  verify row of a decode step selects ~2051 tokens; together a step's rows select ~3,900 distinct tokens a layer at
+  170k (one request, 3.4 rows a step), read at 18-24 GB/s across PCIe: ~160 µs a call, 2.35 ms of a 28 ms step at
+  192k. On ROCm the slab is allocated non-coherent, so the GPU's L2 can keep the lines the rows share. The index tiers
+  stay in VRAM. Over these rows the decode attention runs one pipeline stage instead of two
+  (`FREETOKEN_QSA_DECODE_HOST_STAGES`).
+- **A decode keeps the rows it read in VRAM** (`FREETOKEN_QSA_DECODE_CACHE`): most tokens a step selects were
+  selected at the steps before, so each layer keeps the K/V rows of the tokens selected lately (32-65k tokens a layer
+  by the pool's size, ~52k with `--kv-reserve-tokens 787500`, in the prefill staging buffer below, which a decode does
+  not use) and only the others cross PCIe: ~340 a call instead of ~3,900 at 170k. The same values, the same answers.
+  At 192k the step's sparse attention takes ~0.9 ms instead of 2.35 (the copy included); decode +5.5 % (NVFP4) and
+  +6 % (EXL3), the next turn +4.3-4.4 %, two agents at 113k +5.7 % / +7 %.
 - **A prefill** first copies to a VRAM buffer the K/V rows its tokens select, one layer at a time
   (`FREETOKEN_QSA_STAGE_SELECTED`, 28 GB/s), instead of reading each row across PCIe.
 - **The answers are bit-identical** to the K/V in VRAM (the same text at 29k and 118k).

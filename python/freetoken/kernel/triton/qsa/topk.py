@@ -27,6 +27,7 @@ candidates stay in ascending column order throughout, so ties still go to the lo
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import torch
@@ -43,6 +44,12 @@ _MAX_BLOCK_N = 4096
 # phases stay resident; past 8192 the tile spills (255 registers) and that reverses.
 _MAX_RESIDENT = 8192
 _MIN_CHUNK = 4096
+# FREETOKEN_QSA_TOPK_DECODE_WARPS (default 16; 0 = 8 as for more rows): the split path's programs for up to 16 rows (a
+# decode step's) at 16 warps instead of 8. The same winners (an exact selection). A decode call's top-k of 512 among
+# 20-65k columns, 4 rows: 32.3-34.4 -> 25.4-27.8 us on a 7900 XTX, 38.3-41.0 -> 30.3-34.4 on a 7900 XT; at 1024 rows
+# (a prefill chunk) 16 warps are ~6 % slower, so more rows keep 8
+_DECODE_WARPS = int(os.environ.get("FREETOKEN_QSA_TOPK_DECODE_WARPS", "16")) or 8
+_DECODE_ROWS = 16
 
 
 @triton.jit
@@ -530,6 +537,7 @@ def qsa_block_topk(
         )
         return out
 
+    warps = _DECODE_WARPS if rows <= _DECODE_ROWS else 8
     width = 2 * top_k * sum(plan.levels)
     if scratch is None:
         scratch = torch.empty((rows, width), dtype=torch.int32, device=logits.device)
@@ -568,7 +576,7 @@ def qsa_block_topk(
         BINS=_BINS,
         RADIX=_RADIX,
         PASSES=_PASSES,
-        num_warps=8,
+        num_warps=warps,
         num_stages=1,
     )
     for level in range(1, len(plan.levels)):
@@ -592,7 +600,7 @@ def qsa_block_topk(
             BINS=_BINS,
             RADIX=_RADIX,
             PASSES=_PASSES,
-            num_warps=8,
+            num_warps=warps,
             num_stages=1,
         )
     keys, cols = candidates[-1]
@@ -617,7 +625,7 @@ def qsa_block_topk(
         BINS=_BINS,
         RADIX=_RADIX,
         PASSES=_PASSES,
-        num_warps=8,
+        num_warps=warps,
         num_stages=1,
     )
     return out
