@@ -93,7 +93,7 @@ def test_gdn_replicated_heads_ignore_the_split(monkeypatch):
 
 
 def _gdn():
-    from freetoken.models.qwen4_exp.gdn import Qwen4ExpGatedDeltaNet
+    from freetoken.layers.linear_attn import GatedDeltaNet as Qwen4ExpGatedDeltaNet
 
     return Qwen4ExpGatedDeltaNet(**GDN)
 

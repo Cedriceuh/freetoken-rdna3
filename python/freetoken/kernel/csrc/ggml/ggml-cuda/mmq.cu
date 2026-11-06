@@ -48,6 +48,9 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
         case GGML_TYPE_IQ1_S:
             mul_mat_q_case<GGML_TYPE_IQ1_S, GGML_PREC_Q8>(ctx, args, stream);
             break;
+        case GGML_TYPE_IQ1_M:
+            mul_mat_q_case<GGML_TYPE_IQ1_M, GGML_PREC_Q8>(ctx, args, stream);
+            break;
         case GGML_TYPE_IQ2_XXS:
             mul_mat_q_case<GGML_TYPE_IQ2_XXS, GGML_PREC_Q8>(ctx, args, stream);
             break;
@@ -133,7 +136,7 @@ static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggm
 
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
-        int64_t ncols_max) {
+        int64_t ncols_max, bool inactive_ids) {
     // FreeToken: bf16 and fp16 activations are quantized directly, except for the native fp4 paths; dst is fp32, bf16 or fp16
     GGML_ASSERT(        src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_BF16 || src1->type == GGML_TYPE_F16);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32 || dst->type  == GGML_TYPE_BF16 || dst->type  == GGML_TYPE_F16);
@@ -296,29 +299,33 @@ void ggml_cuda_mul_mat_q(
     ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_get_rows);
     ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows + J_best-1); // Needs to be padded for unconditional memory access.
     ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
+    ggml_cuda_pool_alloc<int32_t> ids_scratch(ctx.pool(), ggml_cuda_mm_ids_helper_scratch_size(ne02, ne12, n_expert_used));
+    // FreeToken: inactive routes (negative ids, only with inactive_ids) get no compact row, so their ids_src1 entries stay -1
+    if (inactive_ids) {
+        CUDA_CHECK(cudaMemsetAsync(ids_src1.get(), 0xFF, ne_get_rows*sizeof(int32_t), stream));
+    }
 
     // gate/up activations are broadcast across experts (ne11 == 1): quantize each token once and
     // scatter to its slots. ids_src1 then holds the inverse map (token slot -> compact row).
     const bool dedup_bcast = ne11 == 1 && n_expert_used > 1;
+
+    // Every expert's column tiles fit in ntx_flat grid columns, so a flat grid needs no host sync to size it.
+    ggml_cuda_pool_alloc<int2> tile_map(ctx.pool());
+    int ntx_flat = 0;
+    int jt_none  = 0;
+    if (ncols_max <= 0) {
+        jt_none  = (ne_get_rows + J_best - 1) / J_best;
+        ntx_flat = jt_none + std::min<int64_t>(ne02, ne_get_rows);
+        tile_map.alloc(ntx_flat);
+    }
 
     {
         GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));
         const int si1  = ids->nb[1] / ggml_element_size(ids);
         const int sis1 = nb12 / nb11;
 
-        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
-            ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
-        CUDA_CHECK(cudaGetLastError());
-    }
-
-    // Every expert's column tiles fit in ntx_flat grid columns, so a flat grid needs no host sync to size it.
-    ggml_cuda_pool_alloc<int2> tile_map(ctx.pool());
-    int ntx_flat = 0;
-    if (ncols_max <= 0) {
-        const int jt_none = (ne_get_rows + J_best - 1) / J_best;
-        ntx_flat = jt_none + std::min<int64_t>(ne02, ne_get_rows);
-        tile_map.alloc(ntx_flat);
-        ggml_cuda_launch_mm_ids_tile_map(expert_bounds.get(), tile_map.get(), ne02, J_best, ntx_flat, jt_none, stream);
+        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(), ids_scratch.get(),
+            tile_map.get(), J_best, ntx_flat, jt_none, ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
         CUDA_CHECK(cudaGetLastError());
     }
 
@@ -410,6 +417,7 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         case GGML_TYPE_Q6_K:
 // -------------------------------------------------
         case GGML_TYPE_IQ1_S:
+        case GGML_TYPE_IQ1_M:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ2_S:

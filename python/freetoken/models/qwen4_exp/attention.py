@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 
 
 # FREETOKEN_FEWER_COPIES (default 1 on ROCm, 0 elsewhere): q / k normalized where the projection wrote them, the output
-# gate applied in one kernel (models/qwen4_exp/gdn.py: the gated norm reads z in place); the same bits, fewer launches.
+# gate applied in one kernel (layers/linear_attn/gdn.py: the gated norm reads z in place); the same bits, fewer launches.
 # Off elsewhere: flashinfer's gemma_rmsnorm takes 2D inputs only, and the bits were checked on ROCm's Triton only
 _FEWER_COPIES = os.environ.get("FREETOKEN_FEWER_COPIES", "1" if torch.version.hip is not None else "0") == "1"
 # FREETOKEN_QSA_FUSED_GATE (default 1, with FREETOKEN_FEWER_COPIES): the output gate applied by the QSA backend, in the

@@ -1,138 +1,204 @@
-"""Qwen3.8-Flash-Next MTP draft head (``mtp.*`` in the checkpoint), for speculative decoding.
+"""Qwen3.8-Flash-Next MTP draft: the checkpoint's own ``mtp.*`` layer, one QSA decoder layer over the hyper-connection streams.
 
-One extra decoder layer that reads the main model's hyper-connection streams at row i and the embedding of
-token i+1, and guesses token i+2 (SGLang ``qwen4_exp_mtp.py``, ``_fuse_residual_linear_shared``)::
+Draft row c reads the target's residual streams before the final mix, ``R_c [hc_count*hidden]``, and the token after it::
 
-    e  = fc_embedding(norm_e(embed(token_{i+1})))                         [T, hidden]
-    h  = fc_hidden(norm_h(R_i) viewed [T, hc, hidden])                     per stream
-    R' = layer(h + e)                                                      full attention + MoE, hyper-connections
-    logits = lm_head(mtp_mixer.mix(R')[0])                                 the main model's head
+    e     = fc_embedding(norm_e(embed(x_{c+1})))
+    R_in  = fc_hidden(norm_h(R_c)) per stream + e      # norm_h: one RMS statistic over all hc_count*hidden
+    R_out = layer(R_in)                                # QSA attention + routed MoE, no PLE
+    logits = lm_head(mixer(R_out))
 
-``norm_h`` normalizes each of the hc streams on its own statistic: measured offline (on
-1442 greedy tokens) the draft is accepted 0.875 of the time that way, 0.843 with one statistic over all hc*hidden.
-The checkpoint stores the MTP's 512 routed experts stacked in bf16; :func:`quantize_nvfp4` turns them into the
-main experts' modelopt NVFP4 layout (same acceptance offline), so they ride the existing NVFP4 banks.
+``R_out`` relays to the next draft step. The weights come from the checkpoint's ``mtp.*`` tensors, or from a Strata MTP pack (a GGUF with the same names, stacked ggml experts).
 """
 
 from __future__ import annotations
 
+import dataclasses
 import os
-from typing import TYPE_CHECKING
+import re
+from typing import TYPE_CHECKING, Iterator
 
 import torch
-from freetoken.layers import BaseOP, LinearReplicated, OPList
 
-from .hc import GatedResidual, GroupedPlusOneRMSNorm
+from freetoken.core import get_global_ctx
+from freetoken.layers import GemmaPlusOneRMSNorm, LinearReplicated, OPList
+from freetoken.layers.base import BaseOP
+from freetoken.layers.quantization import finalize_quant
+from freetoken.models.config import FullAttentionGroupConfig
+from freetoken.utils import torch_dtype
 
-# FREETOKEN_MTP_KV_ONLY_STOP=0: the head's KV-only pass (several requests decoding) runs its whole attention and the
-# combine after it; by default it stops once the K/V and the index keys are written (the same KV; nothing reads the
-# rest)
-_KV_ONLY_STOP = os.environ.get("FREETOKEN_MTP_KV_ONLY_STOP", "1") != "0"
+from .hc import GatedResidual
+from .model import Qwen4ExpDecoderLayer
+from .weight import iter_mtp_expert_pieces, iter_mtp_weights
 
 if TYPE_CHECKING:
-    from freetoken.core import Batch
+    from freetoken.layers.embedding import VocabParallelEmbedding
     from freetoken.models.config import ModelConfig
 
-# E2M1 magnitudes indexed by the low 3 bits of a code; bit 3 is the sign (kernel/triton/nvfp4_dequant.py)
-_E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
-_E4M3_MAX = 448.0
-_E2M1_MAX = 6.0
+
+_PACK_EXPERT_RE = re.compile(r"^(mtp\.layers\.0\.mlp\.experts)\.0\.(gate|up|down)_proj$")
 
 
-def quantize_nvfp4(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """modelopt NVFP4 of one ``[out, in]`` weight: packed e2m1 codes ``[out, in/2]`` uint8 (element 2b in the low
-    nibble), e4m3 scales per 16 inputs ``[out, in/16]``, and the per-tensor fp32 scale, with
-    ``w ~= e2m1 * scale * global``. The global scale puts the largest block scale on e4m3's maximum."""
-    out_dim, in_dim = w.shape
-    assert in_dim % 16 == 0, in_dim
-    x = w.float()
-    amax = x.abs().max().clamp(min=1e-12)
-    g = amax / (_E2M1_MAX * _E4M3_MAX)
-    blocks = x.view(out_dim, in_dim // 16, 16)
-    block_amax = blocks.abs().amax(-1, keepdim=True)
-    scale = (block_amax / _E2M1_MAX / g).clamp(max=_E4M3_MAX).to(torch.float8_e4m3fn)
-    denom = scale.float() * g
-    q = torch.where(denom > 0, blocks / denom.clamp(min=1e-30), torch.zeros_like(blocks))
-    grid = torch.tensor(_E2M1, device=w.device)
-    mag = (q.abs().unsqueeze(-1) - grid).abs().argmin(-1)  # nearest magnitude (ties -> the smaller)
-    codes = (mag | ((q < 0) & (mag > 0)).to(mag.dtype) << 3).to(torch.uint8).view(out_dim, in_dim)
-    packed = codes[:, 0::2] | (codes[:, 1::2] << 4)
-    return packed.contiguous(), scale.view(out_dim, in_dim // 16).contiguous(), g.reshape(1)
+def _pack_tensors(name: str, tensors: dict[str, int]) -> tuple[str, ...]:
+    """Module name -> the pack's tensors: the HF name itself, but stacked experts with gate and up in one tensor."""
+    m = _PACK_EXPERT_RE.match(name)
+    if m is None:
+        return (name,)
+    return (f"{m[1]}.{'down_proj' if m[2] == 'down' else 'gate_up_proj'}",)
 
 
-class Qwen4ExpMTP(BaseOP):
-    """The MTP draft head: input fusion, one decoder layer (full attention + MoE, layer id ``num_layers``) and its
-    own top mixer. Shares the main model's embedding and lm_head. State-dict keys are the checkpoint's ``mtp.*``
-    names (``mtp.layers.0...`` for the decoder layer); its routed experts live in the offload cache's last bank."""
+def _iter_pack_weights(model_path: str, config: ModelConfig) -> Iterator[tuple[str, torch.Tensor]]:
+    """The dense tensors of a Strata MTP pack, named and fused as Qwen4ExpMTPDraft names them; its norms are stored zero-centered, as the layers read them."""
+    from freetoken.models.gguf.reader import gguf_tensor_index
+    from freetoken.models.gguf.tensors import float_tensor, fused, matrix
 
-    def __init__(self, config: ModelConfig, *, prefix: str = "mtp") -> None:
-        from .model import Qwen4ExpDecoderLayer
+    index = gguf_tensor_index(model_path)
+    hidden, width = config.hidden_size, config.qwen4_args.hc_count * config.hidden_size
 
-        args = config.qwen4_args
-        self.hc_count, self.hidden_size = args.hc_count, config.hidden_size
-        width = self.hc_count * self.hidden_size
-        self.pre_fc_norm_embedding = GroupedPlusOneRMSNorm(self.hidden_size, config.rms_norm_eps, 1)
-        self.pre_fc_norm_hidden = GroupedPlusOneRMSNorm(width, config.rms_norm_eps, self.hc_count)
-        self.fc_embedding = LinearReplicated(self.hidden_size, self.hidden_size, has_bias=False)
-        self.fc_hidden = LinearReplicated(self.hidden_size, self.hidden_size, has_bias=False)
-        self.layers = OPList([Qwen4ExpDecoderLayer(config, config.num_layers, prefix=f"{prefix}.layers.0")])
-        # The quant config excludes mtp.* (bf16 in the checkpoint), but these experts are quantized at load into the
-        # offload cache's NVFP4 banks: build the layer under a main-expert name so it takes the banks' method.
-        from freetoken.layers.moe import make_moe_layer
+    def t(name: str):
+        return index[f"mtp.{name}.weight"]
 
-        mlp = self.layers.op_list[0].mlp
-        experts = make_moe_layer(config, layer_id=config.num_layers, renormalize=config.norm_topk_prob,
-                                 quant_config=config.quant, prefix="model.layers.0.mlp.experts")
-        experts.defer_all_reduce = mlp.experts.defer_all_reduce
-        experts.prefill_cached_default = getattr(mlp.experts, "prefill_cached_default", False)
-        mlp.experts = experts
-        self.hyper_connection_mixer = GatedResidual(config, use_combine=False, prefix=f"{prefix}.hyper_connection_mixer")
+    def linear(name: str, parts: tuple[str, ...], k: int, pad_to: int = 0):
+        infos = [t(p) for p in parts]
+        return fused(name, infos, [matrix(i) for i in infos], k, pad_to)
 
-    def forward(self, streams: torch.Tensor | list, next_embeds: torch.Tensor, batch: Batch,
-                keep: torch.Tensor | None = None, kv_only: bool = False) -> tuple[torch.Tensor, torch.Tensor] | None:
-        """``streams [T, hc*hidden]``: the main model's streams at rows i (before its top mixer), or a one-element list
-        holding them that the head empties, so they are freed once normed (a 16k-token prefill chunk's are 320 MiB,
-        and the head's mix holds three more of that size); ``next_embeds [T, hidden]``: the embedding of token i+1.
-        Returns the head input (guess for token i+2) and the MTP layer's own streams (the input of a chained guess),
-        for the rows ``keep`` (all T when None): the attention runs on every row, whose KV later drafts read; the MoE
-        after it only where a guess is read (rows are independent past the attention). ``kv_only``: stop after the
-        attention (its KV written), return None."""
-        e = self.fc_embedding.forward(self.pre_fc_norm_embedding.forward(next_embeds))
-        if isinstance(streams, list):
-            streams = streams.pop()
-        h = self.pre_fc_norm_hidden.forward(streams).view(-1, self.hidden_size)  # 2-D: the int8 GEMV takes few rows
-        del streams
-        # the embedding added in place: the same bf16 sums as ``a + b``, without a second [T, hc*hidden] tensor
-        x = self.fc_hidden.forward(h).view(-1, self.hc_count, self.hidden_size)
-        del h
-        x = x.add_(e.unsqueeze(-2)).flatten(-2)
-        del e
-        layer = self.layers.op_list[0]
-        block_input, inject = layer.attn_hyper_connection.mix(x)
-        if kv_only and _KV_ONLY_STOP:
-            layer.self_attn.forward(block_input, batch, kv_only=True)
-            return None
-        from .model import _FUSED_HC_NORM, _block_then_combine_norm
-
-        if _FUSED_HC_NORM and x.is_cuda and not kv_only:
-            # FREETOKEN_FUSED_HC_NORM in the head too: each combine with the norm the next mix starts from, in the
-            # block's closing all-reduce under FREETOKEN_HOST_AR_HC_COMBINE: the same bits as combine then mix
-            x, normed = _block_then_combine_norm(lambda bi: layer.self_attn.forward(bi, batch), block_input, x, inject,
-                                                 layer.attn_hyper_connection, layer.mlp_hyper_connection)
-            if keep is not None:
-                x, normed = x.index_select(0, keep), normed.index_select(0, keep)
-            block_input, inject = layer.mlp_hyper_connection.mix_normed(normed)
-            x, normed = _block_then_combine_norm(layer.mlp.forward, block_input, x, inject, layer.mlp_hyper_connection,
-                                                 self.hyper_connection_mixer)
-            return self.hyper_connection_mixer.mix_normed(normed)[0], x
-        x = layer.attn_hyper_connection.combine(x, layer.self_attn.forward(block_input, batch), inject)
-        if kv_only:
-            return None
-        if keep is not None:
-            x = x.index_select(0, keep)
-        block_input, inject = layer.mlp_hyper_connection.mix(x)
-        x = layer.mlp_hyper_connection.combine(x, layer.mlp.forward(block_input), inject)
-        return self.hyper_connection_mixer.mix(x)[0], x
+    sa, mlp = "layers.0.self_attn", "layers.0.mlp"
+    for name in ("pre_fc_norm_embedding", "pre_fc_norm_hidden", f"{sa}.q_norm", f"{sa}.k_norm", f"{sa}.indexer.q_layernorm",
+                 f"{sa}.indexer.k_layernorm", f"{mlp}.gate", f"{mlp}.shared_expert_gate", "hyper_connection_mixer.hc_norm"):
+        yield f"{name}.weight", float_tensor(t(name))
+    yield from linear("fc_embedding", ("fc_embedding",), hidden)
+    yield from linear("fc_hidden", ("fc_hidden",), hidden)
+    yield from linear(f"{sa}.qkv_proj", tuple(f"{sa}.{p}_proj" for p in "qkv"), hidden)
+    yield from linear(f"{sa}.o_proj", (f"{sa}.o_proj",), int(t(f"{sa}.o_proj").ne[0]))
+    yield from linear(f"{sa}.indexer.index_qk_proj", (f"{sa}.indexer.index_qk_proj",), hidden)
+    yield from linear(f"{mlp}.shared_expert.gate_up_proj", (f"{mlp}.shared_expert.gate_proj", f"{mlp}.shared_expert.up_proj"), hidden)
+    yield from linear(f"{mlp}.shared_expert.down_proj", (f"{mlp}.shared_expert.down_proj",), config.shared_expert_intermediate_size)
+    for hc in ("layers.0.attn_hyper_connection", "layers.0.mlp_hyper_connection"):
+        down = (f"{hc}.input_mix_weight_down", f"{hc}.block_inject_weight")
+        yield from linear(f"{hc}.input_mix_weight_down_block_inject", down, width, pad_to=16)
+        yield from linear(f"{hc}.input_mix_weight_up", (f"{hc}.input_mix_weight_up",), config.qwen4_args.hc_lowrank)
+        yield f"{hc}.hc_norm.weight", float_tensor(t(f"{hc}.hc_norm"))
+    yield from linear("hyper_connection_mixer.input_mix_weight_down", ("hyper_connection_mixer.input_mix_weight_down",), width)
+    yield from linear("hyper_connection_mixer.input_mix_weight_up", ("hyper_connection_mixer.input_mix_weight_up",), config.qwen4_args.hc_lowrank)
 
 
-__all__ = ["Qwen4ExpMTP", "quantize_nvfp4"]
+def _pack_expert_banks(model_path: str, device: torch.device):
+    """The pack's stacked experts as the resident banks of bank layer 0, in their packed ggml rows."""
+    from freetoken.layers.quantization import QuantKind
+    from freetoken.models.gguf.experts import resident_expert_bank
+    from freetoken.models.gguf.reader import gguf_tensor_index
+    from freetoken.moe.expert_banks import ExpertBanks
+
+    index = gguf_tensor_index(model_path)
+    sources = {role: [resident_expert_bank(index[f"mtp.layers.0.mlp.experts.{role}_proj"], device)] for role in ("gate_up", "down")}
+    return ExpertBanks("gguf", sources, kind=QuantKind.GGUF, kernel="ggml", layout=None)
+
+
+def _pack_quant(model_path: str):
+    from freetoken.layers.quantization import GGUFConfig, NameMap
+    from freetoken.models.gguf.reader import gguf_tensor_index
+    from freetoken.models.register import get_model_spec
+
+    packed = get_model_spec("Qwen4ExpForConditionalGeneration").packed_modules_mapping
+    types = {name: info.ggml_type for name, info in gguf_tensor_index(model_path).items()}
+    return GGUFConfig(types, _pack_tensors, name_map=NameMap(packed=packed))
+
+
+def draft_config(config: ModelConfig) -> ModelConfig:
+    """The target config cut to one QSA layer (layer id 0) without PLE."""
+    group = next(g for g in config.attention_groups if isinstance(g, FullAttentionGroupConfig) and g.index_ratio > 1)
+    return dataclasses.replace(
+        config,
+        num_layers=1,
+        attention_groups=(dataclasses.replace(group, layer_ids=(0,), num_index_layers=1),),
+        qwen4_args=dataclasses.replace(config.qwen4_args, ple_layer_ids=()),
+        slot_states=(),
+        vision_config=None,
+    )
+
+
+class Qwen4ExpMTPDraft(BaseOP):
+    attention_backend = "qsa_sparse"
+    draft_config = staticmethod(draft_config)
+
+    @staticmethod
+    def relay_width(config: ModelConfig) -> int:
+        return config.qwen4_args.hc_count * config.hidden_size
+
+    @staticmethod
+    def check_source(path: str, target_path: str) -> None:
+        from freetoken.models.gguf.reader import gguf_tensor_index, is_gguf_path
+        from freetoken.models.loader import safetensors_weight_map
+
+        if is_gguf_path(path):
+            if not any(name.startswith("mtp.") for name in gguf_tensor_index(path)):
+                raise ValueError(f"{path} has no mtp.* tensors; pass a GGUF that carries them (a Strata MTP pack) with --speculative-draft-model-path")
+        elif is_gguf_path(target_path):
+            # a draft read from a folder takes the target's quant config, which for a GGUF target describes GGUF tensors
+            raise ValueError(f"a GGUF target needs a GGUF draft that carries mtp.* tensors (a Strata MTP pack), not {path}")
+        elif os.path.isdir(path) and not any(name.startswith("mtp.") for name in safetensors_weight_map(path)):
+            raise ValueError(f"{path} has no mtp.* tensors")
+
+    def __init__(self, config: ModelConfig, target_model, quant=None) -> None:
+        draft = draft_config(config)
+        # a Strata pack carries its own ggml types
+        self.config = draft = draft if quant is None else dataclasses.replace(draft, quant=quant)
+        hidden = draft.hidden_size
+        self.hc_count = draft.qwen4_args.hc_count
+        self.fc_embedding = LinearReplicated(hidden, hidden, has_bias=False, quant_config=draft.quant, prefix="mtp.fc_embedding")
+        self.fc_hidden = LinearReplicated(hidden, hidden, has_bias=False, quant_config=draft.quant, prefix="mtp.fc_hidden")
+        self.pre_fc_norm_embedding = GemmaPlusOneRMSNorm(hidden, eps=draft.rms_norm_eps)
+        self.pre_fc_norm_hidden = GemmaPlusOneRMSNorm(self.hc_count * hidden, eps=draft.rms_norm_eps)
+        self.layers = OPList([Qwen4ExpDecoderLayer(draft, 0, prefix="mtp.layers.0")])
+        self.hyper_connection_mixer = GatedResidual(draft, use_combine=False, prefix="mtp.hyper_connection_mixer")
+        # the target's own module; an underscore name keeps it out of this module's state dict
+        self._embed_tokens = target_model.model.embed_tokens
+
+    @classmethod
+    def load(cls, config: ModelConfig, target_model, model_path: str, device: torch.device, dtype: torch.dtype) -> Qwen4ExpMTPDraft:
+        from freetoken.models.gguf.reader import is_gguf_path
+        from freetoken.moe.expert_banks import attach_resident_banks, build_expert_banks
+
+        pack = is_gguf_path(model_path)
+        with torch.device("meta"), torch_dtype(dtype):
+            draft = cls(config, target_model, _pack_quant(model_path) if pack else None)
+        expected = draft.state_dict()
+        loaded = {}
+        weights = _iter_pack_weights(model_path, draft.config) if pack else iter_mtp_weights(model_path, device)
+        for name, tensor in weights:
+            if name not in expected:
+                raise ValueError(f"{model_path}: unexpected MTP tensor {name!r}")
+            loaded[name] = tensor.to(device=device, dtype=expected[name].dtype)
+        if missing := sorted(set(expected) - set(loaded)):
+            raise ValueError(f"{model_path}: MTP tensors missing: {missing}")
+        draft.load_state_dict(loaded)
+        # packed by the layer's own expert method, as the target's resident layers are
+        moe = draft.layers.op_list[0].mlp.experts
+        if pack:
+            banks = _pack_expert_banks(model_path, device)
+        else:
+            pieces = iter_mtp_expert_pieces(model_path)
+            banks = build_expert_banks(moe.quant_method, 1, pieces, device=device, resident=True)
+        attach_resident_banks([moe], banks)
+        # not the root: it reaches the target's embedding, which the target finalized already
+        for module in (draft.fc_embedding, draft.fc_hidden, draft.layers, draft.hyper_connection_mixer):
+            finalize_quant(module)
+        return draft
+
+    @property
+    def embed_tokens(self) -> VocabParallelEmbedding:
+        return self._embed_tokens
+
+    def forward_hidden(self, embeds: torch.Tensor, prev_hidden: torch.Tensor) -> torch.Tensor:
+        """``R_out`` of each row from the embedding of its token and the residual streams of the position before it."""
+        rows, hidden = embeds.shape
+        e = self.fc_embedding.forward(self.pre_fc_norm_embedding.forward(embeds))
+        h = self.pre_fc_norm_hidden.forward(prev_hidden)
+        r = self.fc_hidden.forward(h.view(rows * self.hc_count, hidden)).view(rows, self.hc_count, hidden)
+        r += e.unsqueeze(1)
+        return self.layers.op_list[0].forward(r.view(rows, -1), get_global_ctx().batch)
+
+    def head_input(self, hidden: torch.Tensor) -> torch.Tensor:
+        return self.hyper_connection_mixer.mix(hidden)[0]
+
+
+__all__ = ["Qwen4ExpMTPDraft", "draft_config"]

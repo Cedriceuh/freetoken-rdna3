@@ -136,7 +136,16 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
         device=device,
         dtype=dtype,
         num_req_slots=config.max_running_req + 1,  # + 1 for the dummy request row
+        num_speculative_tokens=_extra_rows(config),
     )
+
+
+def _extra_rows(config) -> int:
+    """Rows a decode step runs past each request's token: --speculative-algorithm's drafts, or spec_decode's verify
+    rows (FREETOKEN_SPEC_VERIFY_M); the QSA index-key ring keeps that many more."""
+    from freetoken.spec_decode import SPEC_M
+
+    return max(SPEC_M, getattr(config, "decode_rows_per_req", 1)) - 1
 
 
 def create_kvcache_pool(
@@ -147,6 +156,7 @@ def create_kvcache_pool(
     device: torch.device,
     num_swa_tokens: int | None = None,
     num_req_slots: int | None = None,
+    num_speculative_tokens: int = 0,
 ) -> BaseKVCachePool:
     if model_config.has_swa_attention:
         from .hybrid_swa_pool import HybridSWAKVCache
@@ -223,6 +233,7 @@ def create_kvcache_pool(
             num_index_layers=spec.num_index_layers,
             index_ratio=spec.index_ratio,
             num_req_slots=num_req_slots,
+            ring_capacity=QSAKVCache.ring_capacity_for(spec.index_ratio, num_speculative_tokens),
             layer_ids=spec.layer_ids,
             mrope=model_config.model_is_mrope,
         )

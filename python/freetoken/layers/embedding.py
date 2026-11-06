@@ -219,25 +219,31 @@ class ParallelLMHead(VocabParallelEmbedding):
         _DUMP_COUNT += 1
 
     @nvtx_annotate("LMHead")
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, *, export_hidden: bool = True) -> torch.Tensor:
+        """``export_hidden=False``: the model hands its own final hidden to ``batch.features``."""
         ctx = get_global_ctx()
         batch = ctx.batch
         bs = batch.size
         if _DUMP_DIR and batch.is_prefill:
             self._dump_prompt_topk(x)
+        if export_hidden and (features := getattr(batch, "features", None)) is not None:
+            features.final_hidden(x)
         if batch.is_prefill and x.shape[0] > bs:  # bs rows: one per request already (the MTP head picks its own)
             indices = batch.attn_metadata.get_last_indices(bs)
             x = x[indices].contiguous()
             del indices
+        # FREETOKEN_SPARSE_LOGITS: a decode step keeps this rank's shard (the engine gathers what it needs: gather_full
+        # or candidates)
+        return self.logits(x, local=self.decode_local and batch.is_decode)
 
+    def logits(self, x: torch.Tensor, local: bool = False) -> torch.Tensor:
+        """Full-vocab logits of the rows of ``x`` (``local``: this rank's shard at TP > 1); reads no batch state."""
         if self.tied_embedding is not None:
             logits = self.tied_embedding.quant_method.logits(self.tied_embedding, x, self.bias)
         else:
             logits = self.quant_method.apply(self, x)
-        if self.tp_size == 1:
+        if self.tp_size == 1 or local:
             return logits
-        if self.decode_local and batch.is_decode:
-            return logits  # FREETOKEN_SPARSE_LOGITS: the engine gathers what it needs (gather_full or candidates)
         return self.gather_full(logits)
 
     def gather_full(self, logits: torch.Tensor) -> torch.Tensor:
@@ -251,7 +257,8 @@ class ParallelLMHead(VocabParallelEmbedding):
         input_shape = logits.shape
         output_tensor = self._comm.all_gather(logits)
 
-        if input_shape[0] == 1:  # one row (decode rows can outnumber requests: spec_decode)
+        # keyed on rows, not batch size: a verify batch has several rows per request
+        if input_shape[0] == 1:
             return output_tensor.view(1, -1)[:, : self.num_embeddings]
 
         output_tensor = output_tensor.view((self.tp_size,) + input_shape)

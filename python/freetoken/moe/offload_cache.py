@@ -59,10 +59,14 @@ _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
     # Half the host/cache footprint of bf16; the grouped GEMM (kernel/triton/fp8_blockscale_moe)
     # reads the routed fp8 rows directly and dequantizes in the K-loop (no bf16 materialization).
     "fp8_block": ("gate_up", "gate_up_scale", "down", "down_scale"),
-    # GGUF experts in their own ggml type per layer: gate_up [L*E, 2I, row_bytes] (gate rows, then up rows), down [L*E, H, row_bytes]; float experts keep their dtype
+    # GGUF experts in their own ggml type per layer: gate_up [L*E, 2I, row_bytes] (gate rows, then up rows), down [L*E, H, row_bytes]; a whole-layer float layer loads and runs bf16
     "gguf": ("gate_up", "down"),
     # GGUF experts whose NVFP4 tensors carry per-expert scales: global [L*E, 4] fp32 (gate, up, down, 1) weight_scale_2
     "gguf_scaled": ("gate_up", "down", "global"),
+    # gpt-oss GGUF files: the same layouts plus the per-expert bias rows gate_up_bias [L*E, 2I]
+    # and down_bias [L*E, H] bf16, which follow each expert through the slot cache like its weights
+    "gguf_bias": ("gate_up", "down", "gate_up_bias", "down_bias"),
+    "gguf_scaled_bias": ("gate_up", "down", "global", "gate_up_bias", "down_bias"),
     # native ModelOpt rows for the Triton inline-dequant kernels: packed e2m1 codes +
     # fp8-e4m3 per-16 block scales + per-output-row fp32 globals (w1/w3 carry distinct
     # globals, and folding them into the e4m3 block scales would underflow)
@@ -713,7 +717,7 @@ class OffloadMoeCache:
         reloads banks. Tears down prefill-overlap buffers first (their views alias
         the old ``bank_caches``), frees the old GPU tensors, then reallocates. Slots
         cold-start after rebuild. Object identity is preserved so attached layers and
-        ``ctx.moe_offload_cache`` stay valid.
+        ``Engine.moe_offload_cache`` stay valid.
         """
         assert self.bank_sources, "set_bank_sources must run before rebuild"
         sizes = [cache_size] if pool_sizes is None else list(pool_sizes)

@@ -14,7 +14,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a G
 
 
 def test_blocked_delta_rule_hands_over_the_assembled_rows(monkeypatch):
-    from freetoken.models.qwen4_exp import gdn
+    from freetoken.layers.linear_attn import gdn
 
     monkeypatch.setattr(gdn, "_GDN_PREFILL_BLOCK", 128)
     T, H, HV, K = 512, 4, 12, 128

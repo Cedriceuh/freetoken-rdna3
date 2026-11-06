@@ -39,7 +39,7 @@ import torch
 from freetoken.core import Batch, get_global_ctx
 from freetoken.utils import init_logger
 
-from freetoken.spec_decode import SPEC_M, SPEC_MS, rows_of
+from freetoken.spec_decode import SPEC_MS, rows_of
 
 from .base import AttentionSpec, BaseAttnBackend, BaseAttnMetadata
 
@@ -165,6 +165,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
         # decode staging (static buffers under CUDA graphs; eager decode snapshots per step)
         self._graph: dict[str, torch.Tensor] = {}
         self.capture_bs: List[int] = []
+        self._capture_rows_per_req = 1
         self._dcache = None
         self._dcache_layers = group.layer_ids
         self._dcache_wanted = _DECODE_CACHE and getattr(self.kvcache, "kv_on_host", False)
@@ -605,14 +606,17 @@ class QSASparseAttnBackend(BaseAttnBackend):
         return torch.empty((rows, *shape), dtype=dtype, device=self.device)
 
     # ----- CUDA graph (decode) --------------------------------------------------------------
-    def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
+    def init_capture_graph(self, max_seq_len: int, bs_list: List[int], rows_per_req: int = 1) -> None:
         self.capture_bs = sorted(bs_list)
+        self._capture_rows_per_req = rows_per_req
         max_reqs = max(bs_list)
-        max_bs = max_reqs * SPEC_M  # query rows: SPEC_M per request (spec_decode)
+        # query rows per request: spec_decode's row counts (SPEC_MS), a verify family's rows_per_req, 1 always
+        row_counts = sorted(set(SPEC_MS) | {1, rows_per_req})
+        rows = max_reqs * max(row_counts)
         width = get_global_ctx().page_table.shape[1]
         pages = -(-width // self.page_size)
         columns = pages * self.cmp_page_size
-        chunk = max(1, min(max_bs, _LOGITS_WORKSPACE_BYTES // max(columns * 4, 1)))
+        chunk = max(1, min(rows, _LOGITS_WORKSPACE_BYTES // max(columns * 4, 1)))
         topk_scratch = self._topk_scratch_width(columns)
 
         def empty(*shape: int, dtype: torch.dtype) -> torch.Tensor:
@@ -622,18 +626,18 @@ class QSASparseAttnBackend(BaseAttnBackend):
             "block_table": torch.zeros((max_reqs, pages), dtype=torch.int32, device=self.device),
             "kvlen": torch.zeros(max_reqs, dtype=torch.int32, device=self.device),
             "table_idx": torch.zeros(max_reqs, dtype=torch.int32, device=self.device),
-            # one set per row count a decode step may run (1 always: a batch without spec rows runs one)
+            # one set per row count a step may run (1 always: a batch without spec rows runs one)
             **{f"token_to_req{m}": torch.arange(max_reqs, dtype=torch.int32, device=self.device).repeat_interleave(m)
-               for m in sorted(set(SPEC_MS) | {1})},
+               for m in row_counts},
             **{f"cu_seqlens{m}": torch.arange(max_reqs + 1, dtype=torch.int32, device=self.device) * m
-               for m in sorted(set(SPEC_MS) | {1})},
+               for m in row_counts},
             "logits": empty(chunk, columns, dtype=torch.float32),
-            "visible": empty(max_bs, dtype=torch.int32),
-            "blocks": empty(max_bs, self.block_topk, dtype=torch.int32),
-            "indices": empty(max_bs, self.select_width, dtype=torch.int32),
-            "pooled": empty(max_bs, self.index_head_dim, dtype=self.dtype),
-            "first_pos": empty(max_bs, dtype=torch.int32),
-            "q_index": empty(max_bs, self.index_heads, self.index_head_dim, dtype=self.dtype),
+            "visible": empty(rows, dtype=torch.int32),
+            "blocks": empty(rows, self.block_topk, dtype=torch.int32),
+            "indices": empty(rows, self.select_width, dtype=torch.int32),
+            "pooled": empty(rows, self.index_head_dim, dtype=self.dtype),
+            "first_pos": empty(rows, dtype=torch.int32),
+            "q_index": empty(rows, self.index_heads, self.index_head_dim, dtype=self.dtype),
         }
         if topk_scratch:
             self._graph["topk_scratch"] = empty(chunk, topk_scratch, dtype=torch.int32)
@@ -651,7 +655,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
     def prepare_for_replay(self, batch: Batch) -> None:
         md = batch.attn_metadata
         assert isinstance(md, QSASparseMetadata)
-        assert batch.active_table_idx is not None, "decode batch is missing its page-table rows"
+        assert batch.active_table_idx is not None, "graph batch is missing its page-table rows"
         self._stage_decode(md, batch.padded_size, batch.active_table_idx.to(torch.int64), rows_of(batch))
 
     def reset_capture(self) -> None:

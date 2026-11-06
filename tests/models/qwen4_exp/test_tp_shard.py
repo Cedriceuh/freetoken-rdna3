@@ -282,7 +282,7 @@ GDN = dict(
 
 
 def _gdn(**overrides):
-    from freetoken.models.qwen4_exp.gdn import Qwen4ExpGatedDeltaNet
+    from freetoken.layers.linear_attn import GatedDeltaNet as Qwen4ExpGatedDeltaNet
 
     return Qwen4ExpGatedDeltaNet(**{**GDN, **overrides})
 

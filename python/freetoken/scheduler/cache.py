@@ -33,7 +33,8 @@ _SWA_RETAIN_GAP = 16
 
 class CacheManager:
     def __init__(self, num_pages: int, page_size: int, page_table: torch.Tensor, type: str,
-                 linear_state_pool=None, swa_pool=None, sliding_window_size=None, kv_pool=None):
+                 linear_state_pool=None, swa_pool=None, sliding_window_size=None, kv_pool=None,
+                 radix_lookahead: bool = False):
         # The `_free_slots` follows a page-aligned manner. For example, if page_size = 2,
         # the `_free_slots` may look like [0, 2, 4, 6, ...], and each slot represents a page.
         device = page_table.device
@@ -74,6 +75,9 @@ class CacheManager:
             if host_kv_enabled():
                 logger.warning_rank0(f"FREETOKEN_HOST_KV=1 ignored: the host tier needs the hybrid_radix cache "
                                      f"(this model runs {type})")
+        # radix_lookahead keys position i by (t_i, t_{i+1}), so a hit also matches the token after it and a draft whose KV slot i depends on t_{i+1} (MTP) never reuses a slot written for a different next token
+        assert not (radix_lookahead and self.is_swa), "the SWA radix cache keeps token keys"
+        self.radix_lookahead = radix_lookahead
 
     # ----- capability hooks (defaults; plugged-in pools may narrow them) -----
     supports_runtime_rebuild = True
@@ -112,7 +116,8 @@ class CacheManager:
     def match_req(self, req: PendingReq, max_len: int | None = None) -> MatchResult:
         input_len = req.input_len
         assert input_len > 0, "Input length must be greater than 0."
-        ids = req.input_ids[: input_len - 1 if max_len is None else max(0, min(input_len - 1, max_len))]
+        limit = input_len - 1 if max_len is None else max(0, min(input_len - 1, max_len))
+        ids = self._keys(req.input_ids, limit)
         if self.is_swa:
             from freetoken.kvcache.swa_radix_cache import SWACacheHandle
             m = self.prefix_cache.match_prefix(ids)
@@ -375,8 +380,8 @@ class CacheManager:
         #                                           We should free it if the request has finished.
         page_indices = self.page_table[req.table_idx, : req.cached_len]
         old_handle = req.cache_handle
-        insert_ids = req.input_ids[: req.cached_len]
-        cached_len, new_handle = self.prefix_cache.insert_prefix(insert_ids, page_indices)
+        insert_ids = self._keys(req.input_ids, req.cached_len)
+        cached_len, new_handle = self.prefix_cache.insert_prefix(insert_ids, page_indices[: len(insert_ids)])
         # unlock until all operations on handle is done
         self.unlock(old_handle)
         # this part is already in the prefix cache, free it. A naive-SWA request (swa_paged, no
@@ -430,11 +435,11 @@ class CacheManager:
                 and 0 < L <= req.cached_len
                 and align_down(L, self.page_size) == L
                 and req.mamba_ping_pong is not None
+                and len(keys := self._keys(req.input_ids, L)) == L
             ):
                 frozen_idx = 1 - req.mamba_next_track_idx
                 frozen = req.mamba_ping_pong[frozen_idx]
-                prefix_len, mamba_exist = self.prefix_cache.insert(
-                    req.input_ids[:L], page_indices[:L], frozen)
+                prefix_len, mamba_exist = self.prefix_cache.insert(keys, page_indices[:L], frozen)
                 pool.free([s for s in req.mamba_ping_pong if mamba_exist or s != frozen])
                 req.mamba_ping_pong = None
                 self._free(page_indices[free_upto : max(free_upto, prefix_len)])
@@ -446,10 +451,11 @@ class CacheManager:
             # remain as reuse points).
             insert_len = align_down(req.cached_len, self.page_size)
             keep_live = False
+            keys = self._keys(req.input_ids, insert_len)
             # spec_decode: a request that finished inside a verify step's kept rows has its live state past cached_len
-            if insert_len == req.cached_len and insert_len > 0 and not getattr(req, "state_ahead", False):
-                prefix_len, mamba_exist = self.prefix_cache.insert(
-                    req.input_ids[:insert_len], page_indices[:insert_len], req.linear_slot_idx)
+            if (insert_len == req.cached_len and insert_len > 0 and len(keys) == insert_len
+                    and not getattr(req, "state_ahead", False)):
+                prefix_len, mamba_exist = self.prefix_cache.insert(keys, page_indices[:insert_len], req.linear_slot_idx)
                 self.unlock(old_handle)
                 self._free(page_indices[free_upto : max(free_upto, prefix_len)])
                 keep_live = not mamba_exist           # tree now owns linear_slot_idx
@@ -475,10 +481,11 @@ class CacheManager:
             # starts at or after the admission match) -- this makes them enforced, not argued.
             req.mamba_last_track_seqlen = None
             return
-        if align_down(L, self.page_size) != L:
-            # page_size>1 only: insert would align the key down, attaching a state that encodes
-            # L tokens to a SHORTER node -- a future hit would COW-restore an over-advanced
-            # state. Skip; the next aligned boundary (or the finish-donate) commits instead.
+        keys = self._keys(req.input_ids, L)
+        if align_down(L, self.page_size) != L or len(keys) != L:
+            # page_size>1, or a lookahead key short of the token after L: insert would attach a
+            # state that encodes L tokens to a SHORTER node -- a future hit would COW-restore an
+            # over-advanced state. Skip; the next boundary (or the finish-donate) commits instead.
             req.mamba_last_track_seqlen = None
             return
         # The slot the last TRACKING forward wrote -- this chunk's, or an earlier chunk's carried
@@ -486,14 +493,13 @@ class CacheManager:
         # ever set together, so the pair still names the state captured at exactly L.
         frozen_idx = 1 - req.mamba_next_track_idx
         frozen = req.mamba_ping_pong[frozen_idx]
-        prefix_len, mamba_exist = self.prefix_cache.insert(
-            req.input_ids[:L], page_indices[:L], frozen)
+        prefix_len, mamba_exist = self.prefix_cache.insert(keys, page_indices[:L], frozen)
         self.unlock(old_handle)
         self._free(page_indices[old_handle.cached_len : prefix_len])
         # Lock the committed snapshot node FIRST: the replacement-slot alloc below can trigger
         # evict_mamba (via ensure_mamba_slots), which would otherwise reclaim this still-unlocked
         # just-donated node -- freeing its KV pages under the still-decoding request.
-        m = self.prefix_cache.match_prefix(req.input_ids[:L])
+        m = self.prefix_cache.match_prefix(keys)
         # Same re-point as the generic path: the dedup free above returned this request's own
         # pages for [old_handle.cached_len, prefix_len) while its row still named them.
         if prefix_len > old_handle.cached_len:
@@ -519,6 +525,11 @@ class CacheManager:
         page_indices = self.page_table[req.table_idx, : req.cached_len]
 
         insert_len = align_down(req.cached_len, self.page_size)
+        if not finished and self.prefix_cache.has_locked_tombstone(
+                req.input_ids[:insert_len], old_handle.cached_len):
+            # insert would free our copy of a tombstone another request still locks, and the
+            # windowed re-match may stop before it (#204). Keep the pages; commit at finish.
+            return
         freed = page_indices[:0]
         if insert_len > 0:
             # insert reconciles tombstones (revives the in-window ones by ADOPTING the request's
@@ -726,6 +737,25 @@ class CacheManager:
     def _free(self, indices: torch.Tensor) -> None:
         if len(indices) > 0:
             self.free_slots = torch.cat([self.free_slots, indices[:: self.page_size]])
+
+    def _keys(self, ids: torch.Tensor, n: int) -> torch.Tensor:
+        """Radix keys of the first ``n`` positions of ``ids``; with radix_lookahead, fewer when the token after them is not known yet."""
+        if not self.radix_lookahead:
+            return ids[:n]
+        m = max(0, min(n, len(ids) - 1))
+        # ids stay below 2^31 (multimodal pseudo ids included), so a pair packs into one int64
+        return (ids[:m].to(torch.int64) << 31) | ids[1 : m + 1].to(torch.int64)
+
+    def rollback_tail(self, req: Req, keep_len: int, drop_len: int) -> None:
+        """Free the slots allocated for positions [keep_len, drop_len), rounded out to whole pages as allocate_paged allocates them.
+
+        Call inside lazy_free_region, after the forward that wrote them has drained.
+        """
+        start = div_ceil(keep_len, self.page_size) * self.page_size
+        end = div_ceil(drop_len, self.page_size) * self.page_size
+        assert not self.swa_paged, "rollback_tail frees no SWA slots; speculative decoding rejects SWA targets"
+        if end > start:
+            self._free(self.page_table[req.table_idx, start:end])
 
     def _page_to_token(self, pages: torch.Tensor) -> torch.Tensor:
         if self.page_size == 1:

@@ -22,7 +22,7 @@ from typing import Callable, Dict
 import torch
 
 SPEC_M = max(1, int(os.environ.get("FREETOKEN_SPEC_VERIFY_M", "1")))
-# FREETOKEN_MTP=1: build and load the model's MTP draft head (qwen4_exp: models/qwen4_exp/mtp.py) as one extra
+# FREETOKEN_MTP=1: build and load the model's MTP draft head (qwen4_exp: models/qwen4_exp/mtp_head.py) as one extra
 # layer -- its attention a QSA layer of the KV pool, its routed experts an NVFP4 bank layer of the offload cache.
 # Only with verify rows (SPEC_M > 1): without them nothing checks its drafts and the head would be pure cost.
 MTP_REQUESTED = os.environ.get("FREETOKEN_MTP", "0") == "1"
@@ -181,8 +181,11 @@ def rows_for(reqs) -> int:
 
 
 def rows_of(batch) -> int:
-    """Rows per request of ``batch``: its ``spec_m`` for a decode step, 1 for a prefill."""
-    return getattr(batch, "spec_m", 1) if batch.is_decode else 1
+    """Rows per request of ``batch``: its ``spec_m`` for a decode step, its ``rows_per_req`` for a verify step
+    (--speculative-algorithm), 1 for a prefill."""
+    if batch.is_decode:
+        return getattr(batch, "spec_m", 1)
+    return (getattr(batch, "rows_per_req", None) or 1) if getattr(batch, "phase", None) == "verify" else 1
 
 
 @dataclass

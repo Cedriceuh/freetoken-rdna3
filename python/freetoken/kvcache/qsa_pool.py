@@ -316,9 +316,10 @@ class QSAKVCache(MHAKVCache):
             if spec.attn_type is AttnType.QSA:
                 # One index-key row = all index layers at one position.
                 row = spec.index_head_dim * spec.num_index_layers * _INDEX_DTYPE_BYTES
-                from freetoken.spec_decode import SPEC_M
+                from . import _extra_rows
 
-                fixed += num_req_slots * row * (cls.ring_capacity_for(spec.index_ratio, SPEC_M - 1) + 1)
+                ring = cls.ring_capacity_for(spec.index_ratio, _extra_rows(config))
+                fixed += num_req_slots * row * (ring + 1)
                 if config.model_config.model_is_mrope:
                     per_token += _ROPE_POS_BYTES
         return per_token * config.page_size, fixed, config.page_size, 0

@@ -83,7 +83,7 @@ def test_qsa_decode_host_kv_one_stage_same_bits(monkeypatch, rows):
 def test_gdn_prefill_more_warps_same_bits(monkeypatch):
     import freetoken.kernel.fla.chunk_delta_h as delta_h
     import freetoken.kernel.fla.wy_fast as wy
-    from freetoken.models.qwen3_5_moe.gdn_kernels import gdn_prefill_chunk_fla
+    from freetoken.layers.linear_attn.gdn import gdn_prefill_chunk_fla
 
     autotuned = delta_h.chunk_gated_delta_rule_fwd_kernel_h_blockdim64
 

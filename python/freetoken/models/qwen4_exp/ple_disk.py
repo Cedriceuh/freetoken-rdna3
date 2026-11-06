@@ -379,7 +379,7 @@ class DiskRowTable:
         hash_constants: dict,
         *,
         max_graph_rows: int = 256,
-        max_extend_tokens: int = 8192,
+        max_eager_tokens: int = 8192,
         dtype: torch.dtype = torch.bfloat16,
     ) -> None:
         from freetoken.kernel.row_store import PleStore
@@ -449,7 +449,7 @@ class DiskRowTable:
         # completes once the last graph launch that read ``_graph_pinned`` has run (recorded by the
         # dispatch context after the step's fill: a record inside the capture would not be observable)
         self._graph_consumed = torch.cuda.Event()
-        eager_bytes = max_extend_tokens * self._token_bytes
+        eager_bytes = max_eager_tokens * self._token_bytes
         # the overlap scheduler fills batch k+1 while batch k's lookup copy may still be queued: the
         # eager staging alternates two pinned buffers, and each is rewritten only once the H2D copy
         # that last read it has run (``_eager_read[i]``, recorded right after that copy)
@@ -523,15 +523,20 @@ class DiskRowTable:
         if self._failed:
             raise RuntimeError("a PLE disk fill failed during a launch; recreate the engine before dispatching again")
         eos = self.eos_token_id
-        if batch.is_decode:
+        # decode and verify: m tokens per request on the device (rows_of: spec_decode's spec_m, a verify step's
+        # rows_per_req), the request's own token first: at device_len - 1 on a decode step (spec_decode's drafts follow
+        # it), at device_len - rows_per_req on a verify step (widened by its drafts)
+        m = rows_of(batch)
+        verify = getattr(batch, "phase", None) == "verify"
+        if batch.is_decode or verify:
             reqs = list(batch.reqs)
-            m = rows_of(batch)  # rows per request (spec_decode): the request's token, then its drafts
+            first = m if verify else 1
             if use_graph and self._wait_sync:
                 bs = batch.padded_size
                 self._token_readback[: bs * m].copy_(batch.input_ids, non_blocking=True)
                 self._readback_event.record(torch.cuda.current_stream(self._device))
 
-                contexts = [self._ple_context(r.input_ids, r.device_len - 1) for r in reqs]
+                contexts = [self._ple_context(r.input_ids, r.device_len - first) for r in reqs]
 
                 @torch.inference_mode()
                 def _complete() -> None:
@@ -560,7 +565,7 @@ class DiskRowTable:
             t0 = time.perf_counter() if _FILL_TIMING else 0.0
             tokens = batch.input_ids.to("cpu").to(torch.int64).tolist()
             t1 = time.perf_counter() if _FILL_TIMING else 0.0
-            runs = [torch.tensor([*self._ple_context(r.input_ids, r.device_len - 1), *tokens[i * m:(i + 1) * m]],
+            runs = [torch.tensor([*self._ple_context(r.input_ids, r.device_len - first), *tokens[i * m:(i + 1) * m]],
                                  dtype=torch.int64)
                     for i, r in enumerate(reqs)]
             self.fill(runs, graph=use_graph)

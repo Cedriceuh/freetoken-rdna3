@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from freetoken.kernel.triton import causal_conv1d_triton
-from freetoken.models.qwen4_exp.gdn import Qwen4ExpGatedDeltaNet
+from freetoken.layers.linear_attn import GatedDeltaNet as Qwen4ExpGatedDeltaNet
 
 
 def _op_and_calls(monkeypatch):

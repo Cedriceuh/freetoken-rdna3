@@ -10,8 +10,8 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a G
 
 
 def test_blocked_gdn_prefill_matches_one_call():
-    from freetoken.models.qwen3_5_moe.gdn_kernels import gdn_prefill_chunk_fla
-    from freetoken.models.qwen4_exp import gdn as G
+    from freetoken.layers.linear_attn.gdn import gdn_prefill_chunk_fla
+    from freetoken.layers.linear_attn import gdn as G
 
     torch.manual_seed(0)
     dev = "cuda"

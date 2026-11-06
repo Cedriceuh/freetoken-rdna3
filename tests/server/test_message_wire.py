@@ -106,7 +106,7 @@ def test_user_reply_token_deltas_round_trip():
 
 def test_detokenize_msg_carries_kv_usage_round_trip():
     msg = DetokenizeMsg(
-        uid=3, next_token=42, finished=True,
+        uid=3, next_tokens=[42], finished=True,
         kv_used_pages=10, kv_total_pages=256, gpu_mem_bytes=1 << 30,
         mamba_used_slots=7, mamba_total_slots=64,
         swa_used_tokens=8448, swa_total_tokens=76800,
@@ -116,6 +116,26 @@ def test_detokenize_msg_carries_kv_usage_round_trip():
     assert (decoded.kv_used_pages, decoded.kv_total_pages, decoded.gpu_mem_bytes) == (10, 256, 1 << 30)
     assert (decoded.mamba_used_slots, decoded.mamba_total_slots) == (7, 64)
     assert (decoded.swa_used_tokens, decoded.swa_total_tokens) == (8448, 76800)
+
+
+def test_terminal_replies_carry_scheduler_timings_over_the_wire():
+    timings = {"queue_ms": 5.5, "cache_n": 8, "prompt_n": 2, "prompt_ms": 100.0,
+               "predicted_n": 4, "predicted_ms": 250.0, "draft_n": 6, "draft_n_accepted": 3}
+    msg = DetokenizeMsg(uid=3, next_tokens=[42], finished=True, timings=timings)
+    decoded = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(msg))
+    assert isinstance(decoded, DetokenizeMsg)
+    assert decoded.timings == timings
+
+    reply = UserReply(uid=3, incremental_output="", finished=True,
+                      completion_tokens_delta=1, timings=timings)
+    out = BaseFrontendMsg.decoder(BaseFrontendMsg.encoder(reply))
+    assert isinstance(out, UserReply)
+    assert out.timings == timings
+    # intermediate replies and aborts/errors never carry timings
+    plain = BaseFrontendMsg.decoder(BaseFrontendMsg.encoder(
+        UserReply(uid=3, incremental_output="x", finished=False)
+    ))
+    assert plain.timings is None
 
 
 def test_client_dicts_with_the_wire_tag_key_survive_intact():

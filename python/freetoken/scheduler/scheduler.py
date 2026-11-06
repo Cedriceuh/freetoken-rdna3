@@ -6,7 +6,6 @@ import time
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
 import torch
-from freetoken.attention.linear import build_fla_metadata
 from freetoken.core import Batch, Req
 from freetoken.env import ENV
 from freetoken.gpu_select import gpu_identity
@@ -24,7 +23,7 @@ from freetoken.message import (
     PromptAdmittedMsg,
     UserMsg,
 )
-from freetoken.spec_decode import (MTP_ENABLED, SPEC_BS_MAX, SPEC_DYNAMIC, SPEC_GLUE_KERNELS, SPEC_M, DepthStats,
+from freetoken.spec_decode import (MTP_ENABLED, SPEC_BS_MAX, SPEC_DYNAMIC, SPEC_GLUE_KERNELS, SPEC_M, DepthStats, rows_of,
                                    draft_depth, rows_for)
 from freetoken.utils import (
     init_logger,
@@ -44,6 +43,7 @@ from .table import TableManager
 
 if TYPE_CHECKING:
     from freetoken.engine import BatchSamplingArgs, ForwardOutput
+    from freetoken.engine.spec_protocol import SpecRuntime
 
 
 logger = init_logger(__name__)
@@ -64,7 +64,7 @@ class ForwardInput(NamedTuple):
     batch: Batch
     sample_args: BatchSamplingArgs
     input_tuple: Indice2D  # (token_mapping, positions)
-    write_tuple: Indice2D  # (req_mapping, seq_lens or -1)
+    write_tuple: Indice2D | None  # (req_mapping, seq_lens or -1); None on verify, whose drain writes the pending token
 
 
 ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
@@ -88,6 +88,7 @@ class Scheduler(SchedulerIOMixin):
 
         # initialize other managers
         self.table_manager = TableManager(config.max_running_req, self.engine.page_table)
+        self.spec: SpecRuntime | None = self.engine.spec
         # ONE cache manager for every model (ShadowRadix layering): the shared page table is the
         # virtual full-token coordinate; model-specific tiers ride the plug-ins -- DSV4's
         # window/cmp/idx shadows via swa_pool, Gemma's swa via swa_pool, GDN state via
@@ -101,8 +102,10 @@ class Scheduler(SchedulerIOMixin):
                 (g.sliding_window for g in config.model_config.kv_cache_group_specs() if g.is_swa),
                 None,
             ) or getattr(self.engine.kv_cache, "sliding_window_size", None),
+            radix_lookahead=self.spec is not None and self.spec.radix_lookahead,
         )
-        self.decode_manager = DecodeManager(config.page_size)
+        token_headroom = config.decode_rows_per_req - 1
+        self.decode_manager = DecodeManager(config.page_size, token_headroom=token_headroom)
         self._bidirectional_mm = any(getattr(g, "bidirectional_mm_blocks", False) for g in config.model_config.attention_groups)
         self.prefill_manager = PrefillManager(
             self.cache_manager,
@@ -110,6 +113,7 @@ class Scheduler(SchedulerIOMixin):
             self.decode_manager,
             encoder_cache=self.engine.encoder_cache,
             keep_images_whole=self._bidirectional_mm,
+            token_headroom=token_headroom,
         )
 
         # some alias for easy access
@@ -344,7 +348,7 @@ class Scheduler(SchedulerIOMixin):
         # backend's per-batch SNAPSHOT (staged in prepare_for_replay right before the replay, on
         # the same stream, like the generic out_loc copy_from), not the live slot maps -- so the
         # next batch's allocate_paged cannot corrupt the in-flight graph replay. DSV4 overlaps.
-        if ENV.DISABLE_OVERLAP_SCHEDULING:
+        if ENV.DISABLE_OVERLAP_SCHEDULING or self.spec is not None:
             with self.engine_stream_ctx:
                 self.engine.stream.wait_stream(self.stream)
                 while True:
@@ -369,108 +373,87 @@ class Scheduler(SchedulerIOMixin):
         if last_data is None:
             return
 
-        batch, out = last_data[0].batch, last_data[1]
-        next_tokens_cpu, copy_done = out[1], out[2]
-        n_acc_cpu = getattr(out, "n_acc_cpu", None)  # spec_decode verify step: kept tokens per request
+        batch, output = last_data[0].batch, last_data[1]
+        _, next_tokens_cpu, copy_done = output[:3]
+        n_acc_cpu = getattr(output, "n_acc_cpu", None)  # spec_decode verify step: kept tokens per request
         copy_done.synchronize()
+        # tokens are on the host from here: the per-request timings' token stamps
+        now = time.perf_counter()
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
+        generated = None
         with self.cache_manager.lazy_free_region():
-            for i, req in enumerate(batch.reqs):
-                if isinstance(req, ChunkedReq):
-                    # Don't cache intermediate chunks; the full prompt is cached once when the
-                    # final chunk is processed. Caching here snapshots a handle the next chunk
-                    # already copied (overlap), so cache_req double-frees the prior chunk.
-                    if req.aborted:
-                        # Aborted mid-chunked-prefill while this chunk was in flight: the abort
-                        # popped the pending continuation (no next chunk launches), and this
-                        # drain point frees the chunk's pages/slots exactly once.
-                        self._free_req_resources(req)
-                    continue
-                if req.aborted:
-                    # Aborted while this final-chunk prefill / decode step was in flight: free
-                    # here (the forward is drained) and finish the request. No DetokenizeMsg --
-                    # the abort ack flushed after this method stays the uid's terminal reply.
-                    self.decode_manager.remove_req(req)
-                    self._free_req_resources(req)
-                    new_finished_reqs.add(req)
-                    continue
-                if req in self.finished_reqs:
-                    # Overlap scheduling launched one more decode step for a request that
-                    # already terminated (filter_reqs keeps it while output budget remains,
-                    # and the next batch is scheduled before this drain runs). Its resources
-                    # are freed below/already; shipping this token would append past the
-                    # client's terminal reply.
-                    continue
-                if n_acc_cpu is not None:  # spec_decode verify step: the request's kept tokens, in order
-                    step_tokens = next_tokens_cpu[i, : int(n_acc_cpu[i])]
-                else:
-                    step_tokens = next_tokens_cpu[i].view(1)
-                for next_token in step_tokens:
-                    req.append_host(next_token.unsqueeze(0))
-                    next_token = int(next_token.item())
-                    # EOS / stop-string -> "stop", output budget exhausted -> "length";
-                    # EOS and stop strings win over length.
-                    # Overlap can advance device_len ahead of the token delivered to the host.
-                    hit_length = req.input_ids.numel() >= req.max_device_len
-                    hit_eos = (
-                        not req.sampling_params.ignore_eos and next_token in self.eos_token_ids
-                    )
-                    matched_stop = (
-                        self._match_stop_str(req)
-                        if not hit_eos and req.sampling_params.stop_strs
-                        else None
-                    )
-                    finished = hit_length or hit_eos or matched_stop is not None
-                    finish_reason = (
-                        ("stop" if (hit_eos or matched_stop is not None) else "length")
-                        if finished
-                        else None
-                    )
-                    if (
-                        next_token == self.toolcall_anchor_id
-                        and req.toolcall_anchor_len is None
-                        and not finished
-                    ):
-                        req.toolcall_anchor_len = req.input_ids.numel()
-                    reply.append(
-                        DetokenizeMsg(
-                            uid=req.uid,
-                            next_token=next_token,
-                            finished=finished,
-                            finish_reason=finish_reason,
-                            matched_stop=matched_stop,
-                            stop_strs=req.sampling_params.stop_strs or None,
-                        )
-                    )
-                    if finished:
-                        break
-                if n_acc_cpu is not None and SPEC_DYNAMIC:
-                    if getattr(req, "spec_stats", None) is None:
-                        req.spec_stats = DepthStats()
-                    req.spec_stats.update(batch.spec_m, int(n_acc_cpu[i]))
+            if batch.phase == "verify":
+                generated = self._drain_verify(batch, output, reply, new_finished_reqs)
+            else:
                 if n_acc_cpu is not None:
-                    # the request now holds every kept token; its KV/state cover all but the last one -- or, when it
-                    # finished before its last kept token, more than it keeps (the GDN state must not be donated)
-                    req.state_ahead = len(step_tokens) > 0 and req.input_ids.numel() - 1 < req.device_len - 1 + len(step_tokens)
-                    req.device_len = req.input_ids.numel()
-                    req.cached_len = req.device_len - 1
+                    generated = 0
+                for i, req in enumerate(batch.reqs):
+                    if isinstance(req, ChunkedReq):
+                        # Don't cache intermediate chunks; the full prompt is cached once when the
+                        # final chunk is processed. Caching here snapshots a handle the next chunk
+                        # already copied (overlap), so cache_req double-frees the prior chunk.
+                        if req.aborted:
+                            # Aborted mid-chunked-prefill while this chunk was in flight: the abort
+                            # popped the pending continuation (no next chunk launches), and this
+                            # drain point frees the chunk's pages/slots exactly once.
+                            self._free_req_resources(req)
+                        continue
+                    if req.aborted:
+                        # Aborted while this final-chunk prefill / decode step was in flight: free
+                        # here (the forward is drained) and finish the request. No DetokenizeMsg --
+                        # the abort ack flushed after this method stays the uid's terminal reply.
+                        self.decode_manager.remove_req(req)
+                        self._free_req_resources(req)
+                        new_finished_reqs.add(req)
+                        continue
+                    if req in self.finished_reqs:
+                        # Overlap scheduling launched one more decode step for a request that
+                        # already terminated (filter_reqs keeps it while output budget remains,
+                        # and the next batch is scheduled before this drain runs). Its resources
+                        # are freed below/already; shipping this token would append past the
+                        # client's terminal reply.
+                        continue
+                    if n_acc_cpu is not None:  # spec_decode verify step: the request's kept tokens, in order
+                        step_tokens = next_tokens_cpu[i, : int(n_acc_cpu[i])]
+                    else:
+                        step_tokens = next_tokens_cpu[i : i + 1]
+                    msg, n = self._commit_tokens(req, step_tokens)
+                    req.stats.stamp_token(now)
+                    reply.append(msg)
+                    if msg.finished:
+                        msg.timings = req.stats.finish(req.input_ids.numel() - req.prompt_len)
+                    finished = msg.finished
+                    if n_acc_cpu is not None:
+                        generated += n
+                        # batch.spec_m - 1 drafts verified, n_acc - 1 kept (the last kept row is the target's token)
+                        req.stats.draft_n += batch.spec_m - 1
+                        req.stats.draft_n_accepted += min(n, int(n_acc_cpu[i]) - 1)
+                        if SPEC_DYNAMIC:
+                            if getattr(req, "spec_stats", None) is None:
+                                req.spec_stats = DepthStats()
+                            req.spec_stats.update(batch.spec_m, int(n_acc_cpu[i]))
+                        # the request now holds every kept token; its KV/state cover all but the last one -- or, when it
+                        # finished before its last kept token, more than it keeps (the GDN state must not be donated)
+                        req.state_ahead = len(step_tokens) > 0 and req.input_ids.numel() - 1 < req.device_len - 1 + len(step_tokens)
+                        req.device_len = req.input_ids.numel()
+                        req.cached_len = req.device_len - 1
 
-                # NOTE: overlap scheduling may make the request freed twice, skip second free
-                if finished and req not in self.finished_reqs:
-                    self.decode_manager.remove_req(req)
-                    self._free_req_resources(req)
-                    new_finished_reqs.add(req)
-                elif batch.is_prefill and req.table_idx != -1:
-                    # for prefill, non-chunk req, cache the prefix.
-                    # Polymorphic: the DSV4 naive manager keeps the request's slots (no-op);
-                    # the generic manager inserts the prefix into its radix/naive cache.
-                    # table_idx == -1 is defense-in-depth: aborts mark in-flight requests
-                    # instead of freeing them (handled above), so a freed request should
-                    # never reach this commit -- but if a future path frees one early, skip
-                    # rather than re-read the freed page-table row (and on hybrid, deref the
-                    # None'd GDN ping-pong slots).
-                    self.cache_manager.cache_req(req, finished=False)
+                    # NOTE: overlap scheduling may make the request freed twice, skip second free
+                    if finished and req not in self.finished_reqs:
+                        self.decode_manager.remove_req(req)
+                        self._free_req_resources(req)
+                        new_finished_reqs.add(req)
+                    elif batch.is_prefill and req.table_idx != -1:
+                        # for prefill, non-chunk req, cache the prefix.
+                        # Polymorphic: the DSV4 naive manager keeps the request's slots (no-op);
+                        # the generic manager inserts the prefix into its radix/naive cache.
+                        # table_idx == -1 is defense-in-depth: aborts mark in-flight requests
+                        # instead of freeing them (handled above), so a freed request should
+                        # never reach this commit -- but if a future path frees one early, skip
+                        # rather than re-read the freed page-table row (and on hybrid, deref the
+                        # None'd GDN ping-pong slots).
+                        self.cache_manager.cache_req(req, finished=False)
 
         self.finished_reqs = new_finished_reqs
         # Stamp each reply with the post-batch KV page occupancy so the frontend (shell
@@ -499,9 +482,81 @@ class Scheduler(SchedulerIOMixin):
             page_size=self.config.page_size,
             mamba_slots=mamba_slots,
             swa_tokens=swa_tokens,
-            generated_tokens=len(reply) if batch.is_decode else None,
+            generated=generated,
         )
         self.send_result(reply)
+
+    def _drain_verify(self, batch: Batch, output, reply: List[DetokenizeMsg], new_finished_reqs: Set[Req]) -> int:
+        """Commit each request's accepted tokens, return the slots its rejected rows took, then the target state; returns the tokens committed."""
+        k = self.config.decode_rows_per_req - 1
+        counts, finished = [], []
+        now = time.perf_counter()
+        for i, req in enumerate(batch.reqs):
+            # spec forces normal_loop, which frees an aborted request between steps; overlap would need rollback_tail here and must not donate the GDN slot the verify rolled
+            assert not req.aborted, "a verify batch drained an aborted request"
+            cached = req.cached_len
+            emitted = int(output.emitted_cpu[i])
+            msg, n = self._commit_tokens(req, output.next_tokens_cpu[i, : emitted + 1])
+            # k drafts were proposed; the step hands _commit_tokens the emitted accepted
+            # drafts plus the target's own token, so when a stop lands on a draft every
+            # committed token is an accepted draft: count min(n, emitted), with n already
+            # post stop-truncation. Never exceeds predicted_n - 1: the request's first
+            # committed token came from prefill, outside every verify step.
+            req.stats.stamp_token(now)
+            req.stats.draft_n += k
+            req.stats.draft_n_accepted += min(n, emitted)
+            reply.append(msg)
+            if msg.finished:
+                msg.timings = req.stats.finish(req.input_ids.numel() - req.prompt_len)
+            req.commit_pending(n)
+            self.cache_manager.rollback_tail(req, req.cached_len, cached + k + 1)
+            counts.append(n)
+            if msg.finished:
+                finished.append(req)
+        # before any finish free: the hybrid finish donates the live GDN slot the commit writes
+        self.engine.commit_verify(batch.reqs, counts, output.next_tokens_gpu)
+        # the last committed token is pending at cached_len, like a decode step's sampled token
+        table, pos, last = torch.tensor(
+            [(r.table_idx, r.cached_len, n - 1) for r, n in zip(batch.reqs, counts)],
+            dtype=torch.int64, pin_memory=self.device.type == "cuda",
+        ).to(self.device, non_blocking=True).unbind(1)
+        self.token_pool[table, pos] = output.next_tokens_gpu.gather(1, last.unsqueeze(1)).squeeze(1).to(self.token_pool.dtype)
+        for req in finished:
+            self.decode_manager.remove_req(req)
+            self._free_req_resources(req)
+            new_finished_reqs.add(req)
+        return sum(counts)
+
+    def _commit_tokens(self, req: Req, tokens: torch.Tensor) -> Tuple[DetokenizeMsg, int]:
+        """Append sampled tokens in order until one finishes the request; returns the reply and how many tokens were committed."""
+        params = req.sampling_params
+        committed: List[int] = []
+        finished, finish_reason, matched_stop = False, None, None
+        for j in range(tokens.numel()):
+            req.append_host(tokens[j : j + 1])
+            token = int(tokens[j].item())
+            committed.append(token)
+            # EOS / stop-string -> "stop", output budget exhausted -> "length";
+            # EOS and stop strings win over length.
+            # Overlap can advance device_len one token ahead of this host reply.
+            hit_length = req.input_ids.numel() >= req.max_device_len
+            hit_eos = not params.ignore_eos and token in self.eos_token_ids
+            matched_stop = self._match_stop_str(req) if not hit_eos and params.stop_strs else None
+            if hit_length or hit_eos or matched_stop is not None:
+                finished = True
+                finish_reason = "stop" if (hit_eos or matched_stop is not None) else "length"
+                break
+            if token == self.toolcall_anchor_id and req.toolcall_anchor_len is None:
+                req.toolcall_anchor_len = req.input_ids.numel()
+        msg = DetokenizeMsg(
+            uid=req.uid,
+            next_tokens=committed,
+            finished=finished,
+            finish_reason=finish_reason,
+            matched_stop=matched_stop,
+            stop_strs=params.stop_strs or None,
+        )
+        return msg, len(committed)
 
     def _match_stop_str(self, req: Req) -> str | None:
         """First stop string present in this request's generated tail, else None. Decodes
@@ -709,6 +764,8 @@ class Scheduler(SchedulerIOMixin):
         # slots to two later requests. table_idx == -1 marks an already-freed request.
         if req.table_idx == -1:
             return
+        if self.spec is not None:
+            self.spec.release(req)
         # Polymorphic free: the DSV4 manager returns the request's window pages + cmp/idx blocks
         # to their tier free-lists; the generic manager frees its KV pages (it reads
         # page_table[req.table_idx], so free the table entry after).
@@ -898,13 +955,15 @@ class Scheduler(SchedulerIOMixin):
             logger.warning(f"could not log cache geometry: {e!r}")
 
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
+        if self.spec is not None and batch.is_decode:
+            batch.phase, batch.rows_per_req = "verify", self.config.decode_rows_per_req
         # spec_decode verify step: every request runs m rows (its token, then the drafts) -- allocation, positions,
         # input mapping and attention metadata see device_len + m - 1; the write/sampling side sees the real one.
         # Set before the padding: the graphs of m > 1 rows exist for the small batch sizes only.
         batch.spec_m = rows_for(batch.reqs) if batch.is_decode else 1
         self.engine.graph_runner.pad_batch(batch)
         self._forward_iter += 1
-        if batch.is_decode:
+        if not batch.is_prefill:
             # Free each decoding request's now-out-of-window SWA slots BEFORE the alloc below,
             # so they can back the new token -- this is what bounds the per-request swa
             # footprint during decode. (no-op unless the model is SWA / paged swa pool.)
@@ -917,6 +976,8 @@ class Scheduler(SchedulerIOMixin):
             # this chunk, so a chunked prompt longer than the swa pool never accumulates its
             # whole swa footprint (which would exhaust alloc_swa). No-op unless SWA/paged.
             self.cache_manager.free_swa_out_of_window_extend(batch.reqs)
+        # before the widening below, so the penalty check reads each request's real remain_len
+        sample_args = self.engine.sampler.prepare(batch)
         m = batch.spec_m
         # every decode step drafts (MTP) or verifies: rows and pages for the chained MTP guesses too, which write their
         # KV up to the step's last row + depth - 1 (both capped by what each request may still emit)
@@ -924,11 +985,18 @@ class Scheduler(SchedulerIOMixin):
         ahead = m - 1 + (max(draft_depth(batch.reqs, m) - 1, 0) if MTP_ENABLED and spec_reqs else 0)
         for req in spec_reqs:
             req.device_len += ahead
+        # widened after the window free above, whose threshold reads device_len
+        if batch.phase == "verify":
+            for req in batch.reqs:
+                req.widen_pending(batch.rows_per_req - 1)
         # Polymorphic page allocation: DSV4 allocates window pages + cmp/idx blocks into its
         # slot maps; the generic manager allocates KV pages into the page table.
         self.cache_manager.allocate_paged(batch.reqs)
         for req in spec_reqs:
             req.device_len -= ahead - (m - 1)
+        if batch.phase == "verify":
+            # the drafts run on the GPU while the host builds this batch's metadata below
+            self.spec.propose_into(batch.reqs, self.token_pool)
         staged = self._decode_step_inputs(batch)
         if staged is not None:
             # FREETOKEN_STEP_INPUTS: the same inputs staged in one buffer, written into the graph's by _forward's launch
@@ -939,7 +1007,7 @@ class Scheduler(SchedulerIOMixin):
             staged.stage_rows(batch, slots)
             for req in spec_reqs:
                 req.device_len -= m - 1
-            return ForwardInput(batch=batch, sample_args=self.engine.sampler.prepare(batch), input_tuple=None,
+            return ForwardInput(batch=batch, sample_args=sample_args, input_tuple=None,
                                 write_tuple=staged.stage_writes(batch))
         if batch.is_prefill:
             self._gather_multimodal(batch)
@@ -948,8 +1016,9 @@ class Scheduler(SchedulerIOMixin):
             batch.mrope_positions = _make_mrope_positions(batch, self.device)
         input_mapping = _make_input_tuple(batch, self.device)
         batch.out_loc = self.engine.page_table[input_mapping]
+        rows = rows_of(batch)  # rows per request: spec_decode's m, a verify's rows_per_req, 1 for a prefill
         if self.engine.linear_state_pool is not None:
-            if batch.is_decode:
+            if not batch.is_prefill:
                 # GPU GDN-state slot (one per padded request) for the decode gather/scatter;
                 # lands in the CUDA-graph input buffer via copy_from. Gate on the cache mode,
                 # NOT on whether any padded req has a linear_slot_idx -- the persistent dummy
@@ -965,22 +1034,23 @@ class Scheduler(SchedulerIOMixin):
                         slots, dtype=torch.int32, device="cpu", pin_memory=True
                     ).to(self.device, non_blocking=True)
                 else:
-                    batch.linear_table_idx = input_mapping[0][::m].to(torch.int32)  # one per request
+                    batch.linear_table_idx = input_mapping[0][::rows].to(torch.int32)  # one per request
             # Per-forward GDN metadata (cu_seqlens / cache_indices / continuation flags),
             # built once here instead of rebuilt in each of the 30 GDN layers. For decode
             # under CUDA graph the persistent cu_seqlens buffer is supplied by set_batch.
-            batch.fla_metadata = build_fla_metadata(batch, self.device)
-        if batch.is_decode:
+            self.engine.linear_backend.prepare_metadata(batch)
+        if not batch.is_prefill:
             # This batch's padded per-row page-table rows. Backends that snapshot the table for
             # a captured replay (DSV4) read them in prepare_metadata / prepare_for_replay.
-            batch.active_table_idx = input_mapping[0].view(-1)[::m]  # one row per request
+            batch.active_table_idx = input_mapping[0].view(-1)[::rows]  # one row per request
         self.engine.attn_backend.prepare_metadata(batch)
         for req in spec_reqs:
             req.device_len -= m - 1
-        write_mapping = _make_write_tuple(batch, self.device)
+        # a verify step's drain writes its pending token
+        write_mapping = None if batch.phase == "verify" else _make_write_tuple(batch, self.device)
         return ForwardInput(
             batch=batch,
-            sample_args=self.engine.sampler.prepare(batch),
+            sample_args=sample_args,
             input_tuple=input_mapping,
             write_tuple=write_mapping,
         )
@@ -1070,6 +1140,8 @@ class Scheduler(SchedulerIOMixin):
                 req.state_ahead = True
         if self.toolcall_anchor_id is not None and not batch.is_prefill:
             self.cache_manager.snapshot_toolcall_anchor(batch.reqs)
+        if batch.phase == "verify":
+            return self.spec.verify_step(batch, sample_args)
         forward_output = self.engine.forward_batch(batch, sample_args)
         if forward_output.n_acc_gpu is not None:
             # spec_decode verify step: the target's tokens after each row land at L+1..L+m (rows past n_acc are

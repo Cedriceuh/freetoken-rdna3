@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from freetoken.models.qwen4_exp.mtp import quantize_nvfp4
+from freetoken.models.qwen4_exp.mtp_head import quantize_nvfp4
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
