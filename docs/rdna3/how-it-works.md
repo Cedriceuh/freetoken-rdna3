@@ -15,7 +15,7 @@ usual on consumer boards): every exchange between them goes through system RAM.
 
 | Where | What |
 |---|---|
-| GPU VRAM | dense weights (int8) except the input embedding, the KV cache of the attention layers, the GDN recurrent states, and an **expert cache** filling everything else (on `xtx-xt`: 7.5k of the 24,576 experts, on each card) |
+| GPU VRAM | dense weights (int8) except the input embedding, the KV cache of the attention layers, the GDN recurrent states, and an **expert cache** filling everything else (on `xtx-xt`: 7.3k of the 24,576 experts, on each card) |
 | System RAM | **every expert** (~63 GiB, pinned; each rank holds its own share of every expert), the input embedding (1.2 GiB, a row per token read across PCIe), the PLE rows prefills read (a RAM cache, 0.12-0.17 GiB), conversations moved off the GPUs (the RAM tier), the ranks' exchange buffer |
 | Disk | the n-gram embedding tables, read row by row on demand (direct I/O, no page cache; a large fill over four io_uring rings) |
 
@@ -248,10 +248,10 @@ RAM: locked while serving;
 |---|---:|---:|---:|
 | download | 135 GB | 85 GB | 108 GB |
 | experts in RAM (without the MTP head's) | 63.3 GiB | 42.6 GiB | 56.7 GiB |
-| decode, `xtx-xt` / `xtx` / `xt` | 92-115 / 38-47 / 30-36 tok/s | 117-145 / 62-70 / 49-56 tok/s | 105-112 / 43-56 / 35-44 tok/s |
-| reading a new block, `xtx-xt` | 3100-4150 tok/s | 3470-3770 tok/s | 3200-3750 tok/s |
-| agent turn, first token, `xtx-xt` | 0.56-0.66 s | 0.44-0.46 s | 0.57-0.69 s |
-| RAM locked, `xtx-xt` / one card | 83 / 74 GiB | 62 / 53 GiB | 76 / 67 GiB |
+| decode, `xtx-xt` / `xtx` / `xt` | 107-133 / 45-54 / 36-42 tok/s | 134-168 / 67-74 / 52-58 tok/s | 118-128 / 46-59 / 36-45 tok/s |
+| reading a new block, `xtx-xt` | 3100-4020 tok/s | 3480-3770 tok/s | 3190-3740 tok/s |
+| agent turn, first token, `xtx-xt` | 0.56-0.65 s | 0.44-0.46 s | 0.57-0.69 s |
+| RAM locked, `xtx-xt` / one card | 83 / 74 GiB | 62 / 53 GiB | 75 / 67 GiB |
 | expert cache per card, `xtx-xt` | 7.3k | 10.1k | 7.5k |
 | agentic benchmark (29 bugs) | 12 and 18 (two runs) | 13 (one run) | 12 (one run) |
 

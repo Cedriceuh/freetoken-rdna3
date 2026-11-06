@@ -7,9 +7,9 @@ names another (all three checkpoints: [README](../../README.md#which-checkpoint)
 
 | Profile | GPUs | Context | Decode, MTP head on (off) | Deep decode, greedy | Cold 8.3k prompt | Agent turn | At once |
 |---|---|---:|---:|---:|---:|---:|---:|
-| `xtx-xt` | RX 7900 XTX 24 GB + RX 7900 XT 20 GB | 262,144 | 106.2 (73.1) tok/s | 92-115 (66-74) tok/s | 2.35 s | 0.56-0.66 s | 4 requests |
-| `xtx` | RX 7900 XTX 24 GB | 131,072 | 47.9 (42.2) tok/s | 38-47 (34-42) tok/s | 3.52 s | 1.19-1.28 s | 1 request |
-| `xt` | RX 7900 XT 20 GB | 131,072 | 37.7 (34.4) tok/s | 30-36 (28-33) tok/s | 3.80 s | 1.31-1.40 s | 1 request |
+| `xtx-xt` | RX 7900 XTX 24 GB + RX 7900 XT 20 GB | 262,144 | 122.1 (78.7) tok/s | 107-133 (72-80) tok/s | 2.36 s | 0.56-0.65 s | 4 requests |
+| `xtx` | RX 7900 XTX 24 GB | 131,072 | 54.9 (46.0) tok/s | 45-54 (38-46) tok/s | 3.52 s | 1.18-1.28 s | 1 request |
+| `xt` | RX 7900 XT 20 GB | 131,072 | 42.9 (37.7) tok/s | 36-42 (31-37) tok/s | 3.83 s | 1.31-1.40 s | 1 request |
 | `xtx-xtx` *(untested)* | 2x RX 7900 XTX 24 GB | 262,144 | expected >= `xtx-xt` | – | – | – | 4 requests |
 | `xt-xt` *(untested)* | 2x RX 7900 XT 20 GB | 262,144 | expected a little below `xtx-xt` | – | – | – | 4 requests |
 | `gre` *(untested)* | RX 7900 GRE 16 GB | 65,536 | expected ~20 tok/s at best (head off) | – | – | – | 1 request |

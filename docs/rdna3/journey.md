@@ -2855,6 +2855,18 @@ the merge's on 2 of 6 with each (the hybrid answers move with the expert cache's
 suite on each card: 5,023 passed on the XTX and 5,022 on the XT, the failures the ones of the build before (9, and
 `test_qsa_hf`'s borderline tolerance on the XT).
 
+The release figures and the banner measured again on the merge's image, as at the last measure (section 43): one server
+per row started by `rdna3/serve.sh` with the profile as shipped, the first of each checkpoint and card count run once
+before to fill the kernel cache, 18 servers, no GPU fault. Greedy decode from 9k to the maximum context, against that
+measure: `xtx-xt` NVFP4 107-133 tok/s (92-115), EXL3 3.05 bpw 134-168 (117-145), 4.05 bpw 118-128 (105-112); `xtx`
+NVFP4 45-54 (38-47), EXL3 67-74 (62-70) and 46-59 (43-56); `xt` NVFP4 36-42 (30-36), EXL3 52-58 (49-56) and 36-45
+(35-44); one request at `rdna3/serve.sh`'s sampling on `xtx-xt` 122.1 tok/s (106.2), 78.7 without the head (73.1). The
+decode work of sections 44 to 48 is in between; reading a new block, the cold read and the agent turns are where they
+were (NVFP4 `xtx-xt` 3100-4020 tok/s, 2.36 s, 0.56-0.65 s). The banner's full track went from 150 to 175 tok/s. The
+first `xtx --no-mtp` server decoded its 15 answers at 29.8-32.9 tok/s for four minutes, then at the expected speed
+(43.5 in `quick_bench.py` right after, 38-46 along its sweep); a second server gave 46.0 and 47.1 from its start. The
+first `xt --no-mtp` server of the last measure did the same at 24.6 tok/s; not explained.
+
 ## 50. Still open
 
 - In NVFP4 the model needs ~63 GiB of RAM for its experts alone (the engine keeps every expert in RAM). The EXL3 3.05
@@ -2886,7 +2898,11 @@ suite on each card: 5,023 passed on the XTX and 5,022 on the XT, the failures th
   benchmarks. One on 2026-11-06 at the first request of a start (NVFP4, the XT, a write, section 48's first build with
   the hyper-connection's projections in one launch); the next start under the debug agent, the 15 after it and a
   20-minute soak were clean. One the same day at a load, a first (section 49: the copy engine, while the int8
-  conversion read the dense weights back); the 30 starts after it were clean.
+  conversion read the dense weights back); the 30 starts after it were clean, and the 19 servers of the release measure
+  after them (section 49).
+- A one-card `--no-mtp` server decoding ~30 % below its speed for its first minutes, then at it: 2 of the 7 such
+  servers of the last two release measures (sections 43 and 49), the next start each time normal from its first
+  answer; not explained.
 - Expert misses (section 20): the decode GEMVs now read them from host memory while computing the cached experts
   (section 38), a program's rows copied whole first (section 45), so their PCIe time shows where it exceeds that work
   (a layer's GEMVs at one request, EXL3: 40.5 µs against 32.5 when the copy came first, the copy 34.6 -> 4.2 µs).

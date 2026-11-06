@@ -22,7 +22,7 @@ What the server locks after its start (the growth of the kernel's `Mlocked` coun
 
 | | NVFP4 | EXL3 3.05 bpw | EXL3 4.05 bpw |
 |---|---:|---:|---:|
-| two cards, the K/V in VRAM (`xtx-xt`) | 83 GiB | 62 GiB | 76 GiB |
+| two cards, the K/V in VRAM (`xtx-xt`) | 83 GiB | 62 GiB | 75 GiB |
 | one card (`xtx`, `xt`) | 74 GiB | 53 GiB | 67 GiB |
 
 1.2 GiB of each is the input embedding kept in RAM rather than VRAM (`FREETOKEN_EMBED_HOST`) and a RAM cache of the PLE
