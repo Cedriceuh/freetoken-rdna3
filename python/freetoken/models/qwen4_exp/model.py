@@ -64,6 +64,35 @@ def build_linear_mixer(config: ModelConfig, layer_id: int, prefix: str) -> BaseO
 # block's, the next layer's attention block's, the final mixer's) in one kernel, the same arithmetic in the same order
 # (same bits), two launches fewer per layer; 0 keeps them apart
 _FUSED_HC_NORM = os.environ.get("FREETOKEN_FUSED_HC_NORM", "1") == "1"
+# FREETOKEN_HOST_AR_HC_COMBINE (default 1): with the host all-reduce, a decode step's combine + RMSNorm after a block
+# runs in the launch of the block's closing all-reduce (distributed/impl.py HC_COMBINE): the same arithmetic, one launch
+# fewer a block
+_AR_HC_COMBINE = os.environ.get("FREETOKEN_HOST_AR_HC_COMBINE", "1") == "1"
+
+
+def _block_then_combine_norm(block, x: torch.Tensor, hidden: torch.Tensor, inject: torch.Tensor,
+                             hc: GatedResidual, nxt: GatedResidual):
+    """``block(x)``, then ``hc.combine_norm(hidden, out, inject, nxt)``: ``(hidden', normed)``. Under
+    FREETOKEN_HOST_AR_HC_COMBINE the block's closing all-reduce applies the combine and the norm; any other case runs
+    combine_norm after it."""
+    from freetoken.distributed import impl
+
+    rows = x.shape[0]
+    ctx = None
+    if (_AR_HC_COMBINE and _HC_INPLACE and 1 <= rows <= 16 and hidden.dtype is torch.bfloat16 and hidden.is_contiguous()
+            and inject is not None and nxt.hc_norm.weight.dtype is torch.bfloat16):
+        ctx = {"res": hidden, "inj": inject, "w": nxt.hc_norm.weight, "eps": nxt.hc_norm.eps, "rows": rows,
+               "hidden": hidden.shape[1] // hc.hc_count}
+        impl.HC_COMBINE[0] = ctx
+    try:
+        out = block(x)
+    finally:
+        impl.HC_COMBINE[0] = None
+    if ctx is not None and "rn" in ctx:
+        assert ctx["x"].data_ptr() == out.data_ptr() and ctx["x"].shape == out.shape, \
+            "the combine went to an all-reduce that is not the block's output"
+        return hidden, ctx["rn"]
+    return hc.combine_norm(hidden, out, inject, nxt)
 
 
 def _add_ple(hidden: torch.Tensor, ple: PLELayer, batch: Batch) -> torch.Tensor:
@@ -123,17 +152,17 @@ class Qwen4ExpDecoderLayer(BaseOP):
             block_input, inject = self.attn_hyper_connection.mix_normed(normed)
         del normed
         if self._is_linear:
-            block_output = self.linear_attn.forward(block_input)
+            attn = self.linear_attn.forward
         else:
-            block_output = self.self_attn.forward(block_input, batch)
-        hidden, normed = self.attn_hyper_connection.combine_norm(hidden, block_output, inject, self.mlp_hyper_connection)
-        del block_output
+            attn = lambda x: self.self_attn.forward(x, batch)  # noqa: E731
+        hidden, normed = _block_then_combine_norm(attn, block_input, hidden, inject, self.attn_hyper_connection,
+                                                  self.mlp_hyper_connection)
         block_input, inject = self.mlp_hyper_connection.mix_normed(normed)
         del normed
-        mlp_output = self.mlp.forward(block_input)
         if nxt is None:
-            return self.mlp_hyper_connection.combine(hidden, mlp_output, inject)
-        hidden, normed = self.mlp_hyper_connection.combine_norm(hidden, mlp_output, inject, nxt)
+            return self.mlp_hyper_connection.combine(hidden, self.mlp.forward(block_input), inject)
+        hidden, normed = _block_then_combine_norm(self.mlp.forward, block_input, hidden, inject,
+                                                  self.mlp_hyper_connection, nxt)
         carry.append(normed)
         return hidden
 

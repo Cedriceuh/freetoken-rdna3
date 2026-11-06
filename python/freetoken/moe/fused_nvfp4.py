@@ -25,6 +25,11 @@ logger = init_logger(__name__)
 
 # set by a caller that sums the decode experts' outputs itself (one element: mutable, read at call time)
 PER_EXPERT_OUTPUT = [False]
+# FREETOKEN_NVFP4_DECODE_EPILOGUE: (shared, gate) set by the caller for the next decode call, whose down projection
+# kernel then also applies the layer's epilogue (shared_gate_sum_mul_add) and returns its result; EPILOGUE_APPLIED
+# says whether it did (the caller runs the epilogue otherwise)
+DECODE_EPILOGUE: list = [None]
+EPILOGUE_APPLIED: list = [False]
 
 # the launches live in kernel/nvfp4_moe.py; the RDNA3 benches and tests call them by these names
 SKIP_CPU_ROUTES = nvfp4_moe.SKIP_CPU_ROUTES
@@ -93,6 +98,14 @@ def _fused_experts_decode_nvfp4(
         )
         gated_act_and_mul(activation, ic1.view(-1, two_i), ic2, alpha=act_alpha, limit=act_limit)
     ic3 = torch.empty((M, top_k, H), device=dev, dtype=dt)
+    epi, DECODE_EPILOGUE[0] = DECODE_EPILOGUE[0], None
+    if epi is not None and PER_EXPERT_OUTPUT[0] and gemm_fn is _decode_gemm_marlin:
+        out = torch.empty((M, H), device=dev, dtype=dt)
+        EPILOGUE_APPLIED[0] = bool(gemm_fn(
+            ic2, down_packed, down_scale, down_global,
+            ic3, topk_weights, topk_ids, not apply_router_weight_on_input, True, **dn_miss, epilogue=(*epi, out),
+        ))
+        return out if EPILOGUE_APPLIED[0] else ic3
     gemm_fn(
         ic2, down_packed, down_scale, down_global,
         ic3, topk_weights, topk_ids, not apply_router_weight_on_input, True, **dn_miss,

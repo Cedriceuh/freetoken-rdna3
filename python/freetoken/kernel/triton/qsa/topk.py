@@ -34,6 +34,8 @@ import torch
 import triton
 import triton.language as tl
 
+from .expand import _expand_row
+
 # 5-bit digits beat 8-bit ones here: tl.histogram cost grows faster with the bin count than the
 # extra passes cost. 35 bits of digit cover the 32-bit key, the top pass just sees zero bits.
 _RADIX = 5
@@ -44,12 +46,18 @@ _MAX_BLOCK_N = 4096
 # phases stay resident; past 8192 the tile spills (255 registers) and that reverses.
 _MAX_RESIDENT = 8192
 _MIN_CHUNK = 4096
-# FREETOKEN_QSA_TOPK_DECODE_WARPS (default 16; 0 = 8 as for more rows): the split path's programs for up to 16 rows (a
-# decode step's) at 16 warps instead of 8. The same winners (an exact selection). A decode call's top-k of 512 among
-# 20-65k columns, 4 rows: 32.3-34.4 -> 25.4-27.8 us on a 7900 XTX, 38.3-41.0 -> 30.3-34.4 on a 7900 XT; at 1024 rows
-# (a prefill chunk) 16 warps are ~6 % slower, so more rows keep 8
-_DECODE_WARPS = int(os.environ.get("FREETOKEN_QSA_TOPK_DECODE_WARPS", "16")) or 8
+# FREETOKEN_QSA_TOPK_DECODE_WARPS (default 32; 0 = 8 as for more rows): the split path's programs for up to 16 rows (a
+# decode step's) at 32 warps instead of 8. The same winners (an exact selection). A decode call's top-k of 512 among
+# 20-65k columns, 4 rows: 32.3-34.4 -> 25.4-27.8 us on a 7900 XTX at 16 warps, 38.3-41.0 -> 30.3-34.4 on a 7900 XT; at
+# 32 warps, traced in serving after a 255k read, the split and merge 0.49 -> 0.37 ms a step (XTX), 0.52 -> 0.39 (XT); at
+# 1024 rows (a prefill chunk) 16 warps are ~6 % slower than 8, so more rows keep 8
+_DECODE_WARPS = int(os.environ.get("FREETOKEN_QSA_TOPK_DECODE_WARPS", "32")) or 8
 _DECODE_ROWS = 16
+# FREETOKEN_QSA_TOPK_EXPAND (default 1): the program that emits a row's top-k blocks (the merge, or the one-program
+# kernel) also expands them into the row's token indices, expand_qsa_block_indices' code on the blocks it just stored:
+# the same indices, one launch fewer a QSA layer
+_TOPK_EXPAND = os.environ.get("FREETOKEN_QSA_TOPK_EXPAND", "1") != "0"
+_EXPAND_BLOCK = 1024
 
 
 @triton.jit
@@ -178,6 +186,18 @@ def _emit_candidates(
     return above + tl.minimum(equal, ties)
 
 
+
+@triton.jit
+def _expand_epilogue(out_ptr, stride_out_row, row, exp_pos_ptr, exp_seq_ptr, exp_t2r_ptr, exp_out_ptr, stride_exp_out,
+                     rows, num_requests, TOP_K: tl.constexpr, COMPRESS_RATIO: tl.constexpr,
+                     OUTPUT_WIDTH: tl.constexpr, EXPAND_BLOCK: tl.constexpr):
+    """FREETOKEN_QSA_TOPK_EXPAND: once every thread of the program has stored the row's blocks, its token indices."""
+    tl.debug_barrier()
+    for c0 in tl.static_range(0, OUTPUT_WIDTH, EXPAND_BLOCK):
+        _expand_row(out_ptr, exp_pos_ptr, exp_seq_ptr, exp_t2r_ptr, exp_out_ptr, row.to(tl.int64),
+                    c0 + tl.arange(0, EXPAND_BLOCK), stride_out_row, 1, stride_exp_out, 1, rows, num_requests, TOP_K,
+                    COMPRESS_RATIO, OUTPUT_WIDTH, VOLATILE=True)
+
 @triton.jit
 def _qsa_block_topk_kernel(
     logits_ptr,
@@ -193,6 +213,17 @@ def _qsa_block_topk_kernel(
     BINS: tl.constexpr,
     RADIX: tl.constexpr,
     PASSES: tl.constexpr,
+    exp_pos_ptr=None,
+    exp_seq_ptr=None,
+    exp_t2r_ptr=None,
+    exp_out_ptr=None,
+    stride_exp_out=0,
+    exp_rows=0,
+    exp_requests=0,
+    EXPAND: tl.constexpr = False,
+    COMPRESS_RATIO: tl.constexpr = 1,
+    OUTPUT_WIDTH: tl.constexpr = 1,
+    EXPAND_BLOCK: tl.constexpr = 1024,
 ) -> None:
     row = tl.program_id(0)
     limit = tl.maximum(tl.minimum(tl.load(visible_ptr + row), num_columns), 0)
@@ -246,6 +277,9 @@ def _qsa_block_topk_kernel(
 
     pad = tl.arange(0, PAD_K)
     tl.store(out_row + pad, -1, mask=(pad >= emitted) & (pad < TOP_K))
+    if EXPAND:
+        _expand_epilogue(out_ptr, stride_out_row, row, exp_pos_ptr, exp_seq_ptr, exp_t2r_ptr, exp_out_ptr,
+                         stride_exp_out, exp_rows, exp_requests, TOP_K, COMPRESS_RATIO, OUTPUT_WIDTH, EXPAND_BLOCK)
 
 
 @triton.jit
@@ -413,6 +447,17 @@ def _qsa_topk_merge_kernel(
     BINS: tl.constexpr,
     RADIX: tl.constexpr,
     PASSES: tl.constexpr,
+    exp_pos_ptr=None,
+    exp_seq_ptr=None,
+    exp_t2r_ptr=None,
+    exp_out_ptr=None,
+    stride_exp_out=0,
+    exp_rows=0,
+    exp_requests=0,
+    EXPAND: tl.constexpr = False,
+    COMPRESS_RATIO: tl.constexpr = 1,
+    OUTPUT_WIDTH: tl.constexpr = 1,
+    EXPAND_BLOCK: tl.constexpr = 1024,
 ) -> None:
     """Phase 2: one program per row over the candidates the last level ``LEVEL`` left behind."""
     row = tl.program_id(0)
@@ -454,6 +499,9 @@ def _qsa_topk_merge_kernel(
 
     pad = tl.arange(0, PAD_K)
     tl.store(out_row + pad, -1, mask=(pad >= emitted) & (pad < TOP_K))
+    if EXPAND:
+        _expand_epilogue(out_ptr, stride_out_row, row, exp_pos_ptr, exp_seq_ptr, exp_t2r_ptr, exp_out_ptr,
+                         stride_exp_out, exp_rows, exp_requests, TOP_K, COMPRESS_RATIO, OUTPUT_WIDTH, EXPAND_BLOCK)
 
 
 @dataclass(frozen=True)
@@ -494,13 +542,18 @@ def qsa_block_topk(
     visible: torch.Tensor,
     out: torch.Tensor,
     scratch: torch.Tensor | None = None,
-) -> torch.Tensor:
+    expand: tuple | None = None,
+) -> bool:
     """Top ``out.shape[1]`` columns of every ``logits`` row below ``visible``, -1 padded.
 
     Winners come out in ascending column order, packed at the front of the row; a row with
     fewer live columns than the width, and any column scored -inf, leaves -1 in the tail.
     ``scratch`` is the candidate workspace of the split path (see
-    ``qsa_block_topk_scratch_width``); it is allocated per call when the caller passes none."""
+    ``qsa_block_topk_scratch_width``); it is allocated per call when the caller passes none.
+
+    ``expand``: ``(query_positions, sequence_lengths, token_to_req, compress_ratio, token_topk, indices)``, the
+    arguments of ``expand_qsa_block_indices`` (``out`` its blocks): under FREETOKEN_QSA_TOPK_EXPAND the last kernel
+    also writes ``indices``. Returns whether it did."""
 
     if logits.ndim != 2 or out.ndim != 2:
         raise ValueError("QSA block top-k takes 2-D logits and output")
@@ -513,9 +566,18 @@ def qsa_block_topk(
     rows, columns = logits.shape
     top_k = out.shape[1]
     if not rows or not top_k:
-        return out
+        return False
     pad_k = triton.next_power_of_2(top_k)
     plan = _split_plan(columns, top_k)
+    exp = {}
+    if expand is not None and _TOPK_EXPAND:
+        positions, seq_lens, token_to_req, ratio, token_topk, indices = expand
+        width = token_topk + ratio - 1
+        assert token_topk == top_k * ratio and indices.shape == (rows, width) and indices.stride(1) == 1
+        assert positions.shape[0] == rows and token_to_req.shape[0] == rows and out.stride(1) == 1
+        exp = dict(exp_pos_ptr=positions, exp_seq_ptr=seq_lens, exp_t2r_ptr=token_to_req, exp_out_ptr=indices,
+                   stride_exp_out=indices.stride(0), exp_rows=rows, exp_requests=seq_lens.shape[0], EXPAND=True,
+                   COMPRESS_RATIO=ratio, OUTPUT_WIDTH=width, EXPAND_BLOCK=_EXPAND_BLOCK)
     if plan is None:
         block_n = min(_MAX_BLOCK_N, triton.next_power_of_2(max(columns, 1)))
         _qsa_block_topk_kernel[(rows,)](
@@ -534,8 +596,9 @@ def qsa_block_topk(
             PASSES=_PASSES,
             num_warps=8,
             num_stages=1,
+            **exp,
         )
-        return out
+        return bool(exp)
 
     warps = _DECODE_WARPS if rows <= _DECODE_ROWS else 8
     width = 2 * top_k * sum(plan.levels)
@@ -627,8 +690,9 @@ def qsa_block_topk(
         PASSES=_PASSES,
         num_warps=warps,
         num_stages=1,
+        **exp,
     )
-    return out
+    return bool(exp)
 
 
 __all__ = ["qsa_block_topk", "qsa_block_topk_scratch_width"]

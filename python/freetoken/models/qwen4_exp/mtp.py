@@ -112,6 +112,19 @@ class Qwen4ExpMTP(BaseOP):
         if kv_only and _KV_ONLY_STOP:
             layer.self_attn.forward(block_input, batch, kv_only=True)
             return None
+        from .model import _FUSED_HC_NORM, _block_then_combine_norm
+
+        if _FUSED_HC_NORM and x.is_cuda and not kv_only:
+            # FREETOKEN_FUSED_HC_NORM in the head too: each combine with the norm the next mix starts from, in the
+            # block's closing all-reduce under FREETOKEN_HOST_AR_HC_COMBINE: the same bits as combine then mix
+            x, normed = _block_then_combine_norm(lambda bi: layer.self_attn.forward(bi, batch), block_input, x, inject,
+                                                 layer.attn_hyper_connection, layer.mlp_hyper_connection)
+            if keep is not None:
+                x, normed = x.index_select(0, keep), normed.index_select(0, keep)
+            block_input, inject = layer.mlp_hyper_connection.mix_normed(normed)
+            x, normed = _block_then_combine_norm(layer.mlp.forward, block_input, x, inject, layer.mlp_hyper_connection,
+                                                 self.hyper_connection_mixer)
+            return self.hyper_connection_mixer.mix_normed(normed)[0], x
         x = layer.attn_hyper_connection.combine(x, layer.self_attn.forward(block_input, batch), inject)
         if kv_only:
             return None

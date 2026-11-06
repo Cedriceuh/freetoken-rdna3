@@ -776,6 +776,7 @@ def _exl3_out_kernel(
     c_ptr, slot_ptr, svh_ptr, w_ptr, h_ptr, out_ptr,
     T, SPLITS, stride_cs, stride_cr, stride_vs, stride_wt, stride_ot,
     TOP_K: tl.constexpr, BK: tl.constexpr, BT: tl.constexpr, CB: tl.constexpr, PRECISE: tl.constexpr, HOIST: tl.constexpr,
+    EPI: tl.constexpr = False, shared_ptr=None, gate_ptr=None, stride_sh=0,
 ):
     """out[t, b] = sum_k w[t, k] * (H(y[route t,k]) * svh_down[slot])[b-block], for BT tokens and CB 128-blocks
     (their BT * BK route rows share one tl.dot tile; BK pads top_k)."""
@@ -799,6 +800,15 @@ def _exl3_out_kernel(
         y = _had(y, hm, HOIST, PRECISE) * tl.load(svh_ptr + slot[:, None] * stride_vs + cols[None, :], mask=rm[:, None],
                                               other=0.0).to(tl.float32)
         o = tl.sum(tl.reshape(y, (BT, BK, 128)) * w[:, :, None], axis=1)
+        if EPI:
+            # FREETOKEN_EXL3_DECODE_EPILOGUE: moe_shared_gate.py's epilogue for one summed row, as it computes it:
+            # the routed row as stored, added onto 0 (a -0 becomes +0), then routed + gate * shared
+            rt = o.to(out_ptr.dtype.element_ty).to(tl.float32)
+            rt = tl.where(rt == 0.0, 0.0, rt)
+            g = tl.load(gate_ptr + tm, mask=tm < T, other=0.0)
+            sh = tl.load(shared_ptr + tm[:, None].to(tl.int64) * stride_sh + cols[None, :], mask=(tm < T)[:, None],
+                         other=0.0).to(tl.float32)
+            o = rt + g[:, None] * sh
         tl.store(out_ptr + tm[:, None].to(tl.int64) * stride_ot + cols[None, :], o.to(out_ptr.dtype.element_ty),
                  mask=(tm < T)[:, None])
 
@@ -942,8 +952,10 @@ def exl3_mid(c: torch.Tensor, slots: torch.Tensor, gate_up_svh: torch.Tensor, do
 
 def exl3_out(c: torch.Tensor, slots: torch.Tensor, down_svh: torch.Tensor, topk_weights: torch.Tensor,
              out: torch.Tensor, *, precise: bool = True, tokens: int | None = None, num_warps: int = 4,
-             blocks: int | None = None, hoist: bool | None = None, num_stages: int | None = None) -> torch.Tensor:
-    """``out [T, H]`` = routed sum of the rotated-out down products ``c`` ``[splits, T*top_k, H]``."""
+             blocks: int | None = None, hoist: bool | None = None, num_stages: int | None = None,
+             epilogue: tuple[torch.Tensor, torch.Tensor] | None = None) -> torch.Tensor:
+    """``out [T, H]`` = routed sum of the rotated-out down products ``c`` ``[splits, T*top_k, H]``; ``epilogue``
+    (shared [T, H], gate [T] fp32): ``shared_gate_sum_mul_add``'s result on that sum instead, the same bits."""
     splits, R, H = c.shape
     T, top_k = topk_weights.shape
     assert R == T * top_k and H % 128 == 0 and out.shape == (T, H)
@@ -958,6 +970,8 @@ def exl3_out(c: torch.Tensor, slots: torch.Tensor, down_svh: torch.Tensor, topk_
         T, splits, c.stride(0), c.stride(1), down_svh.stride(0), topk_weights.stride(0), out.stride(0),
         TOP_K=top_k, BK=BK, BT=BT, CB=cb, PRECISE=precise, HOIST=cb > 1 if hoist is None else hoist,
         num_warps=num_warps, **({} if num_stages is None else {"num_stages": num_stages}),
+        **({} if epilogue is None else {"EPI": True, "shared_ptr": epilogue[0], "gate_ptr": epilogue[1],
+                                        "stride_sh": epilogue[0].stride(0)}),
     )
     return out
 

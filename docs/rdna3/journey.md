@@ -2068,7 +2068,7 @@ measured against this build on `xtx-xt-4x262k` with a 300k-token pool, EXL3 3.05
   copies take 0.72-0.79 s whatever the length and every layer's copy ends before the compute stream reaches its wait
   (the same clock for both streams); a read takes 0.72 s at 1.6-1.7k tokens, as long as its copies, then 0.84 s at
   2.2k and 1.18-1.22 s at 3.5-4k. Reading each layer's experts once for a whole read would not shorten it.
-- **A long read's chunk on both cards** (section 47 has rank 0's parts in NVFP4). The same read, one 16k-token chunk
+- **A long read's chunk on both cards** (section 48 has rank 0's parts in NVFP4). The same read, one 16k-token chunk
   at 16-96k of context (XTX / XT): routed experts 1.79 / 1.56 s, after which the XT waits 0.35 s for the XTX's
   all-reduces (the XTX 0.16 s); the sparse attention kernel 0.69 / 0.77 s over the 12 attention layers (each query row
   gathers its 2048 selected keys and values), after which the XTX waits ~0.1 s more in the output projection's
@@ -2571,9 +2571,235 @@ with the K/V in RAM; bit-exact).
   (slower), 4-, 6- or 8-bit digits (no better), a 32-warp split with an 8-warp merge (27.2-29.8 µs on the XTX, 31.6-34.6
   on the XT: close; not taken further).
 - **Starts.** 2 of the ~85 server starts of the night failed while loading the weights (an illegal address, `sq_intr`
-  errors on one card), before any attention ran, one of them with the cache off: the rare start fault of section 47.
+  errors on one card), before any attention ran, one of them with the cache off: the rare start fault of section 48.
 
-## 47. Still open
+## 47. Near the window, the router and the indexer's scoring for a decode step, EXL3's epilogue, lane moves (2026-11-02 and 03)
+
+The long-context numbers of the sections before were taken at 170-192k, the size of the test document then, not a
+choice: this section measures near the window (a 255,030-token read, a ~1.2k-token turn and their answers inside
+262,144), on a corpus frozen for the night (the documentation and the engine's sources, cut by the tokenizer at 255k,
+192k and 120k), so that editing the docs no longer changes the prompts.
+
+- **Section 46's cache and top-k at 255k** (both on against both off, one pair a checkpoint, the same answers): NVFP4
+  121.2 -> 129.5 tok/s mid-answer (+6.9 %), the next turn 138.4 -> 145.0 (+4.8 %); EXL3 3.05 133.4 -> 142.7 (+7.0 %), the
+  next turn's short answer 97.0 -> 100.9; short prompts unchanged. The read takes 61.7-63.2 s (NVFP4), 70.7 s (EXL3).
+- **Where a step goes after a 255k read** (NVFP4, one request, a 700-token answer about the code, 48 traced steps):
+  27.75 ms. The routed experts' GEMVs 10.1 ms on the XTX (8.7 on the XT), the int8 dense GEMVs 2.4, the host
+  all-reduces 1.8-2.0 (most of it one card waiting for the other), the hyper-connections ~2, the context's kernels ~2.1
+  (the sparse attention 0.58-0.66 ms, its rows' copy 0.39, the indexer's scoring 0.47-0.57, its top-k 0.50-0.53), the
+  gaps between launches 4.3-4.5. The same prompt on a 1k-token document: 25.45 ms a step, the experts 9.0 ms: most of
+  the experts' time is this kind of text's misses, the context adds ~1 ms there. EXL3 3.05 after the 255k read: 24.27
+  ms a step.
+- **After a long read the expert cache misses more** (`--moe-collect-stats`): 82.8 % hits and 4.4 misses a
+  layer-step over the first decode interval after the 255k read, 89-94 % and 1.2-3.0 on short prompts, back within tens
+  of steps. A staged prefill borrows the cache's first 1,024 slots (11 % of 9,077) for its whole-layer buffers and
+  clears them: ~1.5 GB to fetch again after a long read, ~60 ms once at 25 GB/s (estimated, not timed). Not worth
+  changing.
+- **The indexer's scoring of a decode step's rows together** (`FREETOKEN_QSA_SCORE_DECODE_ROWS`, kept): the one-row
+  kernel read each layer's compressed keys once per verify row; section 33's multi-row kernel (the same bits as the
+  one-row one) now takes a decode step's rows of one request, 4 a program (2 tiles, one stage, 4 warps). 4 rows 255k
+  deep, 12 layers: 37.3 -> 29.6 µs a call on the XTX, 47.1 -> 35.1 on the XT, the same logits. In serving at 255k
+  (measured with the router's 2-row-slice HIP version below, which gave nothing at short context): +0.6 % decode
+  (NVFP4), +0.8 % (EXL3), the same answers.
+- **The router | shared gate-up launch in HIP** (`FREETOKEN_ROUTER_SHARED_HIP`, kept). Triton's layouts read from the
+  production kernel cache (an offline compile, without the runtime's divisibility hints, showed one byte a lane, a
+  misleading layout), the sums reproduced: the router's 8-column trees over 16 lanes and its four splits in order, the
+  gate | up's 16-column trees over 32 lanes at the K-blocked tile (NVFP4) and the one-pass tile (EXL3); the same bits at
+  the first try. Versions: one block a Triton tile with every load hoisted spilled (up to 190 registers) and ran 2.5x
+  slower at 4 rows; the router in 2-row slices with the gate and the up on their own warps ran faster in a
+  microbenchmark but not in serving, where its 4-row variant still spilled; at 3-4 rows two warps a weight row, no spill
+  (207 registers). Cold (rocprof, a 128 MB write between layers): 4 rows 18.9 -> 13.9 µs on the XTX, 22.0 -> 15.2 on the
+  XT; 1 row 15.0 -> 13.0 / 15.8 -> 14.2. Traced in serving: 0.68 -> 0.53 ms a step on the XTX, 0.75 -> 0.68 on the XT.
+- **The lanes' sums by DPP** in the HIP kernels of section 44 (kept, no switch: the same additions): HIP's `__shfl_xor`
+  goes through `ds_bpermute` (the LDS), Triton's reductions through DPP row moves and `permlanex16`. Attention qkv at 4
+  rows 27.3 -> 25.6 µs on the XTX, 31.9 -> 30.0 on the XT; traced in serving the hyper-connection kernels 1-5 % and qkv
+  3.5-4.7 % shorter.
+- **The three together against the build before them** (`xtx-xt-4x262k`, the same answers in every arm): NVFP4 short
+  prompts 139.5 / 139.0 -> 140.0 / 140.2 tok/s greedy (+0.4 / +0.9 %, two pairs), 135.1 / 135.0 -> 135.8 / 136.2 at T 0.6;
+  after the 255k read 130.1 -> 130.9 mid-answer (+0.7 %), the next turn 145.9 -> 147.0 (+0.7 %); EXL3 3.05 147.3 -> 148.7
+  greedy (+1.0 %), 144.7 -> 146.0 at T 0.6, after the read 143.1 -> 145.2 (+1.5 %, one pair). With the epilogue below
+  too, two agents on one 120k document (two passes a side, the same answers): NVFP4 70.7 / 72.8 -> 71.5 / 73.9 tok/s each
+  (+1.2 / +1.5 %), EXL3 85.4 / 88.7 -> 86.3 / 89.9 (+1.0 / +1.3 %).
+- **EXL3's epilogue in the kernel that sums the routes** (`FREETOKEN_EXL3_DECODE_EPILOGUE`, kept): with EXL3 the routed
+  sum is already one row a token when the epilogue runs, so the kernel that sums the routes applies it (the row as
+  stored, added onto 0, then routed + gate x shared, a multiply and an add); the gate, a 16-warp sum in the Triton
+  epilogue, comes from one more block a row of the HIP router launch, the 16 warps' tree emulated (the same bits as
+  `shared_gate_sigmoid` on every test). One pair, the same answers: 148.7 -> 150.1 tok/s greedy (+1.0 %), 146.0 -> 147.5
+  at T 0.6, after the 255k read 144.9 -> 146.4 mid-answer (+1.1 %); a 10-minute soak (three sessions) 297 requests, none
+  failed.
+- **NVFP4's epilogue in its down projection's kernel** (`FREETOKEN_NVFP4_DECODE_EPILOGUE`, kept). NVFP4's routes come
+  out of separate programs, one a route and block of rows, so the sum cannot run in one of them as EXL3's does: each
+  program stores its rows, then the last of a token's ten over the same rows (an atomic counter after a barrier, the
+  others' rows read back from L2, the counter reset by that program) adds them in order, rounds, and computes routed +
+  gate x shared, the gate from the HIP router launch. One launch fewer a layer (1,234 -> 1,183 kernels a step), the
+  down GEMV 2 µs longer a call: traced 25.29 -> 24.97 ms a step. Two pairs, the same answers: +0.9 / +0.9 % greedy,
+  +0.9 / +0.9 % at T 0.6, after the 255k read +0.8 % mid-answer, +0.9 % on the next turn; a 10-minute soak, 272
+  requests, none failed. The arm run first read its prompts slower (66.8 against 64.0 s): editing the kernels' file
+  had changed every one of its kernels' cache keys, and 14 prefill variants compiled during its reads.
+- **Not kept.** The shared down projection with the router's top-k in HIP: the same bits (ties, NaN and -inf picks
+  tested) but twice as slow as Triton cold (13.9 against 6.0 µs at 4 rows); its first microbenchmark, 24-48 layers of
+  ~0.9 MB, kept the weights in the 96 MB infinity cache and showed it faster. More outputs a block for the one-pass int8
+  tile (activations read once for 4 or 8 output rows): faster at 1-3 rows, slower at 4 (215-249 registers); two outputs a
+  block for the hyper-connections' down projection: slower (9.3 against 7.2 µs on the XTX at 4 rows; 168 blocks for 96
+  CUs). The MoE epilogue (the routed sum, the shared expert's gate and mul-add) inside the host all-reduce kernel, one
+  launch fewer a layer: the same bits (also between the two ranks in serving), but its one 512-thread block took 11.7 µs
+  at 4 rows against the Triton kernel's 4.3 (4 blocks of 16 warps), on the all-reduce's path: NVFP4 -0.8 % greedy and
+  -1.2 % after the 255k read, EXL3 unchanged. Copying predicted experts during the next layer's attention / GatedDeltaNet
+  part (the variant section 45 left): PCIe is free there (a copier alone 24-28 GB/s), but a copier beside the GDN
+  projections slows them 16-53 %; with the predictor's 41-55 % precision, ~1-2 % at best for a large change.
+  NVFP4's down projection in HIP: in a 48-layer graph, 4 rows, 40 experts read cold, the Triton down GEMV took 33.0 µs a
+  layer against 23.6 for a plain read of the same bytes (the gate | up 51.1 against 45.5), ~2 µs of it its copy plan's
+  lookup (a block reduction with barriers in every program, even without a miss). Its compiled code, read from the
+  production launcher (a word's 8 products as one fma chain onto +0, the partial updated by one fma with the scale,
+  each lane's pair, then the lanes at distances 4, 2, 1), redone in HIP with 4 lanes a row, 16-byte loads, the
+  activation row in LDS and the plan by one ballot a wave: the same bits at the first try (1,728 cases a card), 4 rows
+  33.7 -> 28.2 µs on the XTX, 32.8 -> 28.4 on the XT, and with missing experts read from host memory 55.6 -> 38.9 µs
+  (one a layer) to 165.2 -> 92.9 (four), once its copy issued every read before its writes (a loop of read then write
+  waits a PCIe round trip for each piece). In serving it was slower: -0.6 to -1.1 % with the serialized copy, -0.2 to
+  -0.4 % with the fix, the same answers; traced, 67 µs a call against Triton's 62. The bench replays the same host rows
+  (some of them probably cached on the way: ~50 GB/s a miss is more than PCIe carries) and its experts are random,
+  where a verify step's rows share many; not taken further.
+- **Traps.** A decode step waits on values the host writes (the PLE rows' wait-sync, the staged inputs): compile jobs on
+  the host during a trace gave 5-9 ms stalls (`__amd_rocclr_batchMemOp`, 2.5 ms a step at 120k). A JIT module's build is
+  found by its name and version string, not by its source: a test container on a kernel-cache volume that had built
+  another version of `int8_gemv_exact` under the same version loaded that build (49 tests failed on its old signature).
+- **All of it against the build before it** (two interleaved pairs a checkpoint, the same answers in every arm): NVFP4
+  139.5 / 139.1 -> 140.6 / 140.1 tok/s greedy (+0.8 / +0.8 %), 135.2 / 135.2 -> 135.9 / 136.3 at T 0.6, after the 255k
+  read 130.0 -> 131.6 mid-answer (+1.3 %, one pair); EXL3 3.05 147.5 / 146.8 -> 150.1 / 149.8 greedy (+1.8 / +2.1 %),
+  144.8 / 144.7 -> 147.4 / 147.6 at T 0.6, after the read 143.1 -> 146.4 (+2.3 %). Soaks of 20 minutes (three sessions):
+  NVFP4 546 requests, EXL3 584, none failed, no error in the logs; the XTX's VRAM peak 23,532 MiB (NVFP4), 23,290
+  (EXL3). NVFP4's epilogue below came after these and adds its own +0.8-0.9 %.
+
+## 48. Where the two cards wait, what a GEMV cannot carry, launches folded into the top-k, the norms, the all-reduce and the PLE gate (2026-11-05 and 06)
+
+- **Where the two cards wait.** The host all-reduces align the ranks' traces (their ends agree within 0.3-0.4 µs), so a
+  step splits into phases, the kernels between two all-reduces, and each phase shows which card arrived last (NVFP4, one
+  request, `xtx-xt-4x262k`; 255k read / 1k document): the MoE phases end on the XTX 0.49 / 0.70 ms a step later than on
+  the XT, the attention and GatedDeltaNet phases on the XT 0.64 / 0.61 ms later. Both cards hold the same number of
+  expert slots (the cache's plan is the smaller card's), but `FREETOKEN_TP_SPLIT=0.55` gives the XTX 352 of an expert's
+  640 rows against 288: 1.22x the bytes of a missing expert over the same PCIe 4.0 x16 link (both cards on the CPU's
+  lanes). The attention and the hyper-connections are split evenly or replicated, and the XT is the slower card. A
+  perfect balance would save the sum of the phases' maxima minus their means, ~0.65-0.79 ms a step (~3 %); a different
+  split moves terms between the two partial sums the all-reduce adds, so it changes the bits.
+- **The LM head's verify pass is at the card's bandwidth.** The vocabulary is 248,320 tokens: the XTX's shard (~350 MB
+  of int8) is read in 397 µs at 3 rows, ~880 GB/s of the card's 960; the drafts' reduced head reads its rows at ~857
+  GB/s. Nothing left there.
+- **A GEMV does not take another kernel's work for free.** Two fusions gave the same bits and lost: the
+  hyper-connection's combine and RMSNorm (`_hc_combine_rmsnorm_kernel`, 95 launches a step) inside the HC down
+  projection's HIP kernel: its sums reproduced from the compiled Triton kernel (each thread's 32 values as registers `8
+  rr + j` of element `1024 rr + 8 t + j`, a pairwise tree, the lanes at distances 8, 4, 2, 1 then 16, the warps as `(w0
+  + w2) + (w1 + w3)`, a correctly rounded division by 2560, `v_rsq`; the combine `fma(inj, block, res)`, the norm weight
+  `fma(y, w, y)`), the same bits at the first try, but every block must redo the norms of all its columns: 48 layers in
+  a graph 11.1-11.8 µs a layer separate against 15-28 fused at 2-4 rows. And the GatedDeltaNet's causal conv update as
+  the epilogue of the input projection's HIP kernel (a block owns its two channels for every row: no work done twice):
+  the conv's bf16 products are `v_dot2_bf16_bf16` with a zero second lane, which rounds toward zero on gfx11 (clang's
+  `__bf16` builtin for it returned wrong values; inline assembly gives the instruction), the same bits for the outputs,
+  the states and the rollback snapshots, but the projection's kernel ran 1.2-3.4 µs slower from the epilogue's structure
+  alone: 36 layers 36.8 / 39.0 µs a layer separate against 37.1 / 41.8 fused at 3 / 4 rows. These GEMVs are bound by
+  latency and occupancy; a small kernel and its gap cost ~4.3 µs in a graph, not the 7 a trace's durations suggest.
+- **The sparse attention's next rows looked up ahead at decode** (index and page, then also the decode cache's slot and
+  tag), as the prefill profile does: the same bits, slower (4 rows, 255k, 12 layers, cold: 33.4 -> 47.6 / 54.0 µs a call
+  on the XTX). Not kept.
+- **The selection's expansion in the top-k kernel and the K/V store in the norms' launch** (`FREETOKEN_QSA_TOPK_EXPAND`,
+  `FREETOKEN_QK_STORE_KV`, kept): integer indices and copies, two launches fewer a QSA layer. One pair, the same
+  answers: NVFP4 +0.3-0.5 % on every short prompt, +0.5 % mid-answer after a 255k read; EXL3 3.05 bpw +0.5-1.0 %, +0.8
+  %.
+- **The LM head's candidates gathered through host memory, the PLE gate in one launch, the combine in the all-reduce**
+  (`FREETOKEN_HOST_ALLGATHER`, `FREETOKEN_PLE_GATE_FUSED`, `FREETOKEN_HOST_AR_HC_COMBINE`, kept). The candidates'
+  all-gather (three a step) went to RCCL: its kernel took 15-18 µs with gaps of 7-12 µs around it; through the
+  all-reduce's slots and sequence counter it takes 7-11 µs. The PLE gate's eight bf16 launches (torch divides by the CPU
+  scalar sqrt(hidden) as a multiplication by its fp32 reciprocal) in one, checked on every bf16 input. The
+  hyper-connection's combine and RMSNorm after each block (95 launches a step) in the launch of the block's closing
+  all-reduce: block 0 all-reduces and raises a flag, one block per row and stream redoes the Triton program in HIP (two
+  ranks, eager and in a graph: the same bits); the last of them resets the flag for the next launch. Traced (short
+  prompt, NVFP4): 1,153 -> 1,051 kernels a step, 23.76 -> 23.59 ms, the gaps 4.05 -> 3.68 ms but the all-reduces 1.67 ->
+  2.32 ms: with element loads the combine in the all-reduce cost about what its launch and kernel had. One pair, the
+  same answers: NVFP4 +0.5 % greedy, +0.6 % at T 0.6, +0.5 % mid-answer after a 255k read; EXL3 3.05 +0.7 / +0.7 / +0.7
+  %. Then 16-byte loads and stores, and the residual and the norm weight read while block 0 waits for the peer (against
+  the element version, one pair, the same answers): NVFP4 +0.7 % greedy and at T 0.6, +0.5 % after the read; EXL3 +1.1 /
+  +1.0 / +0.9 %; traced 23.59 -> 23.20 ms a step, the all-reduces 2.32 -> 1.97 ms.
+- **The indexer's top-k at 32 warps** (`FREETOKEN_QSA_TOPK_DECODE_WARPS`, kept): the selection is a set (the lowest
+  column wins a tie), the same at any warp count or digit width, so the split path's warps are free to tune. In a
+  microbenchmark the first variant run is always slower (the same merge configuration 16.6 against 9.6 µs), so it was
+  decided in serving: after a 255k read (NVFP4, 3-4 rows) the split and merge took 0.49 -> 0.37 ms a step on the XTX,
+  0.52 -> 0.39 on the XT. The expert cache's ensure kernel was swept the same way (4-32 warps, the same plans): 16, its
+  default, is the fastest.
+- **All of it against the build before it** (`xtx-xt-4x262k`, two interleaved pairs a checkpoint, the first with the
+  255k read, the same answers in every arm): NVFP4 141.2 / 141.3 -> 144.5 / 144.1 tok/s greedy (+2.3 / +2.0 %), 136.7 /
+  136.9 -> 139.6 / 139.6 at T 0.6 (+2.2 / +2.0 %), after a 255k read 120.8 -> 124.0 mid-answer (+2.6 %), the next turn
+  109.6 -> 112.5 (+2.6 %); EXL3 3.05 149.7 / 149.9 -> 153.1 / 153.1 greedy (+2.3 / +2.1 %), 147.1 / 147.2 -> 150.3 /
+  150.6 at T 0.6 (+2.2 / +2.4 %), after the read 140.2 -> 144.2 (+2.9 %), the next turn 151.3 -> 155.4 (+2.7 %). Two
+  agents on one 120k document (two passes a side): NVFP4 +0.8 / +1.1 %, EXL3 +0.4 / +1.1 % (two requests make 6-8 rows a
+  step, where that build's combine still had its own kernel); the combine in the all-reduce up to 16 rows on top, four
+  agents (two passes a side, against the build without it): NVFP4 41.6 / 45.8 against 44.4 / 45.5 tok/s each (its first
+  pass slowed by one request's 31.5), EXL3 56.0 / 56.7 against 52.9 / 55.9; the first EXL3 pass's four answers the same
+  in both builds (concurrent requests' texts move with how their prompts were grouped, see how-it-works). Soaks of 20
+  minutes (three sessions): NVFP4 532 requests, EXL3 605, none failed, no error in the logs; the XTX's VRAM peak 23,776
+  MiB (NVFP4), 23,237 (EXL3). Traced (one request): a short prompt's step (NVFP4) 23.85 -> 23.27 ms, 1,183 -> 1,051
+  kernels; after a 255k read 21.74 -> 21.04 ms (NVFP4, 1,150 -> 1,019 kernels) and 21.81 -> 20.99 ms (EXL3, 1,294 ->
+  1,163). The first long read after the change compiles new kernels (its first 16k chunk at 2,075 against 3,085 tok/s);
+  the other chunks run as before.
+- **The MoE layer at 5-8 rows.** Four requests traced (NVFP4, one 120k document, 8 rows a step): 45.3 ms a step, a
+  MoE layer ~400 µs on the XTX, nearly all of it the two expert GEMVs (263 and 135 µs), and ten launches where 1-4
+  rows take five: the router, the shared expert and the top-k fusions and the epilogues stopped at four rows. All the GEMVs involved compute each row as alone, so the same launches serve 5-8 rows: the
+  Triton router | gate-up launch with NVFP4's K-blocked gate | up in two groups of programs (the first four rows, then
+  the others, each as the shared expert's kernel takes that many), the down projection with the top-k as is; then the
+  HIP kernel with the same two groups, which also gives the epilogues their gate. Its 7-8-row builds spilled 71-129
+  registers (every input row's loads hoisted) until the router's and the one-pass tile's rows went four at a time
+  (scheduling barriers between them; each row's additions unchanged). 48 layers in a graph at 8 rows, the router,
+  shared expert and top-k: 51.2 µs a layer on the XTX, 36.7 with the Triton launches, 20.9 with the HIP one. Against
+  the build before (`xtx-xt-4x262k`), the Triton launches alone: two requests NVFP4 +1.6 / +1.6 %, EXL3 +2.6 / +2.2
+  %; with the HIP kernel and the epilogues: two requests NVFP4 +3.8 / +3.9 %, EXL3 +3.9 / +4.3 %, the same answers;
+  four requests NVFP4 +3.4 % (two pairs), EXL3 +4.2 / +5.4 %; one request unchanged with the same answers, after a
+  255k read too.
+- **The MTP head's combines like the layers'.** The draft head still ran each hyper-connection combine and the norm
+  after it as separate launches; it now takes the layers' path (each combine with the next norm, in the block's
+  closing all-reduce). Checked by the drafts themselves: a deterministic short run counts the same decode steps with
+  and without it (2,162-2,163 NVFP4, 2,223-2,224 EXL3), with the same answers (24 / 24, and the 255k read's and the
+  next turn's). Speed within the noise of one pair (NVFP4 +0.2 % greedy, at T 0.6 and mid-answer after the 255k read;
+  EXL3 0.0 %, -0.2 % mid-answer); kept so the head runs the layers' kernels.
+- **The hyper-connection's two projections in one launch at 6-8 rows** (`FREETOKEN_HC_DOWN_MIX`, kept). Each
+  hyper-connection runs its down projection (336 x 10240, the hc_silu epilogue) then its up projection mixed into the
+  streams (10240 x 320), twice a layer, on both cards. In one launch, the down projection's blocks first, each counting
+  its column done, then the mix's blocks, which load their weights, wait for the count and read the down output: the
+  same code for every output, the same bits. 96 hyper-connections of distinct weights in a graph, per hyper-connection
+  against the two launches: 1-5 rows -1.3, +1.3, +6.5, +6.7, +0.2 % on the XTX (+0.3 to +11.0 % on the XT); without the
+  wait (wrong outputs, timing only) the launch saved 0.2-2.2 µs at 1-4 rows, what section 45 found for two dependent
+  kernels; a longer sleep between the polls changed nothing. At 6-8 rows 25.8 -> 19.8, 27.7 -> 20.9, 32.3 -> 21.5 µs on
+  the XTX, 28.5 -> 23.0, 31.1 -> 24.5, 36.7 -> 25.7 on the XT. There the down projection alone is slow: 14.9-21.3 µs a
+  launch on the XTX against 8.4 at 5 rows, and at 8 rows the fused launch takes as long (21.6 against 21.3). Its
+  compiled code waits on each row's load before the next from 6 rows on (5 rows issue them together); issuing them
+  together gained ~1 µs at 6-7 rows and nothing at 8, and capping its occupancy with LDS made it slower (8 rows 21.3 ->
+  25.3 µs at 32 KiB a block): why the mix hides in it was not found. So the fusion serves 6-8 rows only. Loading the
+  mix's weights first in the standalone kernels too (one source for both) cost registers (one row 43 -> 63) and 0.2-1.6
+  µs at 1-4 rows: they keep their loads where they are used. `xtx-xt-4x262k` against the build before: two requests
+  NVFP4 +1.5 / +1.4 %, EXL3 +1.9 / +1.7 %, the same answers; one request (two launches there) the same decode step
+  counts on the deterministic run (2,162-2,163 NVFP4, 2,223-2,224 EXL3) and the same answers; four requests, means of
+  two pairs (a noisy case whose answers vary between runs of either build): NVFP4 46.96 -> 48.02 tok/s (+2.2 %), EXL3
+  58.69 -> 60.11 (+2.4 %). The first start of the fused build hit a GPU page fault (the XT, a write, at its first
+  request, the signature in "Still open"); the next start under ROCm's debug agent, the 15 after it and a 20-minute soak
+  (three sessions, NVFP4, 575 requests) ran clean.
+- **Not kept.** Every load of a thread issued before its sums in the int8 HIP GEMVs (the compiled kernels wait on each
+  weight row's load before its products: ~6 round trips a thread for the GDN projections, 11 for the HC mix): the same
+  bits, but slower on most shapes (the HC down projection up to +16 %, the GDN output projection +3-8 % on the XTX), the
+  input projection 1.4-2.7 % faster at 1-3 rows: a wave's waits are hidden by the other waves, and the preloads cost
+  registers. The one-pass tile with 4 or 8 outputs a block at 1-3 rows (activations loaded once): slower on both cards
+  (the XTX's input projection 30.9 -> 36.2 µs at one row). The launch options that leave every sum's order alone, for
+  the NVFP4 expert GEMVs and the GatedDeltaNet's delta rule: `num_stages` 1-4 within ±2 %, `waves_per_eu` slower (the
+  expert down projection at 3-4 rows 25.6 -> 38.9 and 33.2 -> 51.0 µs on the XTX). The cache's admission and copies
+  in the launch of the shared down projection and the top-k (one program waiting on the router programs' count, the
+  victims scanned 512 slots at a time, the copiers' chunks halved to keep the warp's registers): the same slots, plan
+  and copied rows (60 steps against the two launches), but a launch runs at one warp where the admission alone runs at
+  16. 48 layers in a graph, the EXL3 pool's 11,458 slots: one row 12.3 -> 11.9 µs a layer on the XTX with every route
+  a hit, 13.9 -> 14.5 with a tenth of them missing, 16.2 -> 17.9 with 30 %; two to four rows 6-30 % slower on both
+  cards; with the copiers' full chunks (their registers spilled) 1.9-2.2x slower. The GatedDeltaNet's gated norm in
+  the delta rule's decode launch, applied by the last of a head's four programs (a counter) with the norm kernel's own
+  program for each row at the same one warp: the same bits (outputs, states, per-step states), but that program's rows
+  run one after another after everything else. 36 layers in a graph on the XTX (a rank's 24 value heads), one request
+  of 1 / 3 / 4 rows 13.6 -> 11.3, 15.5 -> 14.6, 16.5 -> 17.5 µs a layer, two requests of 3 rows 19.4 -> 20.5, four of
+  2 rows 28.6 -> 28.5 (two passes, the XT alike); the rows unrolled were no better. About 0.2 % of a one-request step.
+
+## 49. Still open
 
 - In NVFP4 the model needs ~63 GiB of RAM for its experts alone (the engine keeps every expert in RAM). The EXL3 3.05
   bpw checkpoint needs 42.6 GiB and served under a 56 GiB container limit, but a real 64 GB machine is untested
@@ -2601,24 +2827,28 @@ with the K/V in RAM; bit-exact).
   none in the other starts of both nights. One on 2026-10-29 while serving, not at a start (EXL3 3.05 bpw, `xtx-xt`, the
   XT, a write: a 1k-token agent turn on 207k cached tokens in the depth sweep's first pass, after 16k-token chunks); the
   next server passed the same point twice, its XT at most 18.2 GiB of 20, and none in the other 19 servers of that day's
-  benchmarks.
+  benchmarks. One on 2026-11-06 at the first request of a start (NVFP4, the XT, a write, section 48's first build with
+  the hyper-connection's projections in one launch); the next start under the debug agent, the 15 after it and a
+  20-minute soak were clean.
 - Expert misses (section 20): the decode GEMVs now read them from host memory while computing the cached experts
   (section 38), a program's rows copied whole first (section 45), so their PCIe time shows where it exceeds that work
   (a layer's GEMVs at one request, EXL3: 40.5 µs against 32.5 when the copy came first, the copy 34.6 -> 4.2 µs).
   Fewer of them is the lever left: a larger cache, not a cache policy (an online one gains ~8 % of the misses at best
   on a recorded trace), or the transfer moved off the MoE GEMVs: with the launcher's pool NVFP4 still misses 1.0-4.6
-  experts a layer and step (~1.5 MB each on the XTX), and during a layer's attention or GatedDeltaNet part the expert
-  GEMVs leave PCIe to the attention's host K/V reads and the all-reduces (how busy it is then was not measured).
+  experts a layer and step (~1.5 MB each on the XTX), and during a layer's attention or GatedDeltaNet part PCIe is
+  free (a copier alone reaches 24-28 GB/s there, section 47).
   Section 29's prefetch of predicted experts (42 % fewer misses) ran on a side stream inside the graphs and lost;
-  section 45's copied from the gate | up GEMV and lost 14 %; copies from the attention or GatedDeltaNet kernels were
-  not tried. On one card `--hybrid` computes part of them on the CPU (section 24). More VRAM for the cache: a
+  section 45's copied from the gate | up GEMV and lost 14 %; a copier beside the GatedDeltaNet projections slows them
+  16-53 % (section 47, not built into the model). On one card `--hybrid` computes part of them on the CPU (section 24). More VRAM for the cache: a
   desktop-aware plan for the card that drives
   the display (the ~145-179 Triton kernels a card loads are all in use, section 31).
-- A decode step at long context (NVFP4, one request, 192k, section 46's traces): the sparse attention ~0.9 ms with the
-  decode cache, its rows' lookups (index, page, slot, tag) one after the other before the K/V loads; the indexer's
-  top-k 0.77-0.82 ms at 8 warps (~20 % less at 16) and its scoring 0.37-0.45 ms, both growing with the context. With
-  ~52k slots a call reads ~9 % of its tokens across PCIe (343 of 3,866 on the recorded selections); the attention's
-  lookups are likely most of the call now (an inference from the copy's and the attention's times, not broken down).
+- A decode step at long context (NVFP4, one request, after a 255k read, section 47's trace): the context's kernels ~2.1
+  ms of 27.75 (the same answer on a 1k document: 25.45 ms): the sparse attention 0.58-0.66 ms and its rows' copy 0.39,
+  the rows' lookups (index, page, slot, tag) one after the other before the K/V loads (looked up a tile ahead, slower:
+  section 48); the indexer's top-k 0.50-0.53 ms at 16 warps, 0.37-0.39 at 32 (section 48; its merge over one program a
+  row) and its scoring 0.47-0.57 ms before its decode rows were scored together (~-21-25 % a call). With ~52k slots a call reads ~9 % of its tokens across PCIe at 170k (343 of
+  3,866 on the recorded selections); the attention's lookups are likely most of the call now (an inference from the
+  copy's and the attention's times, not broken down).
 - On two cards `serve.sh` lowers `--memory-ratio` to 0.77 / 0.76 for EXL3 (3.05 bpw at 0.77 measured in section 21; 4.05
   bpw at 0.76 not measured again).
 - Short agent turns (section 27): about half of a 130-row turn at 25k is the routed experts the cache lacks crossing
@@ -2636,12 +2866,14 @@ with the K/V in RAM; bit-exact).
   translates, lazy invalidation) -- machine settings.
 - What a verify row costs (section 42): from 2 to 4 rows a step took 5.6 ms more, the int8 dense GEMVs 4.4 of it and
   the EXL3 expert GEMVs 2.6, the missing experts' copies 0.3. Four of the int8 tiles now run in HIP with Triton's sums
-  (section 44); left in Triton at four rows: the LM head's verify pass (~0.41 ms a step on the XT, near its
-  bandwidth), the shared expert's gate | up with the router (0.7 ms a step) and its down projection with the router's
-  top-k (0.4 ms). The routed experts' NVFP4 marlin GEMVs are now the largest part of an NVFP4 step (5.9-6.5 ms of 23):
+  (section 44), the router with the shared expert's gate | up too (section 47); left in Triton at four rows: the LM
+  head's verify pass (~0.40 ms a step: ~880 GB/s on the XTX, its bandwidth, section 48) and the shared expert's down projection with the
+  router's top-k (0.4 ms; in HIP twice as slow cold, section 47). The routed experts' NVFP4 marlin GEMVs are now the
+  largest part of an NVFP4 step (9.0-10.1 ms of 25.5-27.8 on the XTX for an answer about code, most of it misses):
   their products are exact as well (an e2m1 code times a bf16 activation), then each word's sum of eight is scaled by
-  its e4m3 block scale into the row's partial (its compiled form not read yet); not tried. The two cards are balanced at four rows, so a kernel gain
-  counts only where it speeds both.
+  its e4m3 block scale into the row's partial (its compiled form not read yet); not tried. Each phase between two all-reduces ends on its slower card (section 48): the XTX in the MoE phases (its
+  larger share of each expert crossing the same PCIe link on a miss), the XT in the others; a kernel gain counts where
+  it speeds the card that arrives last.
 - The EXL3 decode GEMV (3.2-3.7 ms of a one-request step, section 44's trace) accumulates with `v_fma_mix_f32` (one
   rounding of the fp16 weight times the fp32 activation plus the sum), so a kernel adding in the same order with fused
   multiply-adds gets its bits. Compiled for the XT's gate | up tiles it runs 1,835 instructions a thread, among them 193
@@ -2655,7 +2887,9 @@ with the K/V in RAM; bit-exact).
   the tree; the Triton kernel's tiling is what a faster one would have to beat.
 - About 3.5 µs separate any two dependent kernels of a decode step (~1,200-1,350 a step, a fifth of it): the dispatch's
   floor (section 44); fewer launches is what is left there, and two dependent kernels in one launch, waiting on a
-  counter across the grid, saved ~1.1 µs at best (section 45).
+  counter across the grid, saved ~1.1 µs at best (section 45). Work folded into a GEMV's kernel costs about what its
+  launch did (the combine in the HC down projection, the conv in the GDN input projection, section 48): a small kernel
+  and its gap cost ~4.3 µs in a graph.
 - The host all-reduce's floor: ~6 µs a call for one row in a CUDA graph (the write, the flag's round trip, the data's
   round trip). The data and the call number in one word did not lower it (section 38).
 - Decode at four requests (EXL3 3.05 bpw, `xtx-xt-4x262k`, a kernel trace of section 38's build): per step on the

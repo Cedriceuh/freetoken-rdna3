@@ -41,6 +41,9 @@ _FEWER_COPIES = os.environ.get("FREETOKEN_FEWER_COPIES", "1" if torch.version.hi
 _FUSED_GATE = os.environ.get("FREETOKEN_QSA_FUSED_GATE", "1") != "0"
 # FREETOKEN_QK_NORM_ROPE: the q and k norms and the rope in one launch (kernel/triton/qk_norm_rope.py), the same bits
 _QK_NORM_ROPE = os.environ.get("FREETOKEN_QK_NORM_ROPE", "1") == "1"
+# FREETOKEN_QK_STORE_KV (default 1): the k heads' programs of the fused norms + rope also store their k row and v into
+# the K/V cache (the store kernel's copy: the same values), and the backend skips its store: one launch fewer a QSA layer
+_QK_STORE_KV = os.environ.get("FREETOKEN_QK_STORE_KV", "1") == "1"
 
 
 @dataclass(frozen=True)
@@ -183,17 +186,33 @@ class Qwen4ExpAttention(BaseOP):
         self._norm_rope_ok = (getattr(self.rotary, "_kernel", None) is not None and hasattr(self.rotary, "section_table")
                               and self.q_norm.eps == self.k_norm.eps and self.q_norm.triton)
 
+    def _kv_store(self, backend, v: torch.Tensor, batch: Batch) -> tuple | None:
+        """FREETOKEN_QK_STORE_KV: qk_norm_rope's ``kv_store`` (this layer's K/V caches as rows, the slots, v) when the
+        backend can skip its own store and that store is a plain row copy; else None."""
+        pool = getattr(backend, "kvcache", None)
+        if not getattr(backend, "takes_kv_stored", False) or pool is None or not _plain_store(pool):
+            return None
+        kc, vc = pool.k_cache(self.layer_id), pool.v_cache(self.layer_id)
+        width = self.num_kv * self.head_dim
+        if kc.dtype != v.dtype or kc.shape[-2:] != (self.num_kv, self.head_dim) or not (kc.is_contiguous()
+                                                                                         and vc.is_contiguous()):
+            return None
+        return kc.view(-1, width), vc.view(-1, width), batch.out_loc, v.view(-1, self.num_kv, self.head_dim)
+
     @nvtx_annotate("QSA")
     def forward(self, x: torch.Tensor, batch: Batch, kv_only: bool = False) -> torch.Tensor | None:
         """``kv_only``: write this layer's K/V and index keys, attend to nothing, return None (the MTP head's pass
         while several requests decode: later drafts read its KV, nothing reads its output)."""
         qg, k, v = self.qkv_proj.forward(x).split(self._qkv_split, dim=-1)
         qg = qg.view(-1, self.num_q, self.head_dim * 2)
-        fused = None
+        backend = get_global_ctx().attn_backend
+        fused = kv_store = None
         if _FEWER_COPIES and _QK_NORM_ROPE and self._norm_rope_ok:
+            kv_store = self._kv_store(backend, v, batch) if _QK_STORE_KV else None
             fused = qk_norm_rope(qg[..., : self.head_dim], k.view(-1, self.num_kv, self.head_dim), self.q_norm.weight,
                                  self.k_norm.weight, self.q_norm.eps, True, batch.get_attn_positions(),
-                                 self.rotary._cos_sin_cache, self.rotary.section_table(qg.device))
+                                 self.rotary._cos_sin_cache, self.rotary.section_table(qg.device), kv_store=kv_store)
+        stored = {"kv_stored": True} if fused is not None and kv_store is not None else {}
         if fused is not None:
             q, k = fused
             q, k = q.view(-1, self.qo_attn_dim), k.view(-1, self.kv_attn_dim)
@@ -217,14 +236,13 @@ class Qwen4ExpAttention(BaseOP):
                 batch.get_attn_positions(), q.view(-1, self.qo_attn_dim), k.view(-1, self.kv_attn_dim)
             )
         index = self.indexer.forward(x)
-        backend = get_global_ctx().attn_backend
         if _FEWER_COPIES and _FUSED_GATE and getattr(backend, "takes_gate", False):
             # FREETOKEN_QSA_FUSED_GATE: the backend applies the gate (in its split merge: a launch fewer)
             gated = backend.qsa_forward(q.view(-1, self.num_q, self.head_dim), k, v, index, self.layer_id, batch,
-                                        kv_only=kv_only, gate=gate)
+                                        kv_only=kv_only, gate=gate, **stored)
             return None if kv_only else self.o_proj.forward(gated)
         o = backend.qsa_forward(
-            q.view(-1, self.num_q, self.head_dim), k, v, index, self.layer_id, batch, kv_only=kv_only
+            q.view(-1, self.num_q, self.head_dim), k, v, index, self.layer_id, batch, kv_only=kv_only, **stored
         )
         if kv_only:
             return None
@@ -233,6 +251,15 @@ class Qwen4ExpAttention(BaseOP):
         else:
             gated = o.reshape(-1, self.qo_attn_dim) * torch.sigmoid(gate)
         return self.o_proj.forward(gated)
+
+
+def _plain_store(pool) -> bool:
+    """The pool's store_kv is store_cache's row copy (bf16 K/V, no int8 codes)."""
+    from freetoken.kvcache.mha_pool import MHAKVCache
+    from freetoken.kvcache.qsa_pool import QSAKVCache
+
+    store = type(pool).store_kv
+    return (store is MHAKVCache.store_kv or (store is QSAKVCache.store_kv and not pool.kv_int8))
 
 
 class TorchDenseQSAReference:

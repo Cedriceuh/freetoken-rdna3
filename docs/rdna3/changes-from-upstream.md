@@ -385,6 +385,32 @@ Line counts here are on top of the lines listed in the sections above.
 | `python/freetoken/kernel/triton/qsa/topk.py` | 11/3 | `FREETOKEN_QSA_TOPK_DECODE_WARPS`: the split path's programs at 16 warps for up to 16 rows |
 | `tests/kernels/test_vocab_topk.py` | 3/2 | the draft head's test sets the TP info only when no earlier test of the session did (it failed in a whole-suite run) |
 
+## The router in HIP, a decode step's rows scored together, the MoE epilogue in the routes' kernels, lane moves by DPP (bit-exact)
+
+Line counts here are on top of the lines listed in the sections above.
+
+| File | Lines | Change |
+|---|---:|---|
+| `python/freetoken/kernel/csrc/jit/router_shared_exact.cuh`, `kernel/router_shared_exact.py`, `kernel/triton/router_shared.py`, `tests/kernels/test_router_shared_exact.py` | new (448), new (31), 13/4, new (46) | `FREETOKEN_ROUTER_SHARED_HIP`: the router \| shared gate-up launch at 1-4 rows as a HIP kernel with the Triton kernel's sums (its K-blocked and one-pass gate \| up tiles); on request one block a row also computes the shared expert's gate with the epilogue's 16-warp sums |
+| `python/freetoken/kernel/triton/exl3.py`, `moe/fused_exl3.py`, `models/qwen4_exp/moe.py`, `tests/kernels/test_exl3_decode_epilogue.py` | 16/2, 10/1, 19/4, new (47) | `FREETOKEN_EXL3_DECODE_EPILOGUE`: an EXL3 decode layer's epilogue in the kernel that sums its routes, the gate from the router launch |
+| `python/freetoken/kernel/triton/nvfp4_fused_moe.py`, `kernel/nvfp4_moe.py`, `moe/fused_nvfp4.py`, `models/qwen4_exp/moe.py`, `tests/kernels/test_nvfp4_decode_epilogue.py` | 32/0, 29/2, 13/0, 6/0, new (80) | `FREETOKEN_NVFP4_DECODE_EPILOGUE`: the NVFP4 decode down GEMV's last program of a token over a row block (an atomic counter) adds the routes and applies the epilogue, the gate from the HIP router launch |
+| `python/freetoken/kernel/triton/qsa/score.py`, `tests/kernels/test_qsa_score_rows.py` | 16/0, 4/1 | `FREETOKEN_QSA_SCORE_DECODE_ROWS`: a decode step's rows of one request scored by the multi-row kernel |
+| `python/freetoken/kernel/csrc/jit/int8_gemv_exact.cuh`, `kernel/int8_gemv_exact.py` | 36/27, 1/1 | the HIP int8 GEMVs' lane sums by DPP row moves and `permlanex16` instead of `__shfl_xor` |
+
+## Fewer launches: the selection's expansion, the K/V store, the candidates' gather, the PLE gate, the combine in the all-reduce, the MoE layer's launches at 5-8 rows, the MTP head's combines, the hyper-connection's two projections at 6-8 rows (bit-exact)
+
+Line counts here are on top of the lines listed in the sections above.
+
+| File | Lines | Change |
+|---|---:|---|
+| `python/freetoken/kernel/triton/qsa/expand.py`, `kernel/triton/qsa/topk.py`, `attention/qsa_sparse.py`, `tests/kernels/test_qsa_topk_expand.py` | 36/8, 74/10, 14/15, new (50) | `FREETOKEN_QSA_TOPK_EXPAND`: the program that emits a row's top-k blocks (the merge, or the one-program kernel) also expands them into the row's token indices (the expand kernel's code, shared); `FREETOKEN_QSA_TOPK_DECODE_WARPS` at 32 |
+| `python/freetoken/kernel/triton/qk_norm_rope.py`, `models/qwen4_exp/attention.py`, `attention/qsa_sparse.py`, `tests/kernels/test_qk_norm_rope.py` | 25/4, 32/5, (above), 38/0 | `FREETOKEN_QK_STORE_KV`: the k heads' programs of the norms + rope launch copy k and v into the K/V cache; the backend skips its store |
+| `python/freetoken/kernel/csrc/jit/host_allreduce.cuh`, `kernel/host_allreduce.py`, `distributed/impl.py`, `models/qwen4_exp/model.py`, `tests/kernels/test_host_allreduce_two_ranks.py` | 295/2, 34/2, 15/0, 36/7, new (131) | `FREETOKEN_HOST_ALLGATHER`: small all-gathers through the host all-reduce's slots; `FREETOKEN_HOST_AR_HC_COMBINE`: a decode block's closing all-reduce also runs the hyper-connection's combine + RMSNorm (the all-reduce body shared by both kernels) |
+| `python/freetoken/kernel/triton/ple_gate.py`, `models/qwen4_exp/ple.py`, `tests/kernels/test_ple_gate.py` | new (55), 13/3, new (44) | `FREETOKEN_PLE_GATE_FUSED`: the PLE gate's eight bf16 ops in one kernel, checked on every bf16 input |
+| `python/freetoken/kernel/triton/router_shared.py`, `kernel/csrc/jit/router_shared_exact.cuh`, `kernel/router_shared_exact.py`, `models/qwen4_exp/moe.py`, `tests/kernels/test_router_shared.py`, `tests/kernels/test_router_shared_exact.py`, `tests/kernels/test_exl3_decode_epilogue.py`, `tests/kernels/test_nvfp4_decode_epilogue.py` | 36/15, 41/14, 3/3, 2/1, 10/5, 3/3, 2/2, 2/2 | `FREETOKEN_ROUTER_SHARED` and `FREETOKEN_ROUTER_SHARED_HIP` at 5-8 rows (two to four requests): the K-blocked gate \| up in two groups of rows, the HIP kernel's input rows four at a time; hence the decode epilogues there too |
+| `python/freetoken/models/qwen4_exp/mtp.py` | 13/0 | the MTP head's two combines with the next norm (`FREETOKEN_FUSED_HC_NORM`), in the blocks' closing all-reduces (`FREETOKEN_HOST_AR_HC_COMBINE`), as in the layers |
+| `python/freetoken/kernel/csrc/jit/int8_gemv_exact.cuh`, `kernel/int8_gemv_exact.py`, `kernel/triton/int8_gemv.py`, `models/qwen4_exp/hc.py`, `tests/kernels/test_int8_gemv_exact.py` | 254/13, 15/2, 23/1, 26/3, 59/4 | `FREETOKEN_HC_DOWN_MIX`: at 6-8 rows the hyper-connection's down GEMV and its up GEMV mixed into the streams in one launch (the down blocks count their columns done, the mix blocks load their weights then wait for the count; the down column a device function shared with the standalone kernel, the standalone mix kernels unchanged) |
+
 ## Tooling and documentation
 
 | File | Change |

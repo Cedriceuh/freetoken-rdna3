@@ -193,6 +193,8 @@ def _decode_nvfp4_marlin_kernel(
     MISS_BULK: tl.constexpr = False,  # FREETOKEN_NVFP4_MISS_BULK: see _fill_rows
     MISS_BULK_W: tl.constexpr = False,  # its scale spans in 4-byte words (_fill_bytes)
     MISS_G: tl.constexpr = False, BANK_G: tl.constexpr = 0,  # with it, the global scales too (host bank BANK_G)
+    EPI: tl.constexpr = False,  # FREETOKEN_NVFP4_DECODE_EPILOGUE: see _down_epilogue
+    shared_ptr=None, gate_ptr=None, out_ptr=None, cnt_ptr=None, stride_sh=0, stride_out=0,
 ):
     """Marlin-style NVFP4 decode GEMV: wide int32 weight loads + deferred reduction.
 
@@ -228,6 +230,9 @@ def _decode_nvfp4_marlin_kernel(
             c_ptrs = c_ptr + token_id * stride_cm + route_k * stride_ck + offs_n * stride_cn
             tl.store(c_ptrs, tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32).to(compute_type),
                      mask=(route_id < total_routes) & n_mask)
+            if EPI:
+                _down_epilogue(c_ptr, token_id, n_block_id, offs_n, n_mask, stride_cm, stride_ck, stride_cn,
+                               shared_ptr, gate_ptr, out_ptr, cnt_ptr, stride_sh, stride_out, TOP_K)
             return
     a_row = route_id if A_ROW_IS_ROUTE else token_id
     a_base = a_ptr + a_row * stride_am
@@ -269,6 +274,9 @@ def _decode_nvfp4_marlin_kernel(
                 accumulator = accumulator * weight
             c_ptrs = c_ptr + token_id * stride_cm + route_k * stride_ck + offs_n * stride_cn
             tl.store(c_ptrs, accumulator.to(compute_type), mask=(route_id < total_routes) & n_mask)
+            if EPI:
+                _down_epilogue(c_ptr, token_id, n_block_id, offs_n, n_mask, stride_cm, stride_ck, stride_cn,
+                               shared_ptr, gate_ptr, out_ptr, cnt_ptr, stride_sh, stride_out, TOP_K)
             return
     for kw_start in range(0, tl.cdiv(K_WORDS, BLOCK_SIZE_KW), UNROLL):
         for u in tl.static_range(UNROLL):
@@ -337,6 +345,30 @@ def _decode_nvfp4_marlin_kernel(
 
     c_ptrs = c_ptr + token_id * stride_cm + route_k * stride_ck + offs_n * stride_cn
     tl.store(c_ptrs, accumulator.to(compute_type), mask=(route_id < total_routes) & n_mask)
+    if EPI:
+        _down_epilogue(c_ptr, token_id, n_block_id, offs_n, n_mask, stride_cm, stride_ck, stride_cn, shared_ptr,
+                       gate_ptr, out_ptr, cnt_ptr, stride_sh, stride_out, TOP_K)
+
+
+@triton.jit
+def _down_epilogue(c_ptr, token_id, n_block_id, offs_n, n_mask, stride_cm, stride_ck, stride_cn, shared_ptr, gate_ptr,
+                   out_ptr, cnt_ptr, stride_sh, stride_out, TOP_K: tl.constexpr):
+    """FREETOKEN_NVFP4_DECODE_EPILOGUE: the last of a token's TOP_K programs over these rows (a counter a token and
+    row block, which it resets) adds the routes' outputs and applies the layer's epilogue as _gate_sum_mul_add_kernel
+    computes it: the routes added in order onto 0 in fp32, rounded to the output dtype, then routed + gate * shared
+    (``gate`` [M] from the HIP router launch, with the 16-warp sums of the Triton gate)."""
+    tl.debug_barrier()  # every thread's outputs stored before the count
+    cnt = cnt_ptr + token_id * tl.num_programs(1) + n_block_id
+    if tl.atomic_add(cnt, 1, sem="acq_rel", scope="gpu") == TOP_K - 1:
+        acc = tl.zeros(offs_n.shape, dtype=tl.float32)
+        for k in range(TOP_K):
+            acc += tl.load(c_ptr + token_id * stride_cm + k * stride_ck + offs_n * stride_cn, mask=n_mask, other=0.0,
+                           volatile=True)
+        routed = acc.to(c_ptr.dtype.element_ty).to(tl.float32)
+        gate = tl.load(gate_ptr + token_id)
+        shared = tl.load(shared_ptr + token_id * stride_sh + offs_n, mask=n_mask, other=0.0).to(tl.float32)
+        tl.store(out_ptr + token_id * stride_out + offs_n, routed + gate * shared, mask=n_mask)
+        tl.atomic_xchg(cnt, 0, sem="relaxed", scope="gpu")
 
 
 @triton.jit

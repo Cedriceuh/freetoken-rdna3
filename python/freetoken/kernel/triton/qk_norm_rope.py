@@ -15,7 +15,8 @@ from freetoken.kernel.triton.norm import _num_warps
 @triton.jit
 def _qk_norm_rope_kernel(Q, K, QO, KO, WQ, WK, POS, CACHE, SEC, sqa, sqb, ska, skb, soqa, soqb, soka, sokb, nnz,
                          HEAD_Q, rotary_dim, half, eps: tl.constexpr, H: tl.constexpr, BLOCK: tl.constexpr,
-                         BLOCK_DHALF: tl.constexpr, GEMMA: tl.constexpr):
+                         BLOCK_DHALF: tl.constexpr, GEMMA: tl.constexpr, KC=None, VC=None, LOC=None, V=None, sva=0,
+                         svb=0, skc=0, STORE: tl.constexpr = False):
     a = tl.program_id(0)
     b = tl.program_id(1)
     cols = tl.arange(0, BLOCK)
@@ -49,13 +50,27 @@ def _qk_norm_rope_kernel(Q, K, QO, KO, WQ, WK, POS, CACHE, SEC, sqa, sqb, ska, s
     x1 = tl.load(o_ptr + half + d, mask=dmask, other=0.0).to(tl.float32)
     tl.store(o_ptr + d, (x0 * cos - x1 * sin).to(QO.dtype.element_ty), mask=dmask)
     tl.store(o_ptr + half + d, (x1 * cos + x0 * sin).to(QO.dtype.element_ty), mask=dmask)
+    if STORE:
+        if b >= HEAD_Q:
+            # FREETOKEN_QK_STORE_KV: the K/V store's copy of this row and head (store_cache: k as stored above, v as
+            # the projection wrote it, at the token's cache slot)
+            tl.debug_barrier()
+            kh = b - HEAD_Q
+            loc = tl.load(LOC + a).to(tl.int64)
+            krow = tl.load(o_ptr + cols, mask=mask, other=0.0, volatile=True)
+            tl.store(KC + loc * skc + kh * H + cols, krow, mask=mask)
+            vrow = tl.load(V + a.to(tl.int64) * sva + kh * svb + cols, mask=mask, other=0.0)
+            tl.store(VC + loc * skc + kh * H + cols, vrow, mask=mask)
 
 
 def qk_norm_rope(q: torch.Tensor, k: torch.Tensor, wq: torch.Tensor, wk: torch.Tensor, eps: float, gemma: bool,
-                 positions: torch.Tensor, cos_sin_cache: torch.Tensor, section_table: torch.Tensor):
+                 positions: torch.Tensor, cos_sin_cache: torch.Tensor, section_table: torch.Tensor,
+                 kv_store: tuple | None = None):
     """``q`` [T, heads_q, H], ``k`` [T, heads_k, H] (any leading strides, unit last) -> new contiguous normalized and
     rotated ``(q, k)``: ``rmsnorm`` of each head (``gemma``: (1 + w)) then the 3-axis rope of positions [3, T]; None
-    where the two norms would run at different warps (prefill row counts)."""
+    where the two norms would run at different warps (prefill row counts). ``kv_store``: ``(k_cache, v_cache, loc, v)``
+    (the caches as [slots, heads_k * H] rows, ``v`` [T, heads_k, H]): the k rows and ``v`` are also stored at slots
+    ``loc``, as store_cache does."""
     T, hq, H = q.shape
     hk = k.shape[1]
     # the norms' warps: what _rmsnorm picks for each of the two calls this replaces
@@ -68,11 +83,17 @@ def qk_norm_rope(q: torch.Tensor, k: torch.Tensor, wq: torch.Tensor, wk: torch.T
     ko = torch.empty((T, hk, H), dtype=k.dtype, device=k.device)
     rotary_dim = cos_sin_cache.shape[1]
     half = rotary_dim // 2
+    store = {}
+    if kv_store is not None:
+        kc, vc, loc, v = kv_store
+        assert kc.shape == vc.shape and kc.stride() == vc.stride() and kc.shape[1] == hk * H and kc.stride(1) == 1
+        assert v.shape == (T, hk, H) and v.stride(2) == 1 and loc.shape == (T,)
+        store = dict(KC=kc, VC=vc, LOC=loc, V=v, sva=v.stride(0), svb=v.stride(1), skc=kc.stride(0), STORE=True)
     _qk_norm_rope_kernel[(T, hq + hk)](
         q, k, qo, ko, wq, wk, positions, cos_sin_cache, section_table, q.stride(0), q.stride(1), k.stride(0),
         k.stride(1), qo.stride(0), qo.stride(1), ko.stride(0), ko.stride(1), T, hq, rotary_dim, half, eps=eps, H=H,
         BLOCK=triton.next_power_of_2(H), BLOCK_DHALF=triton.next_power_of_2(half), GEMMA=gemma, num_warps=warps,
-        num_stages=1)
+        num_stages=1, **store)
     return qo, ko
 
 

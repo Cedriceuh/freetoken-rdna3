@@ -45,6 +45,13 @@ if SHARED_ROUTES not in (1, 2, 4):
     raise ValueError(f"FREETOKEN_EXL3_SHARED_ROUTES must be 1, 2 or 4, got {SHARED_ROUTES}")
 
 
+# FREETOKEN_EXL3_DECODE_EPILOGUE: set by models/qwen4_exp/moe.py around a decode layer's experts to (shared [T, H],
+# gate [T] fp32): exl3_out then returns the layer's epilogue (moe_shared_gate.shared_gate_sum_mul_add) itself, one
+# launch fewer; APPLIED says it did
+DECODE_EPILOGUE: list = [None]
+EPILOGUE_APPLIED: list = [False]
+
+
 def fused_experts_exl3(
     hidden_states: torch.Tensor,
     gate_up: torch.Tensor,
@@ -122,7 +129,9 @@ def fused_experts_exl3(
     a2 = exl3_mid(c1, slots, gate_up_svh, down_suh)
     c2 = exl3_gemv(a2, down, slots, codebook, skip_inactive=SKIP_CPU_ROUTES, group=group, groups=groups,
                    misses=plan, bank=bank.get("down", (0, 0))[0], miss_bulk=bulk)
-    return exl3_out(c2, slots, down_svh, weights, out)
+    epi, DECODE_EPILOGUE[0] = DECODE_EPILOGUE[0], None
+    EPILOGUE_APPLIED[0] = epi is not None
+    return exl3_out(c2, slots, down_svh, weights, out, epilogue=epi)
 
 
 __all__ = ["EXL3_PREFILL_BLOCK", "SHARED_ROUTES", "SKIP_CPU_ROUTES", "fused_experts_exl3"]

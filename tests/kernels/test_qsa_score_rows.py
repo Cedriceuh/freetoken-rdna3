@@ -9,7 +9,10 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a G
 
 
 @pytest.mark.parametrize("depth,rows,holes", [(0, 70, False), (100, 333, False), (5000, 700, False),
-                                              (20000, 1500, False), (60000, 4097, False), (20000, 1500, True)])
+                                              (20000, 1500, False), (60000, 4097, False), (20000, 1500, True),
+                                              # a decode step's verify rows (FREETOKEN_QSA_SCORE_DECODE_ROWS)
+                                              (255000, 4, False), (100000, 2, False), (30000, 3, True),
+                                              (250000, 8, False), (120000, 13, False), (64, 4, False)])
 def test_rows_kernel_matches_one_row_kernel(depth, rows, holes):
     from freetoken.kernel.triton.qsa.score import qsa_mqa_paged
 

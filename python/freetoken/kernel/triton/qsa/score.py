@@ -24,6 +24,10 @@ _ROWS_MIN = 64  # decode and short rows keep the one-row kernel
 _ROCM = torch.version.hip is not None
 _ROWS_STAGES = int(os.environ.get("FREETOKEN_QSA_SCORE_ROWS_STAGES", "1" if _ROCM else "2"))
 _ROWS_TILES = int(os.environ.get("FREETOKEN_QSA_SCORE_ROWS_TILES", "16" if _ROCM else "8"))
+# FREETOKEN_QSA_SCORE_DECODE_ROWS (default 1 on ROCm): a decode step's 2-63 rows of one request (its verify rows)
+# through that kernel too, 4 rows a program (8 or 16 above 4), 2 tiles, one stage, 4 warps: each key tile read once for
+# the rows, the same bits. 4 rows 255k deep, 12 layers' caches: 37.3 -> 29.6 us a call (7900 XTX), 47.1 -> 35.1 (XT)
+_SCORE_DECODE_ROWS = os.environ.get("FREETOKEN_QSA_SCORE_DECODE_ROWS", "1" if _ROCM else "0") == "1"
 
 
 @triton.jit
@@ -279,6 +283,18 @@ def qsa_mqa_paged(
             BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D, ROWS=16, TILES_PER_PROG=_ROWS_TILES, STAGES=_ROWS_STAGES,
             COMPRESS_RATIO=compress_ratio,
             num_warps=8,
+        )
+        return logits, visible_blocks
+    if one_request and _SCORE_DECODE_ROWS and q.shape[1] == 4 and 2 <= q.shape[0] < _ROWS_MIN:
+        rows_c = min(16, max(4, triton.next_power_of_2(q.shape[0])))
+        _qsa_mqa_paged_rows_kernel[(triton.cdiv(q.shape[0], rows_c), triton.cdiv(columns, BLOCK_N * 2))](
+            q, k_cache, page_table, token_to_req, query_positions, sequence_lengths, visible_blocks, logits,
+            q.stride(0), q.stride(1), q.stride(2), k_cache.stride(0), k_cache.stride(1), k_cache.stride(3),
+            page_table.stride(0), page_table.stride(1), logits.stride(0),
+            q.shape[0], columns, k_cache.shape[0], page_table.shape[0], float(score_divisor),
+            PAGE_SIZE=k_cache.shape[1], PAGE_TABLE_WIDTH=page_table.shape[1], NUM_HEADS=q.shape[1], HEAD_DIM=q.shape[2],
+            BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D, ROWS=rows_c, TILES_PER_PROG=2, STAGES=1, COMPRESS_RATIO=compress_ratio,
+            num_warps=4,
         )
         return logits, visible_blocks
     # Tuned on GB300: larger row batches provide enough parallelism to reuse Q.

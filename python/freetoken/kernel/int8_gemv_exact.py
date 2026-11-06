@@ -11,10 +11,11 @@ from .utils import load_jit
 
 @lru_cache(maxsize=None)
 def _module():
-    return load_jit("int8_gemv_exact", "v8", cuda_files=["int8_gemv_exact.cuh"],
+    return load_jit("int8_gemv_exact", "v31", cuda_files=["int8_gemv_exact.cuh"],
                     cuda_wrappers=[("run", "&Int8GemvExact::run"), ("run_k2048", "&Int8GemvExactK2048::run"),
                                    ("run_n4w8", "&Int8GemvExactN4W8::run"),
-                                   ("run_hc_mix", "&Int8HcMixExact::run")])
+                                   ("run_hc_mix", "&Int8HcMixExact::run"),
+                                   ("run_hc_down_mix", "&Int8HcDownMixExact::run")])
 
 
 def gemv_int8_exact(x: torch.Tensor, qweight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
@@ -49,3 +50,15 @@ def gemv_int8_hc_mix_exact(x: torch.Tensor, qweight: torch.Tensor, scale: torch.
     out = torch.empty((M, qweight.shape[0] // 4), dtype=torch.bfloat16, device=x.device)
     _module().run_hc_mix(x, qweight, scale, rn, out)
     return out
+
+
+def gemv_int8_hc_down_mix_exact(rn: torch.Tensor, down_w: torch.Tensor, down_scale: torch.Tensor, up_w: torch.Tensor,
+                                up_scale: torch.Tensor, silu_cols: int, sync: torch.Tensor):
+    """``down = gemv_int8_exact_k2048(rn, down_w, down_scale, 4, silu_cols)`` and
+    ``gemv_int8_hc_mix_exact(down[:, :K], up_w, up_scale, rn)`` (K = up_w's columns) in one launch, the same bits:
+    (down, mixed). ``sync``: two zeroed int32 the launch leaves at 0, one per call site."""
+    M = rn.shape[0]
+    down = torch.empty((M, down_w.shape[0]), dtype=torch.bfloat16, device=rn.device)
+    out = torch.empty((M, up_w.shape[0] // 4), dtype=torch.bfloat16, device=rn.device)
+    _module().run_hc_down_mix(rn, down_w, down_scale, down, up_w, up_scale, out, sync, silu_cols)
+    return down, out

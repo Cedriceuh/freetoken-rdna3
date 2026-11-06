@@ -71,6 +71,13 @@ class PyNCCLDistributedImpl(DistributedImpl):
         return result
 
 
+# FREETOKEN_HOST_AR_HC_COMBINE (default 1): a decoder layer sets HC_COMBINE[0] = {"res", "inj", "w", "eps", "rows",
+# "hidden"} before its attention / mixer / MoE block; the block's closing all-reduce (the first matching one) takes it,
+# runs the hyper-connection's combine + RMSNorm in the all-reduce's launch and leaves {"x": the reduced tensor, "rn":
+# the normed streams} in it (kernel/host_allreduce.py HostAllReduce.hc_combine)
+HC_COMBINE: list = [None]
+
+
 @dataclass
 class HostStagedDistributedImpl(DistributedImpl):
     """Small all-reduces through shared host memory (kernel/host_allreduce.py), large ones through it by the copy
@@ -90,6 +97,12 @@ class HostStagedDistributedImpl(DistributedImpl):
         return True
 
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
+        ctx = HC_COMBINE[0]
+        if (ctx is not None and "rn" not in ctx and x.dim() == 2 and tuple(x.shape) == (ctx["rows"], ctx["hidden"])
+                and x.dtype is torch.bfloat16 and x.is_contiguous() and self.ar.supports(x)):
+            ctx["rn"] = self.ar.hc_combine(x, ctx["res"], ctx["inj"], ctx["w"], ctx["eps"])
+            ctx["x"] = x
+            return x
         if self.ar.supports(x):
             return self.ar(x)
         if self._big(x):
@@ -105,6 +118,8 @@ class HostStagedDistributedImpl(DistributedImpl):
         return self.fallback.all_reduce_async(x)
 
     def all_gather(self, x: torch.Tensor) -> torch.Tensor:
+        if self.ar.supports_gather(x):
+            return self.ar.gather(x)
         return self.fallback.all_gather(x)
 
 

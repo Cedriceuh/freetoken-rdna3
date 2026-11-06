@@ -43,6 +43,11 @@ _HIP_REGISTER_MAPPED = 0x2
 _HIP_REGISTER_UNCACHED = 0x80000000
 
 
+# FREETOKEN_HOST_ALLGATHER (default 1, with the host all-reduce): small all-gathers (the LM head's candidates) through the
+# same shared slots instead of RCCL: copies only
+_GATHER = os.environ.get("FREETOKEN_HOST_ALLGATHER", "1") == "1"
+
+
 def enabled() -> bool:
     return os.environ.get(ENABLE_ENV, "").strip().lower() in ("1", "true", "yes", "on")
 
@@ -55,9 +60,10 @@ def max_bytes() -> int:
 def _module():
     return load_jit(
         "host_allreduce",
-        "v6",  # v2: alignas(16) out buffer; v3: optional wait log; v6: the peer's chunks loaded ahead
+        "v14",  # v2: alignas(16) out buffer; v3: optional wait log; v6: the peer's chunks loaded ahead; v11: all-gather, hc combine
         cuda_files=["host_allreduce.cuh"],
-        cuda_wrappers=[("run", "&HostAllReduce::run")],
+        cuda_wrappers=[("run", "&HostAllReduce::run"), ("gather", "&HostAllGather::run"),
+                       ("hc_combine", "&HostAllReduceHcCombine::run")],
     )
 
 
@@ -135,6 +141,9 @@ class HostAllReduce:
         self.timeout_ticks = int(timeout_s * 1e8) if timeout_s > 0 else 1 << 62
         self._size = size
         self._run = _module().run
+        self._gather = _module().gather
+        self._hc = _module().hc_combine
+        self._flags = None
         # 16-byte plain loads only on uncached pages (no cached copy of the peer's bytes to read)
         uncached = bool(flags & _HIP_REGISTER_UNCACHED)
         self._ahead = (2 if uncached else 1) if os.environ.get("FREETOKEN_HOST_ALLREDUCE_AHEAD", "1") == "1" else 0
@@ -159,6 +168,29 @@ class HostAllReduce:
         """Rank-invariant choice (dtype, size, layout only): both ranks must take the same path."""
         return (x.dtype in (torch.bfloat16, torch.float32) and x.is_contiguous()
                 and x.numel() * x.element_size() <= self.slot_bytes)
+
+    def supports_gather(self, x: torch.Tensor) -> bool:
+        """FREETOKEN_HOST_ALLGATHER (default 1): an all-gather of ``x`` through the slots (rank-invariant choice)."""
+        return (_GATHER and x.is_contiguous() and (x.numel() * x.element_size()) % 4 == 0
+                and x.numel() * x.element_size() <= self.slot_bytes)
+
+    def gather(self, x: torch.Tensor) -> torch.Tensor:
+        """``[2 * x.shape[0], *x.shape[1:]]``: rank 0's ``x`` then rank 1's, as all_gather_into_tensor leaves them."""
+        out = x.new_empty((2 * x.shape[0], *x.shape[1:]))
+        self._gather(x.view(-1).view(torch.int32), out.view(-1).view(torch.int32), self.counter, self.base, self.rank,
+                     self.slot_bytes, self.timeout_ticks, self.wait_log)
+        return out
+
+    def hc_combine(self, x: torch.Tensor, residual: torch.Tensor, inj: torch.Tensor, norm_weight: torch.Tensor,
+                   eps: float) -> torch.Tensor:
+        """FREETOKEN_HOST_AR_HC_COMBINE: all-reduce ``x`` [rows, hidden] (in place), then hc_combine_rmsnorm(residual,
+        x, inj, norm_weight, eps, 4, inplace=True) in the same launch; returns the normed streams."""
+        if self._flags is None:
+            self._flags = torch.zeros(2, dtype=torch.int32, device=x.device)
+        rn = torch.empty_like(residual)
+        self._hc(x, self.counter, self.base, self.rank, self.slot_bytes, self.timeout_ticks, self.wait_log, self._ahead,
+                 residual, inj, norm_weight, rn, float(eps), self._flags)
+        return rn
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         self._run(x.view(-1), self.counter, self.base, self.rank, self.slot_bytes, self.timeout_ticks, self.wait_log,

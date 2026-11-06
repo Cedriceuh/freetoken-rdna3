@@ -280,6 +280,10 @@ PLE_CONV_BLOCK = int(os.environ.get("FREETOKEN_PLE_CONV_BLOCK", "4096"))
 # FREETOKEN_PLE_CONV_KERNEL=0: the m-row decode conv (verify steps) as torch ops instead of one kernel
 # (ple_conv_kernel.py, the same bits on gfx11; other GPUs keep the torch ops)
 _CONV_KERNEL = os.environ.get("FREETOKEN_PLE_CONV_KERNEL", "1") != "0"
+# FREETOKEN_PLE_GATE_FUSED (default 1): the gate after its dot products (the division by sqrt(hidden), sign, abs,
+# clamp_min, sqrt, the product, sigmoid, the product with the value row: eight bf16 launches) in one kernel doing each
+# op as torch does and rounding to bf16 between them (kernel/triton/ple_gate.py): the same bits for every bf16 input
+_GATE_FUSED = os.environ.get("FREETOKEN_PLE_GATE_FUSED", "1") != "0"
 
 @dataclass
 class PLEMetadata:
@@ -712,9 +716,15 @@ class PLELayer(BaseOP):
         value = self.value_proj.forward(embeddings)
         query = self.norm_query.forward(R)
         shape = (-1, self.hc_count, self.hidden_size)
-        gate = (key.view(shape) * query.view(shape)).sum(-1, keepdim=True) / math.sqrt(self.hidden_size)
-        gate = torch.sigmoid(gate.sign() * gate.abs().clamp_min(1e-6).sqrt())
-        gated = (gate * value.unsqueeze(-2)).flatten(-2)
+        dots = (key.view(shape) * query.view(shape)).sum(-1, keepdim=True)
+        if _GATE_FUSED and dots.is_cuda and dots.dtype is torch.bfloat16 and value.dtype is torch.bfloat16:
+            from freetoken.kernel.triton.ple_gate import ple_gate
+
+            gated = ple_gate(dots, value, self.hidden_size)
+        else:
+            gate = dots / math.sqrt(self.hidden_size)
+            gate = torch.sigmoid(gate.sign() * gate.abs().clamp_min(1e-6).sqrt())
+            gated = (gate * value.unsqueeze(-2)).flatten(-2)
         states = conv_states if conv_states is not None else self._conv_state_slab(R)
         x = self.norm_conv.forward(gated)
         fla = getattr(batch, "fla_metadata", None)

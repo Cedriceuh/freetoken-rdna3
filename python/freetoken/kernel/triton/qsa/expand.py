@@ -11,12 +11,14 @@ import triton.language as tl
 
 
 @triton.jit
-def _expand_qsa_indices_kernel(
+def _expand_row(
     block_indices_ptr,
     query_positions_ptr,
     sequence_lengths_ptr,
     token_to_req_ptr,
     output_ptr,
+    row,
+    columns,
     stride_blocks_row,
     stride_blocks_column,
     stride_output_row,
@@ -25,13 +27,11 @@ def _expand_qsa_indices_kernel(
     num_requests,
     BLOCK_TOPK: tl.constexpr,
     COMPRESS_RATIO: tl.constexpr,
-    TOKEN_TOPK: tl.constexpr,
     OUTPUT_WIDTH: tl.constexpr,
-    COLUMN_BLOCK: tl.constexpr,
-) -> None:
-    # row * stride can overflow int32 for large row counts.
-    row = tl.program_id(0).to(tl.int64)
-    columns = tl.program_id(1) * COLUMN_BLOCK + tl.arange(0, COLUMN_BLOCK)
+    VOLATILE: tl.constexpr = False,
+):
+    """``columns`` of row ``row``'s token indices from its top-k blocks (``VOLATILE``: the blocks were just stored by
+    other threads of this program, read past the caches)."""
     query_position = tl.load(query_positions_ptr + row)
     request = tl.load(token_to_req_ptr + row)
     safe_request = tl.minimum(tl.maximum(request, 0), num_requests - 1)
@@ -59,6 +59,7 @@ def _expand_qsa_indices_kernel(
         block_indices_ptr + row * stride_blocks_row + safe_rank * stride_blocks_column,
         mask=(row < rows) & is_expanded,
         other=-1,
+        volatile=VOLATILE,
     )
     expanded = block * COMPRESS_RATIO + offset
     tail_offset = columns - expanded_count
@@ -80,6 +81,33 @@ def _expand_qsa_indices_kernel(
         tl.where(valid, token, -1),
         mask=(row < rows) & (columns < OUTPUT_WIDTH),
     )
+
+
+@triton.jit
+def _expand_qsa_indices_kernel(
+    block_indices_ptr,
+    query_positions_ptr,
+    sequence_lengths_ptr,
+    token_to_req_ptr,
+    output_ptr,
+    stride_blocks_row,
+    stride_blocks_column,
+    stride_output_row,
+    stride_output_column,
+    rows,
+    num_requests,
+    BLOCK_TOPK: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+    TOKEN_TOPK: tl.constexpr,
+    OUTPUT_WIDTH: tl.constexpr,
+    COLUMN_BLOCK: tl.constexpr,
+) -> None:
+    # row * stride can overflow int32 for large row counts.
+    row = tl.program_id(0).to(tl.int64)
+    columns = tl.program_id(1) * COLUMN_BLOCK + tl.arange(0, COLUMN_BLOCK)
+    _expand_row(block_indices_ptr, query_positions_ptr, sequence_lengths_ptr, token_to_req_ptr, output_ptr, row,
+                columns, stride_blocks_row, stride_blocks_column, stride_output_row, stride_output_column, rows,
+                num_requests, BLOCK_TOPK, COMPRESS_RATIO, OUTPUT_WIDTH)
 
 
 def expand_qsa_block_indices(
@@ -128,4 +156,4 @@ def expand_qsa_block_indices(
     return out
 
 
-__all__ = ["expand_qsa_block_indices"]
+__all__ = ["expand_qsa_block_indices"]  # _expand_row: the top-k kernels' FREETOKEN_QSA_TOPK_EXPAND epilogue

@@ -134,7 +134,15 @@ prefix is reused). The pool is shared: up to four requests run at once, together
   by the pool's size, ~52k with `--kv-reserve-tokens 787500`, in the prefill staging buffer below, which a decode does
   not use) and only the others cross PCIe: ~340 a call instead of ~3,900 at 170k. The same values, the same answers.
   At 192k the step's sparse attention takes ~0.9 ms instead of 2.35 (the copy included); decode +5.5 % (NVFP4) and
-  +6 % (EXL3), the next turn +4.3-4.4 %, two agents at 113k +5.7 % / +7 %.
+  +6 % (EXL3), the next turn +4.3-4.4 %, two agents at 113k +5.7 % / +7 %. After a 255k read, with the indexer's
+  top-k at 16 warps: +6.9 % (NVFP4) and +7.0 % (EXL3) mid-answer, the next turn +4.8 % (NVFP4).
+- **A decode step's indexer** scores its verify rows together, each tile of compressed keys read once for them
+  (`FREETOKEN_QSA_SCORE_DECODE_ROWS`; ~-21-25 % a call at 255k), its top-k runs at 32 warps, and the program that
+  emits a row's top-k blocks also expands them into the row's tokens (`FREETOKEN_QSA_TOPK_EXPAND`).
+- **What a step costs near the window** (one request, after a 255k read, traced): ~21.0 ms (NVFP4, 1,019 kernels; EXL3
+  3.05: ~21.0 ms, 1,163 kernels), of which the context's kernels (the attention, its rows' copy, the indexer's scoring
+  and top-k) ~1.7-1.8 ms; a step after a 1k-token document takes ~23.3 ms there (NVFP4), as it verifies more rows (4
+  against mostly 3 near the window).
 - **A prefill** first copies to a VRAM buffer the K/V rows its tokens select, one layer at a time
   (`FREETOKEN_QSA_STAGE_SELECTED`, 28 GB/s), instead of reading each row across PCIe.
 - **The answers are bit-identical** to the K/V in VRAM (the same text at 29k and 118k).

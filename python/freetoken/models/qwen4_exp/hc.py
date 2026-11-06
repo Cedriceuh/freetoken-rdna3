@@ -36,6 +36,9 @@ _HC_INPLACE = os.environ.get("FREETOKEN_HC_INPLACE", "1") == "1"
 _HC_SILU_EPILOGUE = os.environ.get("FREETOKEN_HC_SILU_EPILOGUE", "1") != "0"
 # FREETOKEN_HC_MIX_IN_GEMV=0: hc_gate_mix as its own kernel after the int8 up projection (GatedResidual._mix_int8)
 _HC_MIX_IN_GEMV = os.environ.get("FREETOKEN_HC_MIX_IN_GEMV", "1") != "0"
+# FREETOKEN_HC_DOWN_MIX (default 1): the int8 down projection and the up projection mixed into the streams in one
+# launch (kernel/int8_gemv_exact.py, the same bits)
+_HC_DOWN_MIX = os.environ.get("FREETOKEN_HC_DOWN_MIX", "1") == "1"
 
 
 def grouped_plus_one_rms_norm(
@@ -152,7 +155,7 @@ class GatedResidual(BaseOP):
         if not (_HC_SILU_EPILOGUE and rn.is_cuda and rn.dim() == 2 and rn.dtype is torch.bfloat16
                 and rn.stride(-1) == 1):
             return None
-        from freetoken.kernel.triton.int8_gemv import ROWS_MAX, gemv_int8, gemv_int8_hc_mix
+        from freetoken.kernel.triton.int8_gemv import ROWS_MAX, gemv_int8, gemv_int8_hc_down_mix, gemv_int8_hc_mix
         from freetoken.layers.quantization.int8_weight_only import Int8WeightOnlyLinearMethod
 
         down = self.input_mix_weight_down_block_inject if self.use_combine else self.input_mix_weight_down
@@ -162,13 +165,33 @@ class GatedResidual(BaseOP):
         m = rn.shape[0]
         if not (m == 1 or (1 < m <= ROWS_MAX and rn.is_contiguous())):  # the rows Int8WeightOnlyLinearMethod takes
             return None
-        out = gemv_int8(rn, down.weight, down.weight_scale, silu_hc=self.hc_count, silu_cols=self.lowrank)
+        out = mixed = None
+        if _HC_DOWN_MIX and _HC_MIX_IN_GEMV:
+            sync = self._down_mix_sync(rn.device)
+            if sync is not None:
+                fused = gemv_int8_hc_down_mix(rn, down.weight, down.weight_scale, up.weight, up.weight_scale,
+                                              self.hc_count, self.lowrank, sync)
+                if fused is not None:
+                    out, mixed = fused
+        if out is None:
+            out = gemv_int8(rn, down.weight, down.weight_scale, silu_hc=self.hc_count, silu_cols=self.lowrank)
         s = out[:, self.lowrank : self.lowrank + self.hc_count] if self.use_combine else None
         lora = out[:, : self.lowrank]
-        mixed = gemv_int8_hc_mix(lora, up.weight, up.weight_scale, rn, self.hc_count) if _HC_MIX_IN_GEMV else None
+        if mixed is None and _HC_MIX_IN_GEMV:
+            mixed = gemv_int8_hc_mix(lora, up.weight, up.weight_scale, rn, self.hc_count)
         if mixed is None:
             mixed = hc_gate_mix(rn, gemv_int8(lora, up.weight, up.weight_scale), self.hc_count)
         return mixed, s
+
+    def _down_mix_sync(self, device: torch.device) -> torch.Tensor | None:
+        """The two counters of this hyper-connection's fused down + mix launch (FREETOKEN_HC_DOWN_MIX), allocated at
+        its first eager decode step; None while a graph is captured before that."""
+        sync = getattr(self, "_hc_down_mix_sync", None)
+        if sync is None or sync.device != device:
+            if torch.cuda.is_current_stream_capturing():
+                return None
+            sync = self._hc_down_mix_sync = torch.zeros(2, dtype=torch.int32, device=device)
+        return sync
 
     def _mix_torch(self, R: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor | None]:
         rn = grouped_plus_one_rms_norm(R, self.hc_norm.weight, self.hc_norm.eps, self.hc_count)

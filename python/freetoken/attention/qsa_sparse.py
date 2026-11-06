@@ -117,6 +117,7 @@ class QSASparseMetadata(BaseAttnMetadata):
 
 class QSASparseAttnBackend(BaseAttnBackend):
     takes_gate = True  # qsa_forward(gate=...) returns the gated output (FREETOKEN_QSA_FUSED_GATE)
+    takes_kv_stored = True  # qsa_forward(kv_stored=True): the caller stored this layer's K/V (FREETOKEN_QK_STORE_KV)
 
     def __init__(self, config: ModelConfig) -> None:
         from freetoken.kvcache.qsa_pool import QSAKVCache
@@ -336,13 +337,15 @@ class QSASparseAttnBackend(BaseAttnBackend):
         batch: Batch,
         kv_only: bool = False,
         gate: torch.Tensor | None = None,
+        kv_stored: bool = False,
     ) -> torch.Tensor | None:
         from freetoken.kernel.triton.qsa import qsa_sparse_paged_attention
 
         md = batch.attn_metadata
         assert isinstance(md, QSASparseMetadata)
         slot = self._idx_slot[layer_id]
-        self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
+        if not kv_stored:
+            self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
         if md.block_table is None:
             self._snapshot_decode(md, batch)
         if slot == 0 or md.cmp_rows is None:
@@ -546,16 +549,10 @@ class QSASparseAttnBackend(BaseAttnBackend):
                 one_request=md.block_table.shape[0] == 1,
             )
             blocks = self._scratch("blocks", end - start, self.block_topk, dtype=torch.int32)
-            self._top_blocks(logits, visible, blocks)
-            expand_qsa_block_indices(
-                blocks,
-                positions[chunk],
-                md.seq_lens,
-                md.token_to_req[chunk],
-                self.ratio,
-                self.token_topk,
-                indices[chunk],
-            )
+            expand = (positions[chunk], md.seq_lens, md.token_to_req[chunk], self.ratio, self.token_topk,
+                      indices[chunk])
+            if not self._top_blocks(logits, visible, blocks, expand):
+                expand_qsa_block_indices(blocks, *expand)
         return indices
 
     def _top_blocks(
@@ -563,8 +560,10 @@ class QSASparseAttnBackend(BaseAttnBackend):
         logits: torch.Tensor,
         visible: torch.Tensor,
         blocks: torch.Tensor,
-    ) -> None:
-        """Top ``block_topk`` complete blocks per row, row-relative, -1 padded."""
+        expand: tuple | None = None,
+    ) -> bool:
+        """Top ``block_topk`` complete blocks per row, row-relative, -1 padded; whether the kernel also expanded them
+        (``expand``: expand_qsa_block_indices' other arguments, FREETOKEN_QSA_TOPK_EXPAND)."""
         assert blocks.shape == (logits.shape[0], self.block_topk), (
             f"qsa block top-k output must be [rows, {self.block_topk}], got {tuple(blocks.shape)}"
         )
@@ -575,8 +574,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
                 if scratch_width
                 else None
             )
-            self._block_topk_kernel(logits, visible, blocks, scratch)
-            return
+            return bool(self._block_topk_kernel(logits, visible, blocks, scratch, expand))
         # The score kernel only writes columns below visible_blocks; mask the rest so a
         # stale row cannot win a slot. Real block scores are relu sums, never -inf.
         columns = logits.shape[1]
@@ -587,6 +585,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
         blocks[:, :width] = torch.where(values > -float("inf"), chosen.to(torch.int32), -1)
         if width < self.block_topk:
             blocks[:, width:] = -1
+        return False
 
     def _topk_scratch_width(self, columns: int) -> int:
         """int32 columns per row the block top-k wants as scratch, 0 when it wants none."""

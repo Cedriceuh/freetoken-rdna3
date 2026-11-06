@@ -124,12 +124,15 @@ def decode_gemm_marlin(
     a_row_is_route: bool,
     misses: tuple | None = None,
     banks: tuple[int, ...] = (0, 0),
-) -> None:
+    epilogue: tuple | None = None,
+) -> bool:
     """Marlin-style decode GEMV: int32 wide loads + deferred reduction
     (:func:`_decode_nvfp4_marlin_kernel`). ``packed`` is the uint8 ``[S, N, K//2]`` bank;
     it is reinterpreted as int32 ``[S, N, K//8]`` (contiguous, K%8==0 for NVFP4). ``misses``: the expert cache's
     copy plan (OffloadMoeCache.miss_reads), ``banks`` the packed and scale banks' indices in its host addresses: a
-    slot being filled is read from host memory and written on the way."""
+    slot being filled is read from host memory and written on the way. ``epilogue`` (FREETOKEN_NVFP4_DECODE_EPILOGUE):
+    (shared [M, N], gate [M] fp32, out [M, N]) for the kernel to also write ``shared_gate_sum_mul_add``'s result into
+    ``out``; True if it did."""
     M, top_k = topk_ids.shape
     N = packed.shape[1]
     K = packed.shape[2] * 2
@@ -153,6 +156,14 @@ def decode_gemm_marlin(
         and a.stride(1) == 1 and a.stride(0) % 8 == 0 and a.data_ptr() % 16 == 0
     )
     grid = (total_routes, triton.cdiv(N, block_n))
+    epi = {}
+    if epilogue is not None:
+        shared, gate, out = epilogue
+        cnt = _epilogue_counters(c.device, M * grid[1])
+        if (cnt is not None and shared.stride(1) == 1 and out.stride(1) == 1 and gate.dtype == torch.float32
+                and gate.is_contiguous() and shared.shape == out.shape == (M, N)):
+            epi = dict(EPI=True, shared_ptr=shared, gate_ptr=gate, out_ptr=out, cnt_ptr=cnt,
+                       stride_sh=shared.stride(0), stride_out=out.stride(0))
     _decode_nvfp4_marlin_kernel[grid](
         a, packed_i32, scale, glob, c, topk_weights, topk_ids,
         total_routes, N, K,
@@ -174,7 +185,23 @@ def decode_gemm_marlin(
         SKIP_INACTIVE=SKIP_CPU_ROUTES,
         num_warps=warps,
         **_miss_args(misses, banks, total_routes, packed_i32, scale, block_n, N, glob),
+        **epi,
     )
+    return bool(epi)
+
+
+_EPILOGUE_COUNTERS: dict[int, torch.Tensor] = {}
+
+
+def _epilogue_counters(device: torch.device, need: int) -> torch.Tensor | None:
+    """FREETOKEN_NVFP4_DECODE_EPILOGUE's counters (a token and row block each, zero; the kernel leaves them zero),
+    allocated outside a graph capture (the engine runs each shape eagerly first): None while capturing before any."""
+    have = _EPILOGUE_COUNTERS.get(device.index)
+    if have is None or have.numel() < need:
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        have = _EPILOGUE_COUNTERS[device.index] = torch.zeros(max(need, 1024), dtype=torch.int32, device=device)
+    return have
 
 
 # FREETOKEN_NVFP4_MISS_BULK (default 1): a decode GEMV program whose slot is being filled copies its rows from host

@@ -11,7 +11,7 @@ from freetoken.distributed.split import intermediate_partition, is_uneven
 from freetoken.kernel.triton.moe_shared_gate import shared_gate_mul_add, shared_gate_sigmoid, shared_gate_sum_mul_add
 from freetoken.layers.quantization.moe.exl3 import TritonExl3MoEKernel
 from freetoken.layers.quantization.moe.nvfp4 import TritonNvfp4MoEKernel
-from freetoken.moe import fused_nvfp4, prefill_hooks
+from freetoken.moe import fused_exl3, fused_nvfp4, prefill_hooks
 from freetoken.models.qwen3_5_moe.moe import Qwen3_5MoE, _SharedExpert
 
 if TYPE_CHECKING:
@@ -29,6 +29,12 @@ _PREFILL_COPY_OVERLAP = os.environ.get("FREETOKEN_PREFILL_COPY_OVERLAP", "auto")
 # FREETOKEN_FUSED_MOE_EPILOGUE (default 1): the routed sum, the shared-expert gate and the mul-add in one kernel
 # (decode and prefill); the same arithmetic in the same order, so the same bits, two launches fewer per layer
 _FUSED_EPILOGUE = os.environ.get("FREETOKEN_FUSED_MOE_EPILOGUE", "1") == "1"
+# FREETOKEN_EXL3_DECODE_EPILOGUE (default 1): an EXL3 decode layer's epilogue in its routed sum's kernel (the gate
+# from the HIP router launch, FREETOKEN_ROUTER_SHARED_HIP): one launch fewer a layer, the same bits
+_EXL3_EPILOGUE = os.environ.get("FREETOKEN_EXL3_DECODE_EPILOGUE", "1") == "1"
+# FREETOKEN_NVFP4_DECODE_EPILOGUE (default 1): the same for NVFP4, in its down projection's kernel: the last of a
+# token's routes over a row block adds them and applies the epilogue
+_NVFP4_EPILOGUE = os.environ.get("FREETOKEN_NVFP4_DECODE_EPILOGUE", "1") == "1"
 # FREETOKEN_PREFILL_PREDICT (default 1): when a prefill chunk reads its experts from the slot cache, layer L+1's router
 # applied to layer L's MoE input predicts the experts layer L+1 routes to (top-k + _PREDICT_EXTRA per token), and the
 # absent ones are copied in while layer L computes (only copies, so the same bits). Each token's own top-k (extra 0)
@@ -175,19 +181,29 @@ class Qwen4ExpMoE(Qwen3_5MoE):
 
                 prefill_hooks.BLOCK_DONE[0] = block_done
             fused_nvfp4.PER_EXPERT_OUTPUT[0] = True
+            epi_gate = both[2] if both is not None and len(both) > 2 else None
+            if epi_gate is not None and topk is not None and not blocks and not split_pf:
+                # FREETOKEN_EXL3_DECODE_EPILOGUE / FREETOKEN_NVFP4_DECODE_EPILOGUE (one of them reads it)
+                fused_exl3.DECODE_EPILOGUE[0] = fused_nvfp4.DECODE_EPILOGUE[0] = (shared, epi_gate)
+            fused_exl3.EPILOGUE_APPLIED[0] = fused_nvfp4.EPILOGUE_APPLIED[0] = False
             try:
                 routed = self.experts.prefill_finish(hidden_states, *routing) if split_pf else experts()
             finally:
                 fused_nvfp4.PER_EXPERT_OUTPUT[0] = False
                 prefill_hooks.BLOCK_DONE[0] = None
+                fused_exl3.DECODE_EPILOGUE[0] = fused_nvfp4.DECODE_EPILOGUE[0] = None
             if works:  # every block finished and all-reduced its rows
                 for work in works:
                     if work is not None:
                         work.wait()
                         prefill_hooks.ASYNC_AR[0] = True
                 return out.view(num_tokens, hidden_dim)
-            routed = routed if routed.dim() == 3 else routed.view(num_tokens, 1, hidden_dim)
-            out = shared_gate_sum_mul_add(routed, shared, hidden_states, gate_w)
+            if fused_exl3.EPILOGUE_APPLIED[0] or fused_nvfp4.EPILOGUE_APPLIED[0]:  # the kernel returned the result
+                fused_exl3.EPILOGUE_APPLIED[0] = fused_nvfp4.EPILOGUE_APPLIED[0] = False
+                out = routed
+            else:
+                routed = routed if routed.dim() == 3 else routed.view(num_tokens, 1, hidden_dim)
+                out = shared_gate_sum_mul_add(routed, shared, hidden_states, gate_w)
         else:
             gate = shared_gate_sigmoid(hidden_states, self.shared_expert_gate.weight.view(-1))
             if split:
@@ -207,7 +223,8 @@ class Qwen4ExpMoE(Qwen3_5MoE):
         the int8 GEMV with its activation; else None."""
         from freetoken.kernel.triton import router_shared
 
-        if not router_shared.ENABLED or not x.is_cuda or x.shape[0] > 4 or get_global_ctx().batch.is_prefill:
+        if (not router_shared.ENABLED or not x.is_cuda or x.shape[0] > router_shared.ROWS_LIMIT
+                or get_global_ctx().batch.is_prefill):
             return None
         gate, gu = self.gate, self.shared_expert.gate_up_proj
         counters = getattr(gate, "_gemv_counters", None)
@@ -219,7 +236,12 @@ class Qwen4ExpMoE(Qwen3_5MoE):
         cfg = _decode_gemv_config(gate.weight)
         if cfg is None:
             return None
-        return router_shared.router_and_shared_act(x, gate.weight, cfg, counters, gu.weight, gu.weight_scale)
+        kernel = getattr(self.experts.quant_method, "kernel", None)
+        exl3 = _EXL3_EPILOGUE and isinstance(kernel, TritonExl3MoEKernel)
+        nvfp4 = _NVFP4_EPILOGUE and isinstance(kernel, TritonNvfp4MoEKernel)
+        epi = _FUSED_EPILOGUE and (exl3 or nvfp4) and self._epilogue_fusable()
+        return router_shared.router_and_shared_act(x, gate.weight, cfg, counters, gu.weight, gu.weight_scale,
+                                                   self.shared_expert_gate.weight.view(-1) if epi else None)
 
     def _down_topk(self, both: tuple[torch.Tensor, torch.Tensor]):
         """FREETOKEN_ROUTER_SHARED after ``_router_shared``: (the shared expert's down projection, the routing weights,

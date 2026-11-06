@@ -39,7 +39,11 @@ Several concurrent requests run the same per-row kernel once per row, so a reque
 or batched. Four of these GEMVs at 1-8 rows (the GDN projections, attention qkv and output, the hyper-connections' down
 and up projections) run as HIP kernels that add in the Triton kernels' order: an int8 weight times a bf16 activation is
 exact in fp32, so the same order gives the same bits, with fewer instructions a row (`FREETOKEN_INT8_EXACT_GEMV`,
-+5-6 % decode at one request).
++5-6 % decode at one request); their lanes' sums move by DPP, as Triton's reductions do. At two to four requests
+(6-8 rows) a hyper-connection's down and up projections share one launch, the up projection's blocks waiting on a
+count of the down projection's columns (`FREETOKEN_HC_DOWN_MIX`, the same bits). A MoE layer's router GEMV
+(bf16) with its shared expert's gate | up runs the same way at 1-8 rows, up to four requests' verify rows
+(`FREETOKEN_ROUTER_SHARED_HIP`).
 
 ## Two unequal cards: uneven tensor parallelism (+4 %)
 
@@ -59,9 +63,12 @@ mixers, the PLE projections, the attention indexer, the norms and the routers ar
 
 Without peer-to-peer, RCCL stages each small decode all-reduce (5 KB) through host memory with its proxy threads:
 ~12 µs inside a CUDA graph, ~97 times per token. Here both ranks map one shared host-memory region and a one-block
-kernel copies, signals, waits and adds (fp32, rounded to bf16 exactly as RCCL does): 6 µs, same bits. Separately, the
-two MoE all-reduces of a layer (routed and shared experts) are merged into one (+2.7 % decode): that change reorders
-sums and was validated on the agentic benchmark.
+kernel copies, signals, waits and adds (fp32, rounded to bf16 exactly as RCCL does): 6 µs, same bits. The same region
+and sequence counter carry the small all-gathers too (the LM head's candidates, three a decode step), and a decode
+step's hyper-connection combine and RMSNorm after each block run in the launch of the block's closing all-reduce: one
+block all-reduces, then one block per row and stream redoes that Triton program in HIP with its order of additions (the
+same bits; one launch fewer a block). Separately, the two MoE all-reduces of a layer (routed and shared experts) are
+merged into one (+2.7 % decode): that change reorders sums and was validated on the agentic benchmark.
 
 A prefill's large all-reduces (20 MiB and up: a block of a long chunk) go through shared host memory too, moved by the
 copy engines: each rank copies its message there in 8 MiB pieces and flags each one, the other copies it back and adds

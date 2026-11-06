@@ -357,6 +357,8 @@ _ROW_GROUPS = os.environ.get("FREETOKEN_INT8_ROW_GROUPS", "1") == "1"
 # silu_and_mul in one launch (_gemv_int8_act_pair, one column pair a program) instead of the row-group GEMV then the
 # activation; the same bits
 _ACT_PAIR4 = os.environ.get("FREETOKEN_INT8_ACT_PAIR4", "1") == "1"
+# the fewest rows gemv_int8_hc_down_mix fuses: below 6 the two launches are as fast or faster
+_HC_DOWN_MIX_ROWS = 6
 
 
 def _exact_operands(x: torch.Tensor, qweight: torch.Tensor) -> bool:
@@ -441,6 +443,26 @@ def gemv_int8_hc_mix(x: torch.Tensor, qweight: torch.Tensor, scale: torch.Tensor
     return out
 
 
+def gemv_int8_hc_down_mix(rn: torch.Tensor, down_w: torch.Tensor, down_scale: torch.Tensor, up_w: torch.Tensor,
+                          up_scale: torch.Tensor, hc: int, silu_cols: int, sync: torch.Tensor):
+    """``down = gemv_int8(rn, down_w, down_scale, silu_hc=hc, silu_cols=silu_cols)`` and
+    ``gemv_int8_hc_mix(down[:, :K], up_w, up_scale, rn, hc)`` (K = up_w's columns) in one launch where both run the
+    HIP kernels (kernel/int8_gemv_exact.py, the same bits): (down, mixed); None otherwise. ``sync``: two zeroed int32
+    for this call site (allocated outside graph capture), left at 0 by each launch."""
+    M, KD = rn.shape
+    N, KU = up_w.shape
+    if not (_EXACT_HIP and hc == 4 and _HC_DOWN_MIX_ROWS <= M <= min(ROWS_MAX, 8) and KD % 8 == 0 and KU % 16 == 0
+            and KU <= silu_cols <= down_w.shape[0] and N == KD and down_w.shape[1] == KD):
+        return None
+    if (_config(down_w.shape[0], KD) != (1, 2048, 1, 8) or _config(N, KU) != (1, 512, 1, 1)
+            or not _exact_operands(rn, down_w) or not _exact_operands(rn, up_w) or rn.stride(0) % 8
+            or down_w.shape[0] % 8):
+        return None
+    from freetoken.kernel.int8_gemv_exact import gemv_int8_hc_down_mix_exact
+
+    return gemv_int8_hc_down_mix_exact(rn, down_w, down_scale, up_w, up_scale, silu_cols, sync)
+
+
 def gemv_int8_act_mul(x: torch.Tensor, qweight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor | None:
     """``silu_and_mul(gemv_int8(x, qweight, scale))`` (the Triton activation, kernel/triton/activation.py) in one
     kernel, the same bits: ``qweight`` [2D, K] (gate rows, then up rows) -> [M, D] bf16. None for a split-K config, and
@@ -474,5 +496,5 @@ def gemv_int8_act_mul(x: torch.Tensor, qweight: torch.Tensor, scale: torch.Tenso
     return out
 
 
-__all__ = ["gemv_int8", "gemv_int8_act_mul", "gemv_int8_hc_mix"]
+__all__ = ["gemv_int8", "gemv_int8_act_mul", "gemv_int8_hc_down_mix", "gemv_int8_hc_mix"]
 

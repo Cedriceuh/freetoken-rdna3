@@ -1,5 +1,7 @@
 """FREETOKEN_ROUTER_SHARED: the router GEMV and the shared expert's gate | up GEMV with its activation in one launch give
-the bits of the two launches (gemv_bf16 with its in-kernel reduce, gemv_int8_act_mul), at the warps they run at."""
+the bits of the two launches (gemv_bf16 with its in-kernel reduce, gemv_int8_act_mul; at 5-8 rows of a K-blocked shape
+the GEMV then the Triton activation, which serving runs there), at the warps they run at; so do the shared down
+projection and the router's top-k, at 1-8 rows."""
 
 from __future__ import annotations
 
@@ -15,12 +17,13 @@ SHARED_ROWS = [640, 704, 576, 768]
 
 
 @pytest.mark.parametrize("n2", SHARED_ROWS)
-@pytest.mark.parametrize("rows", [1, 2, 3, 4])
+@pytest.mark.parametrize("rows", [1, 2, 3, 4, 5, 6, 7, 8])
 @pytest.mark.parametrize("seed", range(4))
 def test_one_launch_matches_the_two(n2, rows, seed, monkeypatch):
     from freetoken.kernel.triton import router_shared
+    from freetoken.kernel.triton.activation import silu_and_mul
     from freetoken.kernel.triton.dense_gemv import _BF16_CONFIGS, gemv_bf16, gemv_counters
-    from freetoken.kernel.triton.int8_gemv import gemv_int8_act_mul
+    from freetoken.kernel.triton.int8_gemv import gemv_int8, gemv_int8_act_mul
 
     monkeypatch.setattr(router_shared, "ENABLED", True)
     dev = torch.device("cuda")
@@ -32,13 +35,15 @@ def test_one_launch_matches_the_two(n2, rows, seed, monkeypatch):
     cfg = _BF16_CONFIGS[(512, 2560)]
     ref_logits = gemv_bf16(x, gate_w, cfg, counters=gemv_counters(gate_w, cfg))
     ref_act = gemv_int8_act_mul(x, q, scale)
+    two = silu_and_mul(gemv_int8(x, q, scale))
+    assert ref_act is None or torch.equal(ref_act, two)
     got = router_shared.router_and_shared_act(x, gate_w, cfg, gemv_counters(gate_w, cfg), q, scale)
     assert got is not None
-    assert torch.equal(got[0], ref_logits) and torch.equal(got[1], ref_act)
+    assert torch.equal(got[0], ref_logits) and torch.equal(got[1], two)
 
 
 @pytest.mark.parametrize("dk", [n // 2 for n in SHARED_ROWS])
-@pytest.mark.parametrize("rows", [1, 2, 3, 4])
+@pytest.mark.parametrize("rows", [1, 2, 3, 4, 5, 6, 7, 8])
 @pytest.mark.parametrize("seed", range(4))
 def test_down_and_topk_match_the_two(dk, rows, seed, monkeypatch):
     """The shared expert's down projection and the router's softmax top-k in one launch: the bits of gemv_int8 and
