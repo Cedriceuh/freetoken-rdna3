@@ -114,6 +114,14 @@ What each change measured, and how it was found: [docs/rdna3/journey.md](docs/rd
   tensors kept beside the index (n-gram hash constants, MTP mixer, vision patch), which upstream's loader now skips; a
   decode step's PLE fill runs on a thread started before the launch (`FREETOKEN_PLE_FILL_THREAD`), so a graph larger
   than the hardware queue no longer hangs behind its wait.
+- Upstream FreeToken merged up to `e5856ac`, the authors' commits kept: among others speculative decoding with the
+  checkpoint's MTP layer (`--speculative-algorithm mtp`, one GPU: Qwen3.5 / 3.6 and Qwen3.8-Flash-Next; exclusive with
+  this repository's MTP decoding, which the profiles keep), per-request timings in the API answers
+  (`--enable-timings-report`), `continuous_usage_stats`, Qwen tool calls recovered after an unclosed think, image input
+  for Qwen3-VL, MiniMax-M3 and Muse Glimmer GGUFs, gpt-oss GGUF checkpoints. On `xtx-xt-4x262k` the same answers as
+  before (one request, greedy and T 0.6, both checkpoints; a 255k-token read and the turn after it) and the same speeds;
+  a verify step's kept tokens now stream in one piece, and the decode log line shows the drafts' acceptance
+  (`accept len`).
 - Opt-in, not bit-exact: `FREETOKEN_INT8_TP_TILES`. Measured and left off: `FREETOKEN_MOE_COPY_OVERLAP` (33 % slower).
 
 ### Fixed

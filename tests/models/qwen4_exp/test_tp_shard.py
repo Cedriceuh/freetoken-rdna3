@@ -321,7 +321,7 @@ def test_gdn_conv_dim_matches_the_state_pool_allocation(tp):
         value_head_dim=GDN["head_v_dim"], conv_kernel_dim=GDN["conv_kernel_size"],
         output_gate=GDN["output_gate"],
     )
-    _, pool_conv_dim, pool_v_heads = _linear_local_dims(group, tp)
+    _, pool_conv_dim, pool_v_heads, _ = _linear_local_dims(group, tp)
     with as_rank(0, tp):
         gdn = _gdn()
     assert gdn.conv_dim == pool_conv_dim

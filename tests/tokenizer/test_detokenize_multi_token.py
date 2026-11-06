@@ -19,7 +19,8 @@ def _stream(batches):
     det = DetokenizeManager(_Tok(), frozenset({0}))
     pieces = {}
     for batch in batches:
-        msgs = [DetokenizeMsg(uid=u, next_token=t, finished=False) for u, t in batch]
+        msgs = [DetokenizeMsg(uid=u, next_tokens=list(t) if isinstance(t, tuple) else [t], finished=False)
+                for u, t in batch]
         for (u, _), text in zip(batch, det.detokenize(msgs)):
             pieces.setdefault(u, []).append(text)
     return {u: "".join(p) for u, p in pieces.items()}
@@ -29,6 +30,9 @@ def test_two_tokens_of_a_request_in_one_batch():
     one_by_one = _stream([[(7, t)] for t in (1, 2, 3, 4, 5, 6, 7)])
     paired = _stream([[(7, 1), (7, 2)], [(7, 3)], [(7, 4), (7, 5)], [(7, 6), (7, 7)]])
     assert paired == one_by_one == {7: "Ce document est la référence"}
+    # a verify step's kept tokens in one message, beside messages of one token
+    grouped = _stream([[(7, (1, 2, 3))], [(7, 4), (7, (5, 6, 7))]])
+    assert grouped == one_by_one
 
 
 def test_interleaved_requests_keep_their_own_order():

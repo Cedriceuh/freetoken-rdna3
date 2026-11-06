@@ -185,7 +185,10 @@ def rows_of(batch) -> int:
     (--speculative-algorithm), 1 for a prefill."""
     if batch.is_decode:
         return getattr(batch, "spec_m", 1)
-    return (getattr(batch, "rows_per_req", None) or 1) if getattr(batch, "phase", None) == "verify" else 1
+    if getattr(batch, "phase", None) != "verify":
+        return 1
+    # every request of a verify step runs the same rows
+    return getattr(batch, "rows_per_req", None) or batch.padded_reqs[0].extend_len
 
 
 @dataclass

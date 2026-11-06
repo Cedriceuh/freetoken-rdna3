@@ -52,6 +52,9 @@ _FLAG_SYNC = os.getenv("FREETOKEN_CPU_MOE_FLAG_SYNC", "1") != "0"
 # memops instead of its publish and merge kernels (kernel/triton/hybrid_split.py), which write and read the pinned IO
 # rows in place and ring / wait on two pinned flag words themselves.
 _FLAG_IN_KERNEL = os.getenv("FREETOKEN_HYBRID_FLAG_IN_KERNEL", "1") != "0"
+# FREETOKEN_CPU_MOE_KERNEL_IO_ROCM=1: on ROCm too, upstream's kernel IO (a publish kernel copies the inputs and rings the
+# doorbell, a combine kernel adds the result) when its probe passes; off, ROCm keeps the copies around the doorbell
+_ROCM_KERNEL_IO = os.getenv("FREETOKEN_CPU_MOE_KERNEL_IO_ROCM", "0") == "1"
 # Pool threads spin up to 50 ms before they park. FREETOKEN_CPU_MOE_SPIN=0 opts out.
 _SPIN_WAIT = os.getenv("FREETOKEN_CPU_MOE_SPIN", "1") != "0"
 # ds_fp4 runs its input FP8 round-trip on the GPU when it can; tests turn this off to compare against the CPU round-trip.
@@ -415,9 +418,9 @@ class CpuMoeExecutor:
         self._kflags = None
         if self._flag_sync:
             self._ext.start_flag_coordinator(self._coord_core)
-            # ROCm keeps the copies around the doorbell and the hybrid layer's in-kernel flags below (the paths measured
-            # on RDNA3); the kernel IO stays CUDA's here
-            if torch.version.hip is None:
+            # ROCm keeps the copies around the doorbell and the hybrid layer's in-kernel flags below, the paths measured
+            # on RDNA3 (FREETOKEN_CPU_MOE_KERNEL_IO_ROCM)
+            if torch.version.hip is None or _ROCM_KERNEL_IO:
                 reason = _cpu_moe.kernel_io_probe(torch.cuda.current_stream().cuda_stream)
                 if reason:
                     logger.warning_rank0(f"cpu-moe kernel IO unavailable ({reason}); using D2H/H2D copies around the doorbell")

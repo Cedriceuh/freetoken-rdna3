@@ -600,6 +600,8 @@ class CacheManager:
         end = div_ceil(req.alloc_len, self.page_size) * self.page_size
         if end > start:
             self._free(self.page_table[req.table_idx, start:end])
+        # those pages are gone: the next allocate_paged allocates them again (alloc_len would skip them)
+        req.alloc_len = min(req.alloc_len, start)
         req.alloc_len = req.cached_len
 
     def _padded_tail(self, req: Req, start: int) -> torch.Tensor:
@@ -756,6 +758,8 @@ class CacheManager:
         assert not self.swa_paged, "rollback_tail frees no SWA slots; speculative decoding rejects SWA targets"
         if end > start:
             self._free(self.page_table[req.table_idx, start:end])
+        # those pages are gone: the next allocate_paged allocates them again (alloc_len would skip them)
+        req.alloc_len = min(req.alloc_len, start)
 
     def _page_to_token(self, pages: torch.Tensor) -> torch.Tensor:
         if self.page_size == 1:

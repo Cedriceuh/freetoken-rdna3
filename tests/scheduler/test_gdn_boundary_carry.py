@@ -89,7 +89,7 @@ def _forward_track(pool, reqs):
     saved = core._GLOBAL_CTX
     core._GLOBAL_CTX = SimpleNamespace(linear_state_pool=pool)
     try:
-        track = _build_track_metadata(reqs, cu, torch.device("cpu"), {"device": "cpu"})
+        track = _build_track_metadata(reqs, cu, torch.device("cpu"), {"device": "cpu"}, pool.conv_states.shape[-1])
     finally:
         core._GLOBAL_CTX = saved
 

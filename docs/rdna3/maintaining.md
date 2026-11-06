@@ -4,11 +4,12 @@ How this repository relates to upstream FreeToken and how to keep it current. Fo
 
 ## What this tree is
 
-Upstream [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken) at `ba31db2` ("chore(release): 0.2.1
-(#824)"), plus the changes listed file by file in [changes-from-upstream.md](changes-from-upstream.md). The history is
-upstream's own up to `0d652e7`, then this project's commits on top (the first one holds everything up to 0.1.0), a
-merge of upstream up to `ee9789f`, five upstream commits cherry-picked (`74a3877`, `9c635a1`, `7d6490c`, `9b68e00`,
-`b6193e8`, authors kept), a merge of the rest up to `9b68e00`, a merge up to `cc56b6b` and one up to `ba31db2`. Once
+Upstream [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken) at `e5856ac` ("fix(utils): read stop ids
+from config.json without generation_config.json (#874)"), plus the changes listed file by file in
+[changes-from-upstream.md](changes-from-upstream.md). The history is upstream's own up to `0d652e7`, then this
+project's commits on top (the first one holds everything up to 0.1.0), a merge of upstream up to `ee9789f`, five
+upstream commits cherry-picked (`74a3877`, `9c635a1`, `7d6490c`, `9b68e00`, `b6193e8`, authors kept), a merge of the
+rest up to `9b68e00`, merges up to `cc56b6b`, `ba31db2` and `e5856ac`. Once
 the `upstream` remote is set up (below), `git diff $(git merge-base HEAD upstream/main)` shows every change against the
 upstream version this tree is based on.
 
@@ -23,9 +24,10 @@ upstream version this tree is based on.
 | qwen4_exp tensor parallelism | rewritten from the community port's | upstream supports qwen4_exp at TP>1 |
 | unequal cards, uneven split, int8 dense, GEMVs, host all-reduce, sampler, tuned tiles, blocked prefill, multi-request, RAM tier, review fixes | this repository | upstream merges it (to be proposed piece by piece) |
 | MTP head, EXL3 checkpoints, K/V in host RAM, short prefills through the expert cache, `--hybrid` on ROCm | this repository | upstream merges it |
+| this tree's MTP decoding (`spec_decode.py`, `models/qwen4_exp/mtp_head.py`) beside upstream's `--speculative-algorithm mtp` (`c2c3e82`, `dacac5f`) | this repository | upstream's verify runs on two cards with overlap scheduling, at this tree's speed and bits |
 | `kernel/triton/moe_align.py` on ROCm, over upstream's staged align (`0bca88f`) | this repository (Triton 3.8 histogram fix) | upstream's align is checked on ROCm's Triton 3.8, or Triton fixes the histogram range |
-| hybrid publish / merge kernels over pinned flag words | this repository | upstream drops its copies around the doorbell on ROCm |
-| the PLE wait-sync's replayed-wait check; the decode fill's verify rows and draft reads on upstream's fill thread | this repository | upstream's HIP fill handles the verify rows (it reads one row a request) |
+| hybrid publish / merge kernels over pinned flag words; the copies around the doorbell on ROCm | this repository | upstream's kernel IO on ROCm (`9cacd08`) is measured on RDNA3 and matches them |
+| the PLE wait-sync's replayed-wait check; the decode fill's verify rows and draft reads on this tree's fill thread | this repository | upstream's HIP fill (a verify step's rows since `dacac5f`) also reads the drafts ahead |
 | `LaunchKernel::with_attr` refuses `use_pdl=True` on ROCm | this repository | upstream refuses it too |
 | `Dockerfile.rdna3`, `rdna3/`, `docs/rdna3/` | this repository | never |
 
@@ -60,6 +62,24 @@ fallback. Upstream's loader lists only the shards the index names (`0bf7dbb`); q
 files beside the index, where the EXL3 checkpoints keep their n-gram hash constants, MTP mixer and vision patch. The
 hybrid ensure kernel took upstream's fetch cap, rounding modes and chunked scan, the router body upstream's sigmoid
 routing.
+
+At the merge of `e5856ac`: upstream added rows per request to the graphs and attention backends (`e328cf6`), speculative
+decoding with a verify phase (`c2c3e82`: `--speculative-algorithm`, `spec/`, a verify scratch in the GatedDeltaNet state
+pool) and an MTP draft for Qwen3.8-Flash-Next (`dacac5f`, one GPU, no overlap scheduling). This tree's MTP decoding
+stays the profiles' and refuses `--speculative-algorithm` beside it; both share `rows_of` (spec_decode's rows on a
+decode step, `rows_per_req` on a verify step), the graph runner captures spec_decode's row counts on the decode family
+or one verify family, and its capture buffer keeps the GatedDeltaNet slots the step-inputs kernel writes (upstream moved
+them into a `LinearAttnBackend`, whose per-forward metadata this tree builds from the slots the scheduler staged).
+Upstream made one GatedDeltaNet op for every model (`d043fb6`, `layers/linear_attn/gdn.py`): it is this tree's
+(tensor-parallel, the prefill in blocks, the all-reduce overlap, the rollback buffers) with upstream's verify branch,
+and the `gdn_kernels` helpers live in it. Both trees added `models/qwen4_exp/mtp.py`: upstream's draft keeps the name,
+this tree's head is `mtp_head.py`. The QSA index-key ring is sized for the larger of both methods' extra rows (upstream
+now passes its size, which skipped spec_decode's rows). The conv update kernel carries both the rollback snapshots and
+the verify windows; the LM head's `logits()` keeps a decode step's logits local under `FREETOKEN_SPARSE_LOGITS`; the
+drain sends a verify step's kept tokens in one message (upstream's `_commit_tokens`) with the per-request timings, and
+upstream's `rollback_tail` lowers this tree's `alloc_len` so the pages it returns are allocated again. On ROCm the CPU
+MoE executor keeps its copies around the doorbell and the hybrid layer's in-kernel flags, where upstream now enables its
+kernel IO (`9cacd08`).
 
 ## Keeping current
 

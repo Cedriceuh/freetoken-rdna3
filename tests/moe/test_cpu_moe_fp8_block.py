@@ -319,8 +319,11 @@ def test_cpu_fp8_block_graph_distinct_layer_inputs(bs, accumulate):
 @pytest.mark.parametrize("kernel_io", [True, False])
 def test_cpu_fp8_block_graph_replay_and_recapture(monkeypatch, kernel_io):
     from freetoken.kernel import _cpu_moe
+    from freetoken.moe import cpu_executor
     from freetoken.moe.cpu_executor import CpuMoeExecutor
 
+    if kernel_io and not cpu_executor._ROCM_KERNEL_IO:
+        pytest.skip("this tree keeps the copies around the doorbell on ROCm (FREETOKEN_CPU_MOE_KERNEL_IO_ROCM=1 runs it)")
     if not kernel_io:
         monkeypatch.setattr(_cpu_moe, "kernel_io_probe", lambda stream: "forced memcpy fallback")
     L, E, H, I, top_k = 3, 8, 256, 128, 4

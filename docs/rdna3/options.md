@@ -118,6 +118,7 @@ disagreements over ~8k sampled tokens in `check` mode). It is on the torch.distr
 | `FREETOKEN_HYBRID_FETCH_FRACTION` | unset | With `--moe-strategy hybrid` ([cpu-experts.md](cpu-experts.md)): the share of each decode step's expert misses fetched over PCIe (strictly between 0 and 1), the rest computed on the CPU, the same share on every MoE layer (`rdna3/serve.sh --hybrid` sets `0.25` on one card and `0.4` on two with NVFP4, `0.6` with EXL3). Unset: the split `ft bench bw --model <checkpoint>` measured for each layer's kind, or a fixed cap of one fetch per layer without one (EXL3 is not benched). |
 | `FREETOKEN_HYBRID_MIN_REQS` | `1` | With `--moe-strategy hybrid`: decode steps of fewer requests fetch every miss (the offload path). CUDA graphs are captured per batch size, so each size takes one path. `rdna3/serve.sh --hybrid` does not set it. |
 | `FREETOKEN_HYBRID_FLAG_IN_KERNEL` | `1` | With `--moe-strategy hybrid`: one kernel writes the CPU's inputs into its pinned IO rows and rings the coordinator, another waits for the CPU's partial and adds it back, over two pinned flag words (`0`: upstream's copies around the doorbell's stream memops, ~3.2 us a node). Bit-identical. With the other hybrid kernels, one request on NVFP4 `xtx-xt` 74.3 -> 78.3 tok/s, measured with an earlier handshake that these replaced, not again since ([cpu-experts.md](cpu-experts.md)). Replaces `FREETOKEN_HYBRID_SPLIT_KERNEL`. |
+| `FREETOKEN_CPU_MOE_KERNEL_IO_ROCM` | `0` | CPU expert executor on ROCm: `1` tries upstream's kernel IO there too (a publish kernel copies the inputs and rings the doorbell, a combine kernel adds the result back), kept only when its start-up probe matches a CPU reference; `0` keeps the copies around the doorbell with upstream's event before it. Upstream's CPU MoE tests pass both ways on the 7900 XTX; not measured in serving. |
 | `FREETOKEN_CPU_MOE_GROUP` | `1` | CPU expert executor, NVFP4 / bf16: one task per (expert, row block) for the routes of rows that share an expert, so its rows are read from RAM once (`0`: one task per route). Bit-identical. |
 | `FREETOKEN_CPU_MOE_ROUTE_STATS` | unset | Measurement: every `n` CPU expert tasks, print how many of the CPU's routes repeat an expert of another row of the same step (8-13 % in the `--hybrid` runs). |
 | `FREETOKEN_HYBRID_SKIP_CPU_ROUTES` | `1` | With `--moe-strategy hybrid`, NVFP4 and EXL3: the GPU decode kernels write zeros for the routes the CPU computes (slot -1) instead of computing them on slot 0 at weight 0. Bit-identical; +1-3 % decode ([cpu-experts.md](cpu-experts.md)). |
@@ -181,7 +182,9 @@ decode step of one request verifies the head's guesses in the same forward: m ro
 drafts), of which it keeps the matching prefix. How it works and what it costs:
 [decisions.md](decisions.md#speculative-decoding-with-the-mtp-head), measurements:
 [benchmarks.md](benchmarks.md#speculative-decoding-mtp-head). The profiles except `gre` turn it on (`FREETOKEN_MTP=1`,
-`FREETOKEN_SPEC_VERIFY_M=4`); `rdna3/serve.sh --no-mtp` serves without it.
+`FREETOKEN_SPEC_VERIFY_M=4`); `rdna3/serve.sh --no-mtp` serves without it. Upstream's own speculative decoding
+(`--speculative-algorithm mtp`, one GPU, no overlap scheduling; untested on RDNA3) is the other way to draft with the
+head: the server refuses the two together.
 
 | Variable | Default | Effect |
 |---|---|---|

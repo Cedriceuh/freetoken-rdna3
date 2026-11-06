@@ -217,3 +217,17 @@ def test_resolve_pool_class_and_factory():
 
     with pytest.raises(ValueError, match="num_req_slots"):
         create_kvcache_pool(mc, num_pages=4, page_size=64, dtype=torch.bfloat16, device=DEV)
+
+
+def test_ring_rows_cover_spec_decode_and_verify_rows(monkeypatch):
+    """The pool factory sizes the index-key ring for the rows a decode step runs past each request's token: spec_decode's
+    verify rows (FREETOKEN_SPEC_VERIFY_M) or --speculative-algorithm's drafts, whichever is larger."""
+    import freetoken.spec_decode as spec
+    from freetoken.kvcache import _extra_rows
+
+    monkeypatch.setattr(spec, "SPEC_M", 4)
+    assert _extra_rows(SimpleNamespace(decode_rows_per_req=1)) == 3
+    assert QSAKVCache.ring_capacity_for(4, _extra_rows(SimpleNamespace(decode_rows_per_req=1))) == 8
+    monkeypatch.setattr(spec, "SPEC_M", 1)
+    assert _extra_rows(SimpleNamespace(decode_rows_per_req=5)) == 4
+    assert _extra_rows(SimpleNamespace()) == 0

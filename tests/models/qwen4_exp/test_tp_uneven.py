@@ -125,7 +125,7 @@ def test_gdn_uneven_heads_match_the_state_pool(split55, rank):
     )
     with as_rank(rank, 2):
         gdn = _gdn()
-        _, pool_conv_dim, pool_v_heads = _linear_local_dims(group, 2)
+        _, pool_conv_dim, pool_v_heads, _ = _linear_local_dims(group, 2)
     assert (gdn.conv_dim, gdn.num_v_heads) == (pool_conv_dim, pool_v_heads)
 
 
@@ -274,6 +274,7 @@ def test_engine_uneven_plan_takes_the_min_over_ranks(split55, monkeypatch):
         _pool_cls=SimpleNamespace(kv_cost=lambda config: (1, 0, 64, 0)),
         _baseline_free=20 * gib, _weights_bytes=5 * gib,
         _local_baseline_free=24 * gib, _local_weights_bytes=6 * gib, tp_cpu_group=None,
+        _spec_budget=lambda config: (0, 0),
     )
     config = SimpleNamespace(
         tp_info=SimpleNamespace(size=2, rank=0), memory_ratio=0.8, model_config=SimpleNamespace(

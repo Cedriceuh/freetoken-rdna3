@@ -606,6 +606,13 @@ def test_cpu_moe_hip_event_fallback_when_kernel_io_unavailable(monkeypatch):
     assert ex.graph_capture_safe(torch.bfloat16)
 
 
+def _rocm_kernel_io() -> bool:
+    """Whether the executor tries upstream's kernel IO on ROCm (FREETOKEN_CPU_MOE_KERNEL_IO_ROCM; off: the copies)."""
+    from freetoken.moe import cpu_executor
+
+    return cpu_executor._ROCM_KERNEL_IO
+
+
 @pytest.mark.skipif(torch.version.hip is None, reason="requires ROCm")
 @pytest.mark.parametrize("graph_bs,max_bs", [(None, 0), ([], 4), (None, 1), ([1], 0), (None, None), (None, -1)])
 def test_cpu_moe_hip_kernel_graph_mismatch_uses_event(monkeypatch, caplog, graph_bs, max_bs):
@@ -615,6 +622,8 @@ def test_cpu_moe_hip_kernel_graph_mismatch_uses_event(monkeypatch, caplog, graph
 
     torch.manual_seed(0)
     graph_enabled = bool(_determine_cuda_graph_bs(graph_bs, max_bs, free_memory=1 << 30))
+    if not graph_enabled and not _rocm_kernel_io():
+        pytest.skip("this tree keeps the copies around the doorbell on ROCm (FREETOKEN_CPU_MOE_KERNEL_IO_ROCM=1 runs it)")
     monkeypatch.setattr(logger, "propagate", True)
     original = CpuMoeExecutor.decode_sync
 
@@ -736,6 +745,8 @@ def test_cpu_moe_graph_dtype_and_hybrid_accumulation(dtype, accumulate):
 
 @pytest.mark.parametrize("kernel_io", [False, True])
 def test_cpu_moe_hip_event_record_failure_is_loud(hip_probe_fault_library, kernel_io):
+    if kernel_io and torch.version.hip is not None and not _rocm_kernel_io():
+        pytest.skip("this tree keeps the copies around the doorbell on ROCm (FREETOKEN_CPU_MOE_KERNEL_IO_ROCM=1 runs it)")
     import os
     from pathlib import Path
     import subprocess

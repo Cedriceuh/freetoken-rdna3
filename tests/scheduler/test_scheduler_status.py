@@ -142,10 +142,10 @@ def test_decode_counts_the_tokens_delivered():
     rep, logs, clock = _reporter(interval=2)
     clock["t"] = 1.0
     rep.report_batch(_decode_batch(1), running_reqs=1, queue_reqs=0,
-                     kv_used_pages=1, kv_total_pages=10, page_size=1, generated_tokens=3)
+                     kv_used_pages=1, kv_total_pages=10, page_size=1, generated=3)
     clock["t"] = 2.0  # 3 + 2 tokens over 2.0 s
     rep.report_batch(_decode_batch(1), running_reqs=1, queue_reqs=0,
-                     kv_used_pages=1, kv_total_pages=10, page_size=1, generated_tokens=2)
+                     kv_used_pages=1, kv_total_pages=10, page_size=1, generated=2)
     assert "gen throughput (token/s): 2.50" in logs[-1]
 
 def test_zero_gap_and_zero_total_are_guarded():

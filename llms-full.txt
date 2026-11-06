@@ -815,6 +815,7 @@ disagreements over ~8k sampled tokens in `check` mode). It is on the torch.distr
 | `FREETOKEN_HYBRID_FETCH_FRACTION` | unset | With `--moe-strategy hybrid` ([cpu-experts.md](cpu-experts.md)): the share of each decode step's expert misses fetched over PCIe (strictly between 0 and 1), the rest computed on the CPU, the same share on every MoE layer (`rdna3/serve.sh --hybrid` sets `0.25` on one card and `0.4` on two with NVFP4, `0.6` with EXL3). Unset: the split `ft bench bw --model <checkpoint>` measured for each layer's kind, or a fixed cap of one fetch per layer without one (EXL3 is not benched). |
 | `FREETOKEN_HYBRID_MIN_REQS` | `1` | With `--moe-strategy hybrid`: decode steps of fewer requests fetch every miss (the offload path). CUDA graphs are captured per batch size, so each size takes one path. `rdna3/serve.sh --hybrid` does not set it. |
 | `FREETOKEN_HYBRID_FLAG_IN_KERNEL` | `1` | With `--moe-strategy hybrid`: one kernel writes the CPU's inputs into its pinned IO rows and rings the coordinator, another waits for the CPU's partial and adds it back, over two pinned flag words (`0`: upstream's copies around the doorbell's stream memops, ~3.2 us a node). Bit-identical. With the other hybrid kernels, one request on NVFP4 `xtx-xt` 74.3 -> 78.3 tok/s, measured with an earlier handshake that these replaced, not again since ([cpu-experts.md](cpu-experts.md)). Replaces `FREETOKEN_HYBRID_SPLIT_KERNEL`. |
+| `FREETOKEN_CPU_MOE_KERNEL_IO_ROCM` | `0` | CPU expert executor on ROCm: `1` tries upstream's kernel IO there too (a publish kernel copies the inputs and rings the doorbell, a combine kernel adds the result back), kept only when its start-up probe matches a CPU reference; `0` keeps the copies around the doorbell with upstream's event before it. Upstream's CPU MoE tests pass both ways on the 7900 XTX; not measured in serving. |
 | `FREETOKEN_CPU_MOE_GROUP` | `1` | CPU expert executor, NVFP4 / bf16: one task per (expert, row block) for the routes of rows that share an expert, so its rows are read from RAM once (`0`: one task per route). Bit-identical. |
 | `FREETOKEN_CPU_MOE_ROUTE_STATS` | unset | Measurement: every `n` CPU expert tasks, print how many of the CPU's routes repeat an expert of another row of the same step (8-13 % in the `--hybrid` runs). |
 | `FREETOKEN_HYBRID_SKIP_CPU_ROUTES` | `1` | With `--moe-strategy hybrid`, NVFP4 and EXL3: the GPU decode kernels write zeros for the routes the CPU computes (slot -1) instead of computing them on slot 0 at weight 0. Bit-identical; +1-3 % decode ([cpu-experts.md](cpu-experts.md)). |
@@ -878,7 +879,9 @@ decode step of one request verifies the head's guesses in the same forward: m ro
 drafts), of which it keeps the matching prefix. How it works and what it costs:
 [decisions.md](decisions.md#speculative-decoding-with-the-mtp-head), measurements:
 [benchmarks.md](benchmarks.md#speculative-decoding-mtp-head). The profiles except `gre` turn it on (`FREETOKEN_MTP=1`,
-`FREETOKEN_SPEC_VERIFY_M=4`); `rdna3/serve.sh --no-mtp` serves without it.
+`FREETOKEN_SPEC_VERIFY_M=4`); `rdna3/serve.sh --no-mtp` serves without it. Upstream's own speculative decoding
+(`--speculative-algorithm mtp`, one GPU, no overlap scheduling; untested on RDNA3) is the other way to draft with the
+head: the server refuses the two together.
 
 | Variable | Default | Effect |
 |---|---|---|
@@ -1755,7 +1758,7 @@ in two runs.
 | | |
 |---|---|
 | Choice | On in the profiles except `gre` (`FREETOKEN_MTP=1 FREETOKEN_SPEC_VERIFY_M=4`; `rdna3/serve.sh --no-mtp` turns it off). The checkpoint's MTP layer drafts up to 3 tokens; the next decode step verifies them in the same captured forward, 2-4 rows chosen per request from its measured acceptance and the step costs of the card count. Rejected rows are undone by restoring the GDN, conv and PLE states saved after each row (the attention KV needs nothing: rejected positions are rewritten before any query sees them). Sampled requests use exact speculative sampling, their drafts drawn under their own sampling. In `xtx-xt` and its K/V-in-RAM variants up to four requests at once verify, 2 rows each past two; in the other profiles one request at a time. With more, steps run one row each and the head only writes its KV |
-| Alternatives | Plain decode; a fixed draft depth; more than 2 rows each for three or four requests at once; the head's own forward captured in a graph |
+| Alternatives | Plain decode; a fixed draft depth; more than 2 rows each for three or four requests at once; the head's own forward captured in a graph; upstream's `--speculative-algorithm mtp` (one GPU, no overlap scheduling; not measured here, and refused beside this one) |
 | For | Agentic benchmark on ROCm 10 with the head: 12 and 18 of 29 (two runs). One request on `xtx-xt`: +35 % decode at `rdna3/serve.sh`'s sampling, +35-60 % greedy up to 260k of context, x1.38 on 60 code and math items; one card +6-13 % (+9-16 % greedy); greedy answers identical to plain decode (bit-exact on every check) |
 | Against | 3-4 % slower at 3-4 requests that do not verify (measured on `xtx-xt` with `FREETOKEN_SPEC_BS_MAX=1`, an earlier build); prompt reading 0-5 % slower (the head reads it too; an earlier build); the head's 512 experts compete for the expert cache; a CUDA graph per row count |
 | Evidence | Step costs 31 / 53 / 78 / 102 ms at 1-4 rows on one card (the extra rows' missing experts cross PCIe); 1.9-3.9 tokens kept per request step ([benchmarks.md](benchmarks.md#speculative-decoding-mtp-head)) |
@@ -4593,7 +4596,63 @@ choice: this section measures near the window (a 255,030-token read, a ~1.2k-tok
   of 1 / 3 / 4 rows 13.6 -> 11.3, 15.5 -> 14.6, 16.5 -> 17.5 µs a layer, two requests of 3 rows 19.4 -> 20.5, four of
   2 rows 28.6 -> 28.5 (two passes, the XT alike); the rows unrolled were no better. About 0.2 % of a one-request step.
 
-## 49. Still open
+## 49. Upstream up to e5856ac (2026-11-06)
+
+31 commits merged, the authors' kept; 31 files conflicted. The largest piece of upstream's is speculative decoding
+(`c2c3e82`, `e328cf6`, `dacac5f`): a `verify` batch phase with `rows_per_req` rows per request through the graphs, the
+attention backends and the GatedDeltaNet state pool (which stashes each row's inputs and replays the accepted ones),
+`spec/` with an MTP proposer, and a draft for Qwen3.8-Flash-Next from the checkpoint's `mtp.*` layer, on one GPU and
+without overlap scheduling. This tree's MTP decoding (section 15 onwards) does the same job on two cards with overlap
+scheduling, its own rollback and the drafts drawn under each request's sampling; it stays the profiles', and
+`--speculative-algorithm` refuses to start beside `FREETOKEN_SPEC_VERIFY_M` > 1.
+
+- **One GatedDeltaNet op.** Upstream moved qwen4_exp's op to `layers/linear_attn/gdn.py` for every model (`d043fb6`).
+  The merged op is this tree's (heads sharded, the prefill in 4096-token blocks, the all-reduce overlap, the rollback
+  buffers) with upstream's verify branch; the conv update kernel carries both the rollback snapshots and the verify
+  windows.
+- **Rows per request, twice.** Upstream's `rows_per_req` and this tree's `spec_m` meet in `rows_of`: spec_decode's
+  rows on a decode step, `rows_per_req` on a verify step. The graph runner took upstream's form (a forward callable, a
+  phase, its outputs) and keeps one graph per (batch size, rows); its capture buffer keeps the GatedDeltaNet slots the
+  step-inputs kernel writes, where upstream moved them into a `LinearAttnBackend`.
+- **Three changes that merged without a conflict but not without harm.** Upstream now passes the QSA index-key ring's
+  size when it builds the pool (for its verify rows); the pool's own default, which counted spec_decode's verify rows,
+  was no longer used, so a 4-row verify step would have kept too short a ring. The ring takes the larger of both
+  methods' rows. Upstream split the LM head's `forward` into `forward` and `logits()`, and this tree's
+  `FREETOKEN_SPARSE_LOGITS` test, merged into `logits()`, read a `batch` no longer in scope: it moved back into
+  `forward`. And upstream's `rollback_tail` (its verify step returns the pages of the rejected rows) did not lower this
+  tree's `alloc_len`, so the next step would not have allocated those pages again; upstream's own test found it.
+- **What the test suite found.** The merge dropped `Batch.linear_table_idx` with upstream's removal (the scheduler sets
+  it before every read when serving, so the servers ran; a batch built elsewhere failed); upstream's verify tests of
+  the QSA backend build verify batches without `rows_per_req`, which `rows_of` now reads from the requests' rows (the
+  pytest process aborted after those two failures); upstream's CPU MoE tests expect its kernel IO on ROCm, which this
+  tree leaves off: they skip unless `FREETOKEN_CPU_MOE_KERNEL_IO_ROCM=1`, and with it all 70 pass on the XTX. Tests
+  were added for the ring and the LM head (the latter fails on the unresolved merge with `NameError`).
+- Both trees added `models/qwen4_exp/mtp.py`: upstream's draft keeps the name, this tree's head is `mtp_head.py`.
+  A verify step's kept tokens reach the detokenizer in one message (upstream's list of tokens), so the decode log
+  line now shows the drafts' acceptance (`accept len`) for this tree's MTP too. On ROCm the CPU MoE executor keeps its
+  copies around the doorbell and the hybrid layer's in-kernel flags; upstream now enables its kernel IO there
+  (`9cacd08`), not measured here.
+
+Measured on `xtx-xt-4x262k` (`--kv-reserve-tokens 787500` for NVFP4, the default for EXL3), the merge's image against
+the build before, servers in turn: one request, six prompts greedy and six at T 0.6: the same 12 answers on both
+checkpoints, and the same decode step counts (NVFP4 2,162-2,163, EXL3 2,223-2,224: the same drafts kept); greedy 109.36
+against 109.53 tok/s (NVFP4) and 114.20 against 114.22 (EXL3), at T 0.6 100.38 against 105.60 (NVFP4; the build before
+read 101.07 in its run of the morning) and 110.01 against 109.63 (EXL3). A 255k-token cold read, its 256-token answer
+and the turn after it: the same texts; the read 63.08 against 64.12 s (NVFP4) and 70.60 against 70.56 s (EXL3), the
+answer 119.68 against 119.77 tok/s and 135.98 against 135.00. The new image's first read after its first start took 69.9
+and 72.3 s, its second the times above (an image's first start compiles its kernels; the merge changed some). Four
+agents on a 120k-token document, the second run of three servers each: NVFP4 48.1 against 48.0 tok/s each, EXL3 60.5
+against 60.3; the first run after a start had one request near 15 tok/s on both images once (the three others' prefill
+came 11 s after the first one's; not looked into further). Starts: one GPU page fault, at the new image's first EXL3
+load (the XTX, a write by the copy engine SDMA0, a permission fault, while the int8 conversion read the dense weights
+back to the host), then none in the other 16 starts of the new image (10 EXL3) and the 14 of the old one (9 EXL3); the
+first at a load in this journal, cause not found. `rdna3/serve.sh xtx --hybrid` (NVFP4, one card): the graphs captured,
+70.90 tok/s greedy against 71.00 and 71.77 for two runs of the build before; those two runs agree on 2 of 6 answers, and
+the merge's on 2 of 6 with each (the hybrid answers move with the expert cache's contents, section 27). The whole test
+suite on each card: 5,023 passed on the XTX and 5,022 on the XT, the failures the ones of the build before (9, and
+`test_qsa_hf`'s borderline tolerance on the XT).
+
+## 50. Still open
 
 - In NVFP4 the model needs ~63 GiB of RAM for its experts alone (the engine keeps every expert in RAM). The EXL3 3.05
   bpw checkpoint needs 42.6 GiB and served under a 56 GiB container limit, but a real 64 GB machine is untested
@@ -4623,7 +4682,8 @@ choice: this section measures near the window (a 255,030-token read, a ~1.2k-tok
   next server passed the same point twice, its XT at most 18.2 GiB of 20, and none in the other 19 servers of that day's
   benchmarks. One on 2026-11-06 at the first request of a start (NVFP4, the XT, a write, section 48's first build with
   the hyper-connection's projections in one launch); the next start under the debug agent, the 15 after it and a
-  20-minute soak were clean.
+  20-minute soak were clean. One the same day at a load, a first (section 49: the copy engine, while the int8
+  conversion read the dense weights back); the 30 starts after it were clean.
 - Expert misses (section 20): the decode GEMVs now read them from host memory while computing the cached experts
   (section 38), a program's rows copied whole first (section 45), so their PCIe time shows where it exceeds that work
   (a layer's GEMVs at one request, EXL3: 40.5 µs against 32.5 when the copy came first, the copy 34.6 -> 4.2 µs).
@@ -5225,11 +5285,12 @@ How this repository relates to upstream FreeToken and how to keep it current. Fo
 
 ## What this tree is
 
-Upstream [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken) at `ba31db2` ("chore(release): 0.2.1
-(#824)"), plus the changes listed file by file in [changes-from-upstream.md](changes-from-upstream.md). The history is
-upstream's own up to `0d652e7`, then this project's commits on top (the first one holds everything up to 0.1.0), a
-merge of upstream up to `ee9789f`, five upstream commits cherry-picked (`74a3877`, `9c635a1`, `7d6490c`, `9b68e00`,
-`b6193e8`, authors kept), a merge of the rest up to `9b68e00`, a merge up to `cc56b6b` and one up to `ba31db2`. Once
+Upstream [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken) at `e5856ac` ("fix(utils): read stop ids
+from config.json without generation_config.json (#874)"), plus the changes listed file by file in
+[changes-from-upstream.md](changes-from-upstream.md). The history is upstream's own up to `0d652e7`, then this
+project's commits on top (the first one holds everything up to 0.1.0), a merge of upstream up to `ee9789f`, five
+upstream commits cherry-picked (`74a3877`, `9c635a1`, `7d6490c`, `9b68e00`, `b6193e8`, authors kept), a merge of the
+rest up to `9b68e00`, merges up to `cc56b6b`, `ba31db2` and `e5856ac`. Once
 the `upstream` remote is set up (below), `git diff $(git merge-base HEAD upstream/main)` shows every change against the
 upstream version this tree is based on.
 
@@ -5244,9 +5305,10 @@ upstream version this tree is based on.
 | qwen4_exp tensor parallelism | rewritten from the community port's | upstream supports qwen4_exp at TP>1 |
 | unequal cards, uneven split, int8 dense, GEMVs, host all-reduce, sampler, tuned tiles, blocked prefill, multi-request, RAM tier, review fixes | this repository | upstream merges it (to be proposed piece by piece) |
 | MTP head, EXL3 checkpoints, K/V in host RAM, short prefills through the expert cache, `--hybrid` on ROCm | this repository | upstream merges it |
+| this tree's MTP decoding (`spec_decode.py`, `models/qwen4_exp/mtp_head.py`) beside upstream's `--speculative-algorithm mtp` (`c2c3e82`, `dacac5f`) | this repository | upstream's verify runs on two cards with overlap scheduling, at this tree's speed and bits |
 | `kernel/triton/moe_align.py` on ROCm, over upstream's staged align (`0bca88f`) | this repository (Triton 3.8 histogram fix) | upstream's align is checked on ROCm's Triton 3.8, or Triton fixes the histogram range |
-| hybrid publish / merge kernels over pinned flag words | this repository | upstream drops its copies around the doorbell on ROCm |
-| the PLE wait-sync's replayed-wait check; the decode fill's verify rows and draft reads on upstream's fill thread | this repository | upstream's HIP fill handles the verify rows (it reads one row a request) |
+| hybrid publish / merge kernels over pinned flag words; the copies around the doorbell on ROCm | this repository | upstream's kernel IO on ROCm (`9cacd08`) is measured on RDNA3 and matches them |
+| the PLE wait-sync's replayed-wait check; the decode fill's verify rows and draft reads on this tree's fill thread | this repository | upstream's HIP fill (a verify step's rows since `dacac5f`) also reads the drafts ahead |
 | `LaunchKernel::with_attr` refuses `use_pdl=True` on ROCm | this repository | upstream refuses it too |
 | `Dockerfile.rdna3`, `rdna3/`, `docs/rdna3/` | this repository | never |
 
@@ -5281,6 +5343,24 @@ fallback. Upstream's loader lists only the shards the index names (`0bf7dbb`); q
 files beside the index, where the EXL3 checkpoints keep their n-gram hash constants, MTP mixer and vision patch. The
 hybrid ensure kernel took upstream's fetch cap, rounding modes and chunked scan, the router body upstream's sigmoid
 routing.
+
+At the merge of `e5856ac`: upstream added rows per request to the graphs and attention backends (`e328cf6`), speculative
+decoding with a verify phase (`c2c3e82`: `--speculative-algorithm`, `spec/`, a verify scratch in the GatedDeltaNet state
+pool) and an MTP draft for Qwen3.8-Flash-Next (`dacac5f`, one GPU, no overlap scheduling). This tree's MTP decoding
+stays the profiles' and refuses `--speculative-algorithm` beside it; both share `rows_of` (spec_decode's rows on a
+decode step, `rows_per_req` on a verify step), the graph runner captures spec_decode's row counts on the decode family
+or one verify family, and its capture buffer keeps the GatedDeltaNet slots the step-inputs kernel writes (upstream moved
+them into a `LinearAttnBackend`, whose per-forward metadata this tree builds from the slots the scheduler staged).
+Upstream made one GatedDeltaNet op for every model (`d043fb6`, `layers/linear_attn/gdn.py`): it is this tree's
+(tensor-parallel, the prefill in blocks, the all-reduce overlap, the rollback buffers) with upstream's verify branch,
+and the `gdn_kernels` helpers live in it. Both trees added `models/qwen4_exp/mtp.py`: upstream's draft keeps the name,
+this tree's head is `mtp_head.py`. The QSA index-key ring is sized for the larger of both methods' extra rows (upstream
+now passes its size, which skipped spec_decode's rows). The conv update kernel carries both the rollback snapshots and
+the verify windows; the LM head's `logits()` keeps a decode step's logits local under `FREETOKEN_SPARSE_LOGITS`; the
+drain sends a verify step's kept tokens in one message (upstream's `_commit_tokens`) with the per-request timings, and
+upstream's `rollback_tail` lowers this tree's `alloc_len` so the pages it returns are allocated again. On ROCm the CPU
+MoE executor keeps its copies around the doorbell and the hybrid layer's in-kernel flags, where upstream now enables its
+kernel IO (`9cacd08`).
 
 ## Keeping current
 
@@ -5340,9 +5420,9 @@ Infinity Cache and promises gains that serving does not see.
 
 This repository is a modified version of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken) (Apache
 License 2.0), taken at `0d652e7` and merged with upstream up to `ee9789f`, then up to `9b68e00` (five of its commits
-cherry-picked first, then the rest merged), then up to `cc56b6b`, then up to `ba31db2`. Every file changed or added
-relative to upstream is listed here with the reason. Line counts are `added/removed`, against the upstream commit a
-section or row names, `0d652e7` otherwise; `git diff ba31db2` gives the current ones. Files the merge made
+cherry-picked first, then the rest merged), then up to `cc56b6b`, then up to `ba31db2`, then up to `e5856ac`. Every
+file changed or added relative to upstream is listed here with the reason. Line counts are `added/removed`, against the
+upstream commit a section or row names, `0d652e7` otherwise; `git diff e5856ac` gives the current ones. Files the merge made
 identical to upstream again are gone from the tables ([maintaining.md](maintaining.md#the-stack-on-top-of-upstream-oldest-first)).
 Who wrote what: [credits.md](credits.md).
 
@@ -5364,7 +5444,7 @@ Who wrote what: [credits.md](credits.md).
 | `python/freetoken/models/qwen3_vl/vision.py` | 18/23 | the Qwen VL vision tower never split (whole on a rank) instead of tensor-parallel modules whose weights nothing sharded; a rank without a tower places nothing |
 | `python/freetoken/models/qwen4_exp/model.py` | 3/1 | the vision tower built on rank 0 only (rank 0 encodes for every rank) |
 | `python/freetoken/models/qwen4_exp/attention.py` | 20/7 | attention heads and output projection sharded |
-| `python/freetoken/models/qwen4_exp/gdn.py` | 41/14 | GatedDeltaNet heads sharded, unevenly when a split is set |
+| `python/freetoken/layers/linear_attn/gdn.py` | 41/14 | GatedDeltaNet heads sharded, unevenly when a split is set |
 | `python/freetoken/models/qwen4_exp/moe.py` | 30/2 | routed / shared experts sharded; one all-reduce per MoE block |
 | `python/freetoken/models/qwen4_exp/ple.py` | 106/3 | PLE heads sharded (except with the disk source, which serves every head to every rank); the PLE convolution processed in time blocks for long and batched prefills |
 | `python/freetoken/models/qwen4_exp/ple_disk.py` | 4/0 | the disk source declares that it serves every PLE head, so each rank reads them all |
@@ -5440,19 +5520,19 @@ Line counts in this section and the next are relative to `d72e5cb` (0.1.0 plus i
 | File | Lines | Change |
 |---|---:|---|
 | `python/freetoken/spec_decode.py` | 274/0 | new: rows per step (capped by the tokens a request may still emit), the rollback targets, the adaptive depth with step costs per card count, the phase timing and stall probe |
-| `python/freetoken/models/qwen4_exp/mtp.py` | 106/0 | new: the MTP head, and the NVFP4 quantizer for its bf16 experts |
+| `python/freetoken/models/qwen4_exp/mtp_head.py` | 106/0 | new: the MTP head, and the NVFP4 quantizer for its bf16 experts |
 | `python/freetoken/models/qwen4_exp/model.py`, `config.py`, `weight.py`, `__init__.py`, `models/config.py` | 30/0, 11/0, 74/3, 3/3, 4/1 | the head built and loaded as layer 48 (not without verify rows; unsupported head layouts refused); the streams it reads kept in buffers stable after capture |
 | `python/freetoken/engine/engine.py` | 253/1 | the verify step, the drafts (chained), the rollback; the first token streamed before the head; image pad ids kept out of the head's lookup; the runtime cache rebuild refused while verify rows are on (the rollback holds the state pools); `FREETOKEN_MTP=1` on a model without the head refused at start |
 | `python/freetoken/engine/spec_sample.py` | 106/0 | new: exact speculative sampling, with each sampler's own truncation |
 | `python/freetoken/engine/graph.py` | 48/30 | a graph set per row count; `FREETOKEN_SPEC_BS_MAX` checked against them |
-| `python/freetoken/scheduler/scheduler.py`, `scheduler/cache.py`, `scheduler/prefill.py`, `scheduler/status.py`, `core.py` | 134/40, 15/2, 2/0, 5/1, 6/0 | rows per step, pages allocated ahead, several kept tokens per step, the overlap loop with the head, no donated state from a verify step in flight; decode throughput counted in tokens |
-| `python/freetoken/models/qwen4_exp/gdn.py`, `ple.py`, `ple_disk.py`, `models/qwen3_5_moe/gdn_kernels.py` | 48/2, 57/3, 37/6, 3/0 | m rows per request, with the states after each row saved; one row per norm program in decode; the PLE fill probe |
+| `python/freetoken/scheduler/scheduler.py`, `scheduler/cache.py`, `scheduler/prefill.py`, `core.py` | 134/40, 15/2, 2/0, 6/0 | rows per step, pages allocated ahead, several kept tokens per step, the overlap loop with the head, no donated state from a verify step in flight; decode throughput counted in tokens (upstream's `generated` count since `e5856ac`) |
+| `python/freetoken/layers/linear_attn/gdn.py` (with its decode helper, once `models/qwen3_5_moe/gdn_kernels.py`), `models/qwen4_exp/ple.py`, `ple_disk.py` | 48/2 + 3/0, 57/3, 37/6 | m rows per request, with the states after each row saved; one row per norm program in decode; the PLE fill probe |
 | `python/freetoken/kernel/triton/causal_conv1d_triton.py`, `kernel/fla/fused_sigmoid_gating_recurrent.py`, `kernel/fla/layernorm_gated.py`, `layers/norm.py` | 58/0, 2/1, 7/1, 4/2 | the conv over m rows in one launch; intermediate states; rows per norm program settable |
 | `python/freetoken/kernel/triton/int8_gemv.py` | 53/1 | up to 4 rows share each weight tile (`FREETOKEN_INT8_ROW_GROUPS`) |
 | `python/freetoken/attention/qsa_sparse.py`, `kernel/triton/qsa/attend.py`, `attention/linear.py`, `kvcache/qsa_pool.py`, `kvcache/__init__.py` | 22/13, 7/2, 4/1, 6/2, 2/1 | m rows per request in the attention metadata; decode keeps the one-row tile profile; the index ring sized for the drafts; the head's KV layer |
 | `python/freetoken/layers/embedding.py` | 2/2 | the LM head's one-row shortcut keyed on rows; no second last-row gather |
 | `python/freetoken/tokenizer/detokenize.py` | 20/0 | several tokens of one request in a step |
-| `tests/test_spec_decode.py`, `tests/engine/test_spec_sample.py`, `tests/kernels/test_conv1d_decode_rows.py`, `tests/models/qwen4_exp/test_mtp.py`, `test_qsa_spec_rows.py`, `test_gdn.py`, `tests/scheduler/test_spec_alloc_ahead.py`, `test_scheduler_status.py`, `tests/tokenizer/test_detokenize_multi_token.py`, `tests/layers/test_int8_weight_only.py`, `tests/kvcache/test_qsa_pool.py` | new, except `test_gdn.py` 88/0, `test_scheduler_status.py` 11/0, `test_int8_weight_only.py` 18/0, `test_qsa_pool.py` 1/1 | tests of the above (`test_qsa_spec_rows.py` computes its toy projections a row at a time: ROCm 10's `F.linear` changes its sums with the row count for such shapes) |
+| `tests/test_spec_decode.py`, `tests/engine/test_spec_sample.py`, `tests/kernels/test_conv1d_decode_rows.py`, `tests/models/qwen4_exp/test_mtp.py`, `test_qsa_spec_rows.py`, `tests/layers/test_gdn_spec_rows.py`, `tests/scheduler/test_spec_alloc_ahead.py`, `test_scheduler_status.py`, `tests/tokenizer/test_detokenize_multi_token.py`, `tests/layers/test_int8_weight_only.py`, `tests/kvcache/test_qsa_pool.py` | new, except `test_scheduler_status.py` 11/0, `test_int8_weight_only.py` 18/0, `test_qsa_pool.py` 1/1 | tests of the above (`test_qsa_spec_rows.py` computes its toy projections a row at a time: ROCm 10's `F.linear` changes its sums with the row count for such shapes) |
 
 ## ROCm 10 image, PLE wait-sync, memory lock
 
@@ -5501,7 +5581,7 @@ Line counts here are on top of the lines listed in the sections above.
 
 | File | Lines | Change |
 |---|---:|---|
-| `python/freetoken/models/qwen4_exp/attention.py`, `models/qwen4_exp/gdn.py`, `layers/norm.py`, `kernel/triton/attn_gate.py` | 29/6, 7/1, 7/0, new | q / k normalized where the projection wrote them, the output gate in one kernel, the GDN gate read in place (`FREETOKEN_FEWER_COPIES`) |
+| `python/freetoken/models/qwen4_exp/attention.py`, `layers/linear_attn/gdn.py`, `layers/norm.py`, `kernel/triton/attn_gate.py` | 29/6, 7/1, 7/0, new | q / k normalized where the projection wrote them, the output gate in one kernel, the GDN gate read in place (`FREETOKEN_FEWER_COPIES`) |
 | `python/freetoken/kernel/fla/layernorm_gated.py`, `kernel/triton/qsa/compress.py`, `attention/qsa_sparse.py` | 24/4, 23/5, 1/1 | the gated norm and the QSA indexer's norm + rope take token / head strides |
 | `python/freetoken/kernel/triton/dense_gemv.py`, `layers/quantization/linear/unquantized.py` | 38/7, 10/1 | the split-K bf16 GEMV's last program reduces (`FREETOKEN_GEMV_LAST_REDUCES`), counters allocated at layer finalize |
 | `tests/kernels/test_fewer_copies.py` | new | bit-exactness on the GPU |
@@ -5513,8 +5593,8 @@ Line counts here are on top of the lines listed in the sections above.
 | File | Lines | Change |
 |---|---:|---|
 | `python/freetoken/kernel/triton/hc.py`, `models/qwen4_exp/hc.py`, `models/qwen4_exp/model.py`, `models/qwen4_exp/ple.py` | 7/3, 7/2, 9/3, 50/2 | the hc combines write over their input, the PLE output is added to the streams in place, block by block for one request (`FREETOKEN_HC_INPLACE`) |
-| `python/freetoken/models/qwen4_exp/gdn.py`, `attention/linear.py` | 66/12, 10/2 | the GDN delta rule of a prefill 4096 tokens of a request at a time (`FREETOKEN_GDN_PREFILL_BLOCK`); the host bounds of each request and track entry in the metadata |
-| `python/freetoken/models/qwen4_exp/mtp.py`, `engine/engine.py` | 16/7, 44/4 | the MTP head frees the prompt's streams and their normed copy once read and adds the embedding in place; the torch allocator capped short of the card on ROCm (`FREETOKEN_VRAM_MARGIN_MIB`) |
+| `python/freetoken/layers/linear_attn/gdn.py`, `attention/linear.py` | 66/12, 10/2 | the GDN delta rule of a prefill 4096 tokens of a request at a time (`FREETOKEN_GDN_PREFILL_BLOCK`); the host bounds of each request and track entry in the metadata |
+| `python/freetoken/models/qwen4_exp/mtp_head.py`, `engine/engine.py` | 16/7, 44/4 | the MTP head frees the prompt's streams and their normed copy once read and adds the embedding in place; the torch allocator capped short of the card on ROCm (`FREETOKEN_VRAM_MARGIN_MIB`) |
 | `python/freetoken/kernel/triton/qsa/attend.py` | 9/0 | at least 4 warps on ROCm (`FREETOKEN_QSA_MIN_WARPS`) |
 | `python/freetoken/kernel/fla/utils.py`, `chunk_delta_h.py`, `wy_fast.py` | 6/0, 2/1, 3/2 | two GDN prefill kernels at 8 warps on ROCm (`FREETOKEN_GDN_PREFILL_WARPS`) |
 | `tests/kernels/test_gdn_prefill_blocks.py`, `test_prefill_warps.py`, `test_fewer_copies.py`, `tests/models/qwen4_exp/test_ple_conv_blocks.py` | new, new, 20/0, 34/0 | bit-exactness (GPU; the PLE one on the CPU) |
@@ -5561,8 +5641,8 @@ Line counts here are on top of the lines listed in the sections above.
 |---|---:|---|
 | `python/freetoken/kernel/triton/qsa/plan.py`, `attention/qsa_sparse.py` | 84/0, 22/1 | the QSA layers' per-forward index-write plan in two kernels instead of ~30 torch ops (`FREETOKEN_QSA_PLAN_KERNEL`); `qsa_forward(kv_only=True)` stops once the K/V and the index keys are written |
 | `python/freetoken/models/qwen4_exp/ple_conv_kernel.py`, `models/qwen4_exp/ple.py` | 78/0, 16/3 | the PLE's m-row decode conv in one kernel on gfx11 (`FREETOKEN_PLE_CONV_KERNEL`; no FMA contraction, torch's sum order there); its rollback target described for the fused copy |
-| `python/freetoken/models/qwen4_exp/attention.py`, `models/qwen4_exp/mtp.py` | 16/6, 9/0 | the MTP head's KV-only pass attends to nothing (`FREETOKEN_MTP_KV_ONLY_STOP`; the QSA backend protocol and the dense reference take `kv_only` too) |
-| `python/freetoken/kernel/triton/spec_glue.py`, `spec_decode.py`, `models/qwen4_exp/gdn.py`, `engine/engine.py`, `scheduler/scheduler.py` | 156/0, 27/2, 11/3, 65/11, 11/1 | a verify step's glue in kernels (`FREETOKEN_SPEC_GLUE_KERNELS`): the rollback copies (one kernel per state), the token-pool writes, the kept counts of greedy rows, the MTP head's rows and the chained guesses' addressing; the acceptance tally summed on the host |
+| `python/freetoken/models/qwen4_exp/attention.py`, `models/qwen4_exp/mtp_head.py` | 16/6, 9/0 | the MTP head's KV-only pass attends to nothing (`FREETOKEN_MTP_KV_ONLY_STOP`; the QSA backend protocol and the dense reference take `kv_only` too) |
+| `python/freetoken/kernel/triton/spec_glue.py`, `spec_decode.py`, `layers/linear_attn/gdn.py`, `engine/engine.py`, `scheduler/scheduler.py` | 156/0, 27/2, 11/3, 65/11, 11/1 | a verify step's glue in kernels (`FREETOKEN_SPEC_GLUE_KERNELS`): the rollback copies (one kernel per state), the token-pool writes, the kept counts of greedy rows, the MTP head's rows and the chained guesses' addressing; the acceptance tally summed on the host |
 | `tests/kernels/test_decode_glue.py` | 169/0 | each kernel bit-identical to the torch ops it replaces over random batches (GPU) |
 
 ## Agent turns and cold reads, bit-exact: short prefills through the expert cache, the prompt tokens reused, the K/V pages read, the GDN conv token-major; `--default-temperature`
@@ -5572,22 +5652,22 @@ Line counts here are on top of the lines listed in the sections above.
 | `python/freetoken/moe/offload_cache.py`, `moe/offload_kernels.py` | 134/1, 115/0 | with one slot pool (upstream's default for a model whose MoE layers share one layout, `b416f85`), `ensure_prefill_routed`: a short prefill chunk's routed experts made resident in the slot cache (LRU by (usage, slot), the routed hits and the predicted ones protected), the misses copied by decode's copy, the next layer's predicted experts by the copy engine on the copy stream; the bookkeeping in three Triton kernels and one top-k a layer; the experts brought in demoted after their GEMMs |
 | `python/freetoken/layers/moe.py`, `layers/quantization/moe/base.py`, `exl3.py`, `nvfp4.py` | 67/5, 8/0, 2/0, 6/1 | `FREETOKEN_PREFILL_CACHED_MAX` (default for the layers of a model that predicts: the expert kernel's `prefill_cached_max`, 2400 for NVFP4, else 1280); `ExpertView.slot_map` for the EXL3 / NVFP4 Triton prefill |
 | `python/freetoken/moe/fused.py`, `moe/fused_exl3.py`, `moe/fused_nvfp4.py` | 7/0, 8/3, 9/3 | `blocks_to_slots`: the tiles of the expert-id alignment read their weights from the slots (the same tiles, the same bits) |
-| `python/freetoken/models/qwen4_exp/moe.py`, `models/qwen4_exp/mtp.py` | 18/0, 1/0 | layer L+1's router on layer L's MoE input, each token's top-10, as the prediction (`FREETOKEN_PREFILL_PREDICT`) |
+| `python/freetoken/models/qwen4_exp/moe.py`, `models/qwen4_exp/mtp_head.py` | 18/0, 1/0 | layer L+1's router on layer L's MoE input, each token's top-10, as the prediction (`FREETOKEN_PREFILL_PREDICT`) |
 | `python/freetoken/kernel/triton/exl3.py`, `tests/kernels/test_exl3_mid_cols.py`, `tests/kernels/test_exl3_gemm_stages.py` | 79/7, 34/0, new | the prefill's mid step 32 Hadamard columns at a time (`FREETOKEN_EXL3_MID_COLS`): the tile kernel's bits without its 2.7 KB of scratch per lane, 1.7-3.3x faster; the prefill GEMMs with two pipeline stages (the same bits, checked against one stage) |
 | `Dockerfile.rdna3`, `rdna3/serve.sh` | 5/2, 2/0 | `TVM_FFI_CACHE_DIR` in the kernel-cache volume |
 | `python/freetoken/kernel/triton/qsa/stage.py`, `kvcache/qsa_pool.py`, `attention/qsa_sparse.py`, `tests/kernels/test_qsa_kv_host.py` | 66/1, 26/5, 2/1, 84/0 | host K/V: a prefill stages only the K/V rows of the tokens it selects (`FREETOKEN_QSA_STAGE_SELECTED`), marked by the attention kernel's mapping |
-| `python/freetoken/kernel/triton/causal_conv1d_triton.py`, `models/qwen4_exp/gdn.py`, `tests/kernels/test_conv_rows.py` | 46/0, 38/3, new | the GatedDeltaNet prefill conv token-major (`FREETOKEN_GDN_CONV_ROWS`): the projection's q / k / v columns read in place, each group written to its own contiguous buffer, the same kernel and taps |
+| `python/freetoken/kernel/triton/causal_conv1d_triton.py`, `layers/linear_attn/gdn.py`, `tests/kernels/test_conv_rows.py` | 46/0, 38/3, new | the GatedDeltaNet prefill conv token-major (`FREETOKEN_GDN_CONV_ROWS`): the projection's q / k / v columns read in place, each group written to its own contiguous buffer, the same kernel and taps |
 | `python/freetoken/server/args.py`, `server/api_server.py`, `docs/cli.md`, `tests/server/test_default_temperature.py` | 13/0, 16/3, 1/0, 43/0 | `--default-temperature`: the temperature of requests that send none, in place of the checkpoint's |
 | `python/freetoken/tokenizer/prefix_cache.py`, `tokenizer/tokenize.py`, `tests/tokenizer/test_prefix_cache.py` | 167/0, 11/5, 133/0 | `PromptPrefixCache`: a templated prompt reuses an earlier prompt's tokens up to the last `<\|im_start\|>` of their shared prefix and encodes the rest, the same tokens (`FREETOKEN_TOKENIZE_PREFIX_CACHE`) |
 | `tests/README.md` | 1/0 | `FREETOKEN_TOKENIZE_CACHE_MODEL`, the checkpoint the prefix-cache test tokenizes with |
 | `tests/moe/test_prefill_cached.py` | 273/0 | prefill from slots bit-identical to the full-layer buffers (EXL3, NVFP4), the LRU claims and demotion, the predicted prefetch then the fix-up copy, the split prefetch by DMA or shader copy (GPU) |
-| `python/freetoken/models/qwen4_exp/gdn.py`, `moe/fused_nvfp4.py`, `moe/fused_exl3.py`, `tests/models/qwen4_exp/test_gdn_host_bounds.py`, `tests/moe/test_nvfp4_prefill_tiles.py`, `tests/moe/test_short_prefill_tiles.py` | 6/3, 17/1, 7/3, new, new, new | short prefills (agent turns): the GDN prefill conv takes its longest request from the host bounds (a host sync in every GDN layer before); NVFP4 prefills of up to 1536 tokens take 4-warp tiles (`FREETOKEN_NVFP4_PREFILL_TUNED`), EXL3 ones of up to 512 tokens 16-row tiles (the same K order, the same bits) |
+| `python/freetoken/layers/linear_attn/gdn.py`, `moe/fused_nvfp4.py`, `moe/fused_exl3.py`, `tests/models/qwen4_exp/test_gdn_host_bounds.py`, `tests/moe/test_nvfp4_prefill_tiles.py`, `tests/moe/test_short_prefill_tiles.py` | 6/3, 17/1, 7/3, new, new, new | short prefills (agent turns): the GDN prefill conv takes its longest request from the host bounds (a host sync in every GDN layer before); NVFP4 prefills of up to 1536 tokens take 4-warp tiles (`FREETOKEN_NVFP4_PREFILL_TUNED`), EXL3 ones of up to 512 tokens 16-row tiles (the same K order, the same bits) |
 | `python/freetoken/layers/moe.py`, `moe/offload_cache.py`, `models/qwen4_exp/moe.py`, `tests/moe/test_prefill_cached.py` | 36/0, 23/2, 21/1, 13/6 | a short prefill's fix-up copy (the routed experts the prediction missed) on the prefill copy stream while the shared expert runs (`FREETOKEN_PREFILL_COPY_OVERLAP`, the same copies and GEMMs); the test runs the predicted prefetch then the fix-up copy both ways |
 | `python/freetoken/kernel/triton/fast_launch.py`, `server/launch.py`, `tests/kernels/test_triton_fast_launch.py` | new, 4/0, new | Triton launches through a shorter host path (`FREETOKEN_TRITON_FAST_LAUNCH`): the compiled kernel kept under a key computed from what Triton's specialization reads, its C launcher called with the same arguments; the test checks that equal keys specialize alike and that launches through it run the kernel Triton would |
 | `python/freetoken/moe/offload_cache.py`, `tests/moe/test_prefill_cached.py` | 81/9, 9/2 | a slot-cache prefill reads its predicted experts' copy plan (the copy engine's host addresses) once the layer's GEMMs are queued, from pinned memory behind an event, instead of a sync right after the plan (`FREETOKEN_PREFILL_PREFETCH_DEFER`); the prefetch test runs both ways |
 | `python/freetoken/kernel/triton/int8_dequant.py`, `layers/quantization/int8_weight_only.py`, `tests/kernels/test_int8_dequant.py` | new, 9/1, new | a prefill's int8 dense weights dequantized in one Triton pass with `torch.mul`'s bits (`FREETOKEN_INT8_PREFILL_DEQUANT`) |
 | `python/freetoken/models/qwen4_exp/moe.py`, `moe/prefill_hooks.py`, `moe/fused_nvfp4.py`, `moe/fused_exl3.py`, `kernel/triton/moe_shared_gate.py`, `distributed/impl.py`, `tests/moe/test_prefill_block_hook.py` | 89/7, new, 4/0, 4/0, 7/4, 20/0, new | each prefill block of routed experts finishes its rows and starts their all-reduce while the next block computes (`FREETOKEN_PREFILL_AR_OVERLAP`, two ranks, the layer's path agreed across them once; the epilogue keeps the whole chunk's warps, an async all-reduce on the torch.distributed path); `FREETOKEN_PREFILL_COPY_OVERLAP=auto` with EXL3 experts too |
-| `python/freetoken/models/qwen4_exp/gdn.py`, `tests/models/qwen4_exp/test_gdn_ar_overlap.py` | 82/2, new | a one-request prefill chunk of whole GDN blocks: each block's gated norm, output projection and all-reduce started as its delta rule finishes (`FREETOKEN_GDN_AR_OVERLAP`), after a check, agreed across the ranks, that hipBLASLt's block rows equal the whole call's |
+| `python/freetoken/layers/linear_attn/gdn.py`, `tests/models/qwen4_exp/test_gdn_ar_overlap.py` | 82/2, new | a one-request prefill chunk of whole GDN blocks: each block's gated norm, output projection and all-reduce started as its delta rule finishes (`FREETOKEN_GDN_AR_OVERLAP`), after a check, agreed across the ranks, that hipBLASLt's block rows equal the whole call's |
 | `python/freetoken/kernel/triton/qsa/score.py`, `attention/qsa_sparse.py`, `tests/kernels/test_qsa_score_rows.py` | 128/1, 1/0, new | the QSA indexer's scoring of a one-request prefill 16 query rows a program, the heads unpadded and summed in the padded reduction's order (`FREETOKEN_QSA_SCORE_ROWS`) |
 | `tests/models/qwen4_exp/test_predict_votes.py` | new | with NVFP4 experts (`auto`), a short prefill copies ahead only the experts at least two tokens predict (`FREETOKEN_PREFILL_PREDICT_MIN_VOTES`, in `models/qwen4_exp/moe.py`) |
 | `python/freetoken/models/qwen4_exp/ple_disk.py`, `scheduler/prefill.py`, `tests/models/qwen4_exp/test_ple_disk.py` | 140/18, 1/0, 36/0 | a prefill's PLE rows read on a thread with a store of its own (the lookup waits for them), and the next chunk's rows read ahead while a chunk of a longer prompt computes, taken when its tokens match (`FREETOKEN_PLE_PREFILL_PREFETCH`; a chunked request carries the whole prompt); at TP>1 only rank 0 reads them and broadcasts the bytes at the lookup (`FREETOKEN_PLE_PREFILL_RANK0`) |
@@ -5746,8 +5826,32 @@ Line counts here are on top of the lines listed in the sections above.
 | `python/freetoken/kernel/csrc/jit/host_allreduce.cuh`, `kernel/host_allreduce.py`, `distributed/impl.py`, `models/qwen4_exp/model.py`, `tests/kernels/test_host_allreduce_two_ranks.py` | 295/2, 34/2, 15/0, 36/7, new (131) | `FREETOKEN_HOST_ALLGATHER`: small all-gathers through the host all-reduce's slots; `FREETOKEN_HOST_AR_HC_COMBINE`: a decode block's closing all-reduce also runs the hyper-connection's combine + RMSNorm (the all-reduce body shared by both kernels) |
 | `python/freetoken/kernel/triton/ple_gate.py`, `models/qwen4_exp/ple.py`, `tests/kernels/test_ple_gate.py` | new (55), 13/3, new (44) | `FREETOKEN_PLE_GATE_FUSED`: the PLE gate's eight bf16 ops in one kernel, checked on every bf16 input |
 | `python/freetoken/kernel/triton/router_shared.py`, `kernel/csrc/jit/router_shared_exact.cuh`, `kernel/router_shared_exact.py`, `models/qwen4_exp/moe.py`, `tests/kernels/test_router_shared.py`, `tests/kernels/test_router_shared_exact.py`, `tests/kernels/test_exl3_decode_epilogue.py`, `tests/kernels/test_nvfp4_decode_epilogue.py` | 36/15, 41/14, 3/3, 2/1, 10/5, 3/3, 2/2, 2/2 | `FREETOKEN_ROUTER_SHARED` and `FREETOKEN_ROUTER_SHARED_HIP` at 5-8 rows (two to four requests): the K-blocked gate \| up in two groups of rows, the HIP kernel's input rows four at a time; hence the decode epilogues there too |
-| `python/freetoken/models/qwen4_exp/mtp.py` | 13/0 | the MTP head's two combines with the next norm (`FREETOKEN_FUSED_HC_NORM`), in the blocks' closing all-reduces (`FREETOKEN_HOST_AR_HC_COMBINE`), as in the layers |
+| `python/freetoken/models/qwen4_exp/mtp_head.py` | 13/0 | the MTP head's two combines with the next norm (`FREETOKEN_FUSED_HC_NORM`), in the blocks' closing all-reduces (`FREETOKEN_HOST_AR_HC_COMBINE`), as in the layers |
 | `python/freetoken/kernel/csrc/jit/int8_gemv_exact.cuh`, `kernel/int8_gemv_exact.py`, `kernel/triton/int8_gemv.py`, `models/qwen4_exp/hc.py`, `tests/kernels/test_int8_gemv_exact.py` | 254/13, 15/2, 23/1, 26/3, 59/4 | `FREETOKEN_HC_DOWN_MIX`: at 6-8 rows the hyper-connection's down GEMV and its up GEMV mixed into the streams in one launch (the down blocks count their columns done, the mix blocks load their weights then wait for the count; the down column a device function shared with the standalone kernel, the standalone mix kernels unchanged) |
+
+## On upstream up to `e5856ac`
+
+Line counts here are each file's whole difference from `e5856ac` (the sections above included). Upstream added
+speculative decoding with a verify phase (`c2c3e82`, `e328cf6`) and an MTP draft for Qwen3.8-Flash-Next (`dacac5f`, one
+GPU); this tree's MTP decoding stays the profiles' and the two are exclusive.
+
+| File | Lines | Change |
+|---|---:|---|
+| `python/freetoken/engine/engine.py` | 742/18 | `--speculative-algorithm` refused beside `FREETOKEN_SPEC_VERIFY_M`; the CPU MoE executor's IO rows sized for the larger of both methods' rows; upstream's `forward_logits` with this tree's step timer, profiler and expert-cache health read; the LM head's local decode logits (`FREETOKEN_SPARSE_LOGITS`) set before every capture |
+| `python/freetoken/engine/graph.py` | 128/39 | upstream's generalized runner (a forward callable, a phase, rows per request, its outputs) capturing spec_decode's row counts on the decode family, one graph per (batch size, rows); its capture buffer keeps the GatedDeltaNet slots and indptrs the step-inputs kernel writes (upstream moved them into `LinearAttnBackend`); a spec_decode verify step's output per padded request |
+| `python/freetoken/spec_decode.py`, `attention/linear.py`, `attention/qsa_sparse.py` | 322/0, 20/7, 177/54 | `rows_of` reads a verify batch's `rows_per_req` (its requests' rows when a test batch has none); the decode and verify GDN metadata take the slots the scheduler staged (from the requests otherwise); the QSA graph buffers for every row count of both methods |
+| `python/freetoken/scheduler/scheduler.py`, `scheduler/cache.py`, `core.py` | 181/10, 116/6, 9/0 | a spec_decode verify step's kept tokens committed by upstream's `_commit_tokens`, one message a request a step, with the per-request timings and draft counts; the sampling arguments built before any widening; the finish donation keeps upstream's lookahead keys and this tree's state-ahead guard; upstream's `rollback_tail` lowers `alloc_len`, so the pages it returns are allocated again; `Batch` keeps `linear_table_idx`, which upstream dropped |
+| `python/freetoken/kvcache/__init__.py`, `kvcache/qsa_pool.py` | 11/2, 183/3 | the QSA index-key ring sized for the larger of spec_decode's verify rows and `decode_rows_per_req` (upstream now passes its size, which left spec_decode's rows out) |
+| `python/freetoken/layers/linear_attn/gdn.py` | 382/49 | upstream's shared GatedDeltaNet op (`d043fb6`) is this tree's (tensor-parallel, the prefill in blocks, the all-reduce overlap, the rollback buffers) with upstream's verify branch; the decode and chunk helpers once in `models/qwen3_5_moe/gdn_kernels.py` |
+| `python/freetoken/kernel/triton/causal_conv1d_triton.py` | 103/0 | the conv update kernel carries both the rollback snapshots and upstream's verify windows |
+| `python/freetoken/layers/embedding.py` | 125/6 | upstream's `logits()` keeps a decode step's logits local under `FREETOKEN_SPARSE_LOGITS` |
+| `python/freetoken/models/qwen4_exp/mtp_head.py` | 138/0 | this tree's MTP head, formerly `mtp.py` (upstream's draft took the name) |
+| `python/freetoken/models/qwen4_exp/model.py`, `ple.py`, `ple_disk.py` | 130/7, 250/13, 467/96 | the fused hyper-connection loop with upstream's verify stash and feature export; the PLE verify conv beside the spec_decode rows; the disk table's fill reads a verify step's rows on this tree's fill thread |
+| `python/freetoken/moe/cpu_executor.py`, `tests/moe/test_cpu_moe.py`, `tests/moe/test_cpu_moe_fp8_block.py` | 156/10, 67/0, 3/0 | on ROCm the copies around the doorbell and the hybrid layer's in-kernel flags stay, where upstream enables its kernel IO (`9cacd08`; `FREETOKEN_CPU_MOE_KERNEL_IO_ROCM=1`); upstream's graph IO probe kept; its tests that expect the kernel IO on ROCm skip without it |
+| `tests/layers/test_gdn_spec_rows.py`, `tests/scheduler/test_scheduler_status.py`, `tests/tokenizer/test_detokenize_multi_token.py` | new, 11/0, new | the verify-row GDN tests on upstream's GDN test harness; the status and detokenizer tests on upstream's `generated` count and token lists |
+| `tests/kvcache/test_qsa_pool.py`, `tests/layers/test_lm_head_dump.py` | 15/1, new | the ring sized for both methods' rows; a decode step's LM head logits local under `FREETOKEN_SPARSE_LOGITS` (fails on the unresolved merge) |
+| `tests/models/qwen4_exp/test_tp_shard.py`, `test_tp_uneven.py`, `tests/scheduler/test_gdn_boundary_carry.py` | new | on upstream's signatures (`_linear_local_dims`' k heads, `_build_track_metadata`'s conv width, the engine's draft budget) |
+| `Dockerfile.rdna3` | (this repository's) | the content check reads the GatedDeltaNet op at its new path |
 
 ## Tooling and documentation
 
@@ -6028,8 +6132,10 @@ How the fractions were chosen (decode tok/s; measured on older builds than the f
 
 - **The GPU <-> CPU handshake.** Upstream's executor signals the CPU pool with stream memory operations. HIP's own
   `hipStreamWriteValue64` / `hipStreamWaitValue64` work, in captured graphs too, on ROCm 10.1 (the PLE disk reads rely
-  on them too), and upstream's executor has a HIP backend for them. The hybrid layer's kernels below carry the
-  handshake themselves.
+  on them too), and upstream's executor has a HIP backend for them. Upstream also turns on its kernel IO on ROCm (a
+  publish kernel copies the inputs and rings, qualified at start against a CPU reference); this tree keeps the copies
+  around the doorbell there, the path measured here (`FREETOKEN_CPU_MOE_KERNEL_IO_ROCM=1` tries upstream's). The hybrid
+  layer's kernels below carry the handshake themselves.
 - **MTP verify rows.** A verify step runs up to `FREETOKEN_SPEC_VERIFY_M` rows per request. The executor's row bound
   counts them, sized up front, and a larger task is refused; sized for `max(--max-running-requests,
   --cuda-graph-max-bs)` rows only, the C++ scratch grew on the first verify step, in the middle of serving (the EXL3

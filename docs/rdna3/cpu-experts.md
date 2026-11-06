@@ -100,8 +100,10 @@ How the fractions were chosen (decode tok/s; measured on older builds than the f
 
 - **The GPU <-> CPU handshake.** Upstream's executor signals the CPU pool with stream memory operations. HIP's own
   `hipStreamWriteValue64` / `hipStreamWaitValue64` work, in captured graphs too, on ROCm 10.1 (the PLE disk reads rely
-  on them too), and upstream's executor has a HIP backend for them. The hybrid layer's kernels below carry the
-  handshake themselves.
+  on them too), and upstream's executor has a HIP backend for them. Upstream also turns on its kernel IO on ROCm (a
+  publish kernel copies the inputs and rings, qualified at start against a CPU reference); this tree keeps the copies
+  around the doorbell there, the path measured here (`FREETOKEN_CPU_MOE_KERNEL_IO_ROCM=1` tries upstream's). The hybrid
+  layer's kernels below carry the handshake themselves.
 - **MTP verify rows.** A verify step runs up to `FREETOKEN_SPEC_VERIFY_M` rows per request. The executor's row bound
   counts them, sized up front, and a larger task is refused; sized for `max(--max-running-requests,
   --cuda-graph-max-bs)` rows only, the C++ scratch grew on the first verify step, in the middle of serving (the EXL3

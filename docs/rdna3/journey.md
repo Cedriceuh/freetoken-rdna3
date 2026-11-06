@@ -2799,7 +2799,63 @@ choice: this section measures near the window (a 255,030-token read, a ~1.2k-tok
   of 1 / 3 / 4 rows 13.6 -> 11.3, 15.5 -> 14.6, 16.5 -> 17.5 µs a layer, two requests of 3 rows 19.4 -> 20.5, four of
   2 rows 28.6 -> 28.5 (two passes, the XT alike); the rows unrolled were no better. About 0.2 % of a one-request step.
 
-## 49. Still open
+## 49. Upstream up to e5856ac (2026-11-06)
+
+31 commits merged, the authors' kept; 31 files conflicted. The largest piece of upstream's is speculative decoding
+(`c2c3e82`, `e328cf6`, `dacac5f`): a `verify` batch phase with `rows_per_req` rows per request through the graphs, the
+attention backends and the GatedDeltaNet state pool (which stashes each row's inputs and replays the accepted ones),
+`spec/` with an MTP proposer, and a draft for Qwen3.8-Flash-Next from the checkpoint's `mtp.*` layer, on one GPU and
+without overlap scheduling. This tree's MTP decoding (section 15 onwards) does the same job on two cards with overlap
+scheduling, its own rollback and the drafts drawn under each request's sampling; it stays the profiles', and
+`--speculative-algorithm` refuses to start beside `FREETOKEN_SPEC_VERIFY_M` > 1.
+
+- **One GatedDeltaNet op.** Upstream moved qwen4_exp's op to `layers/linear_attn/gdn.py` for every model (`d043fb6`).
+  The merged op is this tree's (heads sharded, the prefill in 4096-token blocks, the all-reduce overlap, the rollback
+  buffers) with upstream's verify branch; the conv update kernel carries both the rollback snapshots and the verify
+  windows.
+- **Rows per request, twice.** Upstream's `rows_per_req` and this tree's `spec_m` meet in `rows_of`: spec_decode's
+  rows on a decode step, `rows_per_req` on a verify step. The graph runner took upstream's form (a forward callable, a
+  phase, its outputs) and keeps one graph per (batch size, rows); its capture buffer keeps the GatedDeltaNet slots the
+  step-inputs kernel writes, where upstream moved them into a `LinearAttnBackend`.
+- **Three changes that merged without a conflict but not without harm.** Upstream now passes the QSA index-key ring's
+  size when it builds the pool (for its verify rows); the pool's own default, which counted spec_decode's verify rows,
+  was no longer used, so a 4-row verify step would have kept too short a ring. The ring takes the larger of both
+  methods' rows. Upstream split the LM head's `forward` into `forward` and `logits()`, and this tree's
+  `FREETOKEN_SPARSE_LOGITS` test, merged into `logits()`, read a `batch` no longer in scope: it moved back into
+  `forward`. And upstream's `rollback_tail` (its verify step returns the pages of the rejected rows) did not lower this
+  tree's `alloc_len`, so the next step would not have allocated those pages again; upstream's own test found it.
+- **What the test suite found.** The merge dropped `Batch.linear_table_idx` with upstream's removal (the scheduler sets
+  it before every read when serving, so the servers ran; a batch built elsewhere failed); upstream's verify tests of
+  the QSA backend build verify batches without `rows_per_req`, which `rows_of` now reads from the requests' rows (the
+  pytest process aborted after those two failures); upstream's CPU MoE tests expect its kernel IO on ROCm, which this
+  tree leaves off: they skip unless `FREETOKEN_CPU_MOE_KERNEL_IO_ROCM=1`, and with it all 70 pass on the XTX. Tests
+  were added for the ring and the LM head (the latter fails on the unresolved merge with `NameError`).
+- Both trees added `models/qwen4_exp/mtp.py`: upstream's draft keeps the name, this tree's head is `mtp_head.py`.
+  A verify step's kept tokens reach the detokenizer in one message (upstream's list of tokens), so the decode log
+  line now shows the drafts' acceptance (`accept len`) for this tree's MTP too. On ROCm the CPU MoE executor keeps its
+  copies around the doorbell and the hybrid layer's in-kernel flags; upstream now enables its kernel IO there
+  (`9cacd08`), not measured here.
+
+Measured on `xtx-xt-4x262k` (`--kv-reserve-tokens 787500` for NVFP4, the default for EXL3), the merge's image against
+the build before, servers in turn: one request, six prompts greedy and six at T 0.6: the same 12 answers on both
+checkpoints, and the same decode step counts (NVFP4 2,162-2,163, EXL3 2,223-2,224: the same drafts kept); greedy 109.36
+against 109.53 tok/s (NVFP4) and 114.20 against 114.22 (EXL3), at T 0.6 100.38 against 105.60 (NVFP4; the build before
+read 101.07 in its run of the morning) and 110.01 against 109.63 (EXL3). A 255k-token cold read, its 256-token answer
+and the turn after it: the same texts; the read 63.08 against 64.12 s (NVFP4) and 70.60 against 70.56 s (EXL3), the
+answer 119.68 against 119.77 tok/s and 135.98 against 135.00. The new image's first read after its first start took 69.9
+and 72.3 s, its second the times above (an image's first start compiles its kernels; the merge changed some). Four
+agents on a 120k-token document, the second run of three servers each: NVFP4 48.1 against 48.0 tok/s each, EXL3 60.5
+against 60.3; the first run after a start had one request near 15 tok/s on both images once (the three others' prefill
+came 11 s after the first one's; not looked into further). Starts: one GPU page fault, at the new image's first EXL3
+load (the XTX, a write by the copy engine SDMA0, a permission fault, while the int8 conversion read the dense weights
+back to the host), then none in the other 16 starts of the new image (10 EXL3) and the 14 of the old one (9 EXL3); the
+first at a load in this journal, cause not found. `rdna3/serve.sh xtx --hybrid` (NVFP4, one card): the graphs captured,
+70.90 tok/s greedy against 71.00 and 71.77 for two runs of the build before; those two runs agree on 2 of 6 answers, and
+the merge's on 2 of 6 with each (the hybrid answers move with the expert cache's contents, section 27). The whole test
+suite on each card: 5,023 passed on the XTX and 5,022 on the XT, the failures the ones of the build before (9, and
+`test_qsa_hf`'s borderline tolerance on the XT).
+
+## 50. Still open
 
 - In NVFP4 the model needs ~63 GiB of RAM for its experts alone (the engine keeps every expert in RAM). The EXL3 3.05
   bpw checkpoint needs 42.6 GiB and served under a 56 GiB container limit, but a real 64 GB machine is untested
@@ -2829,7 +2885,8 @@ choice: this section measures near the window (a 255,030-token read, a ~1.2k-tok
   next server passed the same point twice, its XT at most 18.2 GiB of 20, and none in the other 19 servers of that day's
   benchmarks. One on 2026-11-06 at the first request of a start (NVFP4, the XT, a write, section 48's first build with
   the hyper-connection's projections in one launch); the next start under the debug agent, the 15 after it and a
-  20-minute soak were clean.
+  20-minute soak were clean. One the same day at a load, a first (section 49: the copy engine, while the int8
+  conversion read the dense weights back); the 30 starts after it were clean.
 - Expert misses (section 20): the decode GEMVs now read them from host memory while computing the cached experts
   (section 38), a program's rows copied whole first (section 45), so their PCIe time shows where it exceeds that work
   (a layer's GEMVs at one request, EXL3: 40.5 µs against 32.5 when the copy came first, the copy 34.6 -> 4.2 µs).

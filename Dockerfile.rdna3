@@ -68,7 +68,7 @@ RUN set -eux; \
       echo "FATAL: this tree still refuses --tp-size > 1 for qwen4_exp (not the rdna3 branch?)"; exit 1; fi; \
     grep -q 'def _shard_for_rank' python/freetoken/models/qwen4_exp/weight.py; \
     grep -q 'LinearOProj' python/freetoken/models/qwen4_exp/attention.py; \
-    grep -q 'LinearRowParallel' python/freetoken/models/qwen4_exp/gdn.py; \
+    grep -q 'LinearRowParallel' python/freetoken/layers/linear_attn/gdn.py; \
     grep -q 'serves_all_heads = True' python/freetoken/models/qwen4_exp/ple_disk.py; \
     grep -q 'def _tp_slice_pieces' python/freetoken/layers/quantization/moe/nvfp4.py; \
     grep -q '_lds_budget = 60 \* 1024' python/freetoken/kernel/triton/qsa/attend.py; \
