@@ -47,15 +47,46 @@ The untested two-card profiles (`xtx-xtx`, `xt-xt`) should lock about what `xtx-
 
 ## Can it run with 64 GB of RAM?
 
+Yes, with an **EXL3 checkpoint at 3 bits per weight** ([how-it-works.md](how-it-works.md#exl3-checkpoints)) and
+`--low-ram`, on a machine kept for the server (a light desktop at most):
+
+```bash
+rdna3/serve.sh xtx-xt --model ~/models/Qwen3.8-Flash-Next-exl3-3.05bpw --low-ram
+```
+
+`--low-ram` works on the profiles that keep the K/V in VRAM (`xtx-xt`, `xtx`, `xt`). It turns the RAM tier off
+(`FREETOKEN_HOST_KV=0`), loads the experts one file at a time (`--expert-load serial`: the parallel loader needs 76 GiB
+for a moment) and limits the container to the machine's RAM minus 6 GiB. `rdna3/serve.sh --check --model DIR` proposes
+it when it is what fits, and ends with that command.
+
+Measured on the 125.7 GiB reference machine, under the 56 GiB container limit a machine reporting 62.7 GiB gets, against
+the profile as it is (two cards, one run each); a real 64 GB machine is untested:
+
+| EXL3 3.05 bpw on `xtx-xt` | `--low-ram`, 56 GiB limit | the profile as it is |
+|---|---:|---:|
+| RAM locked after the start; after the requests below | 52.3; 52.6 GiB | 61.4; 61.8 GiB |
+| the container's memory at its highest, page cache apart | 54.1 GiB | 76.4 GiB (while loading) |
+| start | 138 s | 96 s |
+| decode, greedy; at T 0.6 (12 answers of 400 tokens each) | 129.0; 128.7 tok/s | 129.2; 128.7 tok/s |
+| cold read of 60k tokens (the first long one; a second start: 16.3); 116k; 205k | 19.6; 31.4; 56.1 s | 16.3; 31.6; 56.3 s |
+| agent turn (~1.2k new tokens on 28-37k), first token | 0.62 s | 0.62 s |
+| back to a conversation pushed off the GPUs: 116k; 205k tokens | 31.3; 55.8 s | 0.27; 0.34 s |
+
+The answers are the same (the 12 greedy and 12 seeded ones, the 60k read's, the eight turns'), the expert cache too
+(10,122 slots). **What is lost is the RAM tier**: two conversations that do not fit the GPUs' 262k tokens together (here
+116k + 205k) push each other out, and each return then reads its conversation again instead of copying it back from RAM.
+One conversation, or several that fit the 262k tokens together, lose nothing. A second start under the same limit read
+the 60k tokens in 16.3 s, then served 12 minutes of agent-like load (three sessions, 342 requests) without an error:
+52.3 GiB locked at the end, 53.8 GiB of the container's 56 in use apart from the page cache. That leaves the system
+and a light desktop the machine's other ~6 GiB: keep the machine for the server.
+
 Not with the NVFP4 checkpoint: its experts alone need ~63 GiB of RAM, and the engine has no mode that reads experts from
-disk. An **EXL3 checkpoint at 3 bits per weight** ([how-it-works.md](how-it-works.md#exl3-checkpoints)) needs 42.6 GiB
-for its experts (63.3 in NVFP4; 43.5 and ~64.6 with the MTP head's experts, which an NVFP4 checkpoint stores in bf16,
-4.7 GiB, and the engine quantizes to NVFP4 at load): on `xtx-xt`, with the RAM tier off and the experts loaded one file
-at a time, the server ran under a 56 GiB container limit at 52.3 GiB used (`FREETOKEN_HOST_KV=0` in the profile file,
-then `rdna3/serve.sh xtx-xt --model DIR --memory 56g -- --expert-load serial`; the parallel loader was killed under a 52
-GiB limit). A real 64 GB machine is untested. `serve.sh --check` keeps 25-30 GiB beside a server for a desktop and its
-programs, so it says no on 64 GB: this path is for a machine that runs little else, and `serve.sh` then starts with a
-warning. On the agentic benchmark the 3.05 bpw checkpoint fixed 13 of 29 bugs (one run; NVFP4: 12 and 18 in two runs).
+disk. The EXL3 3.05 bpw checkpoint needs 42.6 GiB for them (63.3 in NVFP4; 43.5 and ~64.6 with the MTP head's experts,
+which an NVFP4 checkpoint stores in bf16, 4.7 GiB, and the engine quantizes to NVFP4 at load); the 4.05 bpw one locks
+~67 GiB without the RAM tier. On one card the 3.05 bpw checkpoint should lock ~47 GiB with `--low-ram` (the two-card
+arithmetic, not measured). For the profile as it is, `serve.sh --check` keeps 25-30 GiB beside a server for a desktop
+and its programs, which 64 GB cannot give: hence the option. On the agentic benchmark the 3.05 bpw checkpoint fixed
+13 of 29 bugs (one run; NVFP4: 12 and 18 in two runs).
 
 ## How much VRAM?
 

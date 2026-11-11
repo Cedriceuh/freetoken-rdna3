@@ -27,6 +27,7 @@ the work.
 |---|---|
 | GPUs | one or two RX 7900 XTX (24 GB) / RX 7900 XT (20 GB); other cards: [which GPUs](docs/rdna3/limits.md#which-gpus) |
 | RAM | 128 GB recommended: the server locks ~53 to ~83 GiB, depending on the checkpoint and the number of cards ([table](#which-checkpoint)), more with conversations kept in RAM, and the system and your programs need ~30 GiB beside it ([how to count](docs/rdna3/limits.md#how-much-ram-do-i-need)) |
+| RAM, 64 GB | an EXL3 3.05 bpw checkpoint with `rdna3/serve.sh <profile> --model DIR --low-ram`, on a machine kept for the server: ~52 GiB locked on two cards, the same speeds and answers, but a conversation pushed off the GPUs is read again when it comes back ([64 GB](docs/rdna3/limits.md#can-it-run-with-64-gb-of-ram); measured under a 56 GiB container limit, not on a real 64 GB machine) |
 | Disk | 85 to 135 GB for the model, ~27 GB for the image (~29 GB more while it builds) |
 | System | Linux x86_64 with the in-kernel `amdgpu` driver, and Docker. ROCm, PyTorch and the rest come inside the image |
 
@@ -236,6 +237,7 @@ how to check that it worked. The two downloads (a 25 GB base image, an 85-135 GB
 |---|---|---|
 | GPUs | RX 7900 XTX 24 GB + RX 7900 XT 20 GB | one RX 7900 XTX 24 GB or RX 7900 XT 20 GB |
 | System RAM the server locks: NVFP4; EXL3 3.05 / 4.05 bpw (keep ~30 GiB more for the system) | ~83 GiB; ~61 / ~76 GiB: a **128 GB** machine | ~74 GiB; ~52 / ~67 GiB |
+| With 64 GB of RAM | EXL3 3.05 bpw with `--low-ram`, on a machine kept for the server: ~52 GiB locked ([64 GB](limits.md#can-it-run-with-64-gb-of-ram)) | the same: ~47 GiB (not measured) |
 | Disk | 135 GB for the NVFP4 model (85 / 108 GB in EXL3 3.05 / 4.05 bpw), ~27 GB for the image, ~29 GB more while building | same |
 | Software | Linux x86_64 with the in-kernel `amdgpu` driver (`/dev/kfd` present), Docker | same |
 | Tested on | Ubuntu 26.04 LTS, kernel 7.0 (older kernels untested) | same |
@@ -367,6 +369,7 @@ loading: that once left GPU memory held until a reboot
 | `--vision` | accept images ([limits](limits.md#images-vision)); off by default, no measurable speed cost on two cards, ~1.5-2 % of decode on one |
 | `--no-mtp` | turn off the MTP draft head: the head speeds up a request decoding alone (+35 % on `xtx-xt`) and up to four at once on `xtx-xt` and its K/V-in-RAM variants; it costs 3-4 % where more requests decode than it verifies (the other profiles, an earlier build; [limits](limits.md#speculative-decoding-mtp)) |
 | `--hybrid` | the CPU computes part of the experts missing from VRAM; off by default, not agent-validated. Measured on an earlier build: NVFP4 +46 % decode on `xtx`, +51 % on `xt`, on `xtx-xt` +2 % for one request and +15 % each with four; EXL3 3.05 bpw +5 % on `xtx`, even on `xtx-xt` ([cpu-experts](cpu-experts.md)) |
+| `--low-ram` | for a machine with ~64 GB of RAM and an EXL3 3.05 bpw checkpoint, on `xtx-xt`, `xtx` or `xt`: no RAM tier, the experts loaded one file at a time, the container limited to the machine's RAM minus 6 GiB ([limits](limits.md#can-it-run-with-64-gb-of-ram)) |
 | `--served-name ID` | the model id `/v1/models` reports (default `qwen3.8-flash-next`) |
 | `--name NAME`, `--image REF`, `--memory SIZE` | container name, image, container RAM limit |
 | `-- <flags>` | anything after `--` goes to `ft serve` (upstream's [CLI reference](../cli.md)) |
@@ -554,6 +557,7 @@ TESTED=0                # derived, not measured: serve.sh says so at start (defa
 CTX=262144              # context length of one request (--ctx overrides); passed as --max-seq-len-override
 KV_TOKENS=1050000       # the K/V pool all requests share, --kv-reserve-tokens (default: CTX, never less)
 MEMORY=110g             # container RAM limit (--memory overrides)
+EXL3_RATIO=0.78         # serve.sh's --memory-ratio for an EXL3 checkpoint below 4 bpw on two cards (default 0.77)
 FREETOKEN_...=...       # any other KEY=value line becomes an environment variable of the container
 FT_ARGS="..."           # flags passed to `ft serve` (its --tp-size must match GPUS)
 ```
@@ -600,7 +604,8 @@ With an EXL3 checkpoint
 experts go through the EXL3 kernels (the start log says `MoE experts: exl3 via triton`), so `--quant-backend
 moe.nvfp4=triton` and the `FREETOKEN_NVFP4_*_TUNED` tiles do nothing; the split rounds to whole 128-wide blocks (384 /
 256, i.e. 60 / 40, which NVFP4 avoids; the EXL3 numbers are measured at it); the n-gram tables take 33 GB (3.05 bpw)
-instead of 51. On two cards `serve.sh` lowers `--memory-ratio` to 0.77 (0.76 from 4 bpw): the card holding the
+instead of 51. On two cards `serve.sh` lowers `--memory-ratio` to 0.77 (a profile's `EXL3_RATIO` replaces it:
+0.78 in `xtx-xt-4x262k`; 0.76 from 4 bpw everywhere): the card holding the
 384-wide slice bounds the expert cache, and at 0.80 the 7900 XTX peaked 200 MiB under full VRAM
 ([journey.md](journey.md#16-exl3-checkpoints-2026-10-04)); `-- --memory-ratio X` overrides it.
 
@@ -618,11 +623,15 @@ share is no longer bounded by VRAM. What differs:
 | `FREETOKEN_HOST_KV` | `0` | `0` | no RAM tier: the pool already lives in RAM |
 | `FREETOKEN_NVFP4_PREFILL_BLOCK` | `8192` | unset (4096) | as in `xtx-xt`; `xtx-xt-1m` keeps the default |
 | `MEMORY` | `104g` | `104g` | the container's RAM limit (`110g` in `xtx-xt`) |
+| `--memory-ratio` | 0.81 | 0.80 | `xtx-xt-4x262k` gives the expert cache the VRAM a verify step's rollback states no longer take (NVFP4, 3 contexts: 9,246 slots instead of 9,077, +1.2 % for one request, +2.8 % for three, lower VRAM peaks than at 0.80 before; [journey.md](journey.md#50-pytorch-215-tried-a-decode-step-at-three-requests-the-vram-beside-the-expert-cache-2026-11-11)) |
+| `EXL3_RATIO` | 0.78 | unset (0.77) | the same for an EXL3 checkpoint below 4 bpw, whose ratio `serve.sh` sets (3.05 bpw, 4 contexts: 11,647 slots instead of 11,437, +1.3 % for one request, +1.9 % for four, lower VRAM peaks) |
 
 Measured with EXL3 3.05 bpw (~77 GiB of RAM locked by `xtx-xt-4x262k`, ~75 GiB by `xtx-xt-1m`), and NVFP4 on
 `xtx-xt-4x262k` with three contexts: four do not fit with NVFP4 on 128 GB, so start it with `rdna3/serve.sh
 xtx-xt-4x262k --model DIR -- --kv-reserve-tokens 787500` (three conversations, 94 GiB locked after the start), or
-`525000` (two) to keep room. A request alone decoded a few percent slower than on `xtx-xt` on an earlier build, before
+`525000` (two) to keep room. Adding `--max-running-requests 3 --cuda-graph-max-bs 3` sizes the state pools and the
+graphs for three requests too, which leaves the expert cache more VRAM (9,488 slots instead of 9,246: one request
++0.9 %, three together +2.4 to +2.9 %, the same answers); a fourth request at once then waits for a place. A request alone decoded a few percent slower than on `xtx-xt` on an earlier build, before
 the decode cache (the kernels read the K/V across PCIe), and reads prompts a little faster (more expert slots). Which
 one to pick, what they cost and their measurements: [long-context.md](long-context.md); how to count your RAM:
 [limits.md](limits.md#how-much-ram-do-i-need).
@@ -685,7 +694,9 @@ Nothing below has been measured; treat it as a starting point and check with the
   gfx1101) and 7600 (8 GB, gfx1102) have less VRAM than any profile plans for. None of them is tested.
 - **Less RAM**: `FREETOKEN_HOST_KV=0` saves the RAM tier (9.5 GiB on two cards, ~5 GiB on one; evicted conversations
   are re-read instead). In NVFP4 the experts themselves cannot go below ~63 GiB; the EXL3 3 bpw
-  checkpoint needs 42.6 GiB: [limits.md](limits.md).
+  checkpoint needs 42.6 GiB, and `rdna3/serve.sh <profile> --model DIR --low-ram` sets a 64 GB machine up for it
+  without editing a file (that variable, `--expert-load serial` and the container's limit):
+  [limits.md](limits.md#can-it-run-with-64-gb-of-ram).
 
 Every environment variable in these files is explained in [options.md](options.md); the `ft serve` flags in the tables
 above and in upstream's [CLI reference](../cli.md).
@@ -731,14 +742,16 @@ For every `ft serve` flag, see upstream's [CLI reference](../cli.md); the flags 
 | `FREETOKEN_TP_ALLOW_IMBALANCE` | unset | `1`: accept ranks whose free memory differs by more than 2 GiB (upstream refuses them) and plan every pool on the smallest one. Needed for unequal cards; below a 2 GiB difference it changes nothing. |
 | `FREETOKEN_HOST_ALLREDUCE` | unset | `1` (two ranks, ROCm): small all-reduces through one shared host-memory region and a one-block kernel instead of RCCL's proxy path. 6 µs instead of ~12 µs per decode all-reduce, **+2.5-4.8 % decode, bit-exact** (fp32 accumulation, rounded to bf16 like RCCL). |
 | `FREETOKEN_HOST_ALLREDUCE_MAX` | `262144` | Largest message (bytes) that takes the host path; bigger ones stay on RCCL. |
-| `FREETOKEN_HOST_ALLGATHER` | `1` | With `FREETOKEN_HOST_ALLREDUCE`: small all-gathers (the LM head's candidates from each rank, three a decode step with the drafts) through the same shared region, flags and sequence counter as the all-reduces (both ranks call them in the same order), instead of RCCL: each rank copies its words into its slot and into its place in the output, publishes, waits for the peer and copies the peer's words. Copies only: **bit-exact** (`tests/kernels/test_host_allreduce_two_ranks.py`, two GPUs). 7-11 µs a call in a decode step's trace against RCCL's 15-18 µs and the gaps around it. Measured with `FREETOKEN_PLE_GATE_FUSED` and `FREETOKEN_HOST_AR_HC_COMBINE`, see the latter. `0`: RCCL. |
+| `FREETOKEN_HOST_ALLREDUCE_MID_MB` | `0` (`20` with `FREETOKEN_NO_RCCL=1`) | Above `FREETOKEN_HOST_ALLREDUCE_MAX` and up to this many MiB (a short prefill's all-reduces: an agent turn's), all-reduces go through four more slots of that size in the shared region instead of RCCL, by pieces: a launch copies a piece into this rank's slot while it adds the other rank's piece before it, and between two launches the one-block kernel exchanges a sequence number (no block waits for another). The same `a + b` in fp32: **bit-exact** (`tests/kernels/test_host_allreduce_two_ranks.py`, two GPUs: bf16 and fp32, 16-byte aligned or not, small ones in between). Alone against RCCL (bf16, 0.5 / 2 / 7.8 / 11.7 / 18.6 MiB): 0.13 / 0.27 / 0.83 / 1.21 / 1.95 ms against 0.15 / 0.27 / 0.77 / 1.14 / 1.76. Takes four times that size of pinned host memory. `0`: RCCL. |
+| `FREETOKEN_NO_RCCL` | `0` | `1` (two ranks, ROCm, with `FREETOKEN_HOST_ALLREDUCE=1`): the engine never creates the RCCL communicator, which takes 274 MiB of VRAM on each card once it is used. The process group is the CPU one; the all-reduces go through the host slots, the mid slots above (`FREETOKEN_HOST_ALLREDUCE_MID_MB`, 20 then) and the copy engines (`FREETOKEN_DMA_ALLREDUCE`), the broadcasts (a prefill's PLE rows, an image's embeddings, a sampled step's tokens) through the gather's slots or the mid slots by bytes, the ranks' first-use agreements through the CPU group, and anything else there too. The same bytes and sums: the same answers. The start log's `outside torch` falls by ~220 MiB a card; the cache plan does not see it (RCCL's VRAM was taken after its baseline), so only a higher `--memory-ratio` turns it into expert slots. `xtx-xt-4x262k`, NVFP4, three contexts, 0.8235 against the same build with RCCL at 0.81: 9,716 slots instead of 9,488, one request +0.9 % (T 0.6 +1.0 %), three together +2.4 to +2.7 %, the answer after a 255k read +2.9 %, eight 1.2k-token agent turns 0.744 s to the first token against 0.745, the VRAM's peak the same; every answer identical (greedy, sampled, three conversations, an image, the turns). A 12-minute soak at 0.8235 (three sessions): 344 requests, no error, no GPU fault, but the 7900 XTX reached 24,063 MiB, where the allocator's cap holds it (23,721 with RCCL at 0.81): under that load the ratio must stay lower, and how much lower is not measured. Not measured with it either: EXL3, a cold 255k read, the other profiles. Off by default: one GPU page fault at the second request of the first server started with it, none in the 19 starts after (the rare fault of [journey.md](journey.md)'s open list has that signature; not told apart). |
+| `FREETOKEN_HOST_ALLGATHER` | `1` | With `FREETOKEN_HOST_ALLREDUCE`: small all-gathers (the LM head's candidates from each rank, three a decode step with the drafts) through the same shared region, flags and sequence counter as the all-reduces (both ranks call them in the same order), instead of RCCL: each rank copies its words into its slot and into its place in the output, publishes, waits for the peer and copies the peer's words. Copies only: **bit-exact** (`tests/kernels/test_host_allreduce_two_ranks.py`, two GPUs). 7-11 µs a call in a decode step's trace against RCCL's 15-18 µs and the gaps around it. Measured with `FREETOKEN_PLE_GATE_FUSED` and `FREETOKEN_HOST_AR_HC_COMBINE`, see the latter. The broadcasts of rank 0's sampled tokens, kept counts and drafts after a sampled step (`FREETOKEN_TP_SYNC_TOKENS`) take the same slots, rank 1 keeping rank 0's half: 13 µs of host time a call where RCCL's broadcast took 43-51 (two ranks alone); T 0.6 124.3 -> 124.7 tok/s on `xtx-xt-4x262k` (NVFP4, one pair), the same answers. `0`: RCCL. |
 | `FREETOKEN_HOST_AR_HC_COMBINE` | `1` | With `FREETOKEN_HOST_ALLREDUCE`, a decode step of 1-16 rows: the hyper-connection's combine and the next RMSNorm after a block (`FREETOKEN_FUSED_HC_NORM`'s kernel) run in the launch of the block's closing all-reduce: block 0 all-reduces and raises a flag, one block per row and stream then runs that Triton program's arithmetic in HIP (each thread's 32 values in the program's register order, its pairwise sum of squares, the lanes and warps in its order, the correctly rounded mean, `v_rsq`, its fused multiply-adds). **Bit-exact** (`tests/kernels/test_host_allreduce_two_ranks.py`, two GPUs: against the all-reduce then the Triton kernel, eagerly and in a graph). One launch fewer a block (95 a decode step). With `FREETOKEN_HOST_ALLGATHER` and `FREETOKEN_PLE_GATE_FUSED`, against all three off (`xtx-xt-4x262k`, one pair, the same answers): NVFP4 +0.5 % greedy and +0.6 % at T 0.6 on short prompts, +0.5 % mid-answer after a 255k read; EXL3 3.05 bpw +0.7 %, +0.7 %, +0.7 %. `0`: the combine's own kernel. |
 | `FREETOKEN_HOST_ALLREDUCE_UNCACHED` | `1` | Register the shared pages as uncached fine-grained memory (`0`: default registration). |
 | `FREETOKEN_HOST_ALLREDUCE_AHEAD` | `1` | The kernel loads four of the peer's 16-byte chunks a thread before it sums any (a message of up to 32 KB in one round of PCIe reads instead of one per 8 KB), each in one 16-byte load when the pages are registered uncached (two 8-byte atomic loads otherwise). The same sums, bit-identical to RCCL (`rdna3/tests/host_allreduce_check.py`). Per call in a CUDA graph, both cards: 15 KB (three decode rows) 8.4 -> 7.6-7.9 µs, 20 KB 10.0 -> 8.5, 40 KB 14.1 -> 12.0, 80 KB 23.8 -> 19.5; one row unchanged (~8 µs). In serving (`xtx-xt-4x262k`, EXL3 3.05 bpw, two runs each): +0.2 % greedy, +0.5 % at T 0.6, +0.45 % at four requests, the same answers. `0`: one chunk at a time. |
 | `FREETOKEN_HOST_ALLREDUCE_TIMEOUT_S` | `300` | How long a rank waits for its peer before trapping (a desynchronized pair must not hang forever); `0` = wait forever. |
 | `FREETOKEN_HOST_ALLREDUCE_WAITLOG` | unset | Debug, `1`: each call stores how long its rank waited for the other one (100 MHz ticks, `[rank][seq % 65536]` after the four slots), and the shared region stays in `/dev/shm` (`freetoken-hostar-*-waitlog`) for a reader inside the container until a clean shutdown (a killed container leaves it: `--ipc=host` puts it in the host's `/dev/shm`, owned by root). Same speed. On `xtx-xt` it showed the XTX waiting ~0.9 ms a decode step for the XT, at every all-reduce. |
 | `FREETOKEN_DMA_ALLREDUCE` | unset; `1` in `xtx-xt`, `xtx-xt-1m`, `xtx-xt-4x262k` | With `FREETOKEN_HOST_ALLREDUCE` (two ranks, ROCm): an all-reduce of 20 MiB or more (a prefill block's, a 16k-token chunk's attention output) goes through a shared pinned host region moved by the copy engines, in 8 MiB pieces, each rank adding the other's pieces to its own: the same additions as RCCL, **bit-exact** (`rdna3/tests/dma_allreduce_check.py`, bf16 and fp32). Alone 20 / 40 / 80 MiB in 1.46 / 2.67 / 5.14 ms against RCCL's 2.00 / 3.92 / 7.78, and no CU held while the bytes cross PCIe. On `xtx-xt-4x262k` with the attention of `FREETOKEN_QSA_PREFILL_PREFETCH` (off one run, on two, the same answers): a 96k-token read NVFP4 27.82 -> 27.01-27.16 s, EXL3 3.05 bpw 30.68 -> 30.18-30.23 s, 3k-token reads unchanged. Takes 160 MiB of pinned host memory and a 32 MiB ring per card. `FREETOKEN_DMA_ALLREDUCE_MIN_KB` (`20480`): smaller messages stay on RCCL (a short prefill's experts stream over PCIe meanwhile; from 2 MiB, 3k-token reads took 30 % longer); `_SLOT_MB` (`80`): the largest message; `_PIECE_KB` (`8192`). Every call is issued on the caller's thread: issued from a thread, a read hung on an RCCL all-reduce ([journey.md](journey.md#43-a-long-reads-all-reduces-by-the-copy-engines-the-sparse-attentions-next-rows-ahead-2026-10-28-and-29)). |
-| `FREETOKEN_TP_SYNC_TOKENS` | `1` | `1` broadcasts rank 0's sampled tokens to the other ranks after each sampled step (~15 µs per step). `0` = off; `check` also compares the ranks' draws and logs each disagreement (one sync per step). |
+| `FREETOKEN_TP_SYNC_TOKENS` | `1` | `1` broadcasts rank 0's sampled tokens to the other ranks after each sampled step (through the host all-gather's slots with `FREETOKEN_HOST_ALLREDUCE`, else RCCL). `0` = off; `check` also compares the ranks' draws and logs each disagreement (one sync per step). |
 | `FREETOKEN_FUSE_MOE_ALLREDUCE` | `1` | qwen4_exp at TP>1: one all-reduce per MoE block (routed + shared experts) instead of two. +2.7 % decode, -4.5 % prefill time. Reorders sums, *agent-validated*. |
 | `FREETOKEN_PREFILL_AR_OVERLAP` | `1` | qwen4_exp at two ranks, with `FREETOKEN_FUSE_MOE_ALLREDUCE` and the fused MoE epilogue (offloaded NVFP4 or EXL3 experts decoded on the GPU: not with `--hybrid`): a prefill chunk whose routed experts run in token blocks (`FREETOKEN_NVFP4_PREFILL_BLOCK`, `FREETOKEN_EXL3_PREFILL_BLOCK`) starts each block's all-reduce while the next block computes, instead of one all-reduce after the last block. Each element is the same epilogue, then the same sum of the two ranks' values: **bit-exact** (`tests/moe/test_prefill_block_hook.py`). Cold reads on `xtx-xt-4x262k` 4-6 % shorter (NVFP4 164k tokens 70.1 -> 67.0 s, EXL3 3.05 bpw 66.6 -> 62.8 s). The engine synchronizes the device once before the next decode step: without it the decode graphs ran a third slower at four requests. `0`: one all-reduce after the experts. |
 | `FREETOKEN_GDN_AR_OVERLAP` | `1` | qwen4_exp at two ranks, the output projection bf16 or int8 weight-only: in a prefill chunk of one request made of whole `FREETOKEN_GDN_PREFILL_BLOCK` blocks (every 16k-token chunk of a long read but its last), each GatedDeltaNet block's gated norm and output projection run as its delta rule finishes, and that block's all-reduce starts while the next block's delta rule runs. hipBLASLt keeps the rows' bits for some shapes and block sizes only, so the first chunk of each length checks block against whole call on random data, and the ranks keep the overlap for that length only if all of them pass: **bit-exact** (`tests/models/qwen4_exp/test_gdn_ar_overlap.py`). Cold reads on `xtx-xt-4x262k`, after `FREETOKEN_PREFILL_AR_OVERLAP`, ~1-1.6 % shorter (NVFP4 164k tokens 66.9 -> 65.8 s). The check takes ~0.2 GiB for a moment, once per chunk length. `0`: the output projection after the last block. |
@@ -890,7 +903,7 @@ head: the server refuses the two together.
 | `FREETOKEN_SPEC_VERIFY_MS` | `1,2,..,M` with the head | The row counts a step may run, each with its CUDA graphs (counts above the smallest only for the batch sizes a verify step can have). Near a request's length limit a step runs no more rows than tokens left. |
 | `FREETOKEN_SPEC_DYNAMIC` | `1` | Each request picks its rows per step (2 to M, at most 2 past `FREETOKEN_SPEC_BS_DEEP` requests; with `FREETOKEN_SPEC_BS_MAX` > 1, the most any of the step's requests wants) from its running acceptance per draft position and the step costs below: the count with the most expected tokens per millisecond (with two or more row counts above 1, as by default). `0`: always M. |
 | `FREETOKEN_SPEC_COSTS` | measured, by card count | Step time per row count (ms; only the ratios matter): two cards (`xtx-xt`) `1:17.7,2:25.3,3:30.7,4:35.5`, one card (`xt`) `1:31,2:53,3:78,4:102`, where the extra rows' missing experts cross PCIe and the adaptive depth mostly keeps to 2 rows. Entries given here override. |
-| `FREETOKEN_SPEC_BS_MAX` | `1`; `4` in `xtx-xt`, `xtx-xt-1m`, `xtx-xt-4x262k` | Verify drafts only while at most this many requests decode (at most `--cuda-graph-max-bs`, checked at start). With more, steps run one row per request, the head only writes its KV (so drafts stay good when a request is alone again) and scheduling overlaps as without the head. `2` against `1` (`xtx-xt`, an earlier build): two agents at ~100k of context decode 33.6-34.4 tok/s each instead of 30.8-31.1, 2-3 short requests finish 3-4 % sooner, 1 and 4 requests take the same time; a sweep to 248k ran without an out-of-memory retry. More than 2 rows each at four requests lose (an earlier build: four requests at 4 rows each 26.3 tok/s against 35.35 without verifying), hence `FREETOKEN_SPEC_BS_DEEP=2` beside it. Greedy answers as with `1`; past 8 rows per step answers can change. `xtx-xtx` and `xt-xt` leave it unset (not measured there). |
+| `FREETOKEN_SPEC_BS_MAX` | `1`; `4` in `xtx-xt`, `xtx-xt-1m`, `xtx-xt-4x262k` | Verify drafts only while at most this many requests decode (at most `--cuda-graph-max-bs`, checked at start; a server started for fewer requests, `--max-running-requests` below it, verifies up to its own count). With more, steps run one row per request, the head only writes its KV (so drafts stay good when a request is alone again) and scheduling overlaps as without the head. `2` against `1` (`xtx-xt`, an earlier build): two agents at ~100k of context decode 33.6-34.4 tok/s each instead of 30.8-31.1, 2-3 short requests finish 3-4 % sooner, 1 and 4 requests take the same time; a sweep to 248k ran without an out-of-memory retry. More than 2 rows each at four requests lose (an earlier build: four requests at 4 rows each 26.3 tok/s against 35.35 without verifying), hence `FREETOKEN_SPEC_BS_DEEP=2` beside it. Greedy answers as with `1`; past 8 rows per step answers can change. `xtx-xtx` and `xt-xt` leave it unset (not measured there). |
 | `FREETOKEN_SPEC_BS_DEEP` | `FREETOKEN_SPEC_BS_MAX`; `2` in `xtx-xt`, `xtx-xt-1m`, `xtx-xt-4x262k` | More than 2 rows per request only while at most this many requests decode (at most `FREETOKEN_SPEC_BS_MAX`); past it, up to `FREETOKEN_SPEC_BS_MAX` requests, a step verifies 2 rows each and the head drafts one guess (1 row and no drafts if `FREETOKEN_SPEC_VERIFY_MS` has no 2). Each row of a wide step brings its own missing experts, so the second row pays where the third and fourth do not: four requests (NVFP4, `xtx-xt-4x262k`, one row count for every step) 31.3 tok/s each at 1 row, 35.2 at 2, 31.7 at 3, 30.4 at 4. `4` / `2` against `2` / `2` on `xtx-xt-4x262k`: three requests +6-9 % each, four +3-6 % greedy (-0.3 to +2.5 % at T 0.6), one request unchanged; `xtx-xt` and `xtx-xt-1m` gain at three requests too ([benchmarks.md](benchmarks.md#several-requests-and-agents-at-once-xtx-xt)). At the profile's own 1,050,000-token pool (EXL3 3.05 bpw, one run each): three requests 43.1 -> 45.9 tok/s each, four at T 0.6 38.2 -> 39.3; cold reads, decodes at 28k-130k of context and agent turns unchanged, 17 of 17 answers the same. Greedy answers the same on prompts read apart; four sent at once can differ, as between two runs without it (their prompts are read in one batch). At most 8 rows per step; a step of 3-4 requests no longer overlaps with the next one's scheduling, as a verify step must not. Two more CUDA graphs per card: ~280-380 MiB less VRAM free after the capture, the expert slots unchanged. |
 | `FREETOKEN_MTP_KV_ONLY_STOP` | `1` | While more than `FREETOKEN_SPEC_BS_MAX` requests decode, the head's pass only writes its KV: it stops once the K/V and the index keys are written instead of attending and combining (nothing reads that output). The same KV. `0`: the whole pass. |
 | `FREETOKEN_SPEC_GLUE_KERNELS` | `1` | A verify step's glue in kernels: the rollback copies (one kernel per state instead of ~6 ops), the token-pool writes, the kept counts of greedy rows, the head's rows and each chained guess's addressing; the acceptance log summed on the host. Same values. One request +1.5 % on EXL3 3.05 bpw `xtx-xt-4x262k` (greedy answers on fixed texts), +1.6 % on NVFP4 `xtx-xt`. `0`: torch ops. |
@@ -1596,7 +1609,7 @@ branch `3.05bpw_h5_ng5` (routed experts at 3 bits per weight, most other linears
   16k-token chunk, more than the generic `(1 - memory_ratio)` headroom absorbs. The expert kernel declares them
   (`prefill_workspace_bytes`) and the cache planner leaves them free (`MoE prefill temporaries` in the start log; 5 %
   fewer cached experts). Without that, the first 16k-token prefill after a start filled the 7900 XTX; on two cards
-  `rdna3/serve.sh` also lowers `--memory-ratio` to 0.77 (0.76 from 4 bpw): see
+  `rdna3/serve.sh` also lowers `--memory-ratio` to 0.77 (0.78 in `xtx-xt-4x262k`; 0.76 from 4 bpw): see
   [journey.md](journey.md#16-exl3-checkpoints-2026-10-04).
 - Not supported: half-integer bitrates, mixed expert bitrates across layers, the pinned PLE backend, the encoder-only
   weight reader (the CPU expert executor of `--hybrid` does read EXL3 experts: [cpu-experts.md](cpu-experts.md)). FTW conversion is untested. The vision tower reads the checkpoint's bf16
@@ -1619,9 +1632,9 @@ RAM: locked while serving;
 
 The agentic benchmark scores come from earlier builds than the other rows. The checkpoints answer differently, so the MTP head
 keeps a different share of its guesses: compare decode rates as an order of magnitude. Greedy answers are identical
-with and without the head. With the RAM tier off and `--expert-load serial`, the 3.05 bpw server started and served under a
-56 GiB container limit at 52.3 GiB used (`quick_bench.py` then: 70.1 tok/s decode at the model's sampling, 8.3k-token
-cold read in 4.41 s, agent turn 0.89 s, tool call parsed); a real 64 GB machine is untested.
+with and without the head. With `serve.sh --low-ram` (the RAM tier off, the experts loaded one file at a time) the 3.05 bpw server ran under a
+56 GiB container limit with 52.6 GiB locked, at the profile's speeds and with its answers
+([limits.md](limits.md#can-it-run-with-64-gb-of-ram)); a real 64 GB machine is untested.
 
 ## What stays upstream's
 
@@ -4665,11 +4678,167 @@ first `xtx --no-mtp` server decoded its 15 answers at 29.8-32.9 tok/s for four m
 (43.5 in `quick_bench.py` right after, 38-46 along its sweep); a second server gave 46.0 and 47.1 from its start. The
 first `xt --no-mtp` server of the last measure did the same at 24.6 tok/s; not explained.
 
-## 50. Still open
+## 50. PyTorch 2.15 tried, a decode step at three requests, the VRAM beside the expert cache (2026-11-11)
+
+**PyTorch 2.15.0** (released 2026-10-28) has ROCm wheels for ROCm 10.0 only (download.pytorch.org); AMD's index and
+the `rocm/pytorch` images stop at 2.14.0 for ROCm 10.1. The 10.0 wheel carries no ROCm library of its own (it asks pip
+for the ROCm 10.0 SDK wheels), so it was installed without its dependencies over the image's ROCm 10.1 SDK, the engine's
+extensions rebuilt against it, Triton 3.8 kept (2.15 asks for 3.9; the kernels' sums depend on Triton's version). That
+test image against the image of section 49, `xtx-xt-4x262k`, the launcher's command:
+
+- **The same answers.** NVFP4 (3 x 262k): 12 greedy and 12 seeded T 0.6 answers of 400 tokens identical in two
+  interleaved pairs, a 255k-token read's answer and the turn after it identical; EXL3 3.05 bpw: 12 + 12 identical, and
+  a greedy answer about an image.
+- **The same speed.** NVFP4 greedy 127.7 -> 127.2 tok/s (-0.4 %), T 0.6 121.8 -> 121.5 (-0.2 %) on the second pair
+  (the first server of a new image compiles: -3 %); the 255k read 61.8 -> 61.7 s to the first token (its first read on
+  the new kernel cache took 77.8 s: compiles), its answer 136.5 -> 135.9 tok/s, the turn 0.44 -> 0.46 s; three
+  conversations decoding together 171.8 / 162.4 -> 167.6 / 162.2 tok/s in all; EXL3 greedy 135.1 -> 134.8, T 0.6 134.4
+  -> 134.2.
+- **A little less VRAM, 112 fewer expert slots.** 2.15 frees hipBLASLt's workspace after each call where 2.14 keeps it
+  (80 MiB after the first `F.linear`, 80 more in a captured graph that holds one, torch alone); the servers used 82 /
+  229 MiB less after their start (XT / XTX) and 326 / 174 MiB less after the 255k read. And 2.15 creates the RCCL
+  communicator in `init_process_group` (170 MiB a card) where 2.14 waits for the first all-reduce (two ranks alone:
+  the same 462 / 450 MiB after it): the free VRAM the cache plan starts from, read after that init, is 164 MiB lower,
+  so the plan gives 8,965 slots instead of 9,077 for the same VRAM in use; a ratio 0.007 higher would give them back.
+- **Stability.** 7 server starts, a 12-minute soak (3 sessions, NVFP4: 334 requests, no error, no degenerate answer,
+  VRAM at most 19,607 / 23,571 MiB) and the runs above: no error line, no GPU fault; the 2.14 image's starts of the same
+  day had none either, so the rare page fault (Still open) is not settled by this. What 2.15's notes list that
+  could bear on it: graphs captured separately on one stream shared hipBLASLt's cached workspace and could fail on
+  replay with an illegal memory access (the workspace is now freed after each call), and `torch.cuda.empty_cache()` with
+  expandable segments.
+- **The test suite** on that image with this section's tree (its rollback buffer; the start check came after): the known
+  failures on both cards (the dsv41 vision, indexer and e4m3 tests and gemma4's router: 9 of 5,038), and on the XT one
+  more, a CPU-executor test whose graph probe ended in `hipErrorStreamCaptureInvalidated`. Not 2.15's:
+  `tests/moe/test_cpu_moe.py` run alone fails one such test every time on both images and both cards (13 runs of 13, the
+  2.14 image's own tree among them), where the whole suite usually passes them. Without a GPU 1,926 passed and one
+  failed, a test that asks for a GPU, on both images. The same tree and its start check on the 2.14 image: the known
+  failures only (9 on the XTX; 10 on the XT, where `test_qsa_hf` is one of them).
+
+Not adopted here: a wheel built against ROCm 10.0 running on ROCm 10.1's libraries is a mix nobody publishes; the
+image stays on AMD's 2.14 build until a 2.15 for ROCm 10.1 exists or the mix is chosen.
+
+**A decode step at three requests** (NVFP4, 3 x 262k, three conversations of 71-89k tokens decoding together: 6 rows a
+step, 2 a request) takes 38.5 ms for 872 kernels, 3.6 ms of it between kernels. On the XTX the routed experts' two GEMVs
+take 20.0 ms of it (13.1 + 6.9; 16.7 on the XT, which then waits ~2 ms in the all-reduces), the GatedDeltaNet
+projections' int8 GEMVs 3.0, the hyper-connections 2.1, the sparse attention with its rows' copy and the indexer 2.4.
+Alone in a graph with every expert cached, the same two GEMVs take 78 + 47 µs a layer at 6 rows (51 + 34 at 4, 100 + 59
+at 8: linear in the rows, the gate | up at ~800 GB/s): 6.1 ms a step. The other ~14 ms, 36 % of the step, is missing
+experts crossing PCIe.
+
+- **The admission changes nothing, the cache's size everything.** The hit bonus at 0, 480, 2,400 or 9,600 calls: 7.2
+  misses a layer and step at three requests either way, the same speed (`--moe-collect-stats`, whose counters cost ~6 %
+  in every arm here). The cache made smaller through `--memory-ratio`: 9,077 slots (0.80) 90.1 % of hits and 2.4 misses
+  a layer-step at one request, 83.7 % and 7.3 at three; 8,401 slots (0.76) 2.7 and 8.5, one request -3.4 %, three -7.8 /
+  -8.5 %; 7,726 slots (0.72) 3.0 and 9.9, -7.9 % and -16.0 / -16.3 %. At three requests one percent of the slots is
+  about one percent of the speed (half that at one request), and one percent of the slots is 133 MiB on the XTX and 108
+  on the XT.
+- **What the VRAM holds beside the experts** (the tensors alive at the end of a start, 7900 XTX, MiB): the expert slots
+  13,274; the GatedDeltaNet states 1,518 (25 slots of 36 layers x 27 heads x 128 x 128 fp32: four a running request,
+  eight cached snapshots, one for padding) and the states a verify step keeps for its rollback 729; the int8 dense
+  weights ~2,400; the staging buffer a prefill's attention reads its K/V from, which the decode steps' K/V cache lives
+  in, 769; the indexer's keys 624; the LM head 333 and the copy of its Latin-script rows for the drafts 192; the routers
+  122. On the XT the states take 1,181 and 567. Outside torch's allocator, RCCL's communicator takes 274 MiB a card once
+  the first all-reduce ran (two ranks alone; the same with `NCCL_MAX_NCHANNELS` at 1, 2 or 4 and `NCCL_BUFFSIZE` at 0.5
+  or 1 MiB). A read's temporaries on top (a 16,384-token chunk, torch's allocation history): 1,281 MiB at the peak on
+  the XTX, in the MoE: the 8192-token block's per-route outputs 400, the chunk's four hyper-connection streams 320, the
+  block's gate | up 110, four chunk-sized tensors of 80, and 95 more; the block's part is
+  `FREETOKEN_NVFP4_PREFILL_BLOCK`'s known cost, nothing to take there without its read speed.
+- **The states a verify step keeps, in one flat buffer** (kept, bit-exact). A step of m rows keeps each request's
+  GatedDeltaNet state after every row but the last, to roll back to the last row kept. The buffer was requests x
+  (rows - 1) at the most of each, 4 x 3 with `FREETOKEN_SPEC_BS_MAX=4`, although past two requests
+  (`FREETOKEN_SPEC_BS_DEEP=2`) a step verifies two rows: a step keeps 6 states at most (two requests x 3, four x 1).
+  Now one flat buffer of those 6, request b's state after row j of a step of m rows at b (m - 1) + j: the delta-rule
+  kernel already took its depth from the buffer's second dimension (it now gets the step's view), the rollback's copy
+  takes its request stride from the step's rows. The same values at other addresses, 364 MiB less on the XTX and 283
+  on the XT (tests: the states after a rollback from 2-4 rows of 1-4 requests against single-row steps, with the
+  kernel's copy and the torch one, both cards). The buffer is not in the cache plan (it lives in the headroom
+  `--memory-ratio` leaves), so the same 9,077 slots at 0.80, the VRAM 259 / 360 MiB lower at the start (XT / XTX), the
+  same answers. Given to the cache: `--memory-ratio 0.81` (`xtx-xt-4x262k`'s from this section on) plans 9,246 slots,
+  against the image of section 49 in the same sequence: 12 greedy and 12 sampled answers, three conversations' turns
+  twice and a 255k read with its turn all identical; greedy 129.4 -> 130.9 tok/s (+1.2 %), T 0.6 122.0 -> 123.4
+  (+1.1 %), three conversations together 170.1 / 162.1 -> 174.9 / 166.4 in all (+2.8 %), the answer after the 255k
+  read 141.2 -> 142.3; the VRAM after the read 19,574 / 23,742 MiB against 19,655 / 23,789 before (lower, with more
+  slots). At 0.814 (9,313 slots, the VRAM of before at the start): +1.9 % and +4.1 %, the XTX's peak 96 MiB above
+  before: not taken. `xtx-xt` and `xtx-xt-1m` keep the same states and their 0.80: more headroom, not measured at more.
+  EXL3 3.05 bpw (four contexts), `--memory-ratio 0.78` where `serve.sh` gives 0.77: 11,647 slots instead of 11,437,
+  the 12 + 12 answers, four conversations' first turns and the 255k read with its turn identical; greedy 134.7 -> 136.4
+  tok/s (+1.3 %), T 0.6 134.1 -> 135.7 (+1.2 %), four conversations together 231.2 -> 235.6 in all (+1.9 %); the VRAM
+  after the read 17,390 / 23,218 MiB against 17,450 / 23,382 (the XTX 164 MiB lower: room above 0.78, not measured).
+  `serve.sh` takes 0.78 for this profile (its `EXL3_RATIO`); from 4 bpw it keeps 0.76, not measured.
+- **The pools sized for three requests** (two arguments). `xtx-xt-4x262k` sizes the GatedDeltaNet states and the
+  graphs for four requests whatever the K/V pool holds. With `--max-running-requests 3 --cuda-graph-max-bs 3` and
+  `FREETOKEN_SPEC_BS_MAX=3` on the image of section 49 (NVFP4, 3 x 262k; two interleaved pairs): 19 state slots
+  instead of 25, 9,319 expert slots instead of 9,077, the 12 greedy answers identical, 128.6 / 129.2 -> 130.2 / 130.9
+  tok/s (+1.2 / +1.3 %), three conversations together 169.0 / 160.9 and 170.5 / 161.7 -> 174.4 / 165.5 and 175.6 /
+  168.4 in all (+3.0 / +3.5 %), the VRAM's peak 203 / 240 MiB lower (the states a step keeps shrank with the requests
+  too). A fourth request at once would wait. The engine refused to start when `FREETOKEN_SPEC_BS_MAX` exceeded the
+  graphs' largest batch; it now counts the requests the scheduler runs at once, so the two arguments are enough under
+  the profile's `FREETOKEN_SPEC_BS_MAX=4` (the same graphs as with 3). With this section's buffer and 0.81 as well,
+  `rdna3/serve.sh xtx-xt-4x262k --model DIR -- --kv-reserve-tokens 787500 --max-running-requests 3 --cuda-graph-max-bs
+  3`: 9,488 slots, the 12 + 12 answers, the three conversations' turns twice and the 255k read with its turn identical
+  to the image of section 49's; greedy 129.4 -> 132.1 tok/s (+2.0 %), T 0.6 +1.9 %, three conversations together
+  170.1 / 162.1 -> 179.1 / 171.2 in all (+5.3 / +5.6 %), the answer after the 255k read 141.2 -> 145.4; the VRAM after
+  the read 19,593 / 23,462 MiB against 19,655 / 23,789.
+- **A sampled step's tokens between the ranks without RCCL** (kept, bit-exact). After a sampled step rank 0's tokens,
+  kept counts and drafts go to rank 1 (`FREETOKEN_TP_SYNC_TOKENS`), two or three `torch.distributed.broadcast` a step
+  through RCCL: 43-51 µs of host time each (two ranks alone, beside a running test suite). Through the host all-gather's
+  slots, rank 1 keeping rank 0's half: 13 µs. `xtx-xt-4x262k` in the three-request form, against the build without it:
+  the 12 greedy and 12 sampled answers and the three conversations' turns identical, T 0.6 124.3 -> 124.7 tok/s (+0.4 %,
+  every prompt at or above), greedy the same. What RCCL still carries is in Still open.
+- **Serving without RCCL** (`FREETOKEN_NO_RCCL`, off by default; bit-exact). RCCL's 274 MiB a card come back only if its
+  communicator is never created, so what it still carried went to host memory: a short prefill's all-reduces (256 KiB to
+  20 MiB) through mid slots of the host all-reduce's region, the broadcasts (a prefill's PLE rows, an image's
+  embeddings) through the gather's slots or the mid slots by bytes, the ranks' two first-use agreements through the CPU
+  group. A first mid all-reduce copied the whole message, exchanged a sequence number and added the peer's: 33-44 %
+  slower than RCCL above 2 MiB (7.8 MiB: 1.05 ms against 0.78), and eight 1.2k-token agent turns took 0.786 s to their
+  first token against 0.745. By pieces, a launch adding the peer's piece while it copies the next one (both PCIe
+  directions at once), four loads ahead a thread and a few large blocks a piece: 0.83 ms at 7.8 MiB (RCCL 0.77), equal
+  or faster up to 2 MiB; smaller blocks (64 KiB) and eight pieces were slower. `xtx-xt-4x262k` in the three-request
+  form, against the same build with RCCL: 220 MiB less outside torch at the start on each card; given to the cache
+  (`--memory-ratio` 0.81 -> 0.8235: 9,716 slots instead of 9,488) one request +0.9 %, T 0.6 +1.0 %, three conversations
+  together 179.1 / 171.6 -> 184.0 / 175.8 tok/s in all (+2.7 / +2.4 %), the answer after a 255k read 145.4 -> 149.6, the
+  turns 0.744 s, the VRAM after the read 19,662 / 23,696 MiB; the 12 + 12 answers, the three conversations' turns twice,
+  the 255k read, an image's answer and the eight turns identical. A 12-minute soak at 0.8235 (three sessions): 344
+  requests, no error, no GPU fault, the XTX at 24,063 MiB at its peak, where the allocator's cap holds it (23,721 in the
+  same soak with RCCL at 0.81): too high a ratio for that load, the right one not measured; EXL3 and a cold 255k read
+  not measured either. The first server started without RCCL died at its second request on a GPU page fault (the XT, a
+  write: the signature of the rare fault below); the 19 starts after it were clean (ten in a row with the same
+  requests), the kernels run one at a time too, and neither the mid slots alone nor the mode without the PLE rows'
+  broadcast showed it: not told apart from the rare fault, so the mode stays off.
+
+**64 GB of RAM: `serve.sh --low-ram`.** The path limits.md described by hand (the RAM tier off in the profile file,
+`--memory 56g -- --expert-load serial`) became one option: `--low-ram` on `xtx-xt`, `xtx` or `xt` sets
+`FREETOKEN_HOST_KV=0`, `--expert-load serial` and a container limit of the machine's RAM minus 6 GiB, and `--check`
+proposes it (with its command) where an EXL3 3.05 bpw checkpoint fits no other way; NVFP4 and 4.05 bpw still get a
+`FAIL`, the first with a line naming the 3.05 bpw checkpoint. Measured with the image of section 49, EXL3 3.05 bpw on
+`xtx-xt`, under `--memory 56g` (what a machine reporting 62.7 GiB gets) against the profile as it is, one run each:
+
+- **RAM.** 52.3 GiB locked after the start and 52.6 after the requests (61.4 and 61.8 with the profile: the 9.5 GiB
+  tier); the container's memory apart from its page cache at most 54.1 GiB, no kill. The profile's parallel loader
+  reached 76.4 GiB while loading, which is why the option loads one file at a time: a start in 138 s instead of 96.
+- **The same speeds and answers.** 10,122 expert slots both ways; greedy 129.0 against 129.2 tok/s, T 0.6 128.7 and
+  128.7, the 12 + 12 answers identical; agent turns 0.620 and 0.622 s to the first token, the same texts; cold reads
+  of 116k and 205k tokens 31.4 and 56.1 s against 31.6 and 56.3. The first long read after the start, 60k tokens, took
+  19.6 s against 16.3, and 16.3 s on a second start under the same limit (the 19.6 not explained).
+- **What is lost.** Two conversations that do not fit the GPUs' 262k tokens together (116k, then 205k): back on the
+  first, the first token after 31.3 s (the whole conversation read again) where the RAM tier gives 0.27 s; back on the
+  second 55.8 s against 0.34. A turn on the conversation still on the GPUs: 0.20 s both ways.
+- **In use.** That second start then served a 12-minute agent-like soak (three sessions): 342 requests, no error, no
+  degenerate answer, no GPU fault; 52.3 GiB locked at the end, the container's memory apart from its page cache at
+  most 53.8 GiB of the 56, the VRAM at most 18,203 / 23,449 MiB.
+
+A real 64 GB machine and one card are not measured.
+
+Two things found on the way: `serve.sh --check` stopped without a word after `Docker reachable` when its files were
+not in a git checkout (a downloaded archive) and the image was there, now it goes on; and the CPU suite of the image
+had one failure, a graph test of the FP8 block that asked for a GPU on a ROCm build without one, now skipped (1,930
+passed, none failed, with `--cpus 8` in 310 and 330 s).
+
+## 51. Still open
 
 - In NVFP4 the model needs ~63 GiB of RAM for its experts alone (the engine keeps every expert in RAM). The EXL3 3.05
-  bpw checkpoint needs 42.6 GiB and served under a 56 GiB container limit, but a real 64 GB machine is untested
-  ([limits.md](limits.md)).
+  bpw checkpoint needs 42.6 GiB and serves under a 56 GiB container limit with `serve.sh --low-ram` (section 50), but
+  a real 64 GB machine is untested, and so is one card ([limits.md](limits.md#can-it-run-with-64-gb-of-ram)).
 - Not run on the agentic benchmark since its last run: Triton 3.8, not bit-exact with that run's 3.7.1 (section 18);
   upstream's NVFP4 decode kernel (section 23, 5 of 15 greedy answers changed); the fp64 rebuild of EXL3's dense
   weights (section 20); `--hybrid` (section 24), whose answers also move with the expert cache's contents (section 27);
@@ -4695,24 +4864,32 @@ first `xt --no-mtp` server of the last measure did the same at 24.6 tok/s; not e
   next server passed the same point twice, its XT at most 18.2 GiB of 20, and none in the other 19 servers of that day's
   benchmarks. One on 2026-11-06 at the first request of a start (NVFP4, the XT, a write, section 48's first build with
   the hyper-connection's projections in one launch); the next start under the debug agent, the 15 after it and a
-  20-minute soak were clean. One the same day at a load, a first (section 49: the copy engine, while the int8
-  conversion read the dense weights back); the 30 starts after it were clean, and the 19 servers of the release measure
-  after them (section 49).
+  20-minute soak were clean. One the same day at a load, a first (section 49: the copy engine, while the int8 conversion
+  read the dense weights back); the 30 starts after it were clean, and the 19 servers of the release measure after them
+  (section 49). One on 2026-11-11 at the second request of a start (NVFP4, the XT, a write), on the first server started
+  without RCCL (section 50): the fault does not need RCCL; the 19 starts of that mode after it were clean. The host
+  all-reduce's shared region is mapped without any page touched by the host, so GPU kernels write each page first, at a
+  start's first requests; GPU kernels writing 2.9 M never-touched pages of freshly registered host memory, alone on the
+  idle XT, did not fault (nor with the pages written by the host first).
 - A one-card `--no-mtp` server decoding ~30 % below its speed for its first minutes, then at it: 2 of the 7 such
   servers of the last two release measures (sections 43 and 49), the next start each time normal from its first
   answer; not explained.
 - Expert misses (section 20): the decode GEMVs now read them from host memory while computing the cached experts
-  (section 38), a program's rows copied whole first (section 45), so their PCIe time shows where it exceeds that work
-  (a layer's GEMVs at one request, EXL3: 40.5 µs against 32.5 when the copy came first, the copy 34.6 -> 4.2 µs).
-  Fewer of them is the lever left: a larger cache, not a cache policy (an online one gains ~8 % of the misses at best
-  on a recorded trace), or the transfer moved off the MoE GEMVs: with the launcher's pool NVFP4 still misses 1.0-4.6
-  experts a layer and step (~1.5 MB each on the XTX), and during a layer's attention or GatedDeltaNet part PCIe is
-  free (a copier alone reaches 24-28 GB/s there, section 47).
-  Section 29's prefetch of predicted experts (42 % fewer misses) ran on a side stream inside the graphs and lost;
-  section 45's copied from the gate | up GEMV and lost 14 %; a copier beside the GatedDeltaNet projections slows them
-  16-53 % (section 47, not built into the model). On one card `--hybrid` computes part of them on the CPU (section 24). More VRAM for the cache: a
-  desktop-aware plan for the card that drives
-  the display (the ~145-179 Triton kernels a card loads are all in use, section 31).
+  (section 38), a program's rows copied whole first (section 45), so their PCIe time shows where it exceeds that work (a
+  layer's GEMVs at one request, EXL3: 40.5 µs against 32.5 when the copy came first, the copy 34.6 -> 4.2 µs). Fewer of
+  them is the lever left: a larger cache, not a cache policy (an online one gains ~8 % of the misses at best on a
+  recorded trace), or the transfer moved off the MoE GEMVs: with the launcher's pool NVFP4 still misses 1.0-4.6 experts
+  a layer and step (~1.5 MB each on the XTX), and during a layer's attention or GatedDeltaNet part PCIe is free (a
+  copier alone reaches 24-28 GB/s there, section 47). Section 29's prefetch of predicted experts (42 % fewer misses) ran
+  on a side stream inside the graphs and lost; section 45's copied from the gate | up GEMV and lost 14 %; a copier
+  beside the GatedDeltaNet projections slows them 16-53 % (section 47, not built into the model). On one card `--hybrid`
+  computes part of them on the CPU (section 24). More VRAM for the cache: a desktop-aware plan for the card that drives
+  the display (the ~145-179 Triton kernels a card loads are all in use, section 31). What the VRAM holds beside the
+  experts is listed in section 50, where the states a verify step keeps came down by half; left there: the GatedDeltaNet
+  state pool's cached snapshots (eight, 486 MiB on the XTX; kept in RAM, a resumed conversation would pay a ~60 MiB
+  copy), the drafts' copy of the LM head's Latin-script rows (192 MiB; it splits them 55 / 45 between the cards, where
+  two thirds sit in the XTX's shard), and a higher `--memory-ratio` for `xtx-xt` and `xtx-xt-1m` (the same states, their
+  ratio not measured above 0.80).
 - A decode step at long context (NVFP4, one request, after a 255k read, section 47's trace): the context's kernels ~2.1
   ms of 27.75 (the same answer on a 1k document: 25.45 ms): the sparse attention 0.58-0.66 ms and its rows' copy 0.39,
   the rows' lookups (index, page, slot, tag) one after the other before the K/V loads (looked up a tile ahead, slower:
@@ -4763,6 +4940,16 @@ first `xt --no-mtp` server of the last measure did the same at 24.6 tok/s; not e
   and its gap cost ~4.3 µs in a graph.
 - The host all-reduce's floor: ~6 µs a call for one row in a CUDA graph (the write, the flag's round trip, the data's
   round trip). The data and the call number in one word did not lower it (section 38).
+- RCCL's 274 MiB of VRAM a card (section 50; ~230 expert slots): `FREETOKEN_NO_RCCL` gives them back with the same
+  answers and no slower agent turn, measured on `xtx-xt-4x262k` with NVFP4 only. It stays off: one page fault at the
+  second request of the first server started with it, not told apart from the rare fault below; EXL3, a cold 255k read
+  and the other profiles are not measured with it, and the `--memory-ratio` that turns its VRAM into slots is not
+  settled (0.8235 held the 255k read and three conversations at the VRAM of before, but a three-session soak reached the
+  allocator's cap).
+- Decode at three requests (NVFP4, three contexts on `xtx-xt-4x262k`, section 50): about a third of a 38.5 ms step is
+  missing experts crossing PCIe (7.2 a layer and step with 9,077 slots; the two expert GEMVs take 20 ms on the XTX where
+  6 would do with every expert cached), so the cache's size sets the speed, about one percent for one percent of the
+  slots; the admission's hit bonus changes nothing, and `--hybrid` gained nothing on this profile (section 24's page).
 - Decode at four requests (EXL3 3.05 bpw, `xtx-xt-4x262k`, a kernel trace of section 38's build): per step on the
   XTX the EXL3 GEMVs take 9.9 ms with the missing experts read inside them (8.6 + 5.0 ms of copies before), the int8
   dense GEMVs ~11 ms (eight rows; their sums run per row, section 42), the sparse attention 2.5;
@@ -4803,6 +4990,13 @@ first `xt --no-mtp` server of the last measure did the same at 24.6 tok/s; not e
   ~1 s (most of it likely waiting for the slower XT, which was not traced), the EXL3 expert GEMMs ~1.35 s, the sparse
   attention ~0.66 s (each tile's K/V gathers waited for two dependent loads before them: section 43 looks the next
   tile's rows up ahead, 30-41 % faster) and the indexer 0.15-0.55 s, growing with the context.
+- PyTorch 2.15 (section 50): only as the ROCm 10.0 wheel over the image's ROCm 10.1 libraries, where it gave the same
+  answers, speed and test results as 2.14; not adopted while no build for ROCm 10.1 exists. With it the cache plan would
+  need a `--memory-ratio` 0.007 higher for the same slots (the RCCL communicator then exists before the plan's
+  baseline).
+- `tests/moe/test_cpu_moe.py` run alone fails one of its graph tests each time (`hipErrorStreamCaptureInvalidated` at
+  the capture of the CPU executor's probe, upstream's kernel IO; 13 runs of 13 on both cards, section 50); the whole
+  suite on a card usually passes it. Not looked into.
 - More than two GPUs, other RDNA3 cards, RDNA4 and NVIDIA are untested.
 - Image input (`serve.sh --vision`) is measured on `xtx-xt`, `xtx` and `xt` only. The derived profiles (`xtx-xtx`,
   `xt-xt`, `gre`) are untested with it, as they are without it.
@@ -4861,15 +5055,46 @@ The untested two-card profiles (`xtx-xtx`, `xt-xt`) should lock about what `xtx-
 
 ## Can it run with 64 GB of RAM?
 
+Yes, with an **EXL3 checkpoint at 3 bits per weight** ([how-it-works.md](how-it-works.md#exl3-checkpoints)) and
+`--low-ram`, on a machine kept for the server (a light desktop at most):
+
+```bash
+rdna3/serve.sh xtx-xt --model ~/models/Qwen3.8-Flash-Next-exl3-3.05bpw --low-ram
+```
+
+`--low-ram` works on the profiles that keep the K/V in VRAM (`xtx-xt`, `xtx`, `xt`). It turns the RAM tier off
+(`FREETOKEN_HOST_KV=0`), loads the experts one file at a time (`--expert-load serial`: the parallel loader needs 76 GiB
+for a moment) and limits the container to the machine's RAM minus 6 GiB. `rdna3/serve.sh --check --model DIR` proposes
+it when it is what fits, and ends with that command.
+
+Measured on the 125.7 GiB reference machine, under the 56 GiB container limit a machine reporting 62.7 GiB gets, against
+the profile as it is (two cards, one run each); a real 64 GB machine is untested:
+
+| EXL3 3.05 bpw on `xtx-xt` | `--low-ram`, 56 GiB limit | the profile as it is |
+|---|---:|---:|
+| RAM locked after the start; after the requests below | 52.3; 52.6 GiB | 61.4; 61.8 GiB |
+| the container's memory at its highest, page cache apart | 54.1 GiB | 76.4 GiB (while loading) |
+| start | 138 s | 96 s |
+| decode, greedy; at T 0.6 (12 answers of 400 tokens each) | 129.0; 128.7 tok/s | 129.2; 128.7 tok/s |
+| cold read of 60k tokens (the first long one; a second start: 16.3); 116k; 205k | 19.6; 31.4; 56.1 s | 16.3; 31.6; 56.3 s |
+| agent turn (~1.2k new tokens on 28-37k), first token | 0.62 s | 0.62 s |
+| back to a conversation pushed off the GPUs: 116k; 205k tokens | 31.3; 55.8 s | 0.27; 0.34 s |
+
+The answers are the same (the 12 greedy and 12 seeded ones, the 60k read's, the eight turns'), the expert cache too
+(10,122 slots). **What is lost is the RAM tier**: two conversations that do not fit the GPUs' 262k tokens together (here
+116k + 205k) push each other out, and each return then reads its conversation again instead of copying it back from RAM.
+One conversation, or several that fit the 262k tokens together, lose nothing. A second start under the same limit read
+the 60k tokens in 16.3 s, then served 12 minutes of agent-like load (three sessions, 342 requests) without an error:
+52.3 GiB locked at the end, 53.8 GiB of the container's 56 in use apart from the page cache. That leaves the system
+and a light desktop the machine's other ~6 GiB: keep the machine for the server.
+
 Not with the NVFP4 checkpoint: its experts alone need ~63 GiB of RAM, and the engine has no mode that reads experts from
-disk. An **EXL3 checkpoint at 3 bits per weight** ([how-it-works.md](how-it-works.md#exl3-checkpoints)) needs 42.6 GiB
-for its experts (63.3 in NVFP4; 43.5 and ~64.6 with the MTP head's experts, which an NVFP4 checkpoint stores in bf16,
-4.7 GiB, and the engine quantizes to NVFP4 at load): on `xtx-xt`, with the RAM tier off and the experts loaded one file
-at a time, the server ran under a 56 GiB container limit at 52.3 GiB used (`FREETOKEN_HOST_KV=0` in the profile file,
-then `rdna3/serve.sh xtx-xt --model DIR --memory 56g -- --expert-load serial`; the parallel loader was killed under a 52
-GiB limit). A real 64 GB machine is untested. `serve.sh --check` keeps 25-30 GiB beside a server for a desktop and its
-programs, so it says no on 64 GB: this path is for a machine that runs little else, and `serve.sh` then starts with a
-warning. On the agentic benchmark the 3.05 bpw checkpoint fixed 13 of 29 bugs (one run; NVFP4: 12 and 18 in two runs).
+disk. The EXL3 3.05 bpw checkpoint needs 42.6 GiB for them (63.3 in NVFP4; 43.5 and ~64.6 with the MTP head's experts,
+which an NVFP4 checkpoint stores in bf16, 4.7 GiB, and the engine quantizes to NVFP4 at load); the 4.05 bpw one locks
+~67 GiB without the RAM tier. On one card the 3.05 bpw checkpoint should lock ~47 GiB with `--low-ram` (the two-card
+arithmetic, not measured). For the profile as it is, `serve.sh --check` keeps 25-30 GiB beside a server for a desktop
+and its programs, which 64 GB cannot give: hence the option. On the agentic benchmark the 3.05 bpw checkpoint fixed
+13 of 29 bugs (one run; NVFP4: 12 and 18 in two runs).
 
 ## How much VRAM?
 
@@ -5211,9 +5436,9 @@ be slower (one-time kernel preparation): run it twice.
 docker run --rm -w /opt/FreeToken --entrypoint python3 freetoken-rdna3:latest -m pytest -q -p no:cacheprovider tests
 ```
 
-About 3 minutes (150 s on the reference machine with `--cpus 8`), no GPU needed, on the tree the image was built
-from: 1853 passed, no failure (the GPU tests skip). The whole suite in one process peaks above 12 GB of RAM: under a
-container memory limit, run it one `tests/` subdirectory at a time.
+Five to six minutes (310 and 330 s on the reference machine with `--cpus 8`), no GPU needed, on the tree the image was
+built from: over 1,900 tests pass, none fails (the GPU tests skip). The whole suite in one process peaks above 12 GB
+of RAM: under a container memory limit, run it one `tests/` subdirectory at a time.
 
 To test source changes without rebuilding, mount your tree instead (`-v "$PWD":/src:ro -w /src -e
 PYTHONPATH=/src/python`); `test_swiglu_clamp.py::test_cpu_extension_supports_swiglu_clamp` then fails, because the
@@ -5864,11 +6089,34 @@ GPU); this tree's MTP decoding stays the profiles' and the two are exclusive.
 | `python/freetoken/layers/embedding.py` | 125/6 | upstream's `logits()` keeps a decode step's logits local under `FREETOKEN_SPARSE_LOGITS` |
 | `python/freetoken/models/qwen4_exp/mtp_head.py` | 138/0 | this tree's MTP head, formerly `mtp.py` (upstream's draft took the name) |
 | `python/freetoken/models/qwen4_exp/model.py`, `ple.py`, `ple_disk.py` | 130/7, 250/13, 467/96 | the fused hyper-connection loop with upstream's verify stash and feature export; the PLE verify conv beside the spec_decode rows; the disk table's fill reads a verify step's rows on this tree's fill thread |
-| `python/freetoken/moe/cpu_executor.py`, `tests/moe/test_cpu_moe.py`, `tests/moe/test_cpu_moe_fp8_block.py` | 156/10, 67/0, 3/0 | on ROCm the copies around the doorbell and the hybrid layer's in-kernel flags stay, where upstream enables its kernel IO (`9cacd08`; `FREETOKEN_CPU_MOE_KERNEL_IO_ROCM=1`); upstream's graph IO probe kept; its tests that expect the kernel IO on ROCm skip without it |
+| `python/freetoken/moe/cpu_executor.py`, `tests/moe/test_cpu_moe.py`, `tests/moe/test_cpu_moe_fp8_block.py` | 156/10, 67/0, 4/1 | on ROCm the copies around the doorbell and the hybrid layer's in-kernel flags stay, where upstream enables its kernel IO (`9cacd08`; `FREETOKEN_CPU_MOE_KERNEL_IO_ROCM=1`); upstream's graph IO probe kept; its tests that expect the kernel IO on ROCm skip without it, and the graph test of the FP8 block skips on a ROCm build without a GPU instead of failing |
 | `tests/layers/test_gdn_spec_rows.py`, `tests/scheduler/test_scheduler_status.py`, `tests/tokenizer/test_detokenize_multi_token.py` | new, 11/0, new | the verify-row GDN tests on upstream's GDN test harness; the status and detokenizer tests on upstream's `generated` count and token lists |
 | `tests/kvcache/test_qsa_pool.py`, `tests/layers/test_lm_head_dump.py` | 15/1, new | the ring sized for both methods' rows; a decode step's LM head logits local under `FREETOKEN_SPARSE_LOGITS` (fails on the unresolved merge) |
 | `tests/models/qwen4_exp/test_tp_shard.py`, `test_tp_uneven.py`, `tests/scheduler/test_gdn_boundary_carry.py` | new | on upstream's signatures (`_linear_local_dims`' k heads, `_build_track_metadata`'s conv width, the engine's draft budget) |
 | `Dockerfile.rdna3` | (this repository's) | the content check reads the GatedDeltaNet op at its new path |
+
+## The states a verify step keeps for its rollback in one flat buffer, a sampled step's token sync without RCCL (bit-exact)
+
+Line counts here are on top of the lines listed in the sections above.
+
+| File | Lines | Change |
+|---|---:|---|
+| `python/freetoken/layers/linear_attn/gdn.py`, `spec_decode.py`, `engine/graph.py` | 26/17, 6/3, 4/3 | the GatedDeltaNet states a verify step keeps (after each row but the last) in one flat buffer, request b's state after row j of a step of m rows at b (m - 1) + j: the 6 states a step keeps at most with `FREETOKEN_SPEC_BS_MAX=4` and `FREETOKEN_SPEC_BS_DEEP=2` (two requests x 3 rows, four x 1) where requests x (rows - 1) held 12, i.e. 364 MiB less on the 7900 XTX and 283 on the XT; a rollback target may lay its snapshots out by the step's rows (`RollbackTarget.by_rows`); the eager forwards before the captures include the shape that keeps the most states |
+| `tests/layers/test_gdn_spec_rows.py`, `tests/kernels/test_decode_glue.py`, `tests/test_spec_decode.py`, `tests/engine/test_graph_sizing.py` | 46/0, 36/0, 18/0, 4/3 | the states after a rollback from 2-4 rows of 1-4 requests are those of single-row steps (the kernel's copy and the torch one; `FREETOKEN_SPEC_VERIFY_M=4` to run them); the copy laid out by the step's rows; the sizing shapes |
+| `python/freetoken/engine/graph.py`, `engine/engine.py`, `tests/engine/test_graph_sizing.py` | 11/1, 1/0, 8/1 | a server started for fewer requests than its profile's `FREETOKEN_SPEC_BS_MAX` (`--max-running-requests 3 --cuda-graph-max-bs 3` under `xtx-xt-4x262k`) verifies up to its own count instead of refusing to start: the check counts the requests the scheduler runs at once (`verify_requests`) |
+| `python/freetoken/distributed/impl.py`, `engine/engine.py`, `tests/kernels/test_host_allreduce_two_ranks.py` | 19/0, 12/4, 24/1 | the broadcasts of rank 0's sampled tokens, kept counts and drafts after a sampled step (`FREETOKEN_TP_SYNC_TOKENS`) go through the host all-gather's slots when the host all-reduce is on (`DistributedCommunicator.broadcast`), rank 1 keeping rank 0's half, instead of RCCL's broadcast (13 µs of host time a call against 43-51) |
+| `rdna3/profiles/xtx-xt-4x262k.env`, `rdna3/serve.sh`, `tests/rdna3/test_serve_sh.py` | 9/1, 5/3, 20/0 | the freed VRAM goes to the expert cache: `--memory-ratio 0.81` (NVFP4, 3 contexts: 9,246 slots instead of 9,077) and a profile key `EXL3_RATIO`, `serve.sh`'s ratio for an EXL3 checkpoint below 4 bpw on two cards (0.78 here, 0.77 without it: 11,647 slots instead of 11,437 at 3.05 bpw), both with lower VRAM peaks than before |
+
+## Serving without RCCL: mid-size all-reduces and broadcasts through host memory (bit-exact, off by default)
+
+Line counts here are on top of the lines listed in the sections above.
+
+| File | Lines | Change |
+|---|---:|---|
+| `python/freetoken/kernel/csrc/jit/host_allreduce.cuh`, `kernel/host_allreduce.py` | 225/0, 65/2 | `FREETOKEN_HOST_ALLREDUCE_MID_MB`: four mid slots in the shared region; an all-reduce above the small slots goes by pieces (`host_mid_step_kernel`: add the peer's piece while copying the next one; the one-block kernel on no element as the handshake between two launches), a broadcast by bytes (`host_mid_copy_kernel`, `host_mid_fetch_kernel`) |
+| `python/freetoken/distributed/impl.py`, `engine/engine.py` | 60/0, 22/6 | `FREETOKEN_NO_RCCL`: the default process group is the CPU one, the host-staged communicator routes small / copy-engine / mid all-reduces and gather / mid broadcasts, a CPU-staged implementation takes what is left, `agree()` settles a first-use agreement between the ranks on the CPU group |
+| `python/freetoken/models/qwen4_exp/moe.py`, `layers/linear_attn/gdn.py`, `models/qwen4_exp/ple_disk.py` | 3/3, 3/4, 8/1 | the ranks' first-use agreements through `agree()`; a prefill's PLE rows broadcast through the communicator under `FREETOKEN_NO_RCCL` |
+| `tests/kernels/test_host_allreduce_two_ranks.py`, `tests/engine/test_dma_allreduce_route.py` | 37/0, 24/0 | the mid slots' all-reduces and broadcasts on two GPUs (bits, sizes past a slot, every dtype by bytes); which path a size takes |
 
 ## Tooling and documentation
 
@@ -5877,8 +6125,8 @@ GPU); this tree's MTP decoding stays the profiles' and the two are exclusive.
 | `python/freetoken/engine/ftprof.py` (106/0) | env-gated decode profiling (`FT_STATS_EVERY`, `FT_PROF_*`) |
 | `python/freetoken/server/args.py` (3/1) | `--cuda-graph-max-bs` help |
 | `Dockerfile.rdna3`, `.dockerignore` | the ROCm image |
-| `rdna3/` | profiles (the MTP head on), `serve.sh` (`--no-mtp`; `--hybrid`; a lower `--memory-ratio` for EXL3 on two cards; `--check` and the RAM warning at start; `--oom-score-adj -999`), `download.sh` (the checkpoints), GPU checks, micro-benchmarks and `bench/depth_sweep.py`, maintenance tools |
-| `tests/rdna3/test_serve_sh.py` (new) | `serve.sh` on a fake machine (topology, RAM, docker stub): the RAM arithmetic and the commands it suggests or prints |
+| `rdna3/` | profiles (the MTP head on), `serve.sh` (`--no-mtp`; `--hybrid`; `--low-ram`, an EXL3 3.05 bpw checkpoint on a 64 GB machine; a lower `--memory-ratio` for EXL3 on two cards; `--check` and the RAM warning at start; `--oom-score-adj -999`), `download.sh` (the checkpoints), GPU checks, micro-benchmarks and `bench/depth_sweep.py`, maintenance tools |
+| `tests/rdna3/test_serve_sh.py` (new) | `serve.sh` on a fake machine (topology, RAM, docker stub): the RAM arithmetic and the commands it suggests or prints, `--low-ram` on a 64 GB one, `--check` outside a git checkout |
 | `README.md`, `NOTICE`, `CHANGELOG.md`, `llms.txt`, `llms-full.txt`, `AGENTS.md`, `CONTRIBUTING.md`, `SECURITY.md`, `docs/rdna3/` | this repository's documentation (the banner rendered from `docs/rdna3/assets/social-preview.html`); upstream's README moved to `docs/FREETOKEN_UPSTREAM_README.md` |
 | `.github/` | upstream's release workflows and issue templates replaced by this repository's |
 

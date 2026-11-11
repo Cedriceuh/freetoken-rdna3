@@ -119,6 +119,14 @@ def _sgl_flash_attn_available() -> bool:
     return True
 
 
+def _tp_broadcast(x: torch.Tensor) -> None:
+    """Rank 0's ``x`` to every rank (a sampled step's tokens): through the host all-gather's slots when the host
+    all-reduce is on (distributed/impl.py), else torch.distributed's broadcast."""
+    from freetoken.distributed import DistributedCommunicator
+
+    DistributedCommunicator().broadcast(x)
+
+
 def _startup_kv_budget(memory_ratio: float, init_free_memory: int, new_free_memory: int) -> int:
     """Bytes available to the KV pool at startup: ratio-scaled pre-load free memory minus
     what the resident model consumed. Kept as a pure function so the composition with the
@@ -759,8 +767,17 @@ class Engine:
             )
             enable_pynccl_distributed(config.tp_info, tp_cpu_group, max_bytes)
         else:
+            from freetoken.distributed.impl import NO_RCCL
+            from freetoken.kernel import host_allreduce
+
+            # FREETOKEN_NO_RCCL: no RCCL communicator (274 MiB of VRAM a card): the default group is the CPU one, the
+            # GPU collectives all go through the host paths (distributed/impl.py)
+            no_rccl = (NO_RCCL and config.tp_info.size == 2 and host_allreduce.enabled()
+                       and getattr(torch.version, "hip", None) is not None)
+            if NO_RCCL and not no_rccl:
+                logger.warning_rank0("FREETOKEN_NO_RCCL=1 ignored: it needs two ranks on ROCm with FREETOKEN_HOST_ALLREDUCE=1")
             torch.distributed.init_process_group(
-                backend="nccl",
+                backend="gloo" if no_rccl else "nccl",
                 rank=config.tp_info.rank,
                 world_size=config.tp_info.size,
                 timeout=timedelta(seconds=config.distributed_timeout),
@@ -780,7 +797,8 @@ class Engine:
             from freetoken.distributed import enable_host_allreduce
 
             if enable_host_allreduce(config.tp_info, tp_cpu_group):
-                logger.info_rank0("small all-reduces go through shared host memory (FREETOKEN_HOST_ALLREDUCE)")
+                logger.info_rank0("small all-reduces go through shared host memory (FREETOKEN_HOST_ALLREDUCE)"
+                                  + (", every other collective too: no RCCL (FREETOKEN_NO_RCCL)" if no_rccl else ""))
         return tp_cpu_group
 
     def _load_weights(self, config: EngineConfig) -> None:
@@ -884,7 +902,12 @@ class Engine:
         torch.distributed.broadcast(shape, src=0, group=self.tp_cpu_group)
         if self.config.tp_info.rank != 0:
             emb = torch.empty(tuple(shape.tolist()), dtype=self.dtype, device=self.device)
-        torch.distributed.broadcast(emb, src=0)
+        from freetoken.distributed.impl import NO_RCCL
+
+        if NO_RCCL:
+            _tp_broadcast(emb)
+        else:
+            torch.distributed.broadcast(emb, src=0)
         return emb
 
     @torch.inference_mode()
@@ -1593,6 +1616,7 @@ class Engine:
             moe_offload_cache=self.moe_offload_cache,
             mrope=config.model_config.model_is_mrope,
             out_dtype=torch.float32,
+            max_running_req=config.max_running_req,
             **verify,
         )
         if self.spec is not None:
@@ -1741,14 +1765,15 @@ class Engine:
         next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
         if args.temperatures is not None and getattr(self, "_sync_sampled_tokens", False):
             if self._check_sampled_tokens:
-                own = [torch.empty_like(next_tokens_gpu) for _ in range(self.config.tp_info.size)]
-                torch.distributed.all_gather(own, next_tokens_gpu)
-                diff = int(sum((o != own[0]).sum() for o in own[1:]).item())
+                from freetoken.distributed import DistributedCommunicator
+
+                own = DistributedCommunicator().all_gather(next_tokens_gpu.reshape(1, -1).contiguous())  # [ranks, n]
+                diff = int((own[1:] != own[:1]).sum().item())
                 if diff:
                     self._sampled_disagreements += diff
                     logger.warning(f"TP ranks sampled different tokens in {diff} row(s) of this step "
                                    f"({self._sampled_disagreements} so far); rank 0's are kept")
-            torch.distributed.broadcast(next_tokens_gpu, src=0)  # greedy (argmax) needs no sync
+            _tp_broadcast(next_tokens_gpu)  # greedy (argmax) needs no sync
         drafts = None
         if batch.is_decode:
             timer.mark("sample")
@@ -1811,8 +1836,8 @@ class Engine:
             tokens[:real] = torch.where(sampled.unsqueeze(-1), s_tok.to(tokens.dtype), tokens[:real])
             n_acc[:real] = torch.where(sampled, s_acc, n_acc[:real])
             if getattr(self, "_sync_sampled_tokens", False):  # rank 0's draws, before anything reads them
-                torch.distributed.broadcast(tokens, src=0)
-                torch.distributed.broadcast(n_acc, src=0)
+                _tp_broadcast(tokens)
+                _tp_broadcast(n_acc)
         for r, counts, _, _ in args.penalties:  # the kept tokens join the counts, device-side
             keep = (torch.arange(m, device=counts.device) < n_acc[r]).to(counts.dtype)
             counts.scatter_add_(0, tokens[r].long(), keep)
@@ -1936,7 +1961,7 @@ class Engine:
             tok = tok.clone()
             tok[:real] = s_tok
         if getattr(self, "_sync_sampled_tokens", False):
-            torch.distributed.broadcast(tok, src=0)
+            _tp_broadcast(tok)
         return tok, q
 
     def _spec_pad_slot(self) -> int:

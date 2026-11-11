@@ -34,6 +34,24 @@ def test_stacked_layers_roll_back_in_one_copy(monkeypatch):
     assert torch.equal(state[:, 2], snaps[:, 0, 0]) and torch.equal(state[:, 3], torch.zeros(3, 2))
 
 
+def test_snapshots_laid_out_by_the_step_rows(monkeypatch):
+    """A ``by_rows`` target (the GatedDeltaNet recurrent states): request b's state after row j of a step of m rows is
+    at b * (m - 1) + j of one flat buffer, whatever SPEC_M is."""
+    monkeypatch.setattr(spec, "SPEC_M", 4)
+    monkeypatch.setattr(spec, "SPEC_GLUE_KERNELS", False)
+    monkeypatch.setattr(spec, "_TARGETS", {})
+    flat = torch.arange(2 * 6 * 3, dtype=torch.float32).view(2, 6, 3)  # [layers, states, ...]: 2 requests x 3 or 4 x 1
+    state = torch.zeros(2, 6, 3)  # [layers, slots, ...]
+    spec.register("gdn", spec.RollbackTarget(state, lambda step, b, m: flat[:, b * (m - 1) + step], dim=1,
+                                             by_rows=True))
+    spec.apply_rollback(torch.tensor([1, 2]), torch.tensor([2, 3]), padding_slot=0, m=4)  # rows 1 and 2 of 4
+    assert torch.equal(state[:, 1], flat[:, 0 * 3 + 1]) and torch.equal(state[:, 2], flat[:, 1 * 3 + 2])
+    state.zero_()
+    spec.apply_rollback(torch.tensor([1, 2, 3, 4]), torch.tensor([1, 2, 1, 1]), padding_slot=0, m=2)  # row 0 of 2
+    assert torch.equal(state[:, 1], flat[:, 0]) and torch.equal(state[:, 3], flat[:, 2])
+    assert torch.equal(state[:, 4], flat[:, 3]) and torch.equal(state[:, 2], torch.zeros(2, 3))  # kept both rows
+
+
 def _depth_env(monkeypatch, m=4, costs=None, dynamic=True, bs_max=1):
     monkeypatch.setattr(spec, "SPEC_BS_DEEP", bs_max)
     monkeypatch.setattr(spec, "SPEC_M", m)

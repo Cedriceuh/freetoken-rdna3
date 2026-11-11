@@ -37,6 +37,10 @@ from .utils import load_jit
 
 ENABLE_ENV = "FREETOKEN_HOST_ALLREDUCE"
 MAX_ENV = "FREETOKEN_HOST_ALLREDUCE_MAX"
+# FREETOKEN_HOST_ALLREDUCE_MID_MB (default 0 = off): all-reduces above the slots, up to this many MiB (a short
+# prefill's, which RCCL carries otherwise), through four more slots of that size in the shared region, in three
+# launches (copy, handshake, add: csrc/jit/host_allreduce.cuh); the same a + b as the small ones
+MID_ENV = "FREETOKEN_HOST_ALLREDUCE_MID_MB"
 _DATA_OFFSET = 4096
 _WAIT_LOG_LEN = 1 << 16
 _HIP_REGISTER_MAPPED = 0x2
@@ -60,10 +64,11 @@ def max_bytes() -> int:
 def _module():
     return load_jit(
         "host_allreduce",
-        "v14",  # v2: alignas(16) out buffer; v3: optional wait log; v6: the peer's chunks loaded ahead; v11: all-gather, hc combine
+        "v21",  # v2: alignas(16) out buffer; v3: optional wait log; v6: the peer's chunks loaded ahead; v11: all-gather, hc combine; v15: mid-size
         cuda_files=["host_allreduce.cuh"],
         cuda_wrappers=[("run", "&HostAllReduce::run"), ("gather", "&HostAllGather::run"),
-                       ("hc_combine", "&HostAllReduceHcCombine::run")],
+                       ("hc_combine", "&HostAllReduceHcCombine::run"), ("mid", "&HostAllReduceMid::run"),
+                       ("mid_bytes", "&HostMidBytes::run")],
     )
 
 
@@ -105,6 +110,12 @@ class HostAllReduce:
         self.slot_bytes = (self.slot_bytes + 4095) // 4096 * 4096
         self._wait_log = os.environ.get("FREETOKEN_HOST_ALLREDUCE_WAITLOG", "0") == "1"
         size = _DATA_OFFSET + 4 * self.slot_bytes + (2 * 8 * _WAIT_LOG_LEN if self._wait_log else 0)
+        self.mid_bytes = max(0, int(float(os.environ.get(MID_ENV, "0")) * (1 << 20))) // 4096 * 4096
+        if 0 < self.mid_bytes < 1 << 20:
+            raise ValueError(f"{MID_ENV} must be 0 or at least 1")
+        self._mid_offset = (size + 4095) // 4096 * 4096
+        if self.mid_bytes:
+            size = self._mid_offset + 4 * self.mid_bytes
         suffix = "-waitlog" if self._wait_log else ""
         name = [f"/dev/shm/freetoken-hostar-{os.getpid()}-{secrets.token_hex(6)}{suffix}" if rank == 0 else None]
         dist.broadcast_object_list(name, src=0, group=cpu_group)
@@ -141,6 +152,9 @@ class HostAllReduce:
         self.timeout_ticks = int(timeout_s * 1e8) if timeout_s > 0 else 1 << 62
         self._size = size
         self._run = _module().run
+        self._mid = _module().mid
+        self._mid_bytes = _module().mid_bytes
+        self.mid_base = self.base + self._mid_offset
         self._gather = _module().gather
         self._hc = _module().hc_combine
         self._flags = None
@@ -168,6 +182,55 @@ class HostAllReduce:
         """Rank-invariant choice (dtype, size, layout only): both ranks must take the same path."""
         return (x.dtype in (torch.bfloat16, torch.float32) and x.is_contiguous()
                 and x.numel() * x.element_size() <= self.slot_bytes)
+
+    def supports_mid(self, x: torch.Tensor) -> bool:
+        """FREETOKEN_HOST_ALLREDUCE_MID_MB: an all-reduce above the slots, up to the mid slots (rank-invariant choice)."""
+        n = x.numel() * x.element_size()
+        return (self.mid_bytes > 0 and x.dtype in (torch.bfloat16, torch.float32) and x.is_contiguous()
+                and self.slot_bytes < n <= self.mid_bytes)
+
+    def mid(self, x: torch.Tensor) -> torch.Tensor:
+        """In-place all-reduce of a mid-size ``x``, by pieces (a rank-invariant split, by size only): a launch copies a
+        piece into this rank's mid slot while it adds the peer's piece before it; between two launches the one-block
+        kernel on no element does the handshake (publish, wait for the peer, bump the sequence)."""
+        flat = x.view(-1)
+        n, el = flat.numel(), x.element_size()
+        # up to four pieces of whole 256 KiB blocks, 1 MiB at least: both PCIe directions busy at once
+        per = max(1 << 20, -(-(n * el) // 4 // 262144) * 262144) // el
+        wide = int(self._ahead == 2)
+        prev = None
+        for lo in range(0, n, per):
+            cur = (lo, min(per, n - lo))
+            self._mid(flat, self.counter, self.mid_base, self.rank, self.mid_bytes, *(prev or (0, 0)), *cur, wide)
+            self._run(self._empty(x.device), self.counter, self.base, self.rank, self.slot_bytes, self.timeout_ticks,
+                      self.wait_log, self._ahead)
+            prev = cur
+        self._mid(flat, self.counter, self.mid_base, self.rank, self.mid_bytes, *prev, 0, 0, wide)
+        return x
+
+    def supports_mid_broadcast(self, x: torch.Tensor) -> bool:
+        """A broadcast of ``x`` (any dtype, any size) through the mid slots, in pieces (rank-invariant choice)."""
+        return self.mid_bytes > 0 and x.is_contiguous() and x.numel() > 0
+
+    def mid_broadcast(self, x: torch.Tensor) -> torch.Tensor:
+        """Rank 0's ``x`` over rank 1's, by bytes, a mid slot at a time: rank 0 copies a piece into its slot, both
+        ranks do the handshake, rank 1 fetches the piece."""
+        raw = x.view(-1).view(torch.uint8)
+        for lo in range(0, raw.numel(), self.mid_bytes):
+            piece = raw[lo: lo + self.mid_bytes]
+            if self.rank == 0:
+                self._mid_bytes(piece, self.counter, self.mid_base, self.rank, self.mid_bytes, 0, 0)
+            self._run(self._empty(x.device), self.counter, self.base, self.rank, self.slot_bytes, self.timeout_ticks,
+                      self.wait_log, self._ahead)
+            if self.rank != 0:
+                self._mid_bytes(piece, self.counter, self.mid_base, self.rank, self.mid_bytes, 1, int(self._ahead == 2))
+        return x
+
+    def _empty(self, device) -> torch.Tensor:
+        """The handshake's no-element tensor (the one-block kernel publishes, waits and bumps the sequence)."""
+        if getattr(self, "_no_elems", None) is None:
+            self._no_elems = torch.empty(16, dtype=torch.float32, device=device)[:0]
+        return self._no_elems
 
     def supports_gather(self, x: torch.Tensor) -> bool:
         """FREETOKEN_HOST_ALLGATHER (default 1): an all-gather of ``x`` through the slots (rank-invariant choice)."""

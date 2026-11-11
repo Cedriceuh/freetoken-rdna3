@@ -234,7 +234,7 @@ branch `3.05bpw_h5_ng5` (routed experts at 3 bits per weight, most other linears
   16k-token chunk, more than the generic `(1 - memory_ratio)` headroom absorbs. The expert kernel declares them
   (`prefill_workspace_bytes`) and the cache planner leaves them free (`MoE prefill temporaries` in the start log; 5 %
   fewer cached experts). Without that, the first 16k-token prefill after a start filled the 7900 XTX; on two cards
-  `rdna3/serve.sh` also lowers `--memory-ratio` to 0.77 (0.76 from 4 bpw): see
+  `rdna3/serve.sh` also lowers `--memory-ratio` to 0.77 (0.78 in `xtx-xt-4x262k`; 0.76 from 4 bpw): see
   [journey.md](journey.md#16-exl3-checkpoints-2026-10-04).
 - Not supported: half-integer bitrates, mixed expert bitrates across layers, the pinned PLE backend, the encoder-only
   weight reader (the CPU expert executor of `--hybrid` does read EXL3 experts: [cpu-experts.md](cpu-experts.md)). FTW conversion is untested. The vision tower reads the checkpoint's bf16
@@ -257,9 +257,9 @@ RAM: locked while serving;
 
 The agentic benchmark scores come from earlier builds than the other rows. The checkpoints answer differently, so the MTP head
 keeps a different share of its guesses: compare decode rates as an order of magnitude. Greedy answers are identical
-with and without the head. With the RAM tier off and `--expert-load serial`, the 3.05 bpw server started and served under a
-56 GiB container limit at 52.3 GiB used (`quick_bench.py` then: 70.1 tok/s decode at the model's sampling, 8.3k-token
-cold read in 4.41 s, agent turn 0.89 s, tool call parsed); a real 64 GB machine is untested.
+with and without the head. With `serve.sh --low-ram` (the RAM tier off, the experts loaded one file at a time) the 3.05 bpw server ran under a
+56 GiB container limit with 52.6 GiB locked, at the profile's speeds and with its answers
+([limits.md](limits.md#can-it-run-with-64-gb-of-ram)); a real 64 GB machine is untested.
 
 ## What stays upstream's
 

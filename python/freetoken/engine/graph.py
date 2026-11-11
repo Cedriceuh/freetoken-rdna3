@@ -148,17 +148,25 @@ def capture_shapes(ms: tuple[int, ...], bs_list: list[int], bs_max: int, bs_deep
     return [(m, bs) for m in ms for bs in bs_list if m == ms[0] or bs <= (verify_bs if m <= SHALLOW_M else deep_bs)]
 
 
+def verify_requests(bs_max: int, max_running_req: int | None) -> int:
+    """The most requests a verify step can hold: ``bs_max`` (FREETOKEN_SPEC_BS_MAX), never more than the scheduler
+    runs at once. The graphs must cover it: a server started for fewer requests than its profile's FREETOKEN_SPEC_BS_MAX
+    (``--max-running-requests 3 --cuda-graph-max-bs 3``) verifies up to its own count."""
+    return bs_max if max_running_req is None else min(bs_max, max_running_req)
+
+
 def sizing_shapes(shapes: list[tuple[int, int]]) -> list[tuple[int, int]]:
     """The (rows per request, batch size) shapes to run eagerly before any capture. The spec_decode buffers are sized
     by the eager forwards: the head's streams once, by the first one's rows; the per-request rollback buffers grow with
-    the requests, freeing the old ones under any graph captured before. So the most rows, then the verify shape with
-    the most requests."""
+    the requests and the states a step keeps, freeing the old ones under any graph captured before. So the most rows,
+    then the verify shapes with the most requests and with the most states."""
     verify = [s for s in shapes if s[0] > 1]
     if not verify:
         return []
     most_rows = max(shapes, key=lambda s: (s[0] * s[1], s[1]))
     most_reqs = max(verify, key=lambda s: (s[1], s[0] * s[1]))
-    return list(dict.fromkeys([most_rows, most_reqs]))
+    most_states = max(verify, key=lambda s: ((s[0] - 1) * s[1], s[1]))  # the states a step keeps for its rollback
+    return list(dict.fromkeys([most_rows, most_reqs, most_states]))
 
 
 class GraphRunner:
@@ -184,6 +192,7 @@ class GraphRunner:
         batch_hook: Callable[[Batch], None] | None = None,
         pool: Any = None,
         out_dtype: torch.dtype | None = None,
+        max_running_req: int | None = None,
     ) -> None:
         cuda_graph_bs = _determine_cuda_graph_bs(
             cuda_graph_bs=cuda_graph_bs,
@@ -195,6 +204,7 @@ class GraphRunner:
         self.forward = forward
         self.attn_backend = attn_backend
         self.max_graph_bs = max(cuda_graph_bs) if cuda_graph_bs else 0
+        self.max_running_req = max_running_req
         self.graph_bs_list = sorted(cuda_graph_bs)
         self.dummy_req = dummy_req
         self.moe_offload_cache = moe_offload_cache
@@ -240,7 +250,8 @@ class GraphRunner:
         self.graph_map: Dict[tuple[int, int], torch.cuda.CUDAGraph] = {}  # (batch size, rows per request)
         if self.max_graph_bs == 0:
             return logger.info_rank0("CUDA graph is disabled.")
-        if self.row_counts == SPEC_MS and SPEC_M > 1 and SPEC_BS_MAX > self.max_graph_bs:
+        if (self.row_counts == SPEC_MS and SPEC_M > 1
+                and verify_requests(SPEC_BS_MAX, self.max_running_req) > self.max_graph_bs):
             # the verify steps' rollback buffers are sized by the captures: a larger eager verify step would move
             # them away from the addresses the graphs write
             raise ValueError(f"FREETOKEN_SPEC_BS_MAX={SPEC_BS_MAX} exceeds the largest CUDA graph batch size "

@@ -124,6 +124,42 @@ def test_rollback_copy_matches_apply_rollback(seed, monkeypatch):
         assert torch.equal(a.index_select(dim, other), b.index_select(dim, other))
 
 
+@pytest.mark.parametrize("B,m", [(1, 4), (2, 4), (2, 3), (3, 2), (4, 2)])
+def test_rollback_copy_of_states_laid_out_by_the_step_rows(B, m, monkeypatch):
+    """The GatedDeltaNet recurrent states' flat buffer (gdn.py): request b's state after row j at b * (m - 1) + j, six
+    states for every captured shape; the kernel's copy (its request stride from the step's rows) against the torch
+    path, and against the states read by hand."""
+    import freetoken.spec_decode as sd
+    from freetoken.spec_decode import RollbackTarget
+
+    dev = torch.device("cuda")
+    g = torch.Generator(device=dev).manual_seed(B * 10 + m)
+    L, n_slots, pad, inner = 3, 9, 8, 5 * 6 * 7
+    flat = torch.randn(L, 6, 5, 6, 7, generator=g, device=dev)
+    state0 = torch.randn(L, n_slots, 5, 6, 7, generator=g, device=dev)
+
+    def target(rec):
+        return {"r": RollbackTarget(rec, lambda step, b, rows: flat[:, b * (rows - 1) + step], dim=1, by_rows=True,
+                                    copy=lambda rows: (flat, flat.stride(0), (rows - 1) * flat.stride(1),
+                                                       flat.stride(1), 0, rec.stride(0), rec.stride(1), L, inner))}
+
+    slots = torch.randperm(n_slots - 1, device=dev)[:B].to(torch.int32) + 1
+    n_acc = torch.randint(1, m + 1, (B,), generator=g, device=dev)
+    ref, got = state0.clone(), state0.clone()
+    monkeypatch.setattr(sd, "_TARGETS", target(ref))
+    monkeypatch.setattr(sd, "SPEC_GLUE_KERNELS", False)
+    sd.apply_rollback(slots, n_acc, pad, m)
+    monkeypatch.setattr(sd, "_TARGETS", target(got))
+    monkeypatch.setattr(sd, "SPEC_GLUE_KERNELS", True)
+    sd.apply_rollback(slots, n_acc, pad, m)
+    other = torch.tensor([i for i in range(n_slots) if i != pad], device=dev)
+    assert torch.equal(ref.index_select(1, other), got.index_select(1, other))
+    for b in range(B):
+        j = int(n_acc[b])
+        want = state0[:, slots[b]] if j >= m else flat[:, b * (m - 1) + j - 1]
+        assert torch.equal(got[:, slots[b]], want)
+
+
 @pytest.mark.parametrize("seed", range(16))
 def test_spec_glue_kernels_match_torch(seed):
     from freetoken.kernel.triton.spec_glue import chain_meta, draft_rows, greedy_n_acc, write_step_tokens

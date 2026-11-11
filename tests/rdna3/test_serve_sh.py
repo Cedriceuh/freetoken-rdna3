@@ -87,7 +87,8 @@ def machine(tmp_path):
         kib = int(ram_gib * (1 << 20))
         meminfo.write_text(f"MemTotal: {kib} kB\nMemAvailable: {kib - 10 * (1 << 20)} kB\n")
         env = {k: v for k, v in os.environ.items() if not k.startswith("STUB_")}
-        env.update(PATH=f"{bin_dir}:{env['PATH']}", SERVE_SH_MEMINFO=str(meminfo), SERVE_SH_KFD_NODES=str(nodes))
+        env.update(PATH=f"{bin_dir}:{env['PATH']}", SERVE_SH_MEMINFO=str(meminfo), SERVE_SH_KFD_NODES=str(nodes),
+                   SERVE_SH_KFD_DEV=str(meminfo))  # the compute driver's device node: any file that exists
         env.update({f"STUB_{k.upper()}": v for k, v in stub.items()})
         args = [str(model) if a == "MODEL" else a for a in args]
         r = subprocess.run(["bash", str(serve), *args], env=env, capture_output=True, text=True, timeout=120)
@@ -155,6 +156,76 @@ def test_dry_run_without_an_image_keeps_the_temperature(machine):
     assert "--default-temperature 0.6" in out and "predates" not in out, out
 
 
+def _exl3(tmp_path, bits):
+    d = tmp_path / f"exl3-{bits}"
+    d.mkdir(exist_ok=True)
+    (d / "config.json").write_text(
+        '{"model_type": "qwen4_exp", "quantization_config": {"quant_method": "exl3", "bits": %s}}' % bits)
+    (d / "model.safetensors.index.json").write_text("{}")  # a finished download, as --check sees one
+    return str(d)
+
+
+def test_check_offers_low_ram_on_64_gb(machine, tmp_path):
+    # 62.7 GiB (a 64 GB machine): EXL3 3.05 bpw with its RAM tier leaves no room for a desktop's programs, without
+    # it the server fits a machine kept for it: --check says so and its command carries --low-ram
+    model, img = _exl3(tmp_path, 3.05), "sha256:" + "1" * 64
+    out = machine(["--check", "--model", model], ram_gib=62.7, image_id=img)
+    assert "EXL3 3.05 bpw, xtx-xt (K/V in VRAM): locks ~61 GiB, more than this machine can hold" in out, out
+    assert "with --low-ram (no RAM tier, the experts loaded one file at a time): ~52 GiB" in out, out
+    nxt = next(line for line in out.splitlines() if line.startswith("Next: "))
+    assert nxt.startswith("Next: rdna3/serve.sh xtx-xt --model ") and nxt.endswith(" --low-ram"), nxt
+    again = machine(["--check", "--low-ram", "--model", model], ram_gib=62.7, image_id=img)
+    assert "EXL3 3.05 bpw, xtx-xt --low-ram: locks ~52 GiB" in again, again
+    assert " --low-ram" in next(line for line in again.splitlines() if line.startswith("Next: ")), again
+    # one card: ~47 GiB
+    one = machine(["--check", "--model", model], ram_gib=62.7, cards=("xtx",), image_id=img)
+    assert "with --low-ram (no RAM tier, the experts loaded one file at a time): ~47 GiB" in one, one
+    # NVFP4's experts alone outgrow the machine: no --low-ram command, the EXL3 checkpoint named instead
+    out = machine(["--check", "--model", "MODEL"], ram_gib=62.7, image_id=img)
+    assert "FAIL  NVFP4, xtx-xt: locks ~83 GiB" in out, out
+    assert "an EXL3 3.05 bpw checkpoint fits this machine with --low-ram (~52 GiB locked)" in out, out
+    assert not any(line.startswith("Next: ") and "--low-ram" in line for line in out.splitlines()), out
+    # 4.05 bpw does not fit either way
+    out = machine(["--check", "--model", _exl3(tmp_path, 4.05)], ram_gib=62.7, image_id=img)
+    assert "FAIL  EXL3 4.05 bpw, xtx-xt" in out and "with --low-ram (no RAM tier" not in out, out
+    # the container's limit (whole GiB, the machine's RAM minus 6) must hold the ~52 GiB locked plus 3 of growth
+    out = machine(["--check", "--model", model], ram_gib=61.0, image_id=img)
+    assert "with --low-ram (no RAM tier" in out, out
+    out = machine(["--check", "--model", model], ram_gib=60.9, image_id=img)
+    assert "FAIL  EXL3 3.05 bpw, xtx-xt" in out and "--low-ram" not in out, out
+    # the reference machine is told nothing about it
+    out = machine(["--check", "--model", model], image_id=img)
+    assert "--low-ram" not in out, out
+
+
+def test_low_ram_sets_the_server_up(machine, tmp_path):
+    model, img = _exl3(tmp_path, 3.05), "sha256:" + "1" * 64
+
+    def cmd(out):
+        return next(line for line in out.splitlines() if " ft serve " in line)
+
+    out = machine(["xtx-xt", "--model", model, "--low-ram", "--dry-run"], ram_gib=62.7, image_id=img)
+    c = cmd(out)
+    assert " --memory 56g " in c and "FREETOKEN_HOST_KV=0" in c and "FREETOKEN_HOST_KV=1" not in c, c
+    assert re.findall(r"--expert-load (\S+)", c) == ["serial"], c
+    assert "note: --low-ram: this server will lock ~52 GiB of this 62.7 GiB machine (container limit 56g)" in out, out
+    assert "warning:" not in out, out
+    # without the option the same start warns, and the profile's settings stay
+    out = machine(["xtx-xt", "--model", model, "--dry-run"], ram_gib=62.7, image_id=img)
+    assert "warning: this server will lock ~61 GiB" in out and "FREETOKEN_HOST_KV=1" in cmd(out), out
+    assert re.findall(r"--expert-load (\S+)", cmd(out)) == ["parallel"], out
+    # --memory wins; a larger machine keeps the profile's limit; one card
+    out = machine(["xtx-xt", "--model", model, "--low-ram", "--memory", "60g", "--dry-run"], ram_gib=62.7, image_id=img)
+    assert " --memory 60g " in cmd(out), out
+    out = machine(["xtx-xt", "--model", model, "--low-ram", "--dry-run"], image_id=img)
+    assert " --memory 110g " in cmd(out) and "FREETOKEN_HOST_KV=0" in cmd(out), out
+    out = machine(["xtx", "--model", model, "--low-ram", "--dry-run"], ram_gib=62.7, image_id=img, cards=("xtx",))
+    assert " --memory 56g " in cmd(out) and "will lock ~47 GiB" in out, out
+    # the profiles with the K/V in RAM have no RAM tier to drop
+    out = machine(["xtx-xt-4x262k", "--model", model, "--low-ram", "--dry-run"], ram_gib=62.7, image_id=img)
+    assert "--low-ram is for the profiles that keep the K/V in VRAM" in out and " ft serve " not in out, out
+
+
 @pytest.fixture
 def repo(tmp_path):
     """A clean git repository holding a copy of rdna3/serve.sh and its profiles: (serve.sh, HEAD, HEAD's tree)."""
@@ -171,6 +242,16 @@ def repo(tmp_path):
 
 
 IMG = "sha256:" + "1" * 64
+
+
+def test_check_runs_outside_a_git_checkout(machine, tmp_path):
+    # the files of a downloaded archive: no commit to compare the image with, the check goes on to the end
+    r = tmp_path / "archive"
+    shutil.copytree(ROOT / "rdna3" / "profiles", r / "rdna3" / "profiles")
+    shutil.copy(SERVE, r / "rdna3" / "serve.sh")
+    out = machine(["--check", "--model", "MODEL"], serve=r / "rdna3" / "serve.sh", image_id=IMG,
+                  prov=f"commit {'1' * 40}\n")
+    assert "ok    image freetoken-rdna3:latest" in out and "RAM: 125.7 GiB" in out and "Model: " in out, out
 
 
 def test_image_of_a_clean_head_is_ok(machine, repo):
@@ -197,3 +278,23 @@ def test_provenance_without_a_tree_compares_the_commit(machine, repo):
     serve, head, _ = repo
     out = machine(["--check"], serve=serve, image_id=IMG, prov=f"commit {'1' * 40}\n")
     assert f"was built from commit 1111111, this checkout is at {head[:7]}" in out, out
+
+
+def test_exl3_ratio_follows_the_profile(machine, tmp_path):
+    # an EXL3 checkpoint on two cards gets serve.sh's own --memory-ratio after the profile's: 0.77 below 4 bpw unless
+    # the profile sets EXL3_RATIO (xtx-xt-4x262k: 0.78), 0.76 from 4 bpw whatever the profile says
+    def last_ratio(profile, bits=None):
+        model = "MODEL"
+        if bits is not None:
+            d = tmp_path / f"exl3-{bits}"
+            d.mkdir(exist_ok=True)
+            (d / "config.json").write_text(
+                '{"model_type": "qwen4_exp", "quantization_config": {"quant_method": "exl3", "bits": %s}}' % bits)
+            model = str(d)
+        out = machine([profile, "--model", model, "--dry-run"], image_id="sha256:" + "1" * 64)
+        cmd = next(line for line in out.splitlines() if " ft serve " in line)
+        return re.findall(r"--memory-ratio (\S+)", cmd)[-1]
+
+    assert last_ratio("xtx-xt", 3.05) == "0.77" and last_ratio("xtx-xt-4x262k", 3.05) == "0.78"
+    assert last_ratio("xtx-xt", 4.05) == "0.76" and last_ratio("xtx-xt-4x262k", 4.05) == "0.76"
+    assert last_ratio("xtx-xt") == "0.80" and last_ratio("xtx-xt-4x262k") == "0.81"  # NVFP4: the profiles' own

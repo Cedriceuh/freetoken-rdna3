@@ -207,7 +207,9 @@ class RollbackTarget:
     padding_slot: int = 0
     # the same copy for the fused kernel (kernel/triton/spec_glue.py): (src, src outer / request / step strides,
     # step offset, dst outer / slot strides, outer count, contiguous elements per row); None: the torch path
-    copy: tuple | None = None
+    copy: tuple | Callable[[int], tuple] | None = None
+    # the snapshots' layout follows the step's rows per request m: ``snapshot(step, b, m)`` and ``copy(m)``
+    by_rows: bool = False
 
 
 def block_contiguous(t: torch.Tensor, lead: int) -> bool:
@@ -239,7 +241,7 @@ def apply_rollback(slots: torch.Tensor, n_acc: torch.Tensor, padding_slot: int |
         mm = SPEC_M if m is None else m
         for target in _TARGETS.values():
             pad = target.padding_slot if padding_slot is None else padding_slot
-            src, so, sb, sst, add, do, dslot, outer, inner = target.copy
+            src, so, sb, sst, add, do, dslot, outer, inner = target.copy(mm) if target.by_rows else target.copy
             rollback_copy(src, so, sb, sst, add, target.state, do, dslot, outer, inner, slots, n_acc.view(-1), pad, mm)
         return
     slots = slots.to(torch.int64)
@@ -251,7 +253,8 @@ def apply_rollback(slots: torch.Tensor, n_acc: torch.Tensor, padding_slot: int |
         # a request that kept every row is already right: its copy goes to the padding slot instead
         pad = target.padding_slot if padding_slot is None else padding_slot
         dst = torch.where(keep, torch.full_like(slots, pad), slots)
-        target.state.index_copy_(target.dim, dst, target.snapshot(step, b).to(target.state.dtype))
+        snap = target.snapshot(step, b, m) if target.by_rows else target.snapshot(step, b)
+        target.state.index_copy_(target.dim, dst, snap.to(target.state.dtype))
 
 
 class SpecTimer:

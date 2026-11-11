@@ -23,9 +23,9 @@ be slower (one-time kernel preparation): run it twice.
 docker run --rm -w /opt/FreeToken --entrypoint python3 freetoken-rdna3:latest -m pytest -q -p no:cacheprovider tests
 ```
 
-About 3 minutes (150 s on the reference machine with `--cpus 8`), no GPU needed, on the tree the image was built
-from: 1853 passed, no failure (the GPU tests skip). The whole suite in one process peaks above 12 GB of RAM: under a
-container memory limit, run it one `tests/` subdirectory at a time.
+Five to six minutes (310 and 330 s on the reference machine with `--cpus 8`), no GPU needed, on the tree the image was
+built from: over 1,900 tests pass, none fails (the GPU tests skip). The whole suite in one process peaks above 12 GB
+of RAM: under a container memory limit, run it one `tests/` subdirectory at a time.
 
 To test source changes without rebuilding, mount your tree instead (`-v "$PWD":/src:ro -w /src -e
 PYTHONPATH=/src/python`); `test_swiglu_clamp.py::test_cpu_extension_supports_swiglu_clamp` then fails, because the

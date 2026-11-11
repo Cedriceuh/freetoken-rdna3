@@ -13,6 +13,15 @@ class _Path:
     def supports(self, x):
         return self.lo <= x.numel() <= self.hi
 
+    mid_hi = 0  # FREETOKEN_HOST_ALLREDUCE_MID_MB: the host path's mid slots, off by default
+
+    def supports_mid(self, x):
+        return self.hi < x.numel() <= self.mid_hi
+
+    def mid(self, x):
+        self.calls.append((self.name + "-mid", "sync"))
+        return x
+
     def __call__(self, x):
         self.calls.append((self.name, "sync"))
         return x
@@ -48,3 +57,18 @@ def test_without_dma_nothing_changes():
     prefill_hooks.ASYNC_AR[0] = False
     impl.all_reduce(torch.zeros(500))
     assert calls == [("rccl", "sync")] and not prefill_hooks.ASYNC_AR[0]
+
+
+def test_mid_slots_take_what_neither_the_slots_nor_the_copy_engines_do():
+    # FREETOKEN_HOST_ALLREDUCE_MID_MB: above the host slots and below the copy engines' minimum, the mid slots; the
+    # fallback (RCCL, or the CPU group under FREETOKEN_NO_RCCL) only past them
+    calls = []
+    host = _Path("host", 0, 10, calls)
+    host.mid_hi = 2000
+    impl = HostStagedDistributedImpl(host, _Path("rccl", 0, 1 << 30, calls), _Path("dma", 100, 1000, calls))
+    for n in (5, 50, 500, 1500, 5000):
+        impl.all_reduce(torch.zeros(n))
+    assert [c[0] for c in calls] == ["host", "host-mid", "dma", "host-mid", "rccl"]
+    calls.clear()
+    assert impl.all_reduce_async(torch.zeros(50)) is None and calls == [("host-mid", "sync")]
+    prefill_hooks.ASYNC_AR[0] = False

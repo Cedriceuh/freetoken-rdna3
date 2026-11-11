@@ -265,9 +265,9 @@ class Qwen4ExpMoE(Qwen3_5MoE):
         agreed = self.__dict__.get("_blocks_agreed")
         if agreed is None:
             local = self._tp_size == 2 and _FUSED_EPILOGUE and self._epilogue_fusable()
-            ok = torch.tensor([int(local)], dtype=torch.int32, device=torch.cuda.current_device())
-            torch.distributed.all_reduce(ok, op=torch.distributed.ReduceOp.MIN)
-            agreed = self._blocks_agreed = bool(ok.item())
+            from freetoken.distributed.impl import agree
+
+            agreed = self._blocks_agreed = agree(local)
         return agreed
 
     def _epilogue_fusable(self) -> bool:

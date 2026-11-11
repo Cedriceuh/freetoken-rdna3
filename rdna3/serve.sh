@@ -22,6 +22,10 @@
 #   --vision           accept image input: builds the vision tower on rank 0 (measured on xtx-xt, xtx and xt:
 #                      docs/rdna3/benchmarks.md); images are scaled down to 1024 tokens (one per 32x32 pixels),
 #                      `-- --image-max-tokens N` changes it
+#   --low-ram          for a machine with ~64 GB of RAM and an EXL3 3.05 bpw checkpoint (the profiles with the K/V in
+#                      VRAM: xtx-xt, xtx, xt): no RAM tier (a conversation pushed off the GPUs is read again when it
+#                      comes back), the experts loaded one file at a time, the container limited to the machine's RAM
+#                      minus 6 GiB; ~52 GiB locked on two cards, ~47 on one (docs/rdna3/limits.md)
 #   --no-mtp           decode without the MTP draft head the profiles except gre turn on (it speeds up a request alone,
 #                      up to four at once on xtx-xt and its K/V-in-RAM variants; docs/rdna3/limits.md)
 #   --hybrid           compute part of each decode step's expert misses on the CPU instead of copying them (off by
@@ -39,8 +43,9 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DOCKER="$(command -v docker || echo docker)"
 # where the machine is read from; tests/rdna3/test_serve_sh.py points these at a fake one
 MEMINFO="${SERVE_SH_MEMINFO:-/proc/meminfo}" KFD_NODES="${SERVE_SH_KFD_NODES:-/sys/class/kfd/kfd/topology/nodes}"
+KFD_DEV="${SERVE_SH_KFD_DEV:-/dev/kfd}"
 image="freetoken-rdna3:latest" name="freetoken-rdna3" served="qwen3.8-flash-next" host=127.0.0.1 port=1919
-model="" ctx="" gpus="" memory="" dry="" no_mtp="" hybrid="" profile="" check="" extra=() mm_args=(--text-model-only)
+model="" ctx="" gpus="" memory="" dry="" no_mtp="" hybrid="" low_ram="" profile="" check="" extra=() mm_args=(--text-model-only)
 
 list_gpus() {  # "hip_index vram_bytes pci_address gfx_arch simd_count" per GPU, from the kernel's KFD topology (no GPU
   # context opened): HIP numbers the GPU nodes in topology order
@@ -127,6 +132,14 @@ gib() { LC_ALL=C awk -v x="$1" 'BEGIN { printf "%.0f", x }'; }  # a ram_locked v
 # the host ran out of memory, and with ~25 GiB left (and benchmark tools) it did too. So: GiB left after the server's
 # use >= RAM_KEEP fits, >= RAM_KEEP_MIN only with little else running, below that does not.
 RAM_GROWTH=3 RAM_KEEP=30 RAM_KEEP_MIN=25
+# --low-ram: a machine kept for the server (a light desktop at most). The container gets the machine's RAM minus
+# RAM_KEEP_LOW, in whole GiB, and that limit must hold what the server locks plus RAM_GROWTH (EXL3 3.05 bpw on xtx-xt
+# under a 56 GiB limit: 52.3 GiB locked after the start, 54.1 GiB that cannot be dropped at the most while it served)
+RAM_KEEP_LOW=6
+ram_low_cap() { LC_ALL=C awk -v t="$(ram_total)" -v k="$RAM_KEEP_LOW" 'BEGIN { print int(t - k) }'; }
+ram_low_fits() {  # $1 GiB locked after start: true if the --low-ram container limit of this machine can hold it
+  LC_ALL=C awk -v c="$(ram_low_cap)" -v l="$1" -v g="$RAM_GROWTH" 'BEGIN { exit !(c + 0.001 >= l + g) }'
+}
 ram_total() { LC_ALL=C awk '/^MemTotal/ { printf "%.1f", $2 / 1048576 }' "$MEMINFO"; }
 ram_verdict() {  # $1 GiB locked after start: ok, tight or over
   LC_ALL=C awk -v t="$(ram_total)" -v l="$1" -v g="$RAM_GROWTH" -v k="$RAM_KEEP" -v m="$RAM_KEEP_MIN" \
@@ -160,7 +173,7 @@ conv_line() {  # --check: $2 conversations of 262k with the K/V in RAM for check
 }
 
 next_command() {  # the command --check suggests: the arguments given, without --check, with $1 / $2 / $3 = the profile
-  # to use, a --ctx and a --kv-reserve-tokens to set (empty: keep)
+  # to use, a --ctx and a --kv-reserve-tokens to set (empty: keep); $4 non-empty: with --low-ram
   local a skip="" after="" pre=() post=() prof="$1"
   for a in "${orig_args[@]}"; do
     if [ -n "$after" ]; then post+=("$a"); continue; fi
@@ -175,6 +188,7 @@ next_command() {  # the command --check suggests: the arguments given, without -
   done
   pre=("$prof" "${pre[@]}")
   [ -n "$model" ] || pre+=(--model DIR)
+  [ -z "${4:-}" ] || [ -n "$low_ram" ] || pre+=(--low-ram)
   if [ -n "$2" ]; then  # drop a --ctx given, then set it
     local i keep=()
     for ((i = 0; i < ${#pre[@]}; i++)); do
@@ -201,13 +215,13 @@ next_command() {  # the command --check suggests: the arguments given, without -
 
 check_machine() {  # --check: what this machine has, what is missing, which profile fits; exit status 1 if a start would fail
   local bad=0 v f n best="" prov commit tree head htree dirty arch total g kind running fits=0 base hk kvhost pool locked
-  local p c m t ct mt want next_ctx="" next_pool=""
+  local p c m t ct mt want next_ctx="" next_pool="" next_low="" low
   ok() { printf '  ok    %s\n' "$*"; }
   warn() { printf '  warn  %s\n' "$*"; }
   fail() { printf '  FAIL  %s\n' "$*"; bad=1; }
 
   echo "System"
-  if [ -e /dev/kfd ]; then ok "$(uname -sr), amdgpu compute driver present (/dev/kfd)"
+  if [ -e "$KFD_DEV" ]; then ok "$(uname -sr), amdgpu compute driver present (/dev/kfd)"
   else fail "no /dev/kfd: the amdgpu kernel driver is not loaded (Linux only; nothing else to install on the host)"; fi
   if ! "$DOCKER" info >/dev/null 2>&1; then
     fail "cannot reach Docker: install it, start it, and add your user to the 'docker' group (then log in again)"
@@ -219,7 +233,7 @@ check_machine() {  # --check: what this machine has, what is missing, which prof
       commit="$(awk '$1 == "commit" { print $2 }' <<< "$prov")" tree="$(awk '$1 == "tree" { print $2 }' <<< "$prov")"
       head="$(git -C "$HERE/.." rev-parse HEAD 2>/dev/null || true)"
       htree="$(git -C "$HERE/.." rev-parse 'HEAD^{tree}' 2>/dev/null || true)"
-      dirty="$(git -C "$HERE/.." status --porcelain 2>/dev/null | head -1)"
+      dirty="$({ git -C "$HERE/.." status --porcelain 2>/dev/null || true; } | head -1)"  # no checkout: empty
       if [ -z "$commit" ] || [ -z "$head" ]; then ok "image $image"
       elif [ "$commit" = "$head" ] && { [ -n "$dirty" ] || [ -z "$tree" ] || [ "$tree" = "$htree" ]; }; then
         # a dirty checkout's files have no tree to compare without writing one into .git: only say they differ
@@ -291,8 +305,8 @@ check_machine() {  # --check: what this machine has, what is missing, which prof
       case "$n" in *-4x262k|*-1m) continue ;; esac
       [ "$n" = "$best" ] || [ "$(pval "$HERE/profiles/$n.env" TESTED 1)" = 1 ] || continue
       locked="$(ram_locked "$(pval "$HERE/profiles/$n.env" GPUS 1)" "$kind" 0 \
-                "$(pval "$HERE/profiles/$n.env" FREETOKEN_HOST_KV_TOKENS 262144)")"
-      if [ "$(ram_verdict "$locked")" != over ]; then
+                "$( [ -n "$low_ram" ] && echo 0 || pval "$HERE/profiles/$n.env" FREETOKEN_HOST_KV_TOKENS 262144)")"
+      if [ "$(ram_verdict "$locked")" != over ] || { [ -n "$low_ram" ] && ram_low_fits "$locked"; }; then
         [ "$n" = "$best" ] || printf '        for this RAM with %s: %s\n' "$(ckpt_label "$kind")" "$n"
         best="$n"; break
       fi
@@ -308,11 +322,25 @@ check_machine() {  # --check: what this machine has, what is missing, which prof
     [ -z "$kind" ] || [ "$kind" = "$v" ] || continue
     locked="$(ram_locked "$g" "$v" 0 "$hk")" n=""
     [ "$(pval "$HERE/profiles/$base.env" TESTED 1)" = 1 ] || n=" (estimated)"
+    low="$(ram_locked "$g" "$v" 0 0)"  # --low-ram: without the RAM tier
+    [ -z "$low_ram" ] || locked="$low"
     case "$(ram_verdict "$locked")" in
-      ok) ok "$(ckpt_label "$v"), $base (K/V in VRAM): locks ~$(gib "$locked") GiB$n"; fits=1 ;;
-      tight) warn "$(ckpt_label "$v"), $base (K/V in VRAM): locks ~$(gib "$locked") GiB$n: fits with little else running"; fits=1 ;;
-      *) if [ "$best" = "$base" ] && [ -n "$kind" ]; then
+      ok) ok "$(ckpt_label "$v"), $base (K/V in VRAM${low_ram:+, --low-ram}): locks ~$(gib "$locked") GiB$n"; fits=1 ;;
+      tight) warn "$(ckpt_label "$v"), $base (K/V in VRAM${low_ram:+, --low-ram}): locks ~$(gib "$locked") GiB$n: fits with little else running"; fits=1 ;;
+      *) if ram_low_fits "$low"; then
+           # a machine kept for the server holds it without the RAM tier: said, and suggested when it is the way left
+           if [ -n "$low_ram" ]; then
+             warn "$(ckpt_label "$v"), $base --low-ram: locks ~$(gib "$low") GiB$n: fits a machine that runs little else (not measured on a real one)"
+           else
+             warn "$(ckpt_label "$v"), $base (K/V in VRAM): locks ~$(gib "$locked") GiB$n, more than this machine can hold"
+             printf '        with --low-ram (no RAM tier, the experts loaded one file at a time): ~%s GiB, fits a machine that runs little else\n' "$(gib "$low")"
+             [ "$best" != "$base" ] || [ -z "$kind" ] || next_low=1
+           fi
+           fits=1
+         elif [ "$best" = "$base" ] && [ -n "$kind" ]; then
            fail "$(ckpt_label "$v"), $base: locks ~$(gib "$locked") GiB$n, more than this machine can hold"
+           [ "$v" = exl3-3.05 ] || ! ram_low_fits "$(ram_locked "$g" exl3-3.05 0 0)" ||
+             printf '        an EXL3 3.05 bpw checkpoint fits this machine with --low-ram (~%s GiB locked)\n' "$(gib "$(ram_locked "$g" exl3-3.05 0 0)")"
          else warn "$(ckpt_label "$v"), $base (K/V in VRAM): locks ~$(gib "$locked") GiB$n, more than this machine can hold"; fi ;;
     esac
     [ -n "$kvhost" ] && [ "$g" = 2 ] || continue
@@ -423,7 +451,7 @@ check_machine() {  # --check: what this machine has, what is missing, which prof
 
   echo
   if [ "$bad" = 0 ] && [ -n "$best" ]; then
-    echo "Next: $(next_command "$best" "$next_ctx" "$next_pool")"
+    echo "Next: $(next_command "$best" "$next_ctx" "$next_pool" "$next_low")"
   elif [ "$bad" != 0 ]; then
     echo "Fix the FAIL lines first (docs/rdna3/getting-started.md)."
   fi
@@ -447,6 +475,7 @@ while [ $# -gt 0 ]; do
     --dry-run) dry=1; shift ;;
     --no-mtp) no_mtp=1; shift ;;
     --hybrid) hybrid=1; shift ;;
+    --low-ram) low_ram=1; shift ;;
     --check) check=1; shift ;;
     --list)
       printf '%-14s %-4s %9s %9s  %-8s %s\n' profile GPUs context "K/V pool" status description
@@ -476,7 +505,7 @@ model="$(cd "$model" && pwd)"
 
 # the profile: GPUS / VRAM_GIB / CTX / KV_TOKENS / MEMORY / TESTED / FT_ARGS drive this script, every other KEY=value
 # is container env
-envs=() ft_args=() p_gpus=1 p_vram="" p_ctx=131072 p_kv="" p_memory=110g p_tested=1
+envs=() ft_args=() p_gpus=1 p_vram="" p_ctx=131072 p_kv="" p_memory=110g p_tested=1 p_exl3=0.77
 while IFS= read -r line || [ -n "$line" ]; do
   case "$line" in ''|\#*) continue ;; esac
   key="${line%%=*}" val="${line#*=}"
@@ -491,12 +520,13 @@ while IFS= read -r line || [ -n "$line" ]; do
     CTX) p_ctx="$val" ;;
     KV_TOKENS) p_kv="$val" ;;
     MEMORY) p_memory="$val" ;;
+    EXL3_RATIO) p_exl3="$val" ;;
     FT_ARGS) read -r -a ft_args <<< "$val" ;;
     FREETOKEN_MTP|FREETOKEN_SPEC_*) [ -n "$no_mtp" ] || envs+=(-e "$key=$val") ;;  # --no-mtp drops the head's settings
     *) envs+=(-e "$key=$val") ;;
   esac
 done < "$pfile"
-user_ctx="$ctx" ctx="${ctx:-$p_ctx}" memory="${memory:-$p_memory}"
+user_ctx="$ctx" ctx="${ctx:-$p_ctx}" user_memory="$memory" memory="${memory:-$p_memory}"
 # the K/V pool the requests share: the profile's KV_TOKENS, never less than one request's context
 kv="${p_kv:-$ctx}"
 [ "$kv" -ge "$ctx" ] || kv="$ctx"
@@ -504,11 +534,12 @@ kv="${p_kv:-$ctx}"
 
 # EXL3 checkpoints on two cards: the expert slices round to 384 / 256, so the card holding 384 bounds the
 # expert cache, and at the profiles' 0.80 the 7900 XTX peaked 200 MiB under full VRAM (two agents at 50k tokens: 24,341
-# of 24,560 MiB at 0.78 with 4.05 bpw); 0.77 / 0.76 keep ~0.5 GiB free (xtx-xt). `-- --memory-ratio X` wins.
+# of 24,560 MiB at 0.78 with 4.05 bpw); 0.77 / 0.76 keep ~0.5 GiB free (xtx-xt). A profile's EXL3_RATIO replaces the
+# 0.77 of the checkpoints below 4 bpw (xtx-xt-4x262k: 0.78, measured with 3.05 bpw). `-- --memory-ratio X` wins.
 cfg="$(tr -d ' \t\n' < "$model/config.json" 2>/dev/null || true)"
 if [[ "$cfg" == *'"quant_method":"exl3"'* ]] && [ "$p_gpus" = 2 ]; then
   bits="$(grep -o '"bits":[0-9.]*' <<< "$cfg" | head -1 | cut -d: -f2)"
-  ratio=0.77
+  ratio="$p_exl3"
   awk -v b="${bits:-0}" 'BEGIN { exit !(b >= 4) }' && ratio=0.76
   ft_args+=(--memory-ratio "$ratio")
   echo "note: EXL3 checkpoint (${bits:-?} bpw) on two cards: --memory-ratio $ratio instead of the profile's ('-- --memory-ratio X' overrides)" >&2
@@ -529,6 +560,31 @@ if [ -n "$hybrid" ]; then
   fi
 fi
 
+# --low-ram (docs/rdna3/limits.md#can-it-run-with-64-gb-of-ram): the profile without its RAM tier, the experts loaded
+# one file at a time (the parallel loader's peak was killed under a 52 GiB limit), and a container limit that leaves
+# RAM_KEEP_LOW GiB to the system unless --memory says otherwise
+if [ -n "$low_ram" ]; then
+  for e in "${envs[@]}"; do
+    [ "$e" != FREETOKEN_QSA_KV_HOST=1 ] ||
+      { echo "--low-ram is for the profiles that keep the K/V in VRAM (xtx-xt, xtx, xt): $profile keeps it in RAM" >&2; exit 2; }
+  done
+  kept=()
+  for ((i = 0; i < ${#envs[@]}; i += 2)); do  # the profile's own setting of the RAM tier leaves the command
+    [[ "${envs[i + 1]}" == FREETOKEN_HOST_KV=* ]] || kept+=("${envs[i]}" "${envs[i + 1]}")
+  done
+  envs=("${kept[@]}" -e FREETOKEN_HOST_KV=0)
+  kept=()
+  for ((i = 0; i < ${#ft_args[@]}; i++)); do
+    if [ "${ft_args[i]}" = --expert-load ]; then i=$((i + 1)); else kept+=("${ft_args[i]}"); fi
+  done
+  ft_args=("${kept[@]}" --expert-load serial)
+  if [ -z "$user_memory" ]; then
+    cap="$(ram_low_cap)"
+    [ "$cap" -lt "${p_memory%g}" ] || cap="${p_memory%g}"
+    memory="${cap}g"
+  fi
+fi
+
 # the RAM this server will lock (ram_locked) against what the machine can spare: a warning, `--check` says what fits
 kind="$(ckpt_kind "$model")" kvpool=0 tier_tokens=262144
 for e in "${envs[@]}"; do
@@ -543,11 +599,17 @@ if [ -n "$locked" ]; then
   chk=(rdna3/serve.sh --check --model "$model")  # the check of this very server: its --ctx and K/V pool
   [ -z "$user_ctx" ] || chk+=(--ctx "$user_ctx")
   chk+=("$profile")
+  [ -z "$low_ram" ] || chk+=(--low-ram)
   [ -z "$(extra_pool)" ] || chk+=(-- --kv-reserve-tokens "$(extra_pool)")
   chk="$(printf '%q ' "${chk[@]}")" chk="${chk% }"
   case "$(ram_verdict "$locked")" in
-    over) echo "warning: this server will lock ~$(gib "$locked") GiB of RAM, more than this $(ram_total) GiB machine can hold" \
-               "beside the system: it may run out of memory; '$chk' shows what fits" >&2 ;;
+    over) if [ -n "$low_ram" ] && ram_low_fits "$locked"; then
+            echo "note: --low-ram: this server will lock ~$(gib "$locked") GiB of this $(ram_total) GiB machine (container limit" \
+                 "$memory): keep the machine for it, a light desktop at most" >&2
+          else
+            echo "warning: this server will lock ~$(gib "$locked") GiB of RAM, more than this $(ram_total) GiB machine can hold" \
+                 "beside the system: it may run out of memory; '$chk' shows what fits" >&2
+          fi ;;
     tight) echo "note: this server will lock ~$(gib "$locked") GiB of RAM: on this $(ram_total) GiB machine that fits with" \
                 "little else running ('$chk')" >&2 ;;
   esac

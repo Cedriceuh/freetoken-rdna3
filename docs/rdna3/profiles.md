@@ -34,6 +34,7 @@ TESTED=0                # derived, not measured: serve.sh says so at start (defa
 CTX=262144              # context length of one request (--ctx overrides); passed as --max-seq-len-override
 KV_TOKENS=1050000       # the K/V pool all requests share, --kv-reserve-tokens (default: CTX, never less)
 MEMORY=110g             # container RAM limit (--memory overrides)
+EXL3_RATIO=0.78         # serve.sh's --memory-ratio for an EXL3 checkpoint below 4 bpw on two cards (default 0.77)
 FREETOKEN_...=...       # any other KEY=value line becomes an environment variable of the container
 FT_ARGS="..."           # flags passed to `ft serve` (its --tp-size must match GPUS)
 ```
@@ -80,7 +81,8 @@ With an EXL3 checkpoint
 experts go through the EXL3 kernels (the start log says `MoE experts: exl3 via triton`), so `--quant-backend
 moe.nvfp4=triton` and the `FREETOKEN_NVFP4_*_TUNED` tiles do nothing; the split rounds to whole 128-wide blocks (384 /
 256, i.e. 60 / 40, which NVFP4 avoids; the EXL3 numbers are measured at it); the n-gram tables take 33 GB (3.05 bpw)
-instead of 51. On two cards `serve.sh` lowers `--memory-ratio` to 0.77 (0.76 from 4 bpw): the card holding the
+instead of 51. On two cards `serve.sh` lowers `--memory-ratio` to 0.77 (a profile's `EXL3_RATIO` replaces it:
+0.78 in `xtx-xt-4x262k`; 0.76 from 4 bpw everywhere): the card holding the
 384-wide slice bounds the expert cache, and at 0.80 the 7900 XTX peaked 200 MiB under full VRAM
 ([journey.md](journey.md#16-exl3-checkpoints-2026-10-04)); `-- --memory-ratio X` overrides it.
 
@@ -98,11 +100,15 @@ share is no longer bounded by VRAM. What differs:
 | `FREETOKEN_HOST_KV` | `0` | `0` | no RAM tier: the pool already lives in RAM |
 | `FREETOKEN_NVFP4_PREFILL_BLOCK` | `8192` | unset (4096) | as in `xtx-xt`; `xtx-xt-1m` keeps the default |
 | `MEMORY` | `104g` | `104g` | the container's RAM limit (`110g` in `xtx-xt`) |
+| `--memory-ratio` | 0.81 | 0.80 | `xtx-xt-4x262k` gives the expert cache the VRAM a verify step's rollback states no longer take (NVFP4, 3 contexts: 9,246 slots instead of 9,077, +1.2 % for one request, +2.8 % for three, lower VRAM peaks than at 0.80 before; [journey.md](journey.md#50-pytorch-215-tried-a-decode-step-at-three-requests-the-vram-beside-the-expert-cache-2026-11-11)) |
+| `EXL3_RATIO` | 0.78 | unset (0.77) | the same for an EXL3 checkpoint below 4 bpw, whose ratio `serve.sh` sets (3.05 bpw, 4 contexts: 11,647 slots instead of 11,437, +1.3 % for one request, +1.9 % for four, lower VRAM peaks) |
 
 Measured with EXL3 3.05 bpw (~77 GiB of RAM locked by `xtx-xt-4x262k`, ~75 GiB by `xtx-xt-1m`), and NVFP4 on
 `xtx-xt-4x262k` with three contexts: four do not fit with NVFP4 on 128 GB, so start it with `rdna3/serve.sh
 xtx-xt-4x262k --model DIR -- --kv-reserve-tokens 787500` (three conversations, 94 GiB locked after the start), or
-`525000` (two) to keep room. A request alone decoded a few percent slower than on `xtx-xt` on an earlier build, before
+`525000` (two) to keep room. Adding `--max-running-requests 3 --cuda-graph-max-bs 3` sizes the state pools and the
+graphs for three requests too, which leaves the expert cache more VRAM (9,488 slots instead of 9,246: one request
++0.9 %, three together +2.4 to +2.9 %, the same answers); a fourth request at once then waits for a place. A request alone decoded a few percent slower than on `xtx-xt` on an earlier build, before
 the decode cache (the kernels read the K/V across PCIe), and reads prompts a little faster (more expert slots). Which
 one to pick, what they cost and their measurements: [long-context.md](long-context.md); how to count your RAM:
 [limits.md](limits.md#how-much-ram-do-i-need).
@@ -165,7 +171,9 @@ Nothing below has been measured; treat it as a starting point and check with the
   gfx1101) and 7600 (8 GB, gfx1102) have less VRAM than any profile plans for. None of them is tested.
 - **Less RAM**: `FREETOKEN_HOST_KV=0` saves the RAM tier (9.5 GiB on two cards, ~5 GiB on one; evicted conversations
   are re-read instead). In NVFP4 the experts themselves cannot go below ~63 GiB; the EXL3 3 bpw
-  checkpoint needs 42.6 GiB: [limits.md](limits.md).
+  checkpoint needs 42.6 GiB, and `rdna3/serve.sh <profile> --model DIR --low-ram` sets a 64 GB machine up for it
+  without editing a file (that variable, `--expert-load serial` and the container's limit):
+  [limits.md](limits.md#can-it-run-with-64-gb-of-ram).
 
 Every environment variable in these files is explained in [options.md](options.md); the `ft serve` flags in the tables
 above and in upstream's [CLI reference](../cli.md).

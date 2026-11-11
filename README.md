@@ -17,6 +17,7 @@ the work.
 |---|---|
 | GPUs | one or two RX 7900 XTX (24 GB) / RX 7900 XT (20 GB); other cards: [which GPUs](docs/rdna3/limits.md#which-gpus) |
 | RAM | 128 GB recommended: the server locks ~53 to ~83 GiB, depending on the checkpoint and the number of cards ([table](#which-checkpoint)), more with conversations kept in RAM, and the system and your programs need ~30 GiB beside it ([how to count](docs/rdna3/limits.md#how-much-ram-do-i-need)) |
+| RAM, 64 GB | an EXL3 3.05 bpw checkpoint with `rdna3/serve.sh <profile> --model DIR --low-ram`, on a machine kept for the server: ~52 GiB locked on two cards, the same speeds and answers, but a conversation pushed off the GPUs is read again when it comes back ([64 GB](docs/rdna3/limits.md#can-it-run-with-64-gb-of-ram); measured under a 56 GiB container limit, not on a real 64 GB machine) |
 | Disk | 85 to 135 GB for the model, ~27 GB for the image (~29 GB more while it builds) |
 | System | Linux x86_64 with the in-kernel `amdgpu` driver, and Docker. ROCm, PyTorch and the rest come inside the image |
 

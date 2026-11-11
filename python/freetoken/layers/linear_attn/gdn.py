@@ -101,29 +101,36 @@ _SPLIT_OK: dict = {}  # (rows, out, in) -> whether F.linear's rows by blocks equ
 # the check runs a bf16 F.linear: what these methods run at a prefill's row counts (int8: dequantize, then F.linear)
 _CHECKED_METHODS = ("UnquantizedLinearMethod", "Int8WeightOnlyLinearMethod")
 assert _GDN_PREFILL_BLOCK % 64 == 0, "FREETOKEN_GDN_PREFILL_BLOCK must be a multiple of the 64-token chunk"
-_SPEC_BUFS: list = []  # [(recurrent [layers, reqs, m-1, ...], conv [layers, m-1, reqs, ...])] once allocated
+# [(recurrent [layers, states, ...], conv [layers, m-1, reqs, ...])] once allocated. The recurrent states are flat: a
+# step of m rows keeps request b's state after its row j at b * (m - 1) + j, so the buffer holds the most states a
+# step keeps (two requests x 3 with SPEC_BS_DEEP=2, four x 1 past it: 6) instead of requests x (SPEC_M - 1) (12)
+_SPEC_BUFS: list = []
 _SPEC_ROWS: list = []
 
 
-def _spec_buffers(pool, reqs: int, device):
+def _spec_buffers(pool, reqs: int, m: int, device):
     """spec_decode buffers shared by every GDN layer (one slice each): the recurrent kernel's per-step states and the
     conv state after each row but the last; one rollback target per pool tensor covers all the layers."""
-    if not _SPEC_BUFS or _SPEC_BUFS[0][0].shape[1] < reqs:
+    states = reqs * (m - 1)
+    if not _SPEC_BUFS or _SPEC_BUFS[0][0].shape[1] < states or _SPEC_BUFS[0][1].shape[2] < reqs:
         assert not torch.cuda.is_current_stream_capturing(), "spec buffers must exist before the capture"
-        m = SPEC_M
+        if _SPEC_BUFS:  # never smaller: the graphs captured so far address the old sizes
+            states, reqs = max(states, _SPEC_BUFS[0][0].shape[1]), max(reqs, _SPEC_BUFS[0][1].shape[2])
         rec, conv = pool.recurrent_states, pool.conv_states  # [layers, slots, ...]
-        inter = rec.new_empty((rec.shape[0], reqs, m - 1, *rec.shape[2:]))
-        snaps = conv.new_empty((conv.shape[0], m - 1, reqs, *conv.shape[2:]))
+        inter = rec.new_empty((rec.shape[0], states, *rec.shape[2:]))
+        snaps = conv.new_empty((conv.shape[0], SPEC_M - 1, reqs, *conv.shape[2:]))
         _SPEC_BUFS[:] = [(inter, snaps)]
-        _SPEC_ROWS[:] = [torch.arange(reqs, dtype=torch.int32, device=device)]
+        _SPEC_ROWS[:] = [torch.arange(max(reqs, states), dtype=torch.int32, device=device)]
         pad = pool.padding_slot
         inner_r, inner_c = math.prod(rec.shape[2:]), math.prod(conv.shape[2:])
-        copy_r = ((inter, inter.stride(0), inter.stride(1), inter.stride(2), 0, rec.stride(0), rec.stride(1),
-                   rec.shape[0], inner_r) if block_contiguous(rec, 2) and block_contiguous(inter, 3) else None)
+        # the recurrent copy's request stride follows the step's rows: (m - 1) states a request
+        copy_r = ((lambda rows: (inter, inter.stride(0), (rows - 1) * inter.stride(1), inter.stride(1), 0,
+                                 rec.stride(0), rec.stride(1), rec.shape[0], inner_r))
+                  if block_contiguous(rec, 2) and block_contiguous(inter, 2) else None)
         copy_c = ((snaps, snaps.stride(0), snaps.stride(2), snaps.stride(1), 0, conv.stride(0), conv.stride(1),
                    conv.shape[0], inner_c) if block_contiguous(conv, 2) and block_contiguous(snaps, 3) else None)
-        register("gdn.recurrent", RollbackTarget(rec, lambda step, b: inter[:, b, step], dim=1, padding_slot=pad,
-                                                 copy=copy_r))
+        register("gdn.recurrent", RollbackTarget(rec, lambda step, b, rows: inter[:, b * (rows - 1) + step], dim=1,
+                                                 padding_slot=pad, copy=copy_r, by_rows=True))
         register("gdn.conv", RollbackTarget(conv, lambda step, b: snaps[:, step, b], dim=1, padding_slot=pad,
                                             copy=copy_c))
     return _SPEC_BUFS[0]
@@ -278,20 +285,22 @@ class GatedDeltaNet(BaseOP):
 
     def _spec_conv_decode(self, conv_in: torch.Tensor, slots: torch.Tensor, pool, li: int, m: int):
         """``m`` rows per request: one conv launch over the rows, the conv state after every row but the last saved,
-        and the recurrent kernel's per-step buffer. Returns ``(mixed [B*m, conv_dim], intermediate [reqs, SPEC_M-1,
-        HV, V, K])``. Buffers are sized for SPEC_M rows and allocated at the first (largest) decode forward with
-        several rows, which runs eagerly before any capture."""
+        and the recurrent kernel's per-step buffer. Returns ``(mixed [B*m, conv_dim], intermediate [reqs, m-1, HV, V,
+        K])``. Buffers are sized by the decode forwards with several rows that run eagerly before any capture
+        (engine/graph.py sizing_shapes)."""
         reqs = conv_in.shape[0] // m
         conv = pool.conv_states[li]
-        inter_all, conv_all = _spec_buffers(pool, reqs, conv_in.device)
-        self._spec_inter, self._spec_conv = inter_all[li], conv_all[li]
+        inter_all, conv_all = _spec_buffers(pool, reqs, m, conv_in.device)
+        # this step's view of the flat states: [reqs, m - 1, ...] (the kernel keeps the steps below its second dim)
+        self._spec_inter = inter_all[li, : reqs * (m - 1)].view(reqs, m - 1, *inter_all.shape[2:])
+        self._spec_conv = conv_all[li]
         self._spec_rows = _SPEC_ROWS[0]
         from freetoken.kernel.triton.causal_conv1d_triton import causal_conv1d_decode_rows
 
         # one launch for the m rows, the state after each row but the last written into the rollback snapshots
         mixed = causal_conv1d_decode_rows(conv_in.view(reqs, m, -1), conv, self._conv_weight(), slots,
                                           snapshots=self._spec_conv[:, :reqs])
-        return mixed.view(reqs * m, -1), self._spec_inter[:reqs]
+        return mixed.view(reqs * m, -1), self._spec_inter
 
     def _conv_verify(self, conv_in: torch.Tensor, fla, pool) -> torch.Tensor:
         """Causal conv over a verify batch's rows: rolls the live conv state as if every row were accepted and parks each row's window in ``fla.verify_scratch``."""
@@ -461,10 +470,9 @@ class GatedDeltaNet(BaseOP):
         key = (total, *self.out_proj.weight.shape)
         if key in _SPLIT_OK:
             return
-        ok = torch.tensor([int(_rows_split_equal(total, *key[1:], self.out_proj.weight.device))],
-                          dtype=torch.int32, device=self.out_proj.weight.device)
-        torch.distributed.all_reduce(ok, op=torch.distributed.ReduceOp.MIN)
-        _SPLIT_OK[key] = bool(ok.item())
+        from freetoken.distributed.impl import agree
+
+        _SPLIT_OK[key] = agree(_rows_split_equal(total, *key[1:], self.out_proj.weight.device))
 
     def _prefill_overlapped(self, q, k, v, g, beta, pool, li, fla, conv_in, z, track) -> torch.Tensor:
         """The blocked delta rule with each block's gated norm, output projection and all-reduce started as the block

@@ -730,7 +730,14 @@ class DiskRowTable:
             if not capturing:
                 self._eager_read[self._eager_slot].record(stream)
         if share:
-            torch.distributed.broadcast(dev[:nbytes], src=0)
+            from freetoken.distributed.impl import NO_RCCL
+
+            if NO_RCCL:
+                from freetoken.distributed import DistributedCommunicator
+
+                DistributedCommunicator().broadcast(dev[:nbytes])
+            else:
+                torch.distributed.broadcast(dev[:nbytes], src=0)
         if self._exl3_bits:
             from freetoken.kernel.triton.exl3 import exl3_ngram_dequant
 

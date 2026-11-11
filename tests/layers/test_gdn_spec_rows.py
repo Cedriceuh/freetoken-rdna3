@@ -108,3 +108,49 @@ def test_batched_verify_rows_match_single_row_decode(monkeypatch, bs, rows):
         assert torch.equal(got[i], want[i]), f"request {i}"
         assert torch.equal(pool.recurrent_states[li][mreq.table_idx], pool.recurrent_states[li][s.table_idx])
         assert torch.equal(pool.conv_states[li][mreq.table_idx], pool.conv_states[li][s.table_idx])
+
+
+@pytest.mark.parametrize("glue", (True, False))
+@pytest.mark.parametrize("bs,rows", [(1, 4), (2, 4), (2, 3), (3, 2), (4, 2)])
+def test_rollback_to_a_kept_row_matches_single_row_decode(monkeypatch, bs, rows, glue):
+    """A verify step of ``bs`` requests x ``rows`` rows, then the rollback to each request's last kept row (one of
+    them keeps every row): the states of as many single-token steps. The recurrent states the step keeps sit in one
+    flat buffer laid out by the step's rows (request b's row j at b * (rows - 1) + j), with the kernel's copy and
+    with the torch one. Run with FREETOKEN_SPEC_VERIFY_M=4 to cover 3 and 4 rows."""
+    import freetoken.layers.linear_attn.gdn as gdn
+    import freetoken.spec_decode as spec
+
+    if rows > spec.SPEC_M:
+        pytest.skip(f"spec buffers sized for FREETOKEN_SPEC_VERIFY_M={spec.SPEC_M}")
+    monkeypatch.setattr(gdn, "_SPEC_BUFS", [])  # this test's pool: the buffers and their rollback targets anew
+    monkeypatch.setattr(gdn, "_SPEC_ROWS", [])
+    monkeypatch.setattr(spec, "_TARGETS", {})
+    monkeypatch.setattr(spec, "SPEC_GLUE_KERNELS", glue)
+    op, _ = _make_layer(3, "sigmoid")
+    ctx = _ctx(monkeypatch, 3, num_slots=2 * bs + 2)
+    torch.manual_seed(11)
+    lengths = [19 + 7 * i for i in range(bs)]
+    hidden, reqs, _ = _prefill(op, ctx, lengths + lengths, seed=2)
+    batch = Batch(reqs=reqs, phase="prefill")  # requests i and bs + i on the same prompt
+    batch.padded_reqs = reqs
+    with ctx.forward_batch(batch):
+        op.forward(torch.cat(hidden[:bs] + hidden[:bs], dim=0))
+    pool = ctx.linear_state_pool
+    singles, multis = reqs[:bs], reqs[bs:]
+    steps = torch.randn(bs, rows, HIDDEN, device=DEV, dtype=torch.bfloat16)
+    kept = [1 + (i * 2 + rows - 1) % rows for i in range(bs)]  # request 0 keeps every row
+    for i, r in enumerate(singles):
+        for j in range(kept[i]):
+            _decode(op, ctx, [r], steps[i, j : j + 1])
+    batch = Batch(reqs=multis, phase="decode")
+    batch.padded_reqs = multis
+    batch.linear_table_idx = torch.tensor([r.table_idx for r in multis], dtype=torch.int32, device=DEV)
+    batch.spec_m = rows
+    with ctx.forward_batch(batch):
+        op.forward(steps.reshape(bs * rows, HIDDEN))
+    assert gdn._SPEC_BUFS[0][0].shape[1] == bs * (rows - 1)  # the states this step keeps, no more
+    spec.apply_rollback(batch.linear_table_idx, torch.tensor(kept, device=DEV), pool.padding_slot, rows)
+    li = pool.local_index(0)
+    for i, (s, mreq) in enumerate(zip(singles, multis)):
+        assert torch.equal(pool.recurrent_states[li][mreq.table_idx], pool.recurrent_states[li][s.table_idx]), i
+        assert torch.equal(pool.conv_states[li][mreq.table_idx], pool.conv_states[li][s.table_idx]), i

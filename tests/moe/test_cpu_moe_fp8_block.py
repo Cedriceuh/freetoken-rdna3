@@ -315,7 +315,7 @@ def test_cpu_fp8_block_graph_distinct_layer_inputs(bs, accumulate):
             torch.testing.assert_close(captured[step], skipped, rtol=0, atol=0)
 
 
-@pytest.mark.skipif(torch.version.hip is None, reason="requires ROCm")
+@pytest.mark.skipif(torch.version.hip is None or not torch.cuda.is_available(), reason="requires ROCm and a GPU")
 @pytest.mark.parametrize("kernel_io", [True, False])
 def test_cpu_fp8_block_graph_replay_and_recapture(monkeypatch, kernel_io):
     from freetoken.kernel import _cpu_moe

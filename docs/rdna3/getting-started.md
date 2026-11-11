@@ -9,6 +9,7 @@ how to check that it worked. The two downloads (a 25 GB base image, an 85-135 GB
 |---|---|---|
 | GPUs | RX 7900 XTX 24 GB + RX 7900 XT 20 GB | one RX 7900 XTX 24 GB or RX 7900 XT 20 GB |
 | System RAM the server locks: NVFP4; EXL3 3.05 / 4.05 bpw (keep ~30 GiB more for the system) | ~83 GiB; ~61 / ~76 GiB: a **128 GB** machine | ~74 GiB; ~52 / ~67 GiB |
+| With 64 GB of RAM | EXL3 3.05 bpw with `--low-ram`, on a machine kept for the server: ~52 GiB locked ([64 GB](limits.md#can-it-run-with-64-gb-of-ram)) | the same: ~47 GiB (not measured) |
 | Disk | 135 GB for the NVFP4 model (85 / 108 GB in EXL3 3.05 / 4.05 bpw), ~27 GB for the image, ~29 GB more while building | same |
 | Software | Linux x86_64 with the in-kernel `amdgpu` driver (`/dev/kfd` present), Docker | same |
 | Tested on | Ubuntu 26.04 LTS, kernel 7.0 (older kernels untested) | same |
@@ -140,6 +141,7 @@ loading: that once left GPU memory held until a reboot
 | `--vision` | accept images ([limits](limits.md#images-vision)); off by default, no measurable speed cost on two cards, ~1.5-2 % of decode on one |
 | `--no-mtp` | turn off the MTP draft head: the head speeds up a request decoding alone (+35 % on `xtx-xt`) and up to four at once on `xtx-xt` and its K/V-in-RAM variants; it costs 3-4 % where more requests decode than it verifies (the other profiles, an earlier build; [limits](limits.md#speculative-decoding-mtp)) |
 | `--hybrid` | the CPU computes part of the experts missing from VRAM; off by default, not agent-validated. Measured on an earlier build: NVFP4 +46 % decode on `xtx`, +51 % on `xt`, on `xtx-xt` +2 % for one request and +15 % each with four; EXL3 3.05 bpw +5 % on `xtx`, even on `xtx-xt` ([cpu-experts](cpu-experts.md)) |
+| `--low-ram` | for a machine with ~64 GB of RAM and an EXL3 3.05 bpw checkpoint, on `xtx-xt`, `xtx` or `xt`: no RAM tier, the experts loaded one file at a time, the container limited to the machine's RAM minus 6 GiB ([limits](limits.md#can-it-run-with-64-gb-of-ram)) |
 | `--served-name ID` | the model id `/v1/models` reports (default `qwen3.8-flash-next`) |
 | `--name NAME`, `--image REF`, `--memory SIZE` | container name, image, container RAM limit |
 | `-- <flags>` | anything after `--` goes to `ft serve` (upstream's [CLI reference](../cli.md)) |

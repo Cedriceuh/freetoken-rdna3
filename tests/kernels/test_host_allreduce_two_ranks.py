@@ -1,7 +1,9 @@
 """The host all-reduce region's two-rank kernels on two GPUs (ROCm): FREETOKEN_HOST_ALLGATHER gives
 all_gather_into_tensor's result for several dtypes and shapes, interleaved with all-reduces; FREETOKEN_HOST_AR_HC_COMBINE
 gives the bits of the plain host all-reduce then hc_combine_rmsnorm (the reduced tensor, the combined streams in place,
-the normed streams) at 1-16 rows and both norm weight shapes, eagerly and replayed in a CUDA graph."""
+the normed streams) at 1-16 rows and both norm weight shapes, eagerly and replayed in a CUDA graph; a small broadcast
+through the gather's slots leaves rank 0's values on both ranks; FREETOKEN_HOST_ALLREDUCE_MID_MB's all-reduces above the
+slots give the bits of the fp32 sum."""
 
 from __future__ import annotations
 
@@ -39,6 +41,61 @@ def _gather(rank, ar, dev, dist):
             dist.all_reduce(ref)
             ar(y)
             ok &= torch.equal(y, ref.to(torch.bfloat16).to(dev))
+    return ok
+
+
+def _broadcast(rank, ar, dev):
+    """A sampled step's token sync (distributed/impl.py HostStagedDistributedImpl.broadcast): rank 0's values on both
+    ranks, for the shapes and integer types the engine sends, interleaved with all-reduces."""
+    from freetoken.distributed.impl import HostStagedDistributedImpl, TorchDistributedImpl
+
+    impl = HostStagedDistributedImpl(ar, TorchDistributedImpl())
+    ok = True
+    for it in range(10):
+        for shape, dt in (((1, 4), torch.int32), ((3, 2), torch.int32), ((4, 4), torch.int32), ((4,), torch.int64)):
+            n = 1
+            for d in shape:
+                n *= d
+            want = (torch.arange(n, device=dev).view(shape) * 7 + it).to(dt)   # what rank 0 holds
+            x = want.clone() if rank == 0 else torch.full(shape, -5 - it, dtype=dt, device=dev)
+            out = impl.broadcast(x)
+            ok &= out is x and torch.equal(x, want)
+            y = torch.randn(4, 2560, device=dev).to(torch.bfloat16)
+            ar(y)  # the slots' sequence goes on
+    # larger than the gather's slots, any dtype: through the mid slots by bytes, in pieces past one slot (24 MiB here)
+    for shape, dt in (((1024, 2560), torch.bfloat16), ((70001,), torch.int64), ((3, 1 << 20, 5), torch.int8),
+                      ((7000, 2560), torch.bfloat16)):
+        n = 1
+        for d in shape:
+            n *= d
+        want = ((torch.arange(n, device=dev) * 2654435761) % 251 - 125).view(shape).to(dt)
+        x = want.clone() if rank == 0 else torch.zeros(shape, dtype=dt, device=dev)
+        assert not ar.supports_gather(x.view(-1)) and ar.supports_mid_broadcast(x)
+        ok &= impl.broadcast(x) is x and torch.equal(x.view(torch.uint8), want.view(torch.uint8))
+    return ok
+
+
+def _mid(rank, ar, dev, dist):
+    """FREETOKEN_HOST_ALLREDUCE_MID_MB: all-reduces above the slots through the mid slots (copy, handshake, add) give
+    the bits of a + b in fp32, for bf16 and fp32, 16-byte aligned or not, interleaved with small ones."""
+    ok = True
+    for it in range(4):
+        g = torch.Generator(device=dev).manual_seed(900 + it * 2 + rank)
+        for shape, dt, off in (((300, 2560), torch.bfloat16, 0), ((2400, 2560), torch.bfloat16, 0),
+                               ((1000, 2560), torch.float32, 0), ((700001,), torch.bfloat16, 1),
+                               ((3, 131072 + 8), torch.float32, 0)):
+            base = (torch.randn(shape, generator=g, device=dev) * (1 + it)).to(dt)
+            y = base.view(-1)[off:].contiguous() if not off else base.view(-1)[off:]  # off: not 16-byte aligned
+            assert ar.supports_mid(y), (shape, dt)
+            ref = y.float().cpu()
+            dist.all_reduce(ref)
+            ar.mid(y)
+            ok &= torch.equal(y, ref.to(dt).to(dev))
+            z = torch.randn(4, 2560, generator=g, device=dev).to(torch.bfloat16)
+            zr = z.float().cpu()
+            dist.all_reduce(zr)
+            ar(z)  # a small one between two mid ones: one sequence
+            ok &= torch.equal(z, zr.to(torch.bfloat16).to(dev))
     return ok
 
 
@@ -90,9 +147,12 @@ def _run(rank, port, results):
     from freetoken.kernel.host_allreduce import HostAllReduce
     from freetoken.kernel.triton.hc import hc_combine_rmsnorm
 
+    os.environ["FREETOKEN_HOST_ALLREDUCE_MID_MB"] = "24"
     ar = HostAllReduce(rank, 2, dist.group.WORLD)
     dev = torch.device("cuda", rank)
     ok = _gather(rank, ar, dev, dist)
+    ok &= _broadcast(rank, ar, dev)
+    ok &= _mid(rank, ar, dev, dist)
     ok_c, (x, res, prev, w, out, graph) = _combine(rank, ar, dev)
     ok &= ok_c
     for it in range(5):

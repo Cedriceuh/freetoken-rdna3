@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List
@@ -10,6 +11,27 @@ import torch.distributed as dist
 if TYPE_CHECKING:
     from freetoken.distributed import DistributedInfo
     from freetoken.kernel import PyNCCLCommunicator
+
+
+# FREETOKEN_NO_RCCL=1 (two ranks, with FREETOKEN_HOST_ALLREDUCE; default 0): the engine never creates the RCCL
+# communicator, which takes 274 MiB of VRAM a card: the all-reduces above the host slots go through the mid slots
+# (FREETOKEN_HOST_ALLREDUCE_MID_MB, 20 by default then), the broadcasts too, and the rare rest (a first-use agreement
+# between the ranks) through the CPU process group
+NO_RCCL = os.environ.get("FREETOKEN_NO_RCCL", "0") == "1"
+_CPU_GROUP: list = [None]  # the CPU process group, set by the engine under NO_RCCL
+
+
+def agree(flag: bool) -> bool:
+    """Whether ``flag`` holds on every rank (a first-use agreement: the ranks must issue the same collectives)."""
+    if dist.get_world_size() == 1:
+        return bool(flag)
+    if _CPU_GROUP[0] is not None:
+        ok = torch.tensor([int(flag)], dtype=torch.int32)
+        dist.all_reduce(ok, op=dist.ReduceOp.MIN, group=_CPU_GROUP[0])
+    else:
+        ok = torch.tensor([int(flag)], dtype=torch.int32, device=torch.cuda.current_device())
+        dist.all_reduce(ok, op=dist.ReduceOp.MIN)
+    return bool(ok.item())
 
 
 @dataclass
@@ -25,6 +47,12 @@ class DistributedImpl(ABC):
 
     @abstractmethod
     def all_gather(self, x: torch.Tensor) -> torch.Tensor: ...
+
+    def broadcast(self, x: torch.Tensor) -> torch.Tensor:
+        """Rank 0's ``x`` into every rank's ``x`` (in place), as ``torch.distributed.broadcast(x, src=0)``."""
+        if dist.get_world_size() > 1:
+            dist.broadcast(x, src=0)
+        return x
 
 
 @dataclass
@@ -50,6 +78,33 @@ class TorchDistributedImpl(DistributedImpl):
         out = torch.empty(shape, dtype=x.dtype, device=x.device)
         dist.all_gather_into_tensor(out, x)
         return out
+
+
+@dataclass
+class CpuStagedDistributedImpl(DistributedImpl):
+    """FREETOKEN_NO_RCCL's last resort, for what no host path takes: the tensor to the host, the collective on the CPU
+    process group, back (a host sync each time). The same values: a sum of two ranks in fp32, bytes otherwise."""
+
+    group: object
+
+    def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
+        c = x.detach().float().cpu() if x.is_floating_point() else x.detach().cpu()
+        dist.all_reduce(c, op=dist.ReduceOp.SUM, group=self.group)
+        x.copy_(c.to(x.dtype))
+        return x
+
+    def all_gather(self, x: torch.Tensor) -> torch.Tensor:
+        world = dist.get_world_size(self.group)
+        raw = x.detach().contiguous().view(-1).view(torch.uint8).cpu()
+        out = torch.empty(world * raw.numel(), dtype=torch.uint8)
+        dist.all_gather_into_tensor(out, raw, group=self.group)
+        return out.to(x.device).view(x.dtype).view(world * x.shape[0], *x.shape[1:])
+
+    def broadcast(self, x: torch.Tensor) -> torch.Tensor:
+        raw = x.detach().contiguous().view(-1).view(torch.uint8).cpu()
+        dist.broadcast(raw, src=0, group=self.group)
+        x.copy_(raw.to(x.device).view(x.dtype).view(x.shape))
+        return x
 
 
 @dataclass
@@ -107,6 +162,8 @@ class HostStagedDistributedImpl(DistributedImpl):
             return self.ar(x)
         if self._big(x):
             return self.big(x)
+        if self.ar.supports_mid(x):
+            return self.ar.mid(x)
         return self.fallback.all_reduce(x)
 
     def all_reduce_async(self, x: torch.Tensor):
@@ -115,12 +172,27 @@ class HostStagedDistributedImpl(DistributedImpl):
             return None
         if self._big(x):
             return self.big.all_reduce_async(x)
+        if self.ar.supports_mid(x):
+            self.ar.mid(x)
+            return None
         return self.fallback.all_reduce_async(x)
 
     def all_gather(self, x: torch.Tensor) -> torch.Tensor:
         if self.ar.supports_gather(x):
             return self.ar.gather(x)
         return self.fallback.all_gather(x)
+
+    def broadcast(self, x: torch.Tensor) -> torch.Tensor:
+        # FREETOKEN_HOST_ALLGATHER: a small broadcast (a sampled step's tokens) through the gather's slots, rank 1
+        # keeping rank 0's half: the same bytes, without RCCL's launch (~45 us of host time against ~13)
+        if x.is_contiguous() and x.numel() and self.ar.supports_gather(x.view(-1)):
+            both = self.ar.gather(x.view(-1))
+            if self.ar.rank != 0:
+                x.view(-1).copy_(both[: x.numel()])
+            return x
+        if self.ar.supports_mid_broadcast(x):
+            return self.ar.mid_broadcast(x)
+        return self.fallback.broadcast(x)
 
 
 class DistributedCommunicator:
@@ -134,6 +206,9 @@ class DistributedCommunicator:
 
     def all_gather(self, x: torch.Tensor) -> torch.Tensor:
         return self.plugins[-1].all_gather(x)
+
+    def broadcast(self, x: torch.Tensor) -> torch.Tensor:
+        return self.plugins[-1].broadcast(x)
 
 
 def enable_pynccl_distributed(
@@ -167,6 +242,10 @@ def enable_host_allreduce(tp_info: DistributedInfo, tp_cpu_group: torch.distribu
 
         init_logger(__name__).warning("FREETOKEN_HOST_ALLREDUCE=1 ignored: ROCm (hipHostRegister) only")
         return False
+    if NO_RCCL:
+        os.environ.setdefault(host_allreduce.MID_ENV, "20")  # every all-reduce below the copy engines' 20 MiB
+        _CPU_GROUP[0] = tp_cpu_group
+        DistributedCommunicator.plugins = [CpuStagedDistributedImpl(tp_cpu_group)]
     ar = host_allreduce.HostAllReduce(tp_info.rank, tp_info.size, tp_cpu_group)
     from freetoken.kernel import dma_allreduce
 

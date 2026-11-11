@@ -182,6 +182,159 @@ __global__ void host_allreduce_kernel(
     allreduce_block<T, kAhead, kWide>(x, n, base, rank, slot_bytes, counter, timeout_ticks, wait_log);
 }
 
+// Mid-size messages (FREETOKEN_HOST_ALLREDUCE_MID_MB: a short prefill's all-reduces, between the slots above and the
+// copy engines' 20 MiB) through slots of their own in the same region, with the same sequence. No block waits for
+// another: a message goes by pieces, each with its own sequence number: a launch copies the first piece into this
+// rank's slot of the next sequence's parity; host_allreduce_kernel on no element publishes the sequence, waits for
+// the peer and bumps the counter; the next launch adds the peer's piece (a + b in fp32 as above) while it copies the
+// following piece into the other slot (host_mid_step_kernel), and so on. 16-byte loads and stores when the tensor
+// allows them (a slot is element-indexed either way, so the ranks may differ).
+constexpr int64_t kMidBlock = 262144;  // bytes a block of a broadcast
+
+template <typename T>
+__global__ void __launch_bounds__(kThreads) host_mid_copy_kernel(
+    const T* __restrict__ x, int64_t n, char* mid, int rank, int64_t mid_slot_bytes, const unsigned long long* counter) {
+    const int parity = static_cast<int>((*counter + 1ull) & 1ull);
+    T* mine = reinterpret_cast<T*>(mid + (rank * 2 + parity) * mid_slot_bytes);
+    const bool vec = (reinterpret_cast<uintptr_t>(x) % 16 == 0) && ((n * sizeof(T)) % 16 == 0);
+    if (vec) {
+        const int64_t nv = n * sizeof(T) / 16, lo = static_cast<int64_t>(blockIdx.x) * (kMidBlock / 16);
+        const int64_t hi = lo + kMidBlock / 16 < nv ? lo + kMidBlock / 16 : nv;
+        const uint4* src = reinterpret_cast<const uint4*>(x);
+        uint4* dst = reinterpret_cast<uint4*>(mine);
+        for (int64_t i = lo + threadIdx.x; i < hi; i += kThreads) dst[i] = src[i];
+    } else {
+        const int64_t per = kMidBlock / sizeof(T), lo = static_cast<int64_t>(blockIdx.x) * per;
+        const int64_t hi = lo + per < n ? lo + per : n;
+        for (int64_t i = lo + threadIdx.x; i < hi; i += kThreads) mine[i] = x[i];
+    }
+    __threadfence_system();
+}
+
+// a broadcast's receiving side: the peer's bytes of the handshake's sequence, copied over x
+template <bool kWide>
+__global__ void __launch_bounds__(kThreads) host_mid_fetch_kernel(
+    uint8_t* __restrict__ x, int64_t n, const char* mid, int rank, int64_t mid_slot_bytes, const unsigned long long* counter) {
+    const int parity = static_cast<int>(*counter & 1ull);
+    const uint8_t* peer = reinterpret_cast<const uint8_t*>(mid + ((1 - rank) * 2 + parity) * mid_slot_bytes);
+#if FREETOKEN_USE_ROCM
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+#else
+    __threadfence_system();
+#endif
+    const bool vec = (reinterpret_cast<uintptr_t>(x) % 16 == 0) && (n % 16 == 0);
+    if (vec) {
+        const int64_t nv = n / 16, lo = static_cast<int64_t>(blockIdx.x) * (kMidBlock / 16);
+        const int64_t hi = lo + kMidBlock / 16 < nv ? lo + kMidBlock / 16 : nv;
+        uint64_t* xv = reinterpret_cast<uint64_t*>(x);
+        const uint64_t* pv = reinterpret_cast<const uint64_t*>(peer);
+        for (int64_t i = lo + threadIdx.x; i < hi; i += kThreads) {
+#if FREETOKEN_USE_ROCM
+            if constexpr (kWide) {
+                const native_u64x2 v = __builtin_nontemporal_load(reinterpret_cast<const native_u64x2*>(pv + 2 * i));
+                xv[2 * i] = v.x;
+                xv[2 * i + 1] = v.y;
+                continue;
+            }
+#endif
+            xv[2 * i] = load_system(pv + 2 * i);
+            xv[2 * i + 1] = load_system(pv + 2 * i + 1);
+        }
+    } else {
+        const int64_t lo = static_cast<int64_t>(blockIdx.x) * kMidBlock, hi = lo + kMidBlock < n ? lo + kMidBlock : n;
+        for (int64_t i = lo + threadIdx.x; i < hi; i += kThreads) {
+            uint8_t b;
+            __builtin_memcpy(&b, const_cast<const uint8_t*>(reinterpret_cast<const volatile uint8_t*>(peer + i)), 1);
+            x[i] = b;
+        }
+    }
+}
+
+// One launch of a mid-size all-reduce's pipeline: the first `nb_add` blocks add the peer's piece of the sequence the
+// handshake just bumped the counter to (elements [add_lo, add_lo + add_n) of x, at the start of the peer's slot of
+// that parity), the others copy the next piece ([copy_lo, copy_lo + copy_n)) to the start of this rank's slot of the
+// next parity: the two PCIe directions work at once. Either part may be empty.
+template <typename T, bool kWide>
+__global__ void __launch_bounds__(kThreads) host_mid_step_kernel(
+    T* __restrict__ x, int64_t add_lo, int64_t add_n, int64_t copy_lo, int64_t copy_n, char* mid, int rank,
+    int64_t mid_slot_bytes, const unsigned long long* counter, int nb_add, int64_t chunk) {
+    const unsigned long long seq = *counter;
+    const int64_t kPerBlock = chunk / sizeof(T), kVecBlock = chunk / 16;  // `chunk` bytes a block
+    if (static_cast<int>(blockIdx.x) >= nb_add) {  // copy
+        const int cb = static_cast<int>(blockIdx.x) - nb_add;
+        const T* src = x + copy_lo;
+        T* mine = reinterpret_cast<T*>(mid + (rank * 2 + static_cast<int>((seq + 1ull) & 1ull)) * mid_slot_bytes);
+        const bool vec = (reinterpret_cast<uintptr_t>(src) % 16 == 0) && ((copy_n * sizeof(T)) % 16 == 0);
+        if (vec) {
+            const int64_t nv = copy_n * sizeof(T) / 16, lo = static_cast<int64_t>(cb) * kVecBlock;
+            const int64_t hi = lo + kVecBlock < nv ? lo + kVecBlock : nv;
+            const uint4* s4 = reinterpret_cast<const uint4*>(src);
+            uint4* d4 = reinterpret_cast<uint4*>(mine);
+            for (int64_t i = lo + threadIdx.x; i < hi; i += kThreads) d4[i] = s4[i];
+        } else {
+            const int64_t lo = static_cast<int64_t>(cb) * kPerBlock, hi = lo + kPerBlock < copy_n ? lo + kPerBlock : copy_n;
+            for (int64_t i = lo + threadIdx.x; i < hi; i += kThreads) mine[i] = src[i];
+        }
+        __threadfence_system();
+        return;
+    }
+    T* dst = x + add_lo;
+    const T* peer = reinterpret_cast<const T*>(mid + ((1 - rank) * 2 + static_cast<int>(seq & 1ull)) * mid_slot_bytes);
+#if FREETOKEN_USE_ROCM
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");  // system scope: drop any cached peer bytes
+#else
+    __threadfence_system();
+#endif
+    const bool vec = (reinterpret_cast<uintptr_t>(dst) % 16 == 0) && ((add_n * sizeof(T)) % 16 == 0);
+    if (vec) {
+        constexpr int kPer = 16 / sizeof(T);
+        constexpr int kAhead = 4;  // peer chunks a thread loads before it sums any
+        const int64_t nv = add_n * sizeof(T) / 16, lo = static_cast<int64_t>(blockIdx.x) * kVecBlock;
+        const int64_t hi = lo + kVecBlock < nv ? lo + kVecBlock : nv;
+        uint4* xv = reinterpret_cast<uint4*>(dst);
+        const uint64_t* pv = reinterpret_cast<const uint64_t*>(peer);
+        for (int64_t i0 = lo + threadIdx.x; i0 < hi; i0 += kAhead * kThreads) {
+            uint64_t b2[kAhead][2];
+#pragma unroll
+            for (int j = 0; j < kAhead; ++j) {
+                const int64_t i = i0 + j * kThreads;
+                if (i < hi) {
+#if FREETOKEN_USE_ROCM
+                    if constexpr (kWide) {
+                        const native_u64x2 v = __builtin_nontemporal_load(reinterpret_cast<const native_u64x2*>(pv + 2 * i));
+                        b2[j][0] = v.x;
+                        b2[j][1] = v.y;
+                        continue;
+                    }
+#endif
+                    b2[j][0] = load_system(pv + 2 * i);
+                    b2[j][1] = load_system(pv + 2 * i + 1);
+                }
+            }
+#pragma unroll
+            for (int j = 0; j < kAhead; ++j) {
+                const int64_t i = i0 + j * kThreads;
+                if (i < hi) {
+                    uint4 a = xv[i];
+                    const T* at = reinterpret_cast<const T*>(&a);
+                    const T* bt = reinterpret_cast<const T*>(b2[j]);
+                    alignas(16) T out[kPer];  // read back through a uint4 below
+#pragma unroll
+                    for (int k = 0; k < kPer; ++k) out[k] = from_f<T>(to_f(at[k]) + to_f(bt[k]));
+                    xv[i] = *reinterpret_cast<const uint4*>(out);
+                }
+            }
+        }
+    } else {
+        const int64_t lo = static_cast<int64_t>(blockIdx.x) * kPerBlock, hi = lo + kPerBlock < add_n ? lo + kPerBlock : add_n;
+        for (int64_t i = lo + threadIdx.x; i < hi; i += kThreads) {
+            T b;
+            __builtin_memcpy(&b, const_cast<const T*>(reinterpret_cast<const volatile T*>(peer + i)), sizeof(T));
+            dst[i] = from_f<T>(to_f(dst[i]) + to_f(b));
+        }
+    }
+}
+
 // --- FREETOKEN_HOST_AR_HC_COMBINE: the all-reduce of a block's output, then kernel/triton/hc.py's
 // _hc_combine_rmsnorm_kernel on it, in one launch. Block 0 all-reduces (allreduce_block) and raises a device flag;
 // blocks 1 .. rows * 4 wait for it, then each does one (row, stream) program of the Triton kernel with its 128 threads
@@ -432,6 +585,78 @@ struct HostAllReduce {
                    : ahead == 1 ? host_allreduce_kernel<bf16_bits, 4> : host_allreduce_kernel<bf16_bits, 1>,
                    static_cast<bf16_bits*>(x.data_ptr()), n, base, static_cast<int>(rank), slot_bytes, ctr,
                    timeout_ticks, wait_log);
+        }
+    }
+};
+
+struct HostAllReduceMid {
+    // one launch of a mid-size all-reduce's pipeline (host_mid_step_kernel): add the piece [add_lo, add_lo + add_n)
+    // and / or copy the piece [copy_lo, copy_lo + copy_n) of x (elements); the handshake between two launches is
+    // HostAllReduce::run on no element
+    static void run(tvm::ffi::TensorView x, tvm::ffi::TensorView counter, int64_t mid_ptr, int64_t rank,
+                    int64_t mid_slot_bytes, int64_t add_lo, int64_t add_n, int64_t copy_lo, int64_t copy_n,
+                    int64_t wide) {
+        using namespace host;
+        auto device = SymbolicDevice{};
+        auto N = SymbolicSize{"numel"};
+        auto dtype = SymbolicDType{};
+        auto cdtype = SymbolicDType{};
+        TensorMatcher({N}).with_dtype(dtype).with_device<kDLCUDA, kDLROCM>(device).verify(x);
+        TensorMatcher({1}).with_dtype<int64_t>(cdtype).with_device<kDLCUDA, kDLROCM>(device).verify(counter);
+        const int64_t n = N.unwrap();
+        const auto dt = dtype.unwrap();
+        const bool is_f32 = dt.code == kDLFloat && dt.bits == 32;
+        const bool is_bf16 = dt.code == kDLBfloat && dt.bits == 16;
+        RuntimeCheck(dt.lanes == 1 && (is_f32 || is_bf16), "host all-reduce: float32 or bfloat16 only");
+        const int64_t el = dt.bits / 8;
+        RuntimeCheck(add_n >= 0 && copy_n >= 0 && add_n + copy_n > 0, "host all-reduce: an empty step");
+        RuntimeCheck(add_lo >= 0 && add_lo + add_n <= n && copy_lo >= 0 && copy_lo + copy_n <= n,
+                     "host all-reduce: a piece outside the tensor");
+        RuntimeCheck(add_n * el <= mid_slot_bytes && copy_n * el <= mid_slot_bytes,
+                     "host all-reduce: a piece larger than the mid slot");
+        RuntimeCheck(rank == 0 || rank == 1, "host all-reduce: two ranks only");
+        auto* mid = reinterpret_cast<char*>(mid_ptr);
+        auto* ctr = static_cast<unsigned long long*>(counter.data_ptr());
+        // a quarter of the larger piece a block, between 256 KiB and 1 MiB: a few large blocks move a piece fastest
+        int64_t chunk = ((add_n > copy_n ? add_n : copy_n) * el / 4 + 65535) / 65536 * 65536;
+        chunk = chunk < 262144 ? 262144 : chunk > 1048576 ? 1048576 : chunk;
+        const int nb_add = static_cast<int>((add_n * el + chunk - 1) / chunk);
+        const int nb_copy = static_cast<int>((copy_n * el + chunk - 1) / chunk);
+        auto launch = LaunchKernel(nb_add + nb_copy, kThreads, device.unwrap());
+        const int r = static_cast<int>(rank);
+        if (is_f32) {
+            launch(wide ? host_mid_step_kernel<float, true> : host_mid_step_kernel<float, false>,
+                   static_cast<float*>(x.data_ptr()), add_lo, add_n, copy_lo, copy_n, mid, r, mid_slot_bytes, ctr, nb_add, chunk);
+        } else {
+            launch(wide ? host_mid_step_kernel<bf16_bits, true> : host_mid_step_kernel<bf16_bits, false>,
+                   static_cast<bf16_bits*>(x.data_ptr()), add_lo, add_n, copy_lo, copy_n, mid, r, mid_slot_bytes, ctr, nb_add, chunk);
+        }
+    }
+};
+
+struct HostMidBytes {
+    // a broadcast through the mid slots, by bytes: the sender's copy launch (fetch = 0) or the receiver's fetch
+    // (fetch = 1), around the handshake (HostAllReduce::run on no element)
+    static void run(tvm::ffi::TensorView x, tvm::ffi::TensorView counter, int64_t mid_ptr, int64_t rank,
+                    int64_t mid_slot_bytes, int64_t fetch, int64_t wide) {
+        using namespace host;
+        auto device = SymbolicDevice{};
+        auto N = SymbolicSize{"bytes"};
+        auto cdtype = SymbolicDType{};
+        TensorMatcher({N}).with_dtype<uint8_t>().with_device<kDLCUDA, kDLROCM>(device).verify(x);
+        TensorMatcher({1}).with_dtype<int64_t>(cdtype).with_device<kDLCUDA, kDLROCM>(device).verify(counter);
+        const int64_t n = N.unwrap();
+        RuntimeCheck(n > 0 && n <= mid_slot_bytes, "host broadcast: message larger than the mid slot");
+        RuntimeCheck(rank == 0 || rank == 1, "host broadcast: two ranks only");
+        auto* mid = reinterpret_cast<char*>(mid_ptr);
+        auto* ctr = static_cast<unsigned long long*>(counter.data_ptr());
+        auto launch = LaunchKernel(static_cast<int>((n + kMidBlock - 1) / kMidBlock), kThreads, device.unwrap());
+        auto* xp = static_cast<uint8_t*>(x.data_ptr());
+        if (!fetch) {
+            launch(host_mid_copy_kernel<uint8_t>, static_cast<const uint8_t*>(xp), n, mid, static_cast<int>(rank), mid_slot_bytes, ctr);
+        } else {
+            launch(wide ? host_mid_fetch_kernel<true> : host_mid_fetch_kernel<false>, xp, n, mid, static_cast<int>(rank),
+                   mid_slot_bytes, ctr);
         }
     }
 };

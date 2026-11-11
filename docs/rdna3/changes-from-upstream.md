@@ -429,11 +429,34 @@ GPU); this tree's MTP decoding stays the profiles' and the two are exclusive.
 | `python/freetoken/layers/embedding.py` | 125/6 | upstream's `logits()` keeps a decode step's logits local under `FREETOKEN_SPARSE_LOGITS` |
 | `python/freetoken/models/qwen4_exp/mtp_head.py` | 138/0 | this tree's MTP head, formerly `mtp.py` (upstream's draft took the name) |
 | `python/freetoken/models/qwen4_exp/model.py`, `ple.py`, `ple_disk.py` | 130/7, 250/13, 467/96 | the fused hyper-connection loop with upstream's verify stash and feature export; the PLE verify conv beside the spec_decode rows; the disk table's fill reads a verify step's rows on this tree's fill thread |
-| `python/freetoken/moe/cpu_executor.py`, `tests/moe/test_cpu_moe.py`, `tests/moe/test_cpu_moe_fp8_block.py` | 156/10, 67/0, 3/0 | on ROCm the copies around the doorbell and the hybrid layer's in-kernel flags stay, where upstream enables its kernel IO (`9cacd08`; `FREETOKEN_CPU_MOE_KERNEL_IO_ROCM=1`); upstream's graph IO probe kept; its tests that expect the kernel IO on ROCm skip without it |
+| `python/freetoken/moe/cpu_executor.py`, `tests/moe/test_cpu_moe.py`, `tests/moe/test_cpu_moe_fp8_block.py` | 156/10, 67/0, 4/1 | on ROCm the copies around the doorbell and the hybrid layer's in-kernel flags stay, where upstream enables its kernel IO (`9cacd08`; `FREETOKEN_CPU_MOE_KERNEL_IO_ROCM=1`); upstream's graph IO probe kept; its tests that expect the kernel IO on ROCm skip without it, and the graph test of the FP8 block skips on a ROCm build without a GPU instead of failing |
 | `tests/layers/test_gdn_spec_rows.py`, `tests/scheduler/test_scheduler_status.py`, `tests/tokenizer/test_detokenize_multi_token.py` | new, 11/0, new | the verify-row GDN tests on upstream's GDN test harness; the status and detokenizer tests on upstream's `generated` count and token lists |
 | `tests/kvcache/test_qsa_pool.py`, `tests/layers/test_lm_head_dump.py` | 15/1, new | the ring sized for both methods' rows; a decode step's LM head logits local under `FREETOKEN_SPARSE_LOGITS` (fails on the unresolved merge) |
 | `tests/models/qwen4_exp/test_tp_shard.py`, `test_tp_uneven.py`, `tests/scheduler/test_gdn_boundary_carry.py` | new | on upstream's signatures (`_linear_local_dims`' k heads, `_build_track_metadata`'s conv width, the engine's draft budget) |
 | `Dockerfile.rdna3` | (this repository's) | the content check reads the GatedDeltaNet op at its new path |
+
+## The states a verify step keeps for its rollback in one flat buffer, a sampled step's token sync without RCCL (bit-exact)
+
+Line counts here are on top of the lines listed in the sections above.
+
+| File | Lines | Change |
+|---|---:|---|
+| `python/freetoken/layers/linear_attn/gdn.py`, `spec_decode.py`, `engine/graph.py` | 26/17, 6/3, 4/3 | the GatedDeltaNet states a verify step keeps (after each row but the last) in one flat buffer, request b's state after row j of a step of m rows at b (m - 1) + j: the 6 states a step keeps at most with `FREETOKEN_SPEC_BS_MAX=4` and `FREETOKEN_SPEC_BS_DEEP=2` (two requests x 3 rows, four x 1) where requests x (rows - 1) held 12, i.e. 364 MiB less on the 7900 XTX and 283 on the XT; a rollback target may lay its snapshots out by the step's rows (`RollbackTarget.by_rows`); the eager forwards before the captures include the shape that keeps the most states |
+| `tests/layers/test_gdn_spec_rows.py`, `tests/kernels/test_decode_glue.py`, `tests/test_spec_decode.py`, `tests/engine/test_graph_sizing.py` | 46/0, 36/0, 18/0, 4/3 | the states after a rollback from 2-4 rows of 1-4 requests are those of single-row steps (the kernel's copy and the torch one; `FREETOKEN_SPEC_VERIFY_M=4` to run them); the copy laid out by the step's rows; the sizing shapes |
+| `python/freetoken/engine/graph.py`, `engine/engine.py`, `tests/engine/test_graph_sizing.py` | 11/1, 1/0, 8/1 | a server started for fewer requests than its profile's `FREETOKEN_SPEC_BS_MAX` (`--max-running-requests 3 --cuda-graph-max-bs 3` under `xtx-xt-4x262k`) verifies up to its own count instead of refusing to start: the check counts the requests the scheduler runs at once (`verify_requests`) |
+| `python/freetoken/distributed/impl.py`, `engine/engine.py`, `tests/kernels/test_host_allreduce_two_ranks.py` | 19/0, 12/4, 24/1 | the broadcasts of rank 0's sampled tokens, kept counts and drafts after a sampled step (`FREETOKEN_TP_SYNC_TOKENS`) go through the host all-gather's slots when the host all-reduce is on (`DistributedCommunicator.broadcast`), rank 1 keeping rank 0's half, instead of RCCL's broadcast (13 µs of host time a call against 43-51) |
+| `rdna3/profiles/xtx-xt-4x262k.env`, `rdna3/serve.sh`, `tests/rdna3/test_serve_sh.py` | 9/1, 5/3, 20/0 | the freed VRAM goes to the expert cache: `--memory-ratio 0.81` (NVFP4, 3 contexts: 9,246 slots instead of 9,077) and a profile key `EXL3_RATIO`, `serve.sh`'s ratio for an EXL3 checkpoint below 4 bpw on two cards (0.78 here, 0.77 without it: 11,647 slots instead of 11,437 at 3.05 bpw), both with lower VRAM peaks than before |
+
+## Serving without RCCL: mid-size all-reduces and broadcasts through host memory (bit-exact, off by default)
+
+Line counts here are on top of the lines listed in the sections above.
+
+| File | Lines | Change |
+|---|---:|---|
+| `python/freetoken/kernel/csrc/jit/host_allreduce.cuh`, `kernel/host_allreduce.py` | 225/0, 65/2 | `FREETOKEN_HOST_ALLREDUCE_MID_MB`: four mid slots in the shared region; an all-reduce above the small slots goes by pieces (`host_mid_step_kernel`: add the peer's piece while copying the next one; the one-block kernel on no element as the handshake between two launches), a broadcast by bytes (`host_mid_copy_kernel`, `host_mid_fetch_kernel`) |
+| `python/freetoken/distributed/impl.py`, `engine/engine.py` | 60/0, 22/6 | `FREETOKEN_NO_RCCL`: the default process group is the CPU one, the host-staged communicator routes small / copy-engine / mid all-reduces and gather / mid broadcasts, a CPU-staged implementation takes what is left, `agree()` settles a first-use agreement between the ranks on the CPU group |
+| `python/freetoken/models/qwen4_exp/moe.py`, `layers/linear_attn/gdn.py`, `models/qwen4_exp/ple_disk.py` | 3/3, 3/4, 8/1 | the ranks' first-use agreements through `agree()`; a prefill's PLE rows broadcast through the communicator under `FREETOKEN_NO_RCCL` |
+| `tests/kernels/test_host_allreduce_two_ranks.py`, `tests/engine/test_dma_allreduce_route.py` | 37/0, 24/0 | the mid slots' all-reduces and broadcasts on two GPUs (bits, sizes past a slot, every dtype by bytes); which path a size takes |
 
 ## Tooling and documentation
 
@@ -442,7 +465,7 @@ GPU); this tree's MTP decoding stays the profiles' and the two are exclusive.
 | `python/freetoken/engine/ftprof.py` (106/0) | env-gated decode profiling (`FT_STATS_EVERY`, `FT_PROF_*`) |
 | `python/freetoken/server/args.py` (3/1) | `--cuda-graph-max-bs` help |
 | `Dockerfile.rdna3`, `.dockerignore` | the ROCm image |
-| `rdna3/` | profiles (the MTP head on), `serve.sh` (`--no-mtp`; `--hybrid`; a lower `--memory-ratio` for EXL3 on two cards; `--check` and the RAM warning at start; `--oom-score-adj -999`), `download.sh` (the checkpoints), GPU checks, micro-benchmarks and `bench/depth_sweep.py`, maintenance tools |
-| `tests/rdna3/test_serve_sh.py` (new) | `serve.sh` on a fake machine (topology, RAM, docker stub): the RAM arithmetic and the commands it suggests or prints |
+| `rdna3/` | profiles (the MTP head on), `serve.sh` (`--no-mtp`; `--hybrid`; `--low-ram`, an EXL3 3.05 bpw checkpoint on a 64 GB machine; a lower `--memory-ratio` for EXL3 on two cards; `--check` and the RAM warning at start; `--oom-score-adj -999`), `download.sh` (the checkpoints), GPU checks, micro-benchmarks and `bench/depth_sweep.py`, maintenance tools |
+| `tests/rdna3/test_serve_sh.py` (new) | `serve.sh` on a fake machine (topology, RAM, docker stub): the RAM arithmetic and the commands it suggests or prints, `--low-ram` on a 64 GB one, `--check` outside a git checkout |
 | `README.md`, `NOTICE`, `CHANGELOG.md`, `llms.txt`, `llms-full.txt`, `AGENTS.md`, `CONTRIBUTING.md`, `SECURITY.md`, `docs/rdna3/` | this repository's documentation (the banner rendered from `docs/rdna3/assets/social-preview.html`); upstream's README moved to `docs/FREETOKEN_UPSTREAM_README.md` |
 | `.github/` | upstream's release workflows and issue templates replaced by this repository's |
