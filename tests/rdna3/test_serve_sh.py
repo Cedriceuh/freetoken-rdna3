@@ -52,15 +52,17 @@ esac
 """
 
 
-def _gpu_node(nodes: Path, i: int, simd: int, vram: int, bus: int) -> None:
+def _gpu_node(nodes: Path, i: int, simd: int, vram: int, bus: int, gfx: int = 110000) -> None:
     d = nodes / str(i)
     (d / "mem_banks" / "0").mkdir(parents=True)
     (d / "properties").write_text(
-        f"simd_count {simd}\nlocation_id {bus << 8}\ndomain 0\ngfx_target_version 110000\n")
+        f"simd_count {simd}\nlocation_id {bus << 8}\ndomain 0\ngfx_target_version {gfx}\n")
     (d / "mem_banks" / "0" / "properties").write_text(f"size_in_bytes {vram}\n")
 
 
-CARDS = {"xt": (168, 20 * GIB), "xtx": (192, 24 * GIB)}
+# igpu: an integrated GPU, a few compute units of another architecture reporting a share of the RAM as its memory
+CARDS = {"xt": (168, 20 * GIB), "xtx": (192, 24 * GIB), "igpu": (4, 62 * GIB)}
+GFX = {"igpu": 100306}
 
 
 @pytest.fixture
@@ -83,7 +85,7 @@ def machine(tmp_path):
             (nodes / "0").mkdir(parents=True)
             (nodes / "0" / "properties").write_text("simd_count 0\n")  # the CPU node
             for i, c in enumerate(cards, 1):  # buses no real device uses
-                _gpu_node(nodes, i, *CARDS[c], 0xF0 + i)
+                _gpu_node(nodes, i, *CARDS[c], 0xF0 + i, GFX.get(c, 110000))
         kib = int(ram_gib * (1 << 20))
         meminfo.write_text(f"MemTotal: {kib} kB\nMemAvailable: {kib - 10 * (1 << 20)} kB\n")
         env = {k: v for k, v in os.environ.items() if not k.startswith("STUB_")}
@@ -300,3 +302,29 @@ def test_exl3_ratio_follows_the_profile(machine, tmp_path):
     assert last_ratio("xtx-xt", 3.05) == "0.77" and last_ratio("xtx-xt-4x262k", 3.05) == "0.78"
     assert last_ratio("xtx-xt", 4.05) == "0.76" and last_ratio("xtx-xt-4x262k", 4.05) == "0.76"
     assert last_ratio("xtx-xt") == "0.80" and last_ratio("xtx-xt-4x262k") == "0.81"  # NVFP4: the profiles' own
+
+
+def test_an_integrated_gpu_is_not_picked(machine):
+    # it reports more memory than a 24 GB card: sorted on memory alone it became rank 0
+    out = machine(["xtx-xtx", "--model", "MODEL", "--dry-run"], cards=("igpu", "xtx", "xtx"))
+    assert "HIP_VISIBLE_DEVICES=1,2" in out and "left out of the automatic choice" in out, out
+    out = machine(["xtx", "--model", "MODEL", "--dry-run"], cards=("igpu", "xtx"))
+    assert "HIP_VISIBLE_DEVICES=1 " in out, out
+    out = machine(["--check", "--model", "MODEL"], cards=("igpu", "xtx"))
+    assert "suggested: xtx\n" in out or "suggested: xtx " in out, out
+    out = machine(["xtx-xt", "--model", "MODEL", "--dry-run"])  # no such GPU: nothing left out, nothing said
+    assert "left out" not in out, out
+
+
+def test_exl3_on_an_even_split_profile_gets_a_split(machine, tmp_path):
+    # 640 intermediate rows are five 128-wide blocks: the server refuses the even split of identical cards
+    model = tmp_path / "exl3"
+    model.mkdir()
+    (model / "config.json").write_text(
+        '{"model_type": "qwen4_exp", "quantization_config": {"quant_method": "exl3", "bits": 3.05}}')
+    out = machine(["xtx-xtx", "--model", str(model), "--dry-run"], cards=("xtx", "xtx"))
+    assert "-e FREETOKEN_TP_SPLIT=0.6 " in out, out
+    out = machine(["xtx-xt", "--model", str(model), "--dry-run"])
+    assert "FREETOKEN_TP_SPLIT=0.55" in out and "FREETOKEN_TP_SPLIT=0.6" not in out, out
+    out = machine(["xtx-xtx", "--model", "MODEL", "--dry-run"], cards=("xtx", "xtx"))  # NVFP4 halves its 16-row blocks
+    assert "FREETOKEN_TP_SPLIT" not in out, out

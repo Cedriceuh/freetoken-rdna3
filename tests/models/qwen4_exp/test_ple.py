@@ -755,3 +755,26 @@ def test_decode_graph_replay_matches_eager():
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(static_out, replayed)
+
+
+@pytest.mark.parametrize("damage", ["zeros", "garbage", "multiplier"])
+def test_damaged_hash_constants_are_refused(damage):
+    # zeros divided by zero in the hash (a rank lost to SIGFPE); other values read wrong rows without an error
+    from freetoken.models.qwen4_exp.ple import NGramEmbedding
+
+    sizes = [20000003, 20000023, 20000033, 20000047]
+    emb = SimpleNamespace(
+        layer_multipliers=torch.tensor([23703573157769, 20109073645365, 8052911324071]),
+        ngram_heads_vocab_sizes=torch.tensor(sizes),
+        ngram_heads_offsets=torch.tensor([0, 20000003, 40000026, 60000059]),
+    )
+    NGramEmbedding.check_hash_constants(emb)  # the checkpoint's layout passes
+    if damage == "zeros":
+        emb.ngram_heads_vocab_sizes = torch.zeros(4, dtype=torch.int64)
+        emb.ngram_heads_offsets = torch.zeros(4, dtype=torch.int64)
+    elif damage == "garbage":
+        emb.ngram_heads_vocab_sizes = torch.tensor([1093295973251946274, 293254994675362725, 7, 9])
+    else:
+        emb.layer_multipliers = torch.tensor([23703573157769, 0, 8052911324071])
+    with pytest.raises(ValueError, match="hash constants"):
+        NGramEmbedding.check_hash_constants(emb)

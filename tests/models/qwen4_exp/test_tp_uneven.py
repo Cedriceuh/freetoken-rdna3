@@ -287,3 +287,54 @@ def test_engine_uneven_plan_takes_the_min_over_ranks(split55, monkeypatch):
     # the bigger card's 4 GiB surplus goes to the cache whole: ratio x baseline gains exactly the surplus
     assert seen["baseline_free"] == 20 * gib + int(4 * gib / 0.8)
     assert seen["weights_bytes"] == 6 * gib
+
+
+def test_dense_axes_take_their_own_shares(monkeypatch):
+    # EXL3 on identical cards: the routed experts 3 + 2 blocks, the other axes the other way round
+    from freetoken.distributed import split
+
+    monkeypatch.setenv("FREETOKEN_TP_SPLIT", "0.6")
+    monkeypatch.setattr(split, "_intermediate_unit", 128)
+    monkeypatch.setattr(split, "LMHEAD_SPLIT", True)
+    both = range(2)
+    assert [split.shared_intermediate_partition(640, rank=r, world_size=2) for r in both] == [(0, 384), (384, 256)]
+    monkeypatch.setenv("FREETOKEN_TP_SPLIT_DENSE", "0.4")
+    assert [split.intermediate_partition(640, rank=r, world_size=2) for r in both] == [(0, 384), (384, 256)]
+    assert [split.shared_intermediate_partition(640, rank=r, world_size=2) for r in both] == [(0, 256), (256, 384)]
+    assert [split.gdn_head_partition(16, 48, rank=r, world_size=2) for r in both] == [(0, 6, 0, 18), (6, 10, 18, 30)]
+    assert split.vocab_shards(248320, 2) == [(0, 99328), (99328, 148992)]
+    monkeypatch.delenv("FREETOKEN_TP_SPLIT")  # alone it does nothing: the even split
+    assert split.gdn_head_partition(16, 48, rank=1, world_size=2) == (8, 8, 24, 24)
+    assert split.shared_intermediate_partition(640, rank=1, world_size=2) == (320, 320)
+
+
+def test_attention_on_one_rank(monkeypatch):
+    # FREETOKEN_ATTN_RANK: two K/V heads cannot follow an uneven split, so one rank holds the attention whole
+    from freetoken.distributed import split
+    from freetoken.kvcache.base import _local_kv_heads
+    from freetoken.models.qwen4_exp.weight import _shard_for_rank
+
+    assert [split.attn_local_heads(24, rank=r, world_size=2) for r in range(2)] == [12, 12]
+    assert split.attn_local_heads(2, rank=1, world_size=4, allow_replicate=True) == 1
+    monkeypatch.setenv("FREETOKEN_ATTN_RANK", "1")
+    monkeypatch.delenv("FREETOKEN_TP_SPLIT", raising=False)
+    with pytest.raises(ValueError, match="needs FREETOKEN_TP_SPLIT"):
+        split.attn_owner(2)
+    monkeypatch.setenv("FREETOKEN_TP_SPLIT", "0.6")
+    assert split.attn_owner(1) is None and split.attn_owner(2) == 1
+    assert [split.attn_local_heads(24, rank=r, world_size=2) for r in range(2)] == [0, 24]
+    assert [split.attn_local_heads(2, rank=r, world_size=2, allow_replicate=True) for r in range(2)] == [0, 2]
+    spec = SimpleNamespace(num_kv_heads=2)
+    kv = [_local_kv_heads(spec, SimpleNamespace(tp_info=SimpleNamespace(rank=r, size=2))) for r in range(2)]
+    assert kv == [0, 2]
+    q = torch.arange(48 * 8, dtype=torch.float32).view(48, 8)
+    config = SimpleNamespace(num_kv_heads=2)
+    for name in ("model.layers.3.self_attn.q_proj.weight", "model.layers.3.self_attn.indexer.index_qk_proj.weight",
+                 "mtp.layers.0.self_attn.o_proj.weight"):
+        with as_rank(0, 2):
+            assert _shard_for_rank(name, q, config=config) is None  # this rank builds no attention
+        with as_rank(1, 2):
+            assert _shard_for_rank(name, q, config=config) is q     # the owner holds it whole
+    monkeypatch.setenv("FREETOKEN_ATTN_RANK", "2")
+    with pytest.raises(ValueError, match="names no rank"):
+        split.attn_owner(2)

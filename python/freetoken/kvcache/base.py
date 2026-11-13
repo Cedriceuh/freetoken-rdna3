@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import ClassVar, NamedTuple
 
 import torch
-from freetoken.utils import div_even, init_logger, mem_GB
+from freetoken.utils import init_logger, mem_GB
 
 logger = init_logger(__name__)
 
@@ -14,6 +14,17 @@ class CacheRebuildRejected(Exception):
     """A runtime cache rebuild was rejected BEFORE any destructive free (e.g. the
     requested geometry does not fit). The old caches are intact and serving continues --
     this is recoverable, unlike a failure after the free."""
+
+
+def _local_kv_heads(spec, config) -> int:
+    """This rank's K/V heads: the even share, or all / none under FREETOKEN_ATTN_RANK."""
+    from freetoken.distributed.split import attn_owner
+    from freetoken.utils import div_even
+
+    owner = attn_owner(config.tp_info.size)
+    if owner is None:
+        return div_even(spec.num_kv_heads, config.tp_info.size, allow_replicate=True)
+    return spec.num_kv_heads if config.tp_info.rank == owner else 0
 
 
 def spec_kv_bytes_per_token(spec, config) -> int:
@@ -28,7 +39,7 @@ def spec_kv_bytes_per_token(spec, config) -> int:
     per_token = (
         (1 if spec.mla else 2)  # MLA latent groups store one slab (V aliases K)
         * spec.head_dim
-        * div_even(spec.num_kv_heads, config.tp_info.size, allow_replicate=True)
+        * _local_kv_heads(spec, config)
         * config.dtype.itemsize
         * spec.num_layers
     )

@@ -33,6 +33,15 @@ What each change measured, and how it was found: [docs/rdna3/journey.md](docs/rd
   one chunk are unchanged. EXL3 3.05 bpw, a 130k-token cold read beside a decoding request: 8 steps a chunk cost the
   read 2.7 % and cut the decoding request's longest stop from 38 s to 4.9 s.
 
+- `FREETOKEN_TP_SPLIT_DENSE` (off by default): shares of their own for the GatedDeltaNet heads, the shared expert and
+  the LM head. An EXL3 checkpoint on two identical cards splits its experts 3 + 2 blocks and leaves VRAM unused on
+  rank 1: `0.4` moves the other layers there, +5.5 % expert slots planned by rank 0 (measured on the XTX + XT, where
+  decode is ~6 % slower since the smaller card gets the work; untested on identical pairs).
+- `FREETOKEN_ATTN_RANK` (off by default): one rank holds the attention whole (weights, heads, K/V), the others none.
+  For an EXL3 checkpoint on two identical cards it takes the K/V off the rank that bounds the expert cache: +13 %
+  expert slots planned for a pair of XTX (each role measured on the XTX of the XTX + XT; speed untested on identical
+  pairs, slower on the XTX + XT).
+
 ### Faster, the same bits
 
 - The MTP head's drafts score the Latin-script tokens only (`FREETOKEN_DRAFT_VOCAB=latin`, in the two-card
@@ -133,6 +142,14 @@ What each change measured, and how it was found: [docs/rdna3/journey.md](docs/rd
 
 ### Fixed
 
+- `FREETOKEN_INT8_DENSE=1`: after the VRAM compaction every tensor is read back against its host copy, copied again
+  if it differs, and the load stops if it still does; the PLE n-gram hash constants are checked before the row store
+  is built. On two RX 7900 XTX the constants were reported as uninitialized memory after the compaction: a rank died
+  on a division by zero at the first decode step, or read wrong n-gram rows without an error (not reproduced on the
+  XTX + XT).
+- `rdna3/serve.sh`: the automatic GPU choice leaves an integrated GPU out (it reports more memory than a 24 GB card
+  and became rank 0); an EXL3 checkpoint on an even-split profile (`xtx-xtx`, `xt-xt`) gets `FREETOKEN_TP_SPLIT=0.6`
+  instead of a server that refuses to start.
 - A conversation that waited while another took many turns was read again from its first token: the prefix cache
   gave up its GatedDeltaNet snapshots least recently used first, and the turn ends the busy conversation left behind
   were always newer. It now gives up first the snapshots that cost little to do without

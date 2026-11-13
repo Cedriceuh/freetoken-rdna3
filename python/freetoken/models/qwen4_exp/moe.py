@@ -7,7 +7,7 @@ import os
 import torch
 from freetoken.core import get_global_ctx
 from freetoken.distributed import DistributedCommunicator, get_tp_info
-from freetoken.distributed.split import intermediate_partition, is_uneven
+from freetoken.distributed.split import is_uneven, shared_intermediate_partition
 from freetoken.kernel.triton.moe_shared_gate import shared_gate_mul_add, shared_gate_sigmoid, shared_gate_sum_mul_add
 from freetoken.layers.quantization.moe.exl3 import TritonExl3MoEKernel
 from freetoken.layers.quantization.moe.nvfp4 import TritonNvfp4MoEKernel
@@ -105,8 +105,8 @@ class Qwen4ExpMoE(Qwen3_5MoE):
         super().__init__(config, layer_id, prefix=prefix)
         if is_uneven():
             # FREETOKEN_TP_SPLIT: the shared expert's intermediate follows the routed experts' uneven split
-            # (the loader cuts its weights with the same intermediate_partition)
-            _, local = intermediate_partition(config.shared_expert_intermediate_size)
+            # (the loader cuts its weights with the same shared_intermediate_partition)
+            _, local = shared_intermediate_partition(config.shared_expert_intermediate_size)
             self.shared_expert = _SharedExpert(
                 config, config.hidden_size, config.shared_expert_intermediate_size,
                 prefix=f"{prefix}.shared_expert", local_intermediate=local,

@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Iterator
 import safetensors
 import torch
 from freetoken.distributed import get_tp_info
-from freetoken.distributed.split import gdn_head_partition, intermediate_partition
+from freetoken.distributed.split import attn_owner, gdn_head_partition, shared_intermediate_partition
 from freetoken.models.qwen3_vl.weight import rename_vl_prefix
 
 from freetoken.models.config import VISION_KEY_PREFIXES
@@ -412,8 +412,12 @@ def _shard_gdn(
     )
 
 
-def _shard_for_rank(name: str, tensor: torch.Tensor, *, config: ModelConfig) -> torch.Tensor:
-    """This rank's slice of ``name``, or the tensor whole when its module is replicated.
+_SELF_ATTN_INFIX = ".self_attn."
+
+
+def _shard_for_rank(name: str, tensor: torch.Tensor, *, config: ModelConfig) -> torch.Tensor | None:
+    """This rank's slice of ``name``, the tensor whole when its module is replicated, None when this rank does not
+    build the module.
 
     Attention and the dense projections go through :func:`freetoken.models.loader.shard_tensor`
     (the rule every other model loads with, including its ``num_kv_heads < world_size`` branch);
@@ -430,12 +434,15 @@ def _shard_for_rank(name: str, tensor: torch.Tensor, *, config: ModelConfig) -> 
     leaf = name.split(_GDN_INFIX, 1)[1] if _GDN_INFIX in name else None
     if leaf is not None:
         return _shard_gdn(leaf, tensor, config.linear_attention_group(), rank=tp.rank, world_size=tp.size)
+    if _SELF_ATTN_INFIX in name and attn_owner(tp.size) is not None:
+        # FREETOKEN_ATTN_RANK: the attention whole on one rank (indexer and norms included), nothing on the others
+        return tensor if tp.rank == attn_owner(tp.size) else None
     if name.endswith(_SHARED_EXPERT_ROWS + _SHARED_EXPERT_COLUMNS):
-        # intermediate_partition: the rule Qwen4ExpMoE sizes its shared expert with (even, or uneven)
+        # shared_intermediate_partition: the rule Qwen4ExpMoE sizes its shared expert with (even, or uneven)
         dim = 0 if name.endswith(_SHARED_EXPERT_ROWS) else 1
         full = tensor.shape[dim]
         assert full == config.shared_expert_intermediate_size, (name, tuple(tensor.shape))
-        lo, size = intermediate_partition(full, rank=tp.rank, world_size=tp.size)
+        lo, size = shared_intermediate_partition(full, rank=tp.rank, world_size=tp.size)
         return tensor.narrow(dim, lo, size).clone()
     if not name.endswith(_TP_SHARDED):
         return tensor
@@ -516,6 +523,8 @@ def iter_weights(
         if exl3 is not None:
             tensor = _exl3_unpad(name, tensor, config)
         tensor = _shard_for_rank(name, tensor, config=config)
+        if tensor is None:
+            return
         emitted = None if name.startswith(VISION_KEY_PREFIXES) else reader.add(name, tensor)
         if emitted is None:
             yield name, tensor

@@ -4,7 +4,6 @@ from typing import Sequence
 
 import torch
 from freetoken.distributed import get_tp_info
-from freetoken.utils import div_even
 
 from .base import BaseKVCachePool
 
@@ -37,7 +36,9 @@ class MHAKVCache(BaseKVCachePool):
         layer_ids: Sequence[int] | None = None,
     ) -> None:
         tp_info = get_tp_info()
-        local_kv_heads = div_even(num_kv_heads, tp_info.size, allow_replicate=True)
+        from freetoken.distributed.split import attn_local_heads
+
+        local_kv_heads = attn_local_heads(num_kv_heads, rank=tp_info.rank, world_size=tp_info.size, allow_replicate=True)
         self._num_layers = num_layers
         if layer_ids is None:
             num_storage_layers = num_layers

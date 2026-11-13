@@ -299,6 +299,8 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 emb.attach_table(ZeroTable(offsets[-1] + sizes[-1], args.ngram_head_dim))
             return 0
 
+        for ple in ple_layers:
+            ple.ple_embedding.check_hash_constants()
         if engine_config.ple_backend == "disk":
             from .ple_disk import DiskRowTable, resolve_row_source
 

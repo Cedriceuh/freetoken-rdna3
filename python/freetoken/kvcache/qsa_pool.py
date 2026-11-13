@@ -291,9 +291,8 @@ class QSAKVCache(MHAKVCache):
 
     @classmethod
     def kv_cost(cls, config) -> tuple[int, int, int, int]:
-        from .base import spec_kv_bytes_per_token
+        from .base import _local_kv_heads, spec_kv_bytes_per_token
         from freetoken.attention import AttnType
-        from freetoken.utils import div_even
 
         if kv_host_enabled() and kv_int8_enabled():
             raise ValueError(f"{KV_HOST_ENV}=1 and {KV_INT8_ENV}=1 do not combine: the host K/V is kept in the compute dtype")
@@ -306,11 +305,11 @@ class QSAKVCache(MHAKVCache):
             per_token += spec_kv_bytes_per_token(spec, config)
             if spec.attn_type is AttnType.QSA and kv_host_enabled():
                 # the K/V slab is host memory: only the index tiers count against the VRAM budget
-                heads = div_even(spec.num_kv_heads, config.tp_info.size, allow_replicate=True)
+                heads = _local_kv_heads(spec, config)
                 per_token -= 2 * heads * (spec.num_layers - 1) * spec.head_dim * config.dtype.itemsize  # one layer staged
             elif spec.attn_type is AttnType.QSA and kv_int8_enabled():
                 # int8 codes + one fp32 scale per (token, kv head) instead of compute-dtype K/V
-                heads = div_even(spec.num_kv_heads, config.tp_info.size, allow_replicate=True)
+                heads = _local_kv_heads(spec, config)
                 slabs = 2 * heads * spec.num_layers
                 per_token += slabs * (spec.head_dim * 1 + _KV_SCALE_BYTES) - slabs * spec.head_dim * config.dtype.itemsize
             if spec.attn_type is AttnType.QSA:

@@ -65,6 +65,13 @@ list_gpus() {  # "hip_index vram_bytes pci_address gfx_arch simd_count" per GPU,
   done
 }
 
+pick_gpus() {  # the list_gpus lines the automatic choice may take: the cards of the gfx arch of the one with the most
+  # compute units. An integrated GPU reports a share of the system's RAM as its memory (more than a 24 GB card), so
+  # sorting on memory alone made it rank 0
+  list_gpus | awk '{ l[NR] = $0; a[NR] = $4; if ($5 + 0 > m) { m = $5 + 0; best = $4 } }
+                   END { for (i = 1; i <= NR; i++) if (a[i] == best) print l[i] }'
+}
+
 card_name() {  # $1 = one list_gpus line: its gfx arch, after the RX 7900 model when VRAM and compute units match one
   LC_ALL=C awk '{ g = int($2 / 1073741824 + 0.5); n = ""
     if ($4 == "gfx1100" && $5 == 192 && g == 24) n = "RX 7900 XTX "
@@ -82,7 +89,7 @@ profile_fits() {  # $1 = profile file: true if this machine's GPUs meet its GPUS
   local g r m
   local -a vram cards
   g=$(pval "$1" GPUS 1); read -r -a vram <<< "$(pval "$1" VRAM_GIB 0)"
-  mapfile -t cards < <(list_gpus | sort -k2,2nr)
+  mapfile -t cards < <(pick_gpus | sort -k2,2nr)
   [ "${#cards[@]}" -ge "$g" ] || return 1
   for ((r = 0; r < g; r++)); do
     m="${vram[$r]:-${vram[0]}}"
@@ -550,6 +557,12 @@ if [[ "$cfg" == *'"quant_method":"exl3"'* ]] && [ "$p_gpus" = 2 ]; then
   awk -v b="${bits:-0}" 'BEGIN { exit !(b >= 4) }' && ratio=0.76
   ft_args+=(--memory-ratio "$ratio")
   echo "note: EXL3 checkpoint (${bits:-?} bpw) on two cards: --memory-ratio $ratio instead of the profile's ('-- --memory-ratio X' overrides)" >&2
+  # the experts' intermediate is five 128-wide Hadamard blocks: two ranks hold 3 and 2 of them, never 2.5 each, so a
+  # profile with an even split (identical cards) gets the 0.6 the server would otherwise refuse to start without
+  if [[ " ${envs[*]} " != *" FREETOKEN_TP_SPLIT="* ]]; then
+    envs+=(-e FREETOKEN_TP_SPLIT=0.6)
+    echo "note: EXL3 experts split in whole 128-wide blocks: FREETOKEN_TP_SPLIT=0.6 added to this even-split profile (rank 0 holds 384 of 640, rank 1 256)" >&2
+  fi
 fi
 
 # --hybrid (docs/rdna3/cpu-experts.md): the split measured best on the Threadripper 3970X + PCIe 4.0: for NVFP4 a quarter
@@ -628,7 +641,9 @@ if [ -z "$gpus" ]; then
   # one GPU: the smallest card with the profile's VRAM (keeps a bigger card free); several: the largest ones, largest
   # first (the uneven split gives rank 0 the bigger share)
   read -r -a need <<< "${p_vram:-0}"
-  mapfile -t found < <(list_gpus | sort -k2,2nr)
+  mapfile -t found < <(pick_gpus | sort -k2,2nr)
+  skipped=$(( $(list_gpus | wc -l) - ${#found[@]} ))
+  [ "$skipped" = 0 ] || echo "note: $skipped GPU(s) of another architecture than the largest card's left out of the automatic choice (an integrated GPU; --gpus picks any card, rdna3/serve.sh --list-gpus)" >&2
   if [ "$p_gpus" = 1 ]; then
     mapfile -t found < <(printf '%s\n' "${found[@]}" | awk -v m="${need[0]}" '$2 >= m * 1073741824 * 0.97' | sort -k2,2n)
   fi

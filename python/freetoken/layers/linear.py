@@ -140,13 +140,15 @@ class LinearOProj(_LinearTPImpl):
         output_size: int,
         has_bias: bool,
         *,
+        local_input_size: int | None = None,
         quant_config: QuantConfig | None = None,
         prefix: str = "",
     ):
         tp_info = get_tp_info()
         full_isize = input_size
         full_osize = output_size
-        local_isize = div_even(input_size, tp_info.size)
+        # the caller's own share of the input (a rank holding every head), else the even one
+        local_isize = div_even(input_size, tp_info.size) if local_input_size is None else local_input_size
         local_osize = output_size
         self._comm = DistributedCommunicator()
         self._tp_size = tp_info.size

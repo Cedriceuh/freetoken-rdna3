@@ -503,6 +503,23 @@ class NGramEmbedding(BaseOP):
     def attach_table(self, table: PLETableBackend) -> None:
         self._table = table
 
+    def check_hash_constants(self) -> None:
+        """Refuse hash constants that cannot be a checkpoint's: a zero vocab size divides by zero in the hash, any
+        other damage reads wrong table rows without an error. Each head's rows follow the previous head's."""
+        mult = self.layer_multipliers.tolist()
+        sizes = self.ngram_heads_vocab_sizes.tolist()
+        offsets = self.ngram_heads_offsets.tolist()
+        expected, total = [], 0
+        for size in sizes:
+            expected.append(total)
+            total += size
+        if min(sizes) <= 0 or offsets != expected or 0 in mult:
+            raise ValueError(
+                "the PLE n-gram hash constants are not the checkpoint's (every head's vocab size must be positive, "
+                "its offset the sum of the sizes before it, every multiplier non-zero): "
+                f"layer_multipliers {mult}, ngram_heads_vocab_sizes {sizes[:3]}..., ngram_heads_offsets "
+                f"{offsets[:3]}...; the model state was damaged after the weights were read")
+
     @property
     def table(self) -> PLETableBackend:
         assert self._table is not None, "PLE table backend was never attached"

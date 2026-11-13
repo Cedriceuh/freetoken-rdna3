@@ -183,10 +183,35 @@ def compact_device_tensors(root: Any) -> None:
         if k in device_keys and id(v) not in dev_by_id:  # one device allocation per shared tensor, no throwaway copy
             dev_by_id[id(v)] = v.to(device)
         placed[k] = dev_by_id[id(v)] if k in device_keys else v
-    root.load_state_dict(placed)
+    root.load_state_dict(dict(placed))  # load_state_dict empties the dict it is given
     torch.cuda.empty_cache()
+    _verify_copies(placed, host, device_keys)
     logger.info_rank0(f"INT8 weight-only: compacted {len(device_keys)} device tensors, free memory "
                       f"{before / 2**30:.2f} -> {torch.cuda.mem_get_info()[0] / 2**30:.2f} GiB")
+
+
+def _verify_copies(placed: dict[str, torch.Tensor], host: dict[str, torch.Tensor], keys: Any) -> None:
+    """Every re-allocated tensor must read back as its host copy; one that does not is copied again, then refused.
+
+    A rank was reported with its smallest tensors (the PLE hash constants) left as uninitialized device memory
+    after this round trip: zeros crashed the n-gram hash, anything else read wrong table rows without an error.
+    """
+    def differing() -> list[str]:
+        return [k for k in host if k in keys and not torch.equal(placed[k].to("cpu"), host[k])]
+
+    bad = differing()
+    if not bad:
+        return
+    logger.warning(f"INT8 weight-only: {len(bad)} tensors differ from their host copy after the compaction "
+                   f"({', '.join(bad[:4])}{', ...' if len(bad) > 4 else ''}); copying them again")
+    for k in bad:
+        placed[k].copy_(host[k])
+    bad = differing()
+    if bad:
+        raise RuntimeError(
+            f"INT8 weight-only: {len(bad)} device tensors still differ from their host copy after the compaction "
+            f"({', '.join(bad[:4])}{', ...' if len(bad) > 4 else ''}): the device copies are not reliable on this "
+            "machine; start with FREETOKEN_INT8_COMPACT=0 and report it")
 
 
 __all__ = ["compact_device_tensors", "convert_model", "enabled", "quantize_rows", "Int8WeightOnlyLinearMethod"]

@@ -168,3 +168,22 @@ def test_act_mul_kernel_matches_gemv_then_silu_and_mul(d):
             got = gemv_int8_act_mul(x[:m], w, s)
             if got is not None:
                 assert torch.equal(got, silu_and_mul(gemv_int8(x[:m], w, s))), (seed, m)
+
+
+def test_a_copy_that_differs_after_compaction_is_made_again():
+    from freetoken.layers.quantization import int8_weight_only as iwo
+
+    host = {"w": torch.arange(6, dtype=torch.int64), "c": torch.tensor([20000003, 20000023])}
+    placed = {"w": host["w"].clone(), "c": torch.zeros(2, dtype=torch.int64)}  # the constants came back as zeros
+    iwo._verify_copies(placed, host, {"w", "c"})
+    assert torch.equal(placed["c"], host["c"]) and torch.equal(placed["w"], host["w"])
+
+
+def test_a_copy_that_keeps_differing_stops_the_load(monkeypatch):
+    from freetoken.layers.quantization import int8_weight_only as iwo
+
+    host = {"c": torch.tensor([20000003, 20000023])}
+    placed = {"c": torch.zeros(2, dtype=torch.int64)}
+    monkeypatch.setattr(torch.Tensor, "copy_", lambda self, src: self)  # the copy does not land
+    with pytest.raises(RuntimeError, match="FREETOKEN_INT8_COMPACT=0"):
+        iwo._verify_copies(placed, host, {"c"})

@@ -20,12 +20,13 @@ from typing import TYPE_CHECKING, Protocol
 
 import torch
 from freetoken.core import get_global_ctx
-from freetoken.distributed import get_tp_info
+from freetoken.distributed import DistributedCommunicator, get_tp_info
+from freetoken.distributed.split import attn_local_heads, attn_owner
 from freetoken.layers import BaseOP, GemmaPlusOneRMSNorm, LinearColParallelMerged, LinearOProj, LinearReplicated
 from freetoken.layers.rotary import get_rope
 from freetoken.kernel.triton.attn_gate import sigmoid_gate_mul
 from freetoken.kernel.triton.qk_norm_rope import qk_norm_rope
-from freetoken.utils import div_even, nvtx_annotate
+from freetoken.utils import nvtx_annotate
 
 if TYPE_CHECKING:
     from freetoken.core import Batch
@@ -146,10 +147,18 @@ class Qwen4ExpAttention(BaseOP):
         tp_size = get_tp_info().size
         # Head counts and every width derived from them are RANK-LOCAL: `qkv_proj` shards its declared
         # outputs, so the split applied to the GEMM result must be the local one. The KV pool divides
-        # the same way (`div_even(..., allow_replicate=True)`).
-        self.num_q = div_even(config.num_qo_heads, tp_size)
-        self.num_kv = div_even(config.num_kv_heads, tp_size, allow_replicate=True)
+        # the same way (`attn_local_heads`: the even share, or all / none under FREETOKEN_ATTN_RANK).
+        self.num_q = attn_local_heads(config.num_qo_heads)
+        self.num_kv = attn_local_heads(config.num_kv_heads, allow_replicate=True)
         self.head_dim = config.head_dim
+        self._absent = self.num_q == 0
+        if self._absent:
+            # FREETOKEN_ATTN_RANK names another rank: no weights, no K/V here; this rank adds zeros to the all-reduce
+            # of the output so that every rank still runs the same collectives
+            self._comm = DistributedCommunicator()
+            self._hidden = config.hidden_size
+            return
+        owned = attn_owner() is not None
         self.qo_attn_dim = self.num_q * self.head_dim
         self.kv_attn_dim = self.num_kv * self.head_dim
         self._qkv_split = [self.qo_attn_dim * 2, self.kv_attn_dim, self.kv_attn_dim]
@@ -157,6 +166,7 @@ class Qwen4ExpAttention(BaseOP):
         full_kv_attn_dim = config.num_kv_heads * self.head_dim
         self.qkv_proj = LinearColParallelMerged(
             config.hidden_size, [full_qo_attn_dim * 2, full_kv_attn_dim, full_kv_attn_dim], has_bias=False,
+            local_output_sizes=self._qkv_split if owned else None,
             quant_config=config.quant, prefix=f"{prefix}.qkv_proj",
         )
         assert sum(self._qkv_split) == self.qkv_proj.local_output_size, (
@@ -167,6 +177,7 @@ class Qwen4ExpAttention(BaseOP):
         # row-parallel, all-reduced at TP>1 (a plain replicated linear at TP=1).
         self.o_proj = LinearOProj(
             full_qo_attn_dim, config.hidden_size, has_bias=False,
+            local_input_size=self.qo_attn_dim if owned else None,
             quant_config=config.quant, prefix=f"{prefix}.o_proj",
         )
         self.q_norm = GemmaPlusOneRMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -203,6 +214,8 @@ class Qwen4ExpAttention(BaseOP):
     def forward(self, x: torch.Tensor, batch: Batch, kv_only: bool = False) -> torch.Tensor | None:
         """``kv_only``: write this layer's K/V and index keys, attend to nothing, return None (the MTP head's pass
         while several requests decode: later drafts read its KV, nothing reads its output)."""
+        if self._absent:
+            return None if kv_only else self._comm.all_reduce(x.new_zeros((x.shape[0], self._hidden)))
         qg, k, v = self.qkv_proj.forward(x).split(self._qkv_split, dim=-1)
         qg = qg.view(-1, self.num_q, self.head_dim * 2)
         backend = get_global_ctx().attn_backend
