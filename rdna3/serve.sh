@@ -558,10 +558,13 @@ if [[ "$cfg" == *'"quant_method":"exl3"'* ]] && [ "$p_gpus" = 2 ]; then
   ft_args+=(--memory-ratio "$ratio")
   echo "note: EXL3 checkpoint (${bits:-?} bpw) on two cards: --memory-ratio $ratio instead of the profile's ('-- --memory-ratio X' overrides)" >&2
   # the experts' intermediate is five 128-wide Hadamard blocks: two ranks hold 3 and 2 of them, never 2.5 each, so a
-  # profile with an even split (identical cards) gets the 0.6 the server would otherwise refuse to start without
+  # profile with an even split (identical cards) gets the 0.6 the server would otherwise refuse to start without, and
+  # the other layers the other way round (0.4): rank 1's free VRAM takes them, rank 0's goes to the expert cache
+  # (reported from two RX 7900 XTX: 10,332 expert slots instead of 9,190, decode +7 %)
   if [[ " ${envs[*]} " != *" FREETOKEN_TP_SPLIT="* ]]; then
     envs+=(-e FREETOKEN_TP_SPLIT=0.6)
-    echo "note: EXL3 experts split in whole 128-wide blocks: FREETOKEN_TP_SPLIT=0.6 added to this even-split profile (rank 0 holds 384 of 640, rank 1 256)" >&2
+    [[ " ${envs[*]} " == *" FREETOKEN_TP_SPLIT_DENSE="* ]] || envs+=(-e FREETOKEN_TP_SPLIT_DENSE=0.4)
+    echo "note: EXL3 experts split in whole 128-wide blocks: FREETOKEN_TP_SPLIT=0.6 added to this even-split profile (rank 0 holds 384 of 640, rank 1 256), the other layers at 0.4 (FREETOKEN_TP_SPLIT_DENSE)" >&2
   fi
 fi
 

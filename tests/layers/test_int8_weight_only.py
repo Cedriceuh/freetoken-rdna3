@@ -175,7 +175,7 @@ def test_a_copy_that_differs_after_compaction_is_made_again():
 
     host = {"w": torch.arange(6, dtype=torch.int64), "c": torch.tensor([20000003, 20000023])}
     placed = {"w": host["w"].clone(), "c": torch.zeros(2, dtype=torch.int64)}  # the constants came back as zeros
-    iwo._verify_copies(placed, host, {"w", "c"})
+    iwo._verify_copies(placed, host, {"w", "c"}, settle=0)
     assert torch.equal(placed["c"], host["c"]) and torch.equal(placed["w"], host["w"])
 
 
@@ -186,4 +186,22 @@ def test_a_copy_that_keeps_differing_stops_the_load(monkeypatch):
     placed = {"c": torch.zeros(2, dtype=torch.int64)}
     monkeypatch.setattr(torch.Tensor, "copy_", lambda self, src: self)  # the copy does not land
     with pytest.raises(RuntimeError, match="FREETOKEN_INT8_COMPACT=0"):
-        iwo._verify_copies(placed, host, {"c"})
+        iwo._verify_copies(placed, host, {"c"}, settle=0)
+
+
+def test_a_late_write_after_the_second_copy_is_caught(monkeypatch):
+    # reported: values right just after the copies were wrong seconds later; one clean read-back is not enough
+    from freetoken.layers.quantization import int8_weight_only as iwo
+
+    host = {"c": torch.tensor([20000003, 20000023])}
+    placed = {"c": torch.zeros(2, dtype=torch.int64)}
+    waits = []
+
+    def settle(_seconds):
+        waits.append(1)
+        if len(waits) == 2:  # after the first clean read-back, something writes into the tensor
+            placed["c"].zero_()
+
+    monkeypatch.setattr(iwo.time, "sleep", settle)
+    iwo._verify_copies(placed, host, {"c"})
+    assert torch.equal(placed["c"], host["c"]) and len(waits) == 4  # copied twice, then right twice in a row

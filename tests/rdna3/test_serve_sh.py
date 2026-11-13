@@ -323,8 +323,8 @@ def test_exl3_on_an_even_split_profile_gets_a_split(machine, tmp_path):
     (model / "config.json").write_text(
         '{"model_type": "qwen4_exp", "quantization_config": {"quant_method": "exl3", "bits": 3.05}}')
     out = machine(["xtx-xtx", "--model", str(model), "--dry-run"], cards=("xtx", "xtx"))
-    assert "-e FREETOKEN_TP_SPLIT=0.6 " in out, out
+    assert "-e FREETOKEN_TP_SPLIT=0.6 -e FREETOKEN_TP_SPLIT_DENSE=0.4 " in out, out
     out = machine(["xtx-xt", "--model", str(model), "--dry-run"])
-    assert "FREETOKEN_TP_SPLIT=0.55" in out and "FREETOKEN_TP_SPLIT=0.6" not in out, out
+    assert "FREETOKEN_TP_SPLIT=0.55" in out and "FREETOKEN_TP_SPLIT=0.6" not in out and "TP_SPLIT_DENSE" not in out, out
     out = machine(["xtx-xtx", "--model", "MODEL", "--dry-run"], cards=("xtx", "xtx"))  # NVFP4 halves its 16-row blocks
     assert "FREETOKEN_TP_SPLIT" not in out, out

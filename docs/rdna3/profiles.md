@@ -147,13 +147,11 @@ a note when you start one (`TESTED=0` in the file).
   every expert: ~9k cached experts instead of 7.5k (estimate), so decode at least as fast as `xtx-xt`. The tuned NVFP4
   decode tiles are keyed to the 0.55 split, so the even split's decode shapes use default tiles. An EXL3 checkpoint
   cannot take the even split (its expert slices must be whole 128-wide blocks, five in all): `serve.sh` adds
-  `FREETOKEN_TP_SPLIT=0.6` for it, here and in `xt-xt` (3 blocks on rank 0, 2 on rank 1; the expert cache is then
-  planned on rank 0's memory and rank 1 keeps VRAM it does not use). That split starts and answers with EXL3 3.05 bpw
-  on the XTX + XT; untested on identical pairs. Two settings to try in a copy of the file kept for
-  EXL3 (with `FREETOKEN_TP_SPLIT=0.6` written in it; both need it, [options.md](options.md)):
-  `FREETOKEN_TP_SPLIT_DENSE=0.4` moves part of the other layers to rank 1 and gives rank 0 ~5 % more expert slots;
-  `FREETOKEN_ATTN_RANK=1` puts the whole attention and its K/V on rank 1, +13 % expert slots for a pair of XTX from
-  the two cards' plans. Their speed on identical cards is not measured.
+  `FREETOKEN_TP_SPLIT=0.6` for it, here and in `xt-xt` (3 blocks on rank 0, 2 on rank 1), and
+  `FREETOKEN_TP_SPLIT_DENSE=0.4`, which puts the larger part of the other layers on rank 1: the expert cache is planned
+  on rank 0's memory, and rank 1 keeps VRAM the cache cannot use. Reported from two RX 7900 XTX with EXL3 3.05 bpw:
+  10,332 expert slots and decode +7 % against the `0.6` alone ([options.md](options.md), with `FREETOKEN_ATTN_RANK`,
+  which measured slower there).
 - **`xt-xt`**: `xtx-xt` with an even split, 4096-token prefill blocks and drafts for one request at a time (as
   `xtx-xtx`). Each XT holds half of every expert instead of 45 %: slightly fewer cached
   experts (~6.5k, estimate), and each XT does 50 % of the split work: expect decode a little below `xtx-xt`.

@@ -23,6 +23,7 @@ to keep in bf16.
 from __future__ import annotations
 
 import os
+import time
 from typing import Any
 
 import torch
@@ -190,28 +191,42 @@ def compact_device_tensors(root: Any) -> None:
                       f"{before / 2**30:.2f} -> {torch.cuda.mem_get_info()[0] / 2**30:.2f} GiB")
 
 
-def _verify_copies(placed: dict[str, torch.Tensor], host: dict[str, torch.Tensor], keys: Any) -> None:
+def _verify_copies(placed: dict[str, torch.Tensor], host: dict[str, torch.Tensor], keys: Any, settle: float = 1.0,
+                   rounds: int = 8) -> None:
     """Every re-allocated tensor must read back as its host copy; one that does not is copied again, then refused.
 
-    A rank was reported with its smallest tensors (the PLE hash constants) left as uninitialized device memory
-    after this round trip: zeros crashed the n-gram hash, anything else read wrong table rows without an error.
+    Reported on two RX 7900 XTX: most tensors came back different from this round trip (zeros, another tensor's
+    data), two read-backs in a row could differ, and values right just after it were wrong seconds later: something
+    still wrote into the freshly allocated memory after the copies. So once a difference is seen, the tensors are
+    copied again and must then read back right twice, ``settle`` seconds apart, before the load goes on.
     """
     def differing() -> list[str]:
         return [k for k in host if k in keys and not torch.equal(placed[k].to("cpu"), host[k])]
 
+    def names(bad: list[str]) -> str:
+        return f"{', '.join(bad[:4])}{', ...' if len(bad) > 4 else ''}"
+
     bad = differing()
     if not bad:
         return
-    logger.warning(f"INT8 weight-only: {len(bad)} tensors differ from their host copy after the compaction "
-                   f"({', '.join(bad[:4])}{', ...' if len(bad) > 4 else ''}); copying them again")
-    for k in bad:
-        placed[k].copy_(host[k])
-    bad = differing()
-    if bad:
-        raise RuntimeError(
-            f"INT8 weight-only: {len(bad)} device tensors still differ from their host copy after the compaction "
-            f"({', '.join(bad[:4])}{', ...' if len(bad) > 4 else ''}): the device copies are not reliable on this "
-            "machine; start with FREETOKEN_INT8_COMPACT=0 and report it")
+    clean = 0
+    for _ in range(rounds):
+        if bad:
+            logger.warning(f"INT8 weight-only: {len(bad)} tensors differ from their host copy after the compaction "
+                           f"({names(bad)}); copying them again")
+            for k in bad:
+                placed[k].copy_(host[k])
+            clean = 0
+        else:
+            clean += 1
+            if clean == 2:
+                return
+        time.sleep(settle)
+        bad = differing()
+    raise RuntimeError(
+        f"INT8 weight-only: the device tensors do not keep their host copy's values after the compaction "
+        f"({len(bad)} differ at the last read-back{': ' + names(bad) if bad else ''}): the device copies are not "
+        "reliable on this machine; start with FREETOKEN_INT8_COMPACT=0 and report it")
 
 
 __all__ = ["compact_device_tensors", "convert_model", "enabled", "quantize_rows", "Int8WeightOnlyLinearMethod"]
