@@ -664,6 +664,9 @@ class SWAModel(RefModel):
 
 
 # --------------------------------------------------------------------------- hybrid (GDN) radix
+import freetoken.kvcache.hybrid_radix_cache as _hrc  # noqa: E402  (FREETOKEN_GDN_EVICT_CHEAP_TOKENS as the cache reads it)
+
+
 class HybridModel(RefModel):
     """HybridRadixCache: full KV + an optional GDN snapshot slot at a node's END boundary."""
 
@@ -715,6 +718,14 @@ class HybridModel(RefModel):
         g.mamba_ref = 0
         return pos + 1
 
+    def _lost_tokens(self, g: MGroup) -> int:
+        """Tokens between the nearest snapshot above ``g`` on its path (the root if none) and ``g``'s end."""
+        n, cur = g.length, self.trie.parent_group(g)
+        while cur is not None and cur.mamba is None:
+            n += cur.length
+            cur = self.trie.parent_group(cur)
+        return n
+
     def evict_second(self, n: int, obs_kv: Sequence[int], obs_mamba: Sequence[int]) -> None:
         """``evict_mamba(n)`` counts SNAPSHOTS, not tokens."""
         tag = "model.evict_mamba"
@@ -729,7 +740,9 @@ class HybridModel(RefModel):
                 raise _fail(tag, f"evict_mamba freed snapshot slot {obs_mamba[pm]} which the model "
                                  f"does not consider an eligible snapshot")
             victim = owners[0]
-            self._pick_victim(cands, victim, tag)
+            # snapshots cheap to lose go first (FREETOKEN_GDN_EVICT_CHEAP_TOKENS), LRU among them
+            cheap = [g for g in cands if self._lost_tokens(g) < _hrc._EVICT_CHEAP_TOKENS]
+            self._pick_victim(cheap if cheap else cands, victim, tag)
             cands.remove(victim)
             freed += 1
             if self.trie.is_leaf(victim) and victim.ref == 0:

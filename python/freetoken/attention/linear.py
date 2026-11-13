@@ -95,7 +95,8 @@ def build_fla_metadata(batch: "Batch", device: torch.device, pool: LinearStatePo
     fresh = [gdn_slot(r) for r in reqs if r.cached_len == 0]
     fresh_host = torch.tensor(fresh, dtype=torch.int64, **pin) if fresh else None
 
-    track = _build_track_metadata(reqs, cu_host, device, pin, pool.conv_states.shape[-1])
+    track = _build_track_metadata(reqs, cu_host, device, pin, pool.conv_states.shape[-1],
+                                  getattr(pool, "track_base", 0))
     cu_list = cu_host.tolist()
 
     return FLAMetadata(
@@ -110,7 +111,7 @@ def build_fla_metadata(batch: "Batch", device: torch.device, pool: LinearStatePo
     )
 
 
-def _build_track_metadata(reqs, cu_host, device, pin, km1: int):
+def _build_track_metadata(reqs, cu_host, device, pin, km1: int, track_base: int = 0):
     """Hybrid-radix (extra_buffer): for each request that crosses a ×CHUNK boundary this
     prefill forward, snapshot its GDN state at the deepest mid-chunk boundary into its current
     ping-pong slot. Returns the ``FLAMetadata`` track kwargs, all None when no request
@@ -137,7 +138,8 @@ def _build_track_metadata(reqs, cu_host, device, pin, km1: int):
             continue
         off = int(cu_host[i])
         boundary = r.cached_len + c * CHUNK_SIZE
-        dst.append(r.mamba_ping_pong[r.mamba_next_track_idx])
+        # rows of the pool's track tensors (LinearStatePool.track_*): the slot id itself unless they are host slots
+        dst.append(r.mamba_ping_pong[r.mamba_next_track_idx] - track_base)
         h_row.append(boh[i] + c)
         seq_chunk.append((i, c))
         conv_src.append([off + c * CHUNK_SIZE - km1 + j for j in range(km1)])

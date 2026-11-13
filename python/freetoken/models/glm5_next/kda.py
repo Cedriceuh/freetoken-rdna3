@@ -86,9 +86,9 @@ class Glm5NextKDA(BaseOP):
         boundary into a donatable pool slot (same contract as GDN, see
         layers/linear_attn/gdn.py). h rows are the kernel's per-chunk [V, K] states --
         a direct copy into the pool's [K, V] slots (D_k == D_v)."""
-        rec = pool.recurrent_states[li]
+        rec = pool.track_recurrent(li)
         rec.index_copy_(0, fla.track_dst, h[0, fla.track_h_row].to(rec.dtype))
-        cv = pool.conv_states[li]
+        cv = pool.track_conv(li)
         conv_win = conv_in[fla.track_conv_src].transpose(-1, -2).contiguous()
         cv.index_copy_(0, fla.track_dst, conv_win.to(cv.dtype))
 

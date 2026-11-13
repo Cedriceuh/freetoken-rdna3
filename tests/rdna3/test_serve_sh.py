@@ -170,7 +170,7 @@ def test_check_offers_low_ram_on_64_gb(machine, tmp_path):
     # it the server fits a machine kept for it: --check says so and its command carries --low-ram
     model, img = _exl3(tmp_path, 3.05), "sha256:" + "1" * 64
     out = machine(["--check", "--model", model], ram_gib=62.7, image_id=img)
-    assert "EXL3 3.05 bpw, xtx-xt (K/V in VRAM): locks ~61 GiB, more than this machine can hold" in out, out
+    assert "EXL3 3.05 bpw, xtx-xt (K/V in VRAM): locks ~63 GiB, more than this machine can hold" in out, out
     assert "with --low-ram (no RAM tier, the experts loaded one file at a time): ~52 GiB" in out, out
     nxt = next(line for line in out.splitlines() if line.startswith("Next: "))
     assert nxt.startswith("Next: rdna3/serve.sh xtx-xt --model ") and nxt.endswith(" --low-ram"), nxt
@@ -182,7 +182,7 @@ def test_check_offers_low_ram_on_64_gb(machine, tmp_path):
     assert "with --low-ram (no RAM tier, the experts loaded one file at a time): ~47 GiB" in one, one
     # NVFP4's experts alone outgrow the machine: no --low-ram command, the EXL3 checkpoint named instead
     out = machine(["--check", "--model", "MODEL"], ram_gib=62.7, image_id=img)
-    assert "FAIL  NVFP4, xtx-xt: locks ~83 GiB" in out, out
+    assert "FAIL  NVFP4, xtx-xt: locks ~85 GiB" in out, out
     assert "an EXL3 3.05 bpw checkpoint fits this machine with --low-ram (~52 GiB locked)" in out, out
     assert not any(line.startswith("Next: ") and "--low-ram" in line for line in out.splitlines()), out
     # 4.05 bpw does not fit either way
@@ -207,12 +207,14 @@ def test_low_ram_sets_the_server_up(machine, tmp_path):
     out = machine(["xtx-xt", "--model", model, "--low-ram", "--dry-run"], ram_gib=62.7, image_id=img)
     c = cmd(out)
     assert " --memory 56g " in c and "FREETOKEN_HOST_KV=0" in c and "FREETOKEN_HOST_KV=1" not in c, c
+    assert "FREETOKEN_GDN_SNAP_HOST" not in c, c   # the cached GatedDeltaNet states stay in VRAM: 2.2 GiB of RAM
     assert re.findall(r"--expert-load (\S+)", c) == ["serial"], c
     assert "note: --low-ram: this server will lock ~52 GiB of this 62.7 GiB machine (container limit 56g)" in out, out
     assert "warning:" not in out, out
     # without the option the same start warns, and the profile's settings stay
     out = machine(["xtx-xt", "--model", model, "--dry-run"], ram_gib=62.7, image_id=img)
-    assert "warning: this server will lock ~61 GiB" in out and "FREETOKEN_HOST_KV=1" in cmd(out), out
+    assert "warning: this server will lock ~63 GiB" in out and "FREETOKEN_HOST_KV=1" in cmd(out), out
+    assert "FREETOKEN_GDN_SNAP_HOST=1" in cmd(out), out
     assert re.findall(r"--expert-load (\S+)", cmd(out)) == ["parallel"], out
     # --memory wins; a larger machine keeps the profile's limit; one card
     out = machine(["xtx-xt", "--model", model, "--low-ram", "--memory", "60g", "--dry-run"], ram_gib=62.7, image_id=img)

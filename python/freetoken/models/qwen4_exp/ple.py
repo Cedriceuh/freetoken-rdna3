@@ -320,6 +320,19 @@ def _state_slot(req) -> int:
     return req.table_idx if slot is None else slot
 
 
+def _track_states(states: torch.Tensor, name: str, layer_id: int | None = None) -> torch.Tensor:
+    """Where a prefill writes the track snapshot of slot state ``name``, whose live slots are ``states``: the same
+    tensor, or the pool's host slots (FREETOKEN_GDN_SNAP_HOST; ``fla.track_dst`` then counts from the first of them)."""
+    from freetoken import core
+
+    ctx = core._GLOBAL_CTX
+    pool = ctx.linear_state_pool if ctx is not None else None
+    if (pool is not None and getattr(pool, "host_snapshots", False) and pool.has_slot_state(name)
+            and pool.slot_state(name, layer_id).data_ptr() == states.data_ptr()):  # not a caller's own tensor
+        return pool.track_slot_state(name, layer_id)
+    return states
+
+
 def _ngram_context_pool() -> torch.Tensor:
     pool = get_global_ctx().linear_state_pool
     assert pool is not None and pool.has_slot_state(PLE_NGRAM_STATE), (
@@ -455,7 +468,8 @@ def commit_ngram_context(meta: PLEMetadata, fla, context_pool: torch.Tensor | No
     context_pool.index_copy_(0, meta.state_slots, nxt.to(context_pool.dtype))
     if fla is not None and fla.track_boundary_row is not None:
         win = ids[fla.track_boundary_row.unsqueeze(1) - ctx_len + steps]
-        context_pool.index_copy_(0, fla.track_dst, win.to(context_pool.dtype))
+        track = _track_states(context_pool, PLE_NGRAM_STATE)
+        track.index_copy_(0, fla.track_dst, win.to(track.dtype))
 
 
 class NGramEmbedding(BaseOP):
@@ -765,7 +779,8 @@ class PLELayer(BaseOP):
         if fla is not None and fla.track_boundary_row is not None:
             src = fla.track_boundary_row.unsqueeze(1) + torch.arange(-self.state_len, 0, device=R.device)
             rows = self.norm_conv.forward(gated.index_select(0, src.reshape(-1))).view(*src.shape, -1)
-            states.index_copy_(0, fla.track_dst, rows.transpose(-1, -2).contiguous().to(states.dtype))
+            _track_states(states, PLE_CONV_STATE, self.layer_id).index_copy_(
+                0, fla.track_dst, rows.transpose(-1, -2).contiguous().to(states.dtype))
         width = gated.shape[1]
         hists = self._read_state(meta, states, gated.dtype)  # [B, width, state_len]
         lens = list(meta.seq_lens)
@@ -825,7 +840,8 @@ class PLELayer(BaseOP):
             del x, h, conv, gated
         if snap is not None:
             rows = self.norm_conv.forward(snap).view(*fla.track_boundary_row.shape, self.state_len, width)
-            states.index_copy_(0, fla.track_dst, rows.transpose(-1, -2).contiguous().to(states.dtype))
+            _track_states(states, PLE_CONV_STATE, self.layer_id).index_copy_(
+                0, fla.track_dst, rows.transpose(-1, -2).contiguous().to(states.dtype))
         states.index_copy_(0, meta.state_slots, hist.unsqueeze(0).to(states.dtype).contiguous())
         return R
 
@@ -837,7 +853,7 @@ class PLELayer(BaseOP):
             -self.state_len, 0, device=x.device
         )
         window = x[src].transpose(-1, -2).contiguous()
-        states.index_copy_(0, fla.track_dst, window.to(states.dtype))
+        _track_states(states, PLE_CONV_STATE, self.layer_id).index_copy_(0, fla.track_dst, window.to(states.dtype))
 
     def _conv_state_slab(self, R: torch.Tensor) -> torch.Tensor:
         pool = get_global_ctx().linear_state_pool

@@ -45,8 +45,8 @@ which pool fits in your RAM.
 - **RAM.** The K/V takes 14,144 bytes per token on each card, so 6.9 GiB per 262k conversation on two cards and ~26 GiB
   for 1M tokens, all of it locked. Measured with EXL3 3.05 bpw: ~77 GiB of RAM locked by `xtx-xt-4x262k`, ~75 GiB by
   `xtx-xt-1m`. The NVFP4 checkpoint's experts alone take 63 GiB: on the 126 GiB reference machine three conversations
-  fit (`rdna3/serve.sh xtx-xt-4x262k --model DIR -- --kv-reserve-tokens 787500`, 94 GiB locked after the start, ~97 in
-  use, with little else running), or two to keep room (`525000`); four, with benchmark tools beside them, ran it out
+  fit (`rdna3/serve.sh xtx-xt-4x262k --model DIR -- --kv-reserve-tokens 787500`, 97 GiB locked after the start, with
+  little else running), or two to keep room (`525000`); four, with benchmark tools beside them, ran it out
   of memory. `xtx-xt-1m` is untested with NVFP4. How to count for your machine:
   [limits.md](limits.md#how-much-ram-do-i-need).
 - **The RAM tier is off** (`FREETOKEN_HOST_KV=0`): the pool already lives in RAM.

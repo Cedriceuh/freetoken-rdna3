@@ -22,12 +22,14 @@ What the server locks after its start (the growth of the kernel's `Mlocked` coun
 
 | | NVFP4 | EXL3 3.05 bpw | EXL3 4.05 bpw |
 |---|---:|---:|---:|
-| two cards, the K/V in VRAM (`xtx-xt`) | 83 GiB | 62 GiB | 75 GiB |
+| two cards, the K/V in VRAM (`xtx-xt`) | 85 GiB | 64 GiB | 77 GiB |
 | one card (`xtx`, `xt`) | 74 GiB | 53 GiB | 67 GiB |
 
 1.2 GiB of each is the input embedding kept in RAM rather than VRAM (`FREETOKEN_EMBED_HOST`) and a RAM cache of the PLE
 rows prefills read (`FREETOKEN_PLE_ROW_CACHE_ROWS`): +1.18 GiB measured on `xtx-xt` with NVFP4, +1.19 GiB on one card
-with EXL3 3.05 bpw.
+with EXL3 3.05 bpw. On two cards 2.2 GiB more are the GatedDeltaNet states of the conversations in the prefix cache, kept in RAM
+rather than VRAM (`FREETOKEN_GDN_SNAP_HOST`, 20 states of 108 MiB over the two cards: 84.9 -> 87.1 GiB measured on
+`xtx-xt` with NVFP4), and on one card 0.8 GiB (7 states of 110 MiB); `--low-ram` leaves them in VRAM.
 
 Where it goes: the experts first (the engine keeps **every** expert in pinned RAM, each rank its own share of each one,
 and the GPUs cache the most used ones: ~63 GiB in NVFP4, ~43 GiB in EXL3 3.05 bpw), then the RAM tier that keeps
@@ -39,11 +41,10 @@ The untested two-card profiles (`xtx-xtx`, `xt-xt`) should lock about what `xtx-
 14,144 bytes per token on each card, so **6.9 GiB per 262k conversation** on two cards and 26 GiB for 1M tokens
 (estimates within 2 GiB of the measured layouts). On the 125.7 GiB reference machine:
 
-- EXL3 3.05 bpw: 60 - 9.5 + 1.2 + 4 x 6.9 = ~79 GiB for four conversations of 262k (77 measured with the embedding in
-  VRAM): ~43 GiB left, fits.
-- NVFP4: two conversations, ~88 GiB: fits. Three, ~94 GiB (94.4 measured with the embedding in VRAM, ~97 in use): fits
-  with little else running; `rdna3/serve.sh xtx-xt-4x262k --model DIR -- --kv-reserve-tokens 787500` sizes the pool for
-  three (262,500 tokens each). Four, ~101 GiB: does not.
+- EXL3 3.05 bpw: 62 - 9.5 + 1.2 + 4 x 6.9 = ~81 GiB for four conversations of 262k (81.7 measured): ~41 GiB left, fits.
+- NVFP4: two conversations, ~90 GiB: fits. Three, ~97 GiB (97.0 measured after the start, 97.6 after a first long
+  read): fits with little else running; `rdna3/serve.sh xtx-xt-4x262k --model DIR -- --kv-reserve-tokens 787500` sizes the pool for
+  three (262,500 tokens each). Four, ~104 GiB: does not.
 
 ## Can it run with 64 GB of RAM?
 

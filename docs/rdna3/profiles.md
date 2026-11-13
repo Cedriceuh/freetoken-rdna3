@@ -74,7 +74,7 @@ With several requests, each one's decode is computed row by row as if it were al
 batch can differ at rounding level. The 4-request setting, the tuned decode tiles and the RAM tier are checked for
 exactness, not on the agentic benchmark ([benchmarks.md](benchmarks.md#precision)).
 
-RAM: 83 GiB while serving, all of it locked (~63 GiB of experts, 9.5 GiB for the RAM tier, 1.2 GiB for the input embedding and the PLE row cache, the rest the two processes); 62 GiB with the EXL3 3.05 bpw checkpoint, 76 GiB with 4.05 bpw.
+RAM: 85 GiB while serving, all of it locked (~63 GiB of experts, 9.5 GiB for the RAM tier, 2.2 GiB for the GatedDeltaNet states of the cached conversations, 1.2 GiB for the input embedding and the PLE row cache, the rest the two processes); 64 GiB with the EXL3 3.05 bpw checkpoint, 78 GiB with 4.05 bpw.
 
 With an EXL3 checkpoint
 ([how-it-works.md](how-it-works.md#exl3-checkpoints)) the same profile applies: the
@@ -100,15 +100,17 @@ share is no longer bounded by VRAM. What differs:
 | `FREETOKEN_HOST_KV` | `0` | `0` | no RAM tier: the pool already lives in RAM |
 | `FREETOKEN_NVFP4_PREFILL_BLOCK` | `8192` | unset (4096) | as in `xtx-xt`; `xtx-xt-1m` keeps the default |
 | `MEMORY` | `104g` | `104g` | the container's RAM limit (`110g` in `xtx-xt`) |
+| `FREETOKEN_GDN_SNAP_HOST` | `1` | `1` | as in `xtx-xt`: the GatedDeltaNet states no request is running on live in mapped RAM (2.2 GiB), their VRAM holds experts (NVFP4, 3 contexts: 10,052 slots instead of 9,246, +3.5 % for one request, +7.6 % for three; EXL3 3.05 bpw, 4 contexts: 12,806 instead of 11,647, +2.2 % and +5.7 %; `xtx-xt-1m`, EXL3 3.05 bpw: 12,533 instead of 11,373, +2.5 %; [journey.md](journey.md#51-the-gateddeltanet-states-the-saved-ones-in-ram-and-which-one-the-cache-gives-up-2026-11-12)) |
 | `--memory-ratio` | 0.81 | 0.80 | `xtx-xt-4x262k` gives the expert cache the VRAM a verify step's rollback states no longer take (NVFP4, 3 contexts: 9,246 slots instead of 9,077, +1.2 % for one request, +2.8 % for three, lower VRAM peaks than at 0.80 before; [journey.md](journey.md#50-pytorch-215-tried-a-decode-step-at-three-requests-the-vram-beside-the-expert-cache-2026-11-11)) |
 | `EXL3_RATIO` | 0.78 | unset (0.77) | the same for an EXL3 checkpoint below 4 bpw, whose ratio `serve.sh` sets (3.05 bpw, 4 contexts: 11,647 slots instead of 11,437, +1.3 % for one request, +1.9 % for four, lower VRAM peaks) |
 
 Measured with EXL3 3.05 bpw (~77 GiB of RAM locked by `xtx-xt-4x262k`, ~75 GiB by `xtx-xt-1m`), and NVFP4 on
 `xtx-xt-4x262k` with three contexts: four do not fit with NVFP4 on 128 GB, so start it with `rdna3/serve.sh
-xtx-xt-4x262k --model DIR -- --kv-reserve-tokens 787500` (three conversations, 94 GiB locked after the start), or
-`525000` (two) to keep room. Adding `--max-running-requests 3 --cuda-graph-max-bs 3` sizes the state pools and the
-graphs for three requests too, which leaves the expert cache more VRAM (9,488 slots instead of 9,246: one request
-+0.9 %, three together +2.4 to +2.9 %, the same answers); a fourth request at once then waits for a place. A request alone decoded a few percent slower than on `xtx-xt` on an earlier build, before
+xtx-xt-4x262k --model DIR -- --kv-reserve-tokens 787500` (three conversations, 97 GiB locked after the start), or
+`525000` (two) to keep room. Adding `--max-running-requests 3 --cuda-graph-max-bs 3` sizes the graphs and the states a
+verify step keeps for three requests too (on an earlier build, where it also saved state slots, one request +0.9 %,
+three together +2.4 to +2.9 %, the same answers; not measured since those slots moved to RAM); a fourth request at once
+then waits for a place. A request alone decoded a few percent slower than on `xtx-xt` on an earlier build, before
 the decode cache (the kernels read the K/V across PCIe), and reads prompts a little faster (more expert slots). Which
 one to pick, what they cost and their measurements: [long-context.md](long-context.md); how to count your RAM:
 [limits.md](limits.md#how-much-ram-do-i-need).
@@ -126,9 +128,10 @@ verify steps mostly stay at 2 rows, the extra rows' missing experts crossing PCI
 | `--max-running-requests 1` | | the GDN state of 4 requests would take ~2 GiB more at TP=1 (estimated) |
 | `--max-prefill-length 8192` | | with 16k chunks a single card runs out of working memory: a 60k-token prompt took 166 s and decode fell to 1.9 tok/s |
 | `FREETOKEN_HOST_KV_TOKENS` / `_SNAPSHOTS` | `131072` / `16` | the RAM tier sized to the context (~5 GiB locked, estimated) |
+| `FREETOKEN_GDN_SNAP_HOST` | `1` | as on two cards: the saved GatedDeltaNet states in mapped RAM (7 of 110 MiB, 0.8 GiB), their VRAM as expert slots (NVFP4: `xtx` 4,228 instead of 3,937, +4.1 % greedy and +5.0 % at T 0.6; `xt` 2,992 instead of 2,701, +6.3 % and +7.1 %) |
 | context | 131,072 | what fits: the XT's VRAM peaked at 19,367 of 20,464 MiB over a sweep to 124k tokens |
 
-RAM: ~74 GiB while serving, locked (73 measured on each card with an earlier build, plus 1.2 GiB; EXL3: ~52 GiB at 3.05 bpw, ~67 GiB at 4.05 bpw).
+RAM: ~74 GiB while serving, locked (73 measured on each card with an earlier build, plus 1.2 GiB, and 0.8 for the GatedDeltaNet states; EXL3: ~52 GiB at 3.05 bpw, ~67 GiB at 4.05 bpw).
 
 The cards are picked by VRAM: `xt` takes the smallest card with at least 20 GiB, `xtx` the smallest with 24 GiB, so a
 machine with both keeps the other card free. The one-card profiles were measured for speed, not run on the agentic

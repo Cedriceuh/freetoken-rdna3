@@ -259,6 +259,27 @@ def test_evict_mamba_on_a_leaf_frees_kv_and_cascades_through_tombstones(hyb):
     assert (m.cached_len, m.second) == (0, None)
 
 
+def test_evict_mamba_gives_up_the_cheap_snapshots_before_a_long_reads(hyb, monkeypatch):
+    """FREETOKEN_GDN_EVICT_CHEAP_TOKENS: a turn's end one page after the snapshot above it goes before the older
+    snapshot three pages of reading stand behind; upstream's order (0) takes the older one first."""
+    import freetoken.kvcache.hybrid_radix_cache as hrc
+
+    monkeypatch.setattr(hrc, "_EVICT_CHEAP_TOKENS", 2 * PAGE)
+    hyb.do_insert(ids(1, 2, 3))                 # an idle conversation: one snapshot, 3 pages from the root
+    long_read = donated(hyb)
+    hyb.do_insert(ids(4, 5, 6))                 # a busy one: a long read, then two turns of one page
+    hyb.do_request(ids(4, 5, 6, 7), prompt_pages=3)
+    turn_1 = donated(hyb)
+    hyb.do_request(ids(4, 5, 6, 7, 8), prompt_pages=4)
+    hyb.check()
+
+    hyb.do_evict_second(1)                      # the model checks the choice: cheap ones first, oldest first
+    assert turn_1 in hyb.second.free and long_read not in hyb.second.free
+    hyb.check()
+    m, _ = hyb.do_match(ids(1, 2, 3))
+    assert (m.cached_len, m.second) == (3 * PAGE, long_read)
+
+
 def test_evict_mamba_counts_snapshots_not_tokens(hyb):
     """A one-page node holds PAGE tokens but one snapshot; ``evict_mamba(2)`` must take two
     snapshots, which a token-counting loop would never do."""

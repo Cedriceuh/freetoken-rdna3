@@ -593,7 +593,8 @@ class Scheduler(SchedulerIOMixin):
         """
         if not self.cache_manager.is_hybrid:
             return None
-        total = self.cache_manager.linear_state_pool.num_slots - 1
+        pool = self.cache_manager.linear_state_pool
+        total = pool.num_slots - 1 + getattr(pool, "num_snap_slots", 0)
         return total - self.cache_manager.mamba_available_size, total
 
     def _swa_token_usage(self) -> Tuple[int, int] | None:

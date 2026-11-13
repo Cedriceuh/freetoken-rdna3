@@ -258,14 +258,20 @@ class HostKVPool:
                     sec.tensor.index_copy_(sec.axis, idx, sec.view(stage).movedim(0, sec.axis))
         self._leave(cur)
 
+    def _slot_rows(self, sec: _Section, slot: int) -> torch.Tensor:
+        """Pool slot ``slot`` of a snapshot section, ``[layers, ...]``: a device slot, or under
+        FREETOKEN_GDN_SNAP_HOST one of the pool's mapped host slots (the tree's snapshots are those)."""
+        rows = getattr(self._linear_pool, "slot_rows", None)
+        return rows(sec.name, slot) if rows is not None else sec.tensor[:, slot]
+
     def save_snap(self, slot: int, hs: int) -> None:
         cur = self._enter()
         with self._ctx():
             row = self.snap_buf[hs : hs + 1]
             for sec in self.snap_sections:
-                dst = sec.view(row)[0]
+                dst, src = sec.view(row)[0], self._slot_rows(sec, slot)
                 for layer in range(sec.tensor.shape[0]):
-                    dst[layer].copy_(sec.tensor[layer, slot], non_blocking=True)
+                    dst[layer].copy_(src[layer], non_blocking=True)
         self._leave(cur)
 
     def load_snap(self, hs: int, slot: int) -> None:
@@ -273,9 +279,9 @@ class HostKVPool:
         with self._ctx():
             row = self.snap_buf[hs : hs + 1]
             for sec in self.snap_sections:
-                src = sec.view(row)[0]
+                src, dst = sec.view(row)[0], self._slot_rows(sec, slot)
                 for layer in range(sec.tensor.shape[0]):
-                    sec.tensor[layer, slot].copy_(src[layer], non_blocking=True)
+                    dst[layer].copy_(src[layer], non_blocking=True)
         self._leave(cur)
 
 

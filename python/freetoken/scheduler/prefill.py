@@ -100,10 +100,7 @@ class PrefillAdder:
         # Second currency (hybrid GDN): reserve 1 live + 2 ping-pong state slots; evict tree
         # snapshots if the pool is short, fail admission if still short (mirrors the KV gate).
         if self.cache_manager.is_hybrid:
-            pool = self.cache_manager.linear_state_pool
-            if pool.num_free_slots < 3:
-                self.cache_manager.ensure_mamba_slots(3)
-            if pool.num_free_slots < 3:
+            if not self.cache_manager.reserve_state_slots():
                 return self.cache_manager.unlock(handle)
 
         # Third currency (SWA): refuse admission unless the swa pool can seat this request's first
@@ -135,9 +132,7 @@ class PrefillAdder:
 
         linear_slot_idx = ping_pong = None
         if self.cache_manager.is_hybrid:
-            pool = self.cache_manager.linear_state_pool
-            linear_slot_idx = pool.alloc(1)[0]
-            ping_pong = tuple(pool.alloc(2))
+            linear_slot_idx, ping_pong = self.cache_manager.alloc_state_slots()
 
         return handle, table_idx, linear_slot_idx, ping_pong, mr.mamba_value
 

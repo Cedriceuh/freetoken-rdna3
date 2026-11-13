@@ -15,8 +15,8 @@ usual on consumer boards): every exchange between them goes through system RAM.
 
 | Where | What |
 |---|---|
-| GPU VRAM | dense weights (int8) except the input embedding, the KV cache of the attention layers, the GDN recurrent states, and an **expert cache** filling everything else (on `xtx-xt`: 7.3k of the 24,576 experts, on each card) |
-| System RAM | **every expert** (~63 GiB, pinned; each rank holds its own share of every expert), the input embedding (1.2 GiB, a row per token read across PCIe), the PLE rows prefills read (a RAM cache, 0.12-0.17 GiB), conversations moved off the GPUs (the RAM tier), the ranks' exchange buffer |
+| GPU VRAM | dense weights (int8) except the input embedding, the KV cache of the attention layers, the GDN recurrent states of the running requests, and an **expert cache** filling everything else (on `xtx-xt`: 8.1k of the 24,576 experts, on each card) |
+| System RAM | **every expert** (~63 GiB, pinned; each rank holds its own share of every expert), the input embedding (1.2 GiB, a row per token read across PCIe), the PLE rows prefills read (a RAM cache, 0.12-0.17 GiB), conversations moved off the GPUs (the RAM tier), the GDN states saved for the conversations in the prefix cache (2.2 GiB on two cards, 0.8 on one), the ranks' exchange buffer |
 | Disk | the n-gram embedding tables, read row by row on demand (direct I/O, no page cache; a large fill over four io_uring rings) |
 
 ## One decode step
@@ -187,6 +187,16 @@ nodes being promoted are pinned against eviction. It pays when conversations tog
 parallel sub-agents do; a single conversation that fits the GPUs gains nothing, and the tier's RAM stays locked for
 the whole run ([options.md](options.md#conversations-kept-in-ram)).
 
+**The GatedDeltaNet states.** A request that continues a conversation needs the recurrent state of the 36 GatedDeltaNet
+layers at the point it resumes from: 61 MiB on the 7900 XTX and 47 on the XT, saved at the last 64-token boundary of a
+prompt's last chunk, at a tool call and at the end of an answer. The pool that holds them has 24 slots at four requests.
+With `FREETOKEN_GDN_SNAP_HOST` (the profiles set it) only the state each running request computes on stays in VRAM; the
+saved ones live in RAM the GPU maps (2.2 GiB on two cards, 0.8 on one), written there by the prefill and copied back once when a conversation returns, and
+the VRAM they took (1.2 GiB on the XTX at four requests) holds ~800 more experts (~290 on one card). When the slots run out, the cache gives up first the
+snapshots that cost little to do without, a turn's end a few hundred tokens after the previous one, and keeps the ones
+a long read stands behind (`FREETOKEN_GDN_EVICT_CHEAP_TOKENS`): an agent that waits while another takes dozens of
+turns finds its conversation where it left it.
+
 ## Images (`--vision`, off by default)
 
 The Qwen3.8 vision tower (27 ViT blocks, ~0.45 B parameters) is upstream's, and it was never split across the GPUs.
@@ -251,8 +261,8 @@ RAM: locked while serving;
 | decode, `xtx-xt` / `xtx` / `xt` | 107-133 / 45-54 / 36-42 tok/s | 134-168 / 67-74 / 52-58 tok/s | 118-128 / 46-59 / 36-45 tok/s |
 | reading a new block, `xtx-xt` | 3100-4020 tok/s | 3480-3770 tok/s | 3190-3740 tok/s |
 | agent turn, first token, `xtx-xt` | 0.56-0.65 s | 0.44-0.46 s | 0.57-0.69 s |
-| RAM locked, `xtx-xt` / one card | 83 / 74 GiB | 62 / 53 GiB | 75 / 67 GiB |
-| expert cache per card, `xtx-xt` | 7.3k | 10.1k | 7.5k |
+| RAM locked, `xtx-xt` / one card | 85 / 74 GiB | 64 / 53 GiB | 77 / 67 GiB |
+| expert cache per card, `xtx-xt` | 8.1k | 10.1k (an earlier build) | 7.5k (an earlier build) |
 | agentic benchmark (29 bugs) | 12 and 18 (two runs) | 13 (one run) | 12 (one run) |
 
 The agentic benchmark scores come from earlier builds than the other rows. The checkpoints answer differently, so the MTP head

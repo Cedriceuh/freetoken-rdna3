@@ -153,12 +153,18 @@ class CacheManager:
             if tokens + need(target_len) > self.available_size:
                 return mr
             # 1 slot for the restored snapshot + the 3 the admission takes right after.
-            if pool.num_free_slots < 4:
-                self.ensure_mamba_slots(4)
-            if pool.num_free_slots < 4:
-                # ensure_mamba_slots may have tombstoned the snapshot mr resumes from: match again
-                return self.match_req(req)
-            slot = pool.alloc(1)[0]
+            if getattr(pool, "host_snapshots", False):
+                # the snapshot and the admission's track pair are host slots, its live slot a device one
+                if not self.ensure_snap_slots(3) or pool.num_free_slots < 1:
+                    return self.match_req(req)
+                slot = pool.alloc_snap()
+            else:
+                if pool.num_free_slots < 4:
+                    self.ensure_mamba_slots(4)
+                if pool.num_free_slots < 4:
+                    # ensure_mamba_slots may have tombstoned the snapshot mr resumes from: match again
+                    return self.match_req(req)
+                slot = pool.alloc(1)[0]
             # Node by node, top-down: each node's device pages may demote other leaves to host, and its own host
             # copy is released right after, so the host never has to hold this whole context AND its victims (that
             # overflow dropped other agents' contexts). Each promoted node is locked until the path is done.
@@ -195,7 +201,8 @@ class CacheManager:
     @property
     def mamba_available_size(self) -> int:
         """Hybrid only: free GDN state slots + evictable (unlocked) tree snapshots."""
-        return self.linear_state_pool.num_free_slots + self.prefix_cache.mamba_evictable_size
+        pool = self.linear_state_pool
+        return pool.num_free_slots + getattr(pool, "num_free_snaps", 0) + self.prefix_cache.mamba_evictable_size
 
     @property
     def swa_available_size(self) -> int:
@@ -219,12 +226,67 @@ class CacheManager:
     def ensure_mamba_slots(self, n: int) -> None:
         """Free GDN state slots until >= ``n`` are available by tombstoning LRU tree snapshots
         (evict_mamba), returning their slots + any freed KV to the pools."""
+        if getattr(self.linear_state_pool, "host_snapshots", False):
+            return  # the tree holds host snapshot slots only: evicting them frees no working slot
         while self.linear_state_pool.num_free_slots < n:
             er = self.prefix_cache.evict_mamba(n - self.linear_state_pool.num_free_slots)
             if not er.mamba_slots:
                 break
             self.linear_state_pool.free(er.mamba_slots)
             self._free(er.kv_indices)
+
+    def ensure_snap_slots(self, n: int) -> bool:
+        """FREETOKEN_GDN_SNAP_HOST: free host slots until ``n`` are, by evicting the tree's oldest unlocked snapshots
+        (as ensure_mamba_slots does for the device pool). False when the tree has no more to give."""
+        pool = self.linear_state_pool
+        while pool.num_free_snaps < n:
+            er = self.prefix_cache.evict_mamba(n - pool.num_free_snaps)
+            if not er.mamba_slots:
+                return False
+            pool.free(er.mamba_slots)
+            self._free(er.kv_indices)
+        return True
+
+    def reserve_state_slots(self) -> bool:
+        """Admission: the live slot and the two track slots a request takes are there (after evicting tree snapshots
+        if need be)."""
+        pool = self.linear_state_pool
+        if getattr(pool, "host_snapshots", False):
+            return pool.num_free_slots >= 1 and self.ensure_snap_slots(2)
+        if pool.num_free_slots < 3:
+            self.ensure_mamba_slots(3)
+        return pool.num_free_slots >= 3
+
+    def alloc_state_slots(self) -> tuple[int, tuple[int, int]]:
+        """``(live slot, track pair)`` of an admitted request (reserve_state_slots said yes)."""
+        pool = self.linear_state_pool
+        live = pool.alloc(1)[0]
+        if getattr(pool, "host_snapshots", False):
+            return live, (pool.alloc_snap(), pool.alloc_snap())
+        return live, tuple(pool.alloc(2))
+
+    def _alloc_track_slot(self) -> int:
+        """A track slot replacing one the tree took."""
+        pool = self.linear_state_pool
+        if getattr(pool, "host_snapshots", False):
+            self.ensure_snap_slots(1)
+            return pool.alloc_snap()
+        self.ensure_mamba_slots(1)
+        return pool.alloc(1)[0]
+
+    def _donate_slot(self, slot: int) -> int | None:
+        """The slot id a donation hands to the tree for a request's ``slot``: itself (a track slot, or any slot
+        without FREETOKEN_GDN_SNAP_HOST), or for a live slot under it a host slot holding its copy (the live slot
+        goes back to the device pool); None when every host slot is locked. The copy is issued on the caller's
+        stream like the anchor's and the restore's: after the forwards issued so far, before the next one."""
+        pool = self.linear_state_pool
+        if not getattr(pool, "host_snapshots", False) or slot >= pool.num_slots:
+            return slot
+        if not self.ensure_snap_slots(1):
+            return None
+        snap = pool.alloc_snap()
+        pool.copy_from(slot, snap)
+        return snap
 
     def snapshot_toolcall_anchor(self, reqs: List[Req]) -> None:
         """Freeze each decoding request's GDN state at its tool-call anchor, into the ping-pong
@@ -453,12 +515,23 @@ class CacheManager:
             keep_live = False
             keys = self._keys(req.input_ids, insert_len)
             # spec_decode: a request that finished inside a verify step's kept rows has its live state past cached_len
+            given = None
             if (insert_len == req.cached_len and insert_len > 0 and len(keys) == insert_len
                     and not getattr(req, "state_ahead", False)):
-                prefix_len, mamba_exist = self.prefix_cache.insert(keys, page_indices[:insert_len], req.linear_slot_idx)
+                if getattr(pool, "host_snapshots", False) and req.mamba_ping_pong is not None:
+                    # the track pair first: its host slots are what a full store gives the live slot's copy
+                    pool.free(list(req.mamba_ping_pong))
+                    req.mamba_ping_pong = None
+                given = self._donate_slot(req.linear_slot_idx)
+            if given is not None:
+                prefix_len, mamba_exist = self.prefix_cache.insert(keys, page_indices[:insert_len], given)
                 self.unlock(old_handle)
                 self._free(page_indices[free_upto : max(free_upto, prefix_len)])
-                keep_live = not mamba_exist           # tree now owns linear_slot_idx
+                if given != req.linear_slot_idx:      # the tree got a host copy: the live slot goes back
+                    if mamba_exist:
+                        pool.free([given])
+                else:
+                    keep_live = not mamba_exist       # tree now owns linear_slot_idx
             else:
                 self.unlock(old_handle)
                 self._free(page_indices[free_upto :])
@@ -508,9 +581,8 @@ class CacheManager:
         req.cache_handle = HybridCacheHandle(m.cached_len, m.node, m.kv_indices)
         self.lock(req.cache_handle)
         if not mamba_exist:                                # tree took `frozen`; replace it
-            self.ensure_mamba_slots(1)
             pp = list(req.mamba_ping_pong)
-            pp[frozen_idx] = pool.alloc(1)[0]
+            pp[frozen_idx] = self._alloc_track_slot()
             req.mamba_ping_pong = tuple(pp)
         req.mamba_last_track_seqlen = None
 
@@ -634,7 +706,12 @@ class CacheManager:
             # exceed the (non-padding) pool capacity; the remainder is held by running requests.
             pool = self.linear_state_pool
             tree_slots = pc.mamba_evictable_size + pc.mamba_protected
-            assert pool.num_free_slots + tree_slots <= pool.num_slots - 1, (
+            host_snaps = getattr(pool, "host_snapshots", False)
+            if host_snaps:  # the rest are the running requests' track pairs
+                assert pool.num_free_snaps + tree_slots <= pool.num_snap_slots, (
+                    f"GDN host snapshot leak: free({pool.num_free_snaps}) + tree({tree_slots}) > "
+                    f"{pool.num_snap_slots}")
+            assert pool.num_free_slots + (0 if host_snaps else tree_slots) <= pool.num_slots - 1, (
                 f"GDN-slot leak: free({pool.num_free_slots}) + tree({tree_slots}) > "
                 f"capacity({pool.num_slots - 1})"
             )

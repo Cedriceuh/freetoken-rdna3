@@ -14,6 +14,7 @@ caller (CacheManager / scheduler) does the actual LinearStatePool / KV-pool free
 from __future__ import annotations
 
 import heapq
+import os
 import time
 from dataclasses import dataclass
 from typing import List, NamedTuple, Optional, Tuple
@@ -27,6 +28,11 @@ from .host_kv_pool import host_kv_log
 from .radix_cache import RadixTreeNode, _get_key_fn
 
 logger = init_logger(__name__)
+
+# FREETOKEN_GDN_EVICT_CHEAP_TOKENS (0: plain LRU, upstream's): evict_mamba first takes, oldest first, the snapshots
+# whose loss costs a returning request fewer than this many tokens to read again (the tokens since the snapshot above
+# it on its path)
+_EVICT_CHEAP_TOKENS = int(os.environ.get("FREETOKEN_GDN_EVICT_CHEAP_TOKENS", "2048") or 0)
 
 
 @dataclass(frozen=True)
@@ -196,11 +202,22 @@ class HybridRadixCache:
         too. Internal node -> TOMBSTONE (free the slot, keep KV + children). Leaf node -> free
         both KV and slot and unlink, then cascade-delete any KV-only tombstone leaves it exposes
         upward (so a leaf always carries a live snapshot -- mirrors sglang)."""
-        cands = [n for n in self._snapshot_nodes() if n.mamba_ref_count == 0]
+        if _EVICT_CHEAP_TOKENS > 0:
+            # a turn's end a few hundred tokens after the snapshot before it is cheap to lose (the next request reads
+            # those tokens again); a snapshot tens of thousands of tokens from the one above it is a long read. Plain
+            # LRU frees an idle conversation's snapshots, the long one too, before the turn ends a busy conversation
+            # leaves behind, and a tie between a path's nodes (one clock read stamps them all) falls anywhere.
+            cost = self._snapshot_costs()
+            cands = [(cost[id(n)] >= _EVICT_CHEAP_TOKENS, n.timestamp, i, n)
+                     for i, n in enumerate(self._snapshot_nodes()) if n.mamba_ref_count == 0]
+        else:
+            cands = [n for n in self._snapshot_nodes() if n.mamba_ref_count == 0]
         heapq.heapify(cands)
         kv, mamba, freed = [], [], 0
         while freed < num and cands:
             node = heapq.heappop(cands)
+            if _EVICT_CHEAP_TOKENS > 0:
+                node = node[3]
             if node.mamba_value is None or node.mamba_ref_count != 0 or node.is_root():
                 continue
             if self._is_dev_leaf(node) and node.ref_count == 0:
@@ -534,6 +551,21 @@ class HybridRadixCache:
             else:
                 stack.extend(dev)
         return out
+
+    def _snapshot_costs(self) -> dict:
+        """For every device snapshot node (by id): the tokens between the nearest device snapshot above it on its path
+        (the root if none) and its own end -- what a request resuming there reads again once this snapshot is gone."""
+        costs: dict = {}
+        stack = [(self.root, 0)]
+        while stack:
+            n, since = stack.pop()
+            if not n.is_root():
+                since += n.length
+                if n.mamba_value is not None:
+                    costs[id(n)] = since
+                    since = 0
+            stack.extend((c, since) for c in n.children.values() if not c.on_host)
+        return costs
 
     def _snapshot_nodes(self) -> List[RadixTreeNode]:
         out, stack = [], [self.root]

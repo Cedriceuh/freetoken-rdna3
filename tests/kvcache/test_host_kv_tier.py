@@ -101,13 +101,39 @@ class FakeLinear:
         assert torch.all(self.recurrent_states[:, slot] == v + 1), slot
 
 
-def _make(monkeypatch, num_pages=24, host_tokens=48, host_snaps=4, slots=16):
+def _host_slot_pool(slots: int):
+    """The real pool under FREETOKEN_GDN_SNAP_HOST: one live slot (and the padding one) on the device, the tree's
+    ``slots - 1`` snapshots in its host slots (plain tensors on the CPU)."""
+    from freetoken.kvcache.linear_state_pool import LinearStatePool
+    from freetoken.models.config import LinearGatedDeltaGroupConfig
+
+    group = LinearGatedDeltaGroupConfig(
+        name="linear", layer_ids=tuple(range(GDN_LAYERS)), num_key_heads=1, num_value_heads=1,
+        key_head_dim=2, value_head_dim=2, conv_kernel_dim=3, output_gate="silu")
+
+    class Pool(LinearStatePool):
+        def write(self, slot: int, ids) -> None:
+            v = _prefix_hash(ids)
+            self.slot_rows("conv", slot).fill_(v)
+            self.slot_rows("recurrent", slot).fill_(v + 1)
+
+        def check(self, slot: int, ids) -> None:
+            v = _prefix_hash(ids)
+            assert slot >= self.num_slots, "a tree snapshot on a device slot"
+            assert torch.all(self.slot_rows("conv", slot) == v), slot
+            assert torch.all(self.slot_rows("recurrent", slot) == v + 1), slot
+
+    return Pool(group=group, num_slots=2, dtype=torch.float32, device=torch.device("cpu"), tp_size=1,
+                snap_slots=slots - 1)
+
+
+def _make(monkeypatch, num_pages=24, host_tokens=48, host_snaps=4, slots=16, host_slots=False):
     from freetoken.scheduler.cache import CacheManager
 
     monkeypatch.setenv("FREETOKEN_HOST_KV", "1")
     monkeypatch.setenv("FREETOKEN_HOST_KV_TOKENS", str(host_tokens))
     monkeypatch.setenv("FREETOKEN_HOST_KV_SNAPSHOTS", str(host_snaps))
-    kv, lin = FakeKV(num_pages), FakeLinear(slots)
+    kv, lin = FakeKV(num_pages), (_host_slot_pool(slots) if host_slots else FakeLinear(slots))
     pt = torch.zeros(4, 512, dtype=torch.int32)
     cm = CacheManager(num_pages, PS, pt, "hybrid_radix", linear_state_pool=lin, kv_pool=kv)
     assert cm.host_kv is not None
@@ -137,11 +163,15 @@ def _prefill(cm, kv, lin, ids) -> None:
     live = lin.alloc(1)[0]
     lin.write(live, ids)
     all_slots = torch.cat([h.get_matched_indices(), slots])
-    dup_len, exist = cm.prefix_cache.insert(ids_t, all_slots, live)
+    given = cm._donate_slot(live)  # the live slot itself, or its copy in a host slot of the pool
+    assert given is not None
+    if given != live:
+        lin.free([live])
+    dup_len, exist = cm.prefix_cache.insert(ids_t, all_slots, given)
     cm.unlock(h)
     cm._free(all_slots[cached:dup_len])
     if exist:
-        lin.free([live])
+        lin.free([given])
 
 
 def _check_tree(cm, kv, lin) -> None:
@@ -167,8 +197,9 @@ def _seq(rng, prefixes, pages):
     return head + [rng.randrange(1, 50) for _ in range(pages * PS - len(head))]
 
 
-def test_evicted_context_comes_back_from_host(monkeypatch):
-    cm, kv, lin = _make(monkeypatch)
+@pytest.mark.parametrize("host_slots", [False, True])
+def test_evicted_context_comes_back_from_host(monkeypatch, host_slots):
+    cm, kv, lin = _make(monkeypatch, host_slots=host_slots)
     a = list(range(1, 1 + 5 * PS))
     _prefill(cm, kv, lin, a)
     # fill the device pool with other contexts until A is evicted (demoted, not dropped)
@@ -202,10 +233,15 @@ def test_no_promotion_when_admission_cannot_fit(monkeypatch):
     _check_tree(cm, kv, lin)
 
 
+@pytest.mark.parametrize("cheap_tokens", [2048, 2 * PS])   # every toy snapshot cheap (LRU order), or a mix of both kinds
+@pytest.mark.parametrize("host_slots", [False, True])
 @pytest.mark.parametrize("seed", range(12))
-def test_random_lifecycle(monkeypatch, seed):
+def test_random_lifecycle(monkeypatch, seed, host_slots, cheap_tokens):
+    import freetoken.kvcache.hybrid_radix_cache as hrc
+
+    monkeypatch.setattr(hrc, "_EVICT_CHEAP_TOKENS", cheap_tokens)
     rng = random.Random(seed)
-    cm, kv, lin = _make(monkeypatch, num_pages=20, host_tokens=12 * PS, host_snaps=3, slots=12)
+    cm, kv, lin = _make(monkeypatch, num_pages=20, host_tokens=12 * PS, host_snaps=3, slots=12, host_slots=host_slots)
     prefixes = [[], list(range(60, 60 + 2 * PS)), list(range(80, 80 + 3 * PS))]
     history = []
     for _ in range(60):
@@ -332,7 +368,11 @@ def test_four_long_agents_taking_turns_keep_their_contexts(monkeypatch, commit_e
 
 def test_gdn_slot_pressure_moves_one_page_not_the_context(monkeypatch):
     """KV room to spare, GDN slots scarce: freeing a snapshot slot must demote the snapshot with a one-page tail,
-    not the whole one-node context (which would copy tens of pages to the host, and overflow it at scale)."""
+    not the whole one-node context (which would copy tens of pages to the host, and overflow it at scale). In plain
+    LRU order (FREETOKEN_GDN_EVICT_CHEAP_TOKENS=0): these toy turns are all cheap to lose."""
+    import freetoken.kvcache.hybrid_radix_cache as hrc
+
+    monkeypatch.setattr(hrc, "_EVICT_CHEAP_TOKENS", 0)
     cm, kv, lin = _make(monkeypatch, num_pages=64, host_tokens=64 * PS, host_snaps=8, slots=8)
     ctxs = [[100 + a] + [(a * 5 + i) % 50 + 1 for i in range(12 * PS - 1)] for a in range(3)]
     for a in range(3):

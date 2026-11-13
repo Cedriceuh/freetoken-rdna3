@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 from typing import List
 
 import torch
@@ -18,6 +19,16 @@ _SSM_DTYPES = {
 def ssm_state_dtype() -> torch.dtype:
     """Recurrent (SSM) state dtype, from FREETOKEN_MAMBA_SSM_DTYPE (default fp32)."""
     return _SSM_DTYPES.get(str(ENV.MAMBA_SSM_DTYPE).lower(), torch.float32)
+
+
+GDN_SNAP_HOST_ENV = "FREETOKEN_GDN_SNAP_HOST"
+
+
+def gdn_snap_host_enabled() -> bool:
+    """FREETOKEN_GDN_SNAP_HOST=1: every GDN state slot but the requests' live ones -- a prefill's track (ping-pong)
+    slots and the prefix tree's snapshots -- lives in host memory the GPU maps (hybrid_radix only), so the device
+    pool holds one slot a running request."""
+    return os.environ.get(GDN_SNAP_HOST_ENV) == "1"
 
 
 def _linear_local_dims(
@@ -60,6 +71,7 @@ class LinearStatePool:
         device: torch.device,
         tp_size: int | None = None,
         slot_states: tuple[SlotStateSpec, ...] = (),
+        snap_slots: int = 0,
     ) -> None:
         if tp_size is None:
             tp_size = get_tp_info().size
@@ -105,6 +117,76 @@ class LinearStatePool:
         self.verify_scratch: LinearVerifyScratch | None = None
         self._verify_handlers: dict[str, SlotVerify] = {}
         self._free_slots: list[int] = list(range(1, num_slots))
+        # FREETOKEN_GDN_SNAP_HOST: ``snap_slots`` slots in host memory the GPU maps, ids num_slots.. : a prefill
+        # writes its track snapshots there (track_*), a finished request's live slot is copied there, a prefix hit
+        # copies one back (copy_from); no decode kernel indexes them
+        self._num_snaps = snap_slots
+        self._snap: dict[str, torch.Tensor] = {}
+        self._free_snaps: list[int] = []
+        self._alloc_snaps()
+
+    def _alloc_snaps(self) -> None:
+        self._snap = {}
+        n = self._num_snaps
+        if n:
+            for name, t in self._slot_tensors():
+                shape = (t.shape[0], n, *t.shape[2:])
+                if self._device.type == "cuda":
+                    from freetoken.kernel.host_mapped import host_mapped_empty
+                    self._snap[name] = host_mapped_empty(shape, t.dtype, self._device)
+                else:
+                    self._snap[name] = torch.empty(shape, dtype=t.dtype)
+        self._free_snaps = list(range(self._num_slots, self._num_slots + n))
+
+    def _slot_tensors(self) -> list[tuple[str, torch.Tensor]]:
+        """Every per-slot tensor, ``[layers, slots, ...]``."""
+        return [("conv", self.conv_states), ("recurrent", self.recurrent_states),
+                *((f"slot:{k}", t) for k, t in self.slot_states.items())]
+
+    def slot_rows(self, name: str, slot: int) -> torch.Tensor:
+        """Slot ``slot`` of the per-slot tensor ``name`` (conv, recurrent, slot:<state>), ``[layers, ...]``, wherever
+        it lives."""
+        if slot >= self._num_slots:
+            return self._snap[name][:, slot - self._num_slots]
+        return dict(self._slot_tensors())[name][:, slot]
+
+    @property
+    def host_snapshots(self) -> bool:
+        return self._num_snaps > 0
+
+    @property
+    def num_snap_slots(self) -> int:
+        return self._num_snaps
+
+    @property
+    def num_free_snaps(self) -> int:
+        return len(self._free_snaps)
+
+    def alloc_snap(self) -> int:
+        """Pop a free host snapshot slot id."""
+        if not self._free_snaps:
+            raise RuntimeError("LinearStatePool: no free host snapshot slot")
+        return self._free_snaps.pop()
+
+    # A prefill's track snapshots: the tensor a layer writes them into and the id that tensor's row 0 has. Without
+    # host slots these are the device tensors themselves.
+    @property
+    def track_base(self) -> int:
+        return self._num_slots if self._num_snaps else 0
+
+    def track_recurrent(self, li: int) -> torch.Tensor:
+        return self._snap["recurrent"][li] if self._num_snaps else self.recurrent_states[li]
+
+    def track_conv(self, li: int) -> torch.Tensor:
+        return self._snap["conv"][li] if self._num_snaps else self.conv_states[li]
+
+    def track_slot_state(self, name: str, layer_id: int | None = None) -> torch.Tensor:
+        t = self._snap[f"slot:{name}"] if self._num_snaps else self.slot_states[name]
+        return t[0] if layer_id is None else t[self._state_layer_index[name][layer_id]]
+
+    def snap_bytes(self) -> int:
+        """Host bytes of the snapshot slots (this rank)."""
+        return sum(t.numel() * t.element_size() for t in self._snap.values())
 
     def _alloc_slot_states(self, num_slots: int) -> dict[str, torch.Tensor]:
         return {
@@ -150,6 +232,7 @@ class LinearStatePool:
         CacheManager rebuild that discards the tree owning donated snapshots) must guarantee no
         running request holds a slot, otherwise live state would be handed out twice."""
         self._free_slots = list(range(1, self._num_slots))
+        self._free_snaps = list(range(self._num_slots, self._num_slots + self._num_snaps))
 
     def rebuild(self, num_slots: int) -> None:
         """Reallocate the conv + recurrent state tensors for ``num_slots`` slots IN PLACE.
@@ -181,6 +264,7 @@ class LinearStatePool:
         self.slot_states = self._alloc_slot_states(num_slots)
         self._num_slots = num_slots
         self._free_slots = list(range(1, num_slots))
+        self._alloc_snaps()  # their ids follow the device slots
 
     def free(self, slots) -> None:
         """Return slot ids to the free-list. Accepts an int, list, or 1-D tensor."""
@@ -188,7 +272,8 @@ class LinearStatePool:
             slots = slots.flatten().tolist()
         elif isinstance(slots, int):
             slots = [slots]
-        self._free_slots.extend(int(s) for s in slots)
+        for s in slots:
+            (self._free_slots if int(s) < self._num_slots else self._free_snaps).append(int(s))
 
     def clear_slots(self, slots) -> None:
         """Zero conv + recurrent state at ``slots`` across all linear layers (fresh sequence)."""
@@ -202,10 +287,8 @@ class LinearStatePool:
     def copy_from(self, src: int, dst: int) -> None:
         """Copy a whole-sequence snapshot (conv + recurrent, all layers) from slot ``src`` to
         ``dst``. Used for COW-on-restore (donated snapshot -> fresh live slot)."""
-        self.conv_states[:, dst].copy_(self.conv_states[:, src])
-        self.recurrent_states[:, dst].copy_(self.recurrent_states[:, src])
-        for t in self.slot_states.values():
-            t[:, dst].copy_(t[:, src])
+        for name, _ in self._slot_tensors():
+            self.slot_rows(name, dst).copy_(self.slot_rows(name, src))
 
     def is_linear_layer(self, layer_id: int) -> bool:
         return layer_id in self._local_index
@@ -377,9 +460,20 @@ def _linear_pool_num_slots(config) -> int:
     mr = config.max_running_req
     if config.cache_type != "hybrid_radix":
         return mr + 1  # live + dummy/padding
+    if gdn_snap_host_enabled():
+        return mr + 1  # live + padding: the track slots and the tree's snapshots are in host memory
     ratio = config.linear_state_cache_ratio
     n_cache = max(4, int(ratio * mr))
     return 4 * mr + n_cache + 1  # live + 2 ping-pong + locked committed snapshot + cache + padding
+
+
+def _linear_pool_snap_slots(config) -> int:
+    """Host slots under FREETOKEN_GDN_SNAP_HOST (0 otherwise): what the device pool held beside the live slots, two
+    track slots and one locked snapshot a request and the cross-request cache."""
+    if config.cache_type != "hybrid_radix" or not gdn_snap_host_enabled():
+        return 0
+    mr = config.max_running_req
+    return 3 * mr + max(4, int(config.linear_state_cache_ratio * mr))
 
 
 def _linear_pool_min_slots(config) -> int:
@@ -391,4 +485,4 @@ def _linear_pool_min_slots(config) -> int:
     mr = config.max_running_req
     if config.cache_type != "hybrid_radix":
         return mr + 1
-    return 4 * mr + 1
+    return (1 if gdn_snap_host_enabled() else 4) * mr + 1

@@ -42,7 +42,7 @@ from freetoken.kvcache import create_kv_pool, resolve_pool_class
 from freetoken.kvcache.base import CacheRebuildRejected
 from freetoken.kvcache.cache_status import _supports_swa_ratio
 from freetoken.kvcache.linear_state_pool import (
-    _linear_pool_min_slots, _linear_pool_num_slots, state_pool_bytes,
+    _linear_pool_min_slots, _linear_pool_num_slots, _linear_pool_snap_slots, state_pool_bytes,
 )
 
 logger = init_logger(__name__)
@@ -680,7 +680,12 @@ class Engine:
                 device=self.device,
                 tp_size=config.tp_info.size,
                 slot_states=config.model_config.slot_states,
+                snap_slots=_linear_pool_snap_slots(config),
             )
+            if self.linear_state_pool.host_snapshots:
+                logger.info(f"GDN snapshots in host memory: {self.linear_state_pool.num_snap_slots} slots, "
+                            f"{self.linear_state_pool.snap_bytes() / 2**20:.0f} MiB mapped; the device pool keeps "
+                            f"{self.linear_state_pool.num_slots} working slots")
             self.ctx.linear_state_pool = self.linear_state_pool
         else:
             self.linear_state_pool = None

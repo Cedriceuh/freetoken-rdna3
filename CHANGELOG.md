@@ -96,6 +96,13 @@ What each change measured, and how it was found: [docs/rdna3/journey.md](docs/rd
   and 62.4 -> 64.1; the same greedy and sampled answers.
 - Lower prefill VRAM peaks (in-place hyper-connections, blocked GatedDeltaNet prefill), and kernels that spilled
   registers on RDNA3 run more warps (prompt reading +2.6 to +3.5 %).
+- The GatedDeltaNet states no request is running on (the prefix cache's snapshots, the slots a prefill
+  writes its chunk-boundary state into) live in RAM the GPUs map instead of VRAM (`FREETOKEN_GDN_SNAP_HOST`, on in
+  the profiles; 2.2 GiB more RAM locked on two cards, 0.8 on one): on two cards 1.2 GiB of the 7900 XTX and 0.9 of
+  the XT for the expert cache. One card, NVFP4: `xtx` +4.1 % (T 0.6 +5.0 %), `xt` +6.3 % (+7.1 %).
+  `xtx-xt-4x262k`, NVFP4 with 3 contexts: 10,052 expert slots instead of 9,246, one request +3.5 %, three
+  conversations together +7.6 % each, the answer after a 255k-token read +5.5 %; EXL3 3.05 bpw: +2.2 % and +5.7 %
+  (four); `xtx-xt`, NVFP4: +5.6 % and +11.5 % (three); cold reads unchanged; the same answers.
 
 ### Changed
 
@@ -126,6 +133,11 @@ What each change measured, and how it was found: [docs/rdna3/journey.md](docs/rd
 
 ### Fixed
 
+- A conversation that waited while another took many turns was read again from its first token: the prefix cache
+  gave up its GatedDeltaNet snapshots least recently used first, and the turn ends the busy conversation left behind
+  were always newer. It now gives up first the snapshots that cost little to do without
+  (`FREETOKEN_GDN_EVICT_CHEAP_TOKENS`): a 60k-token conversation waiting through 60 turns of another answers after
+  0.18 s instead of 14.1 s.
 - A server stopped during a long streamed answer waited for it to end (uvicorn's graceful stop has no limit by
   default): a 6,000-token answer kept it 54 s, past a service manager's stop timeout, whose kill then left the
   container stopping and made the next start fail on its name. It now cancels its open streams after

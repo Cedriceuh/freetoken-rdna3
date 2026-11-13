@@ -319,11 +319,11 @@ class GatedDeltaNet(BaseOP):
         SSM: ``recurrent_states[li, dst] = h[0, h_row]`` -- a DIRECT copy (h is [V,K], the
         state pool is [K,V]; they coincide because GDN requires head_k_dim == head_v_dim).
         Conv: the last (kernel-1) raw conv-input timesteps ending at the boundary."""
-        rec = pool.recurrent_states[li]
+        rec = pool.track_recurrent(li)
         if h_rows is None:  # the blocked prefill hands over the tracked rows only
             h_rows = h[0, fla.track_h_row]
         rec.index_copy_(0, fla.track_dst, h_rows.to(rec.dtype))
-        cv = pool.conv_states[li]
+        cv = pool.track_conv(li)
         # conv_in [total, conv_dim]; gather the (kernel-1) window per tracked req.
         conv_win = conv_in[fla.track_conv_src].transpose(-1, -2).contiguous()  # [nt, conv_dim, K-1]
         cv.index_copy_(0, fla.track_dst, conv_win.to(cv.dtype))

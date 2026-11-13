@@ -458,6 +458,20 @@ Line counts here are on top of the lines listed in the sections above.
 | `python/freetoken/models/qwen4_exp/moe.py`, `layers/linear_attn/gdn.py`, `models/qwen4_exp/ple_disk.py` | 3/3, 3/4, 8/1 | the ranks' first-use agreements through `agree()`; a prefill's PLE rows broadcast through the communicator under `FREETOKEN_NO_RCCL` |
 | `tests/kernels/test_host_allreduce_two_ranks.py`, `tests/engine/test_dma_allreduce_route.py` | 37/0, 24/0 | the mid slots' all-reduces and broadcasts on two GPUs (bits, sizes past a slot, every dtype by bytes); which path a size takes |
 
+## The GatedDeltaNet states no request runs on in mapped RAM, the snapshot the prefix cache gives up (the same answers)
+
+Line counts here are on top of the lines listed in the sections above.
+
+| File | Lines | Change |
+|---|---:|---|
+| `python/freetoken/kvcache/linear_state_pool.py`, `engine/engine.py` | 100/6, 6/1 | `FREETOKEN_GDN_SNAP_HOST=1` (the profiles): beside its device slots (one a running request and the padding one) the pool holds host slots, pinned device-mapped memory (`kernel/host_mapped.py`) with ids after the device ones: `track_recurrent` / `track_conv` / `track_slot_state` give a prefill the tensor its chunk-boundary state goes to, `copy_from` and `slot_rows` take either kind of id, the slot counts and the bytes the cache plan prices follow (`_linear_pool_num_slots`, `_linear_pool_snap_slots`) |
+| `python/freetoken/scheduler/cache.py`, `scheduler/prefill.py`, `scheduler/scheduler.py` | 89/12, 2/7, 2/1 | the scheduler's side: a request takes one device slot and its two track slots from the host ones (`reserve_state_slots`, `alloc_state_slots`), the cache gets a track slot as it did (no copy), a finished request's live state is copied to a host slot (`_donate_slot`) and its device slot returns to the pool, the RAM tier's promotion takes its snapshot slot there; `ensure_snap_slots` evicts for them |
+| `python/freetoken/attention/linear.py`, `layers/linear_attn/gdn.py`, `models/qwen4_exp/ple.py`, `models/glm5_next/kda.py` | 5/3, 2/2, 20/4, 2/2 | a prefill's track writes (the recurrent and conv states, the PLE's conv history and n-gram context) go to the pool's track tensors, their rows counted from the first host slot |
+| `python/freetoken/kvcache/host_kv_pool.py` | 10/4 | the RAM tier copies a snapshot to and from whichever slot holds it (`slot_rows`) |
+| `python/freetoken/kvcache/hybrid_radix_cache.py` | 33/1 | `FREETOKEN_GDN_EVICT_CHEAP_TOKENS` (2048; 0 = upstream's order): `evict_mamba` gives up first, oldest first, the snapshots whose loss costs a returning request fewer tokens than that to read again (`_snapshot_costs`: the tokens since the snapshot above on the path), then the others least recently used first |
+| `tests/scheduler/test_gdn_snap_host.py`, `tests/kvcache/test_host_kv_tier.py`, `tests/kvcache/radix/model.py`, `tests/kvcache/radix/test_hybrid_radix.py` | 248/0, 49/9, 14/1, 21/0 | the donation, restore, eviction, admission and rebuild paths with host slots (CPU: plain tensors) and on a GPU what a prefill's writes and the two copies leave in mapped memory; the RAM tier's lifecycle with the real pool in that mode; a conversation that waits keeps its snapshot while another takes turns (and loses it in upstream's order); the reference model's eviction check follows the rule |
+| `rdna3/profiles/xtx-xt.env`, `xtx-xt-4x262k.env`, `xtx-xt-1m.env`, `xt-xt.env`, `xtx-xtx.env`, `xtx.env`, `xt.env`, `gre.env`, `rdna3/serve.sh`, `tests/rdna3/test_serve_sh.py` | 1/0, 14/9, 1/0, 1/0, 1/0, 1/0, 1/0, 1/0, 19/10, 5/3 | the setting in the profiles; `serve.sh` counts its 2.2 GiB (0.8 on one card) of RAM (`--check`, the warning at start) and `--low-ram` drops it |
+
 ## Tooling and documentation
 
 | File | Change |

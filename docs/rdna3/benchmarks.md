@@ -7,7 +7,11 @@ EXL3 checkpoints in [their depth sweep](#depth-sweep-exl3-checkpoints) and
 
 The summary and the three depth sweeps are the numbers re-measured at each release
 ([maintaining.md](maintaining.md#releasing)). The sections after them come from earlier builds than the summary and
-give orders of magnitude; a section that mixes the two says so.
+give orders of magnitude; a section that mixes the two says so. The two-card rows come from the build before the
+GatedDeltaNet states moved to RAM (`FREETOKEN_GDN_SNAP_HOST`), which gives the expert cache 0.8-1.2k more slots there:
+`xtx-xt` with NVFP4 8,101 slots and 121.9 tok/s greedy against 7,294 and 115.5 in one sequence
+([journey.md](journey.md#51-the-gateddeltanet-states-the-saved-ones-in-ram-and-which-one-the-cache-gives-up-2026-11-12));
+they are measured again with the next release.
 
 ## How the numbers are taken
 
@@ -356,7 +360,7 @@ each rank plans on its own free memory, then both take the smaller plan), both f
 
 | | NVFP4 | EXL3 3.05 bpw | EXL3 4.05 bpw |
 |---|---:|---:|---:|
-| RAM locked, `xtx-xt` / `xtx` / `xt` | 83 / 74 / 74 GiB | 62 / 53 / 53 GiB | 75 / 67 / 67 GiB |
+| RAM locked, `xtx-xt` / `xtx` / `xt` | 85 / 74 / 74 GiB | 64 / 53 / 53 GiB | 77 / 67 / 67 GiB |
 | Expert cache, `xtx-xt` / `xtx` / `xt` | 7,307 / 4,003 / 2,774 | 10,102 / 5,567 / 3,732 | 7,464 / 4,186 / 2,806 |
 | VRAM peak, `xtx-xt` (XTX / XT of 24,560 / 20,464 MiB) | 23,524 / 20,291 MiB | 24,284 / 19,228 MiB | 24,035 / 19,197 MiB |
 | VRAM peak, `xtx` / `xt` | 23,506 / 19,367 MiB | 22,943 / 19,072 MiB | 22,868 / 19,081 MiB |

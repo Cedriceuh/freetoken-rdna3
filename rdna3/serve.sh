@@ -106,9 +106,14 @@ ckpt_label() { case "$1" in nvfp4) echo NVFP4 ;; exl3-*) echo "EXL3 ${1#exl3-} b
 # (the measured totals of docs/rdna3/limits.md minus the RAM tier, plus 1.2 for what this build keeps in RAM beyond
 # them: the input embedding, FREETOKEN_EMBED_HOST, and the PLE row cache; +1.18 measured on xtx-xt with NVFP4, +1.19
 # on one card with EXL3), plus either the RAM tier (FREETOKEN_HOST_KV: 9.5 GiB on two cards, ~5 per 131,072 tokens on
-# one) or, with the K/V in host RAM (FREETOKEN_QSA_KV_HOST), the K/V pool at 14,144 bytes per token and card. Within 2
-# GiB of the four measured layouts with the K/V in RAM (EXL3 3.05 bpw 4 x 262k and 1M, NVFP4 3 and 4 x 262k). One 262k
-# conversation takes 262,500 tokens of pool (the decode's spare page included): 6.9 GiB on two cards.
+# one) or, with the K/V in host RAM (FREETOKEN_QSA_KV_HOST), the K/V pool at 14,144 bytes per token and card; and the
+# GatedDeltaNet states the profiles keep in RAM (FREETOKEN_GDN_SNAP_HOST: on two cards 20 of 108 MiB over the two,
+# 2.2 GiB; NVFP4 3 x 262k: 94.9-95.2 GiB locked without them, 97.0-97.6 with; xtx-xt: 84.9-85.2 and 87.1-87.4; on one
+# card 7 of 110 MiB, 0.8 GiB), which --low-ram leaves in VRAM. Within 2 GiB of the four measured layouts with the K/V
+# in RAM (EXL3 3.05 bpw 4 x 262k and 1M, NVFP4 3 and 4 x 262k). One 262k conversation takes 262,500 tokens of pool
+# (the decode's spare page included): 6.9 GiB on two cards.
+RAM_GDN_HOST=2.2
+RAM_GDN_HOST_ONE=0.8
 ram_core() {
   case "$1:$2" in
     2:nvfp4) echo 73.7 ;; 2:exl3-3.05) echo 51.7 ;; 2:exl3-4.05) echo 66.7 ;;
@@ -121,14 +126,16 @@ ram_locked() {  # $1 GPUs, $2 checkpoint, $3 K/V pool in host RAM in tokens (0: 
   local c
   c="$(ram_core "$1" "$2")"
   [ -n "$c" ] || return 0
-  LC_ALL=C awk -v c="$c" -v g="$1" -v p="$3" -v h="${4:-262144}" 'BEGIN {
+  LC_ALL=C awk -v c="$c" -v g="$1" -v p="$3" -v h="${4:-262144}" -v s="$RAM_GDN_HOST" -v s1="$RAM_GDN_HOST_ONE" 'BEGIN {
     t = (h == 0 ? 0 : (g == 2 ? 9.5 : 5 * h / 131072))
-    printf "%.3f", c + (p > 0 ? p * 14144 * g / 1073741824 : t) }'
+    if (g != 2) s = s1
+    if (p == 0 && h == 0) s = 0   # --low-ram: the states stay in VRAM
+    printf "%.3f", c + s + (p > 0 ? p * 14144 * g / 1073741824 : t) }'
 }
 gib() { LC_ALL=C awk -v x="$1" 'BEGIN { printf "%.0f", x }'; }  # a ram_locked value as the messages show it
 # What the machine needs beside the server, measured on the 126 GiB reference machine (journey.md, sections 22 and
-# 30): a server grows by a few GiB in use (NVFP4 with 3 x 262k in RAM: 94.4 GiB locked after its start, ~97 GiB hours
-# later); with ~31 GiB left it served for hours, with ~29 GiB left and 13-15 GiB of other programs beside the desktop
+# 30): a server grows by a few GiB in use (NVFP4 with 3 x 262k in RAM, an earlier build: 94.4 GiB locked after its
+# start, ~97 GiB hours later); with ~31 GiB left it served for hours, with ~29 GiB left and 13-15 GiB of other programs beside the desktop
 # the host ran out of memory, and with ~25 GiB left (and benchmark tools) it did too. So: GiB left after the server's
 # use >= RAM_KEEP fits, >= RAM_KEEP_MIN only with little else running, below that does not.
 RAM_GROWTH=3 RAM_KEEP=30 RAM_KEEP_MIN=25
@@ -149,8 +156,8 @@ ram_pool_max() {  # $1 GPUs, $2 checkpoint, $3 GiB to leave beside the server: t
   local c
   c="$(ram_core "$1" "$2")"
   [ -n "$c" ] || return 0
-  LC_ALL=C awk -v c="$c" -v g="$1" -v t="$(ram_total)" -v gr="$RAM_GROWTH" -v k="$3" \
-    'BEGIN { p = (t - gr - k - c) * 1073741824 / (14144 * g); printf "%d", (p > 0 ? p : 0) }'
+  LC_ALL=C awk -v c="$c" -v g="$1" -v t="$(ram_total)" -v gr="$RAM_GROWTH" -v k="$3" -v s="$RAM_GDN_HOST" \
+    'BEGIN { p = (t - gr - k - c - s) * 1073741824 / (14144 * g); printf "%d", (p > 0 ? p : 0) }'
 }
 
 extra_pool() {  # the --kv-reserve-tokens passed after -- (the last one, as ft serve's parser keeps), if any
@@ -570,7 +577,9 @@ if [ -n "$low_ram" ]; then
   done
   kept=()
   for ((i = 0; i < ${#envs[@]}; i += 2)); do  # the profile's own setting of the RAM tier leaves the command
-    [[ "${envs[i + 1]}" == FREETOKEN_HOST_KV=* ]] || kept+=("${envs[i]}" "${envs[i + 1]}")
+    # ... nor the GatedDeltaNet states it keeps in RAM (2.2 GiB on two cards, 0.8 on one)
+    [[ "${envs[i + 1]}" == FREETOKEN_HOST_KV=* || "${envs[i + 1]}" == FREETOKEN_GDN_SNAP_HOST=* ]] ||
+      kept+=("${envs[i]}" "${envs[i + 1]}")
   done
   envs=("${kept[@]}" -e FREETOKEN_HOST_KV=0)
   kept=()
