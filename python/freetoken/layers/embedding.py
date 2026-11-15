@@ -6,7 +6,7 @@ from typing import Dict
 import torch
 from freetoken.core import get_global_ctx
 from freetoken.distributed import DistributedCommunicator, get_tp_info
-from freetoken.utils import div_ceil, nvtx_annotate
+from freetoken.utils import div_ceil, nvtx_annotate, release_cached_vram
 
 from .base import BaseOP
 from .quantization import LayerKind, QuantConfig, quant_method_for
@@ -108,7 +108,7 @@ def place_embeddings_on_host(root: BaseOP) -> int:
     w = None  # the last table's VRAM goes back with the others before empty_cache
     if moved:
         torch.cuda.synchronize()
-        torch.cuda.empty_cache()
+        release_cached_vram()
     return moved
 
 

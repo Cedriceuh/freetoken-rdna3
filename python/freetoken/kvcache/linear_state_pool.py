@@ -8,6 +8,7 @@ import torch
 from freetoken.distributed import get_tp_info
 from freetoken.env import ENV
 from freetoken.models.config import LinearGatedDeltaGroupConfig, SlotStateSpec, SlotVerify
+from freetoken.utils import release_cached_vram
 
 _SSM_DTYPES = {
     "float32": torch.float32,
@@ -252,7 +253,7 @@ class LinearStatePool:
         self.slot_states = {}
         if device.type == "cuda":
             torch.cuda.synchronize(device)
-            torch.cuda.empty_cache()
+            release_cached_vram()
         self.conv_states = torch.zeros(
             (n_layers, num_slots, local_conv_dim, km1), dtype=conv_dtype, device=device
         )

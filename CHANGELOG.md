@@ -146,7 +146,9 @@ What each change measured, and how it was found: [docs/rdna3/journey.md](docs/rd
   if it differs, and must then read back right twice a second apart (the load stops otherwise); the PLE n-gram hash constants are checked before the row store
   is built. On two RX 7900 XTX the constants were reported as uninitialized memory after the compaction: a rank died
   on a division by zero at the first decode step, or read wrong n-gram rows without an error (not reproduced on the
-  XTX + XT).
+  XTX + XT). There, a wait of 0.5 s after the release of VRAM left no tensor wrong: once the read-back finds a
+  difference the engine waits a second after each later release of cached VRAM (`FREETOKEN_VRAM_RELEASE_SETTLE` sets
+  the wait from the start, or `0`).
 - `rdna3/serve.sh`: the automatic GPU choice leaves an integrated GPU out (it reports more memory than a 24 GB card
   and became rank 0); an EXL3 checkpoint on an even-split profile (`xtx-xtx`, `xt-xt`) gets `FREETOKEN_TP_SPLIT=0.6`
   with `FREETOKEN_TP_SPLIT_DENSE=0.4`,

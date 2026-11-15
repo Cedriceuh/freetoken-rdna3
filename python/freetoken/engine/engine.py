@@ -32,7 +32,7 @@ from freetoken.moe.host_banks import PinFailed
 from freetoken.moe.locked_fetch import attach_locked_fetch, check_locked_fetch_config, locked_pool_tags, settle_banks, staging_reserve
 from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache, bank_layouts
 from freetoken.moe.pool_policy import group_layers, make_pools, pool_of_layer, resolve_profile, split_slots
-from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
+from freetoken.utils import align_ceil, init_logger, is_sm100_family, is_sm90_family, mem_GB, release_cached_vram, torch_dtype
 
 from .config import EngineConfig
 from .graph import GraphRunner, _determine_cuda_graph_bs, get_free_memory
@@ -1367,7 +1367,7 @@ class Engine:
     def _sync_get_memory(self) -> Tuple[int, int]:
         """Get the min and max free memory across TP ranks."""
         torch.cuda.synchronize(self.device)
-        torch.cuda.empty_cache()
+        release_cached_vram()
         torch.cuda.reset_peak_memory_stats(self.device)
         free_memory = get_free_memory(self.device)
         self._local_free = free_memory

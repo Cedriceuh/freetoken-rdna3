@@ -4,6 +4,7 @@ from typing import Sequence
 
 import torch
 from freetoken.distributed import get_tp_info
+from freetoken.utils import release_cached_vram
 
 from .base import BaseKVCachePool
 
@@ -74,7 +75,7 @@ class MHAKVCache(BaseKVCachePool):
         self._kv_buffer = None
         if device.type == "cuda":
             torch.cuda.synchronize(device)
-            torch.cuda.empty_cache()
+            release_cached_vram()
         self._kv_buffer = self._new_kv_buffer(
             (2, num_storage_layers, num_pages, page_size, local_kv_heads, head_dim), dtype, device
         )

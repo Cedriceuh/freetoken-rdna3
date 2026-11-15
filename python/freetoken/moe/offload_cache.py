@@ -39,7 +39,7 @@ _MISS_READS = os.environ.get("FREETOKEN_MOE_MISS_READS", "1") == "1"
 _PREFILL_HIT_LOG = os.getenv("FREETOKEN_PREFILL_HIT_LOG", "").strip().lower() in ("1", "true", "yes", "on")
 
 from freetoken.kernel.fast_index_copy import default_blocks_per_bank
-from freetoken.utils import init_logger
+from freetoken.utils import init_logger, release_cached_vram
 
 if TYPE_CHECKING:
     from freetoken.moe.offload_kernels import HybridRoutes
@@ -744,7 +744,7 @@ class OffloadMoeCache:
         self.pool_sizes = sizes
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
-            torch.cuda.empty_cache()
+            release_cached_vram()
         # 3. Reallocate the slot cache from the retained host sources.
         self._alloc_banks()
         # 4. Reallocate cache_size-shaped bookkeeping; reset the slot map (cold start).

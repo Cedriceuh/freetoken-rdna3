@@ -33,12 +33,17 @@ is left out (a note says so). Force a choice with `--gpus 1,0` (rank 0 first).
 ## `tensors differ from their host copy after the compaction` or `the PLE n-gram hash constants are not the checkpoint's`
 
 With `FREETOKEN_INT8_DENSE=1` the load moves the model's tensors to RAM and back to pack the VRAM, then reads every
-one back. A warning means some came back different and were copied again, then read back right twice a second apart; the
-error means they never did, or
-that the n-gram hash constants (the smallest tensors of the model) are not a checkpoint's any more: the server stops
-instead of dividing by zero in the hash or reading wrong table rows. The warning was reported at every start on two RX 7900 XTX (kernel 7.2), with a server that then answers
-right; it does not happen on the reference machine (XTX + XT, kernel 7.0). To avoid the round trip, add
-`FREETOKEN_INT8_COMPACT=0` to the profile file (a smaller expert cache); report the machine: kernel version, cards, the lines above from the log.
+one back. A warning means some came back different: they were copied again, then all read back right twice a second
+apart, and from then on the engine waits a second each time it has given VRAM back to the driver before using that
+memory again. The server then serves normally. The error means the tensors never read back right, or that the n-gram
+hash constants (the smallest tensors of the model) are not a checkpoint's any more: the server stops instead of
+dividing by zero in the hash or reading wrong table rows.
+
+The warning was reported at every start on two RX 7900 XTX with a 7.2 kernel; it does not happen on the reference
+machine (XTX + XT, kernel 7.0). There, copies into VRAM allocated right after a release are lost for a fraction of a
+second: `FREETOKEN_VRAM_RELEASE_SETTLE=0.5` in the profile file makes every release wait half a second and the warning
+goes away. `FREETOKEN_INT8_COMPACT=0` skips the round trip altogether (a smaller expert cache). If you see the
+warning, report the machine: kernel version, cards, the lines from the log.
 
 ## Out of memory at start-up or on long prompts
 

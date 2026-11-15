@@ -672,9 +672,10 @@ a note when you start one (`TESTED=0` in the file).
   cannot take the even split (its expert slices must be whole 128-wide blocks, five in all): `serve.sh` adds
   `FREETOKEN_TP_SPLIT=0.6` for it, here and in `xt-xt` (3 blocks on rank 0, 2 on rank 1), and
   `FREETOKEN_TP_SPLIT_DENSE=0.4`, which puts the larger part of the other layers on rank 1: the expert cache is planned
-  on rank 0's memory, and rank 1 keeps VRAM the cache cannot use. Reported from two RX 7900 XTX with EXL3 3.05 bpw:
-  10,332 expert slots and decode +7 % against the `0.6` alone ([options.md](options.md), with `FREETOKEN_ATTN_RANK`,
-  which measured slower there).
+  on rank 0's memory, and rank 1 keeps VRAM the cache cannot use. Reported from two RX 7900 XTX on Gen4 x8 links with EXL3 3.05
+  bpw: 11,106 expert slots, decode 101.7 tok/s (median of 7 runs of `quick_bench.py`), an 8.3k-token cold read in
+  2.57-2.67 s; `FREETOKEN_TP_SPLIT_DENSE=0.4` gave +7 % decode against the `0.6` alone ([options.md](options.md), with
+  `FREETOKEN_ATTN_RANK`, which measured slower there).
 - **`xt-xt`**: `xtx-xt` with an even split, 4096-token prefill blocks and drafts for one request at a time (as
   `xtx-xtx`). Each XT holds half of every expert instead of 45 %: slightly fewer cached
   experts (~6.5k, estimate), and each XT does 50 % of the split work: expect decode a little below `xtx-xt`.
@@ -745,8 +746,8 @@ For every `ft serve` flag, see upstream's [CLI reference](../cli.md); the flags 
 | Variable | Default | Effect |
 |---|---|---|
 | `FREETOKEN_TP_SPLIT` | unset (even) | Uneven tensor parallelism: rank 0's share at TP=2 (`0.55`) or one weight per rank (`11:9`). XTX + XT at `0.55`: +4 % decode. With an EXL3 checkpoint the expert slices round to whole 128-wide blocks (`0.55` gives 384 / 256, the even split is refused). Reorders sums (and, with `FREETOKEN_INT8_DENSE=1`, changes the int8 scales of two layers: see below), *agent-validated*. |
-| `FREETOKEN_TP_SPLIT_DENSE` | unset (the shares of `FREETOKEN_TP_SPLIT`) | With `FREETOKEN_TP_SPLIT`, same syntax: shares of their own for the axes other than the routed experts (GatedDeltaNet heads, shared expert, and the LM head with `FREETOKEN_LMHEAD_SPLIT`). For an EXL3 checkpoint on two identical cards, whose experts split 3 + 2 blocks (`0.6`): `0.4` puts the larger part of the other axes on rank 1, whose VRAM the expert cache cannot use. Measured on the XTX + XT with EXL3 3.05 bpw (rank 0 on the XTX, as on a pair of XTX): rank 0 uses 819 MiB less VRAM and plans 11,965 expert slots instead of 11,336 (+5.5 %), 12,021 with `FREETOKEN_LMHEAD_SPLIT=1`; rank 1 uses 717 MiB more. On that unequal pair it gives the slower card more work and decode is ~6 % slower (110 -> 104 tok/s, four runs each): not for `xtx-xt`. Reported from two RX 7900 XTX (the case it is for): 10,332 expert slots instead of 9,190 and decode +7 % (median of 7 runs each, 93.8 -> 100.0 tok/s), the cold read unchanged; `serve.sh` sets it with the `0.6` it adds for an EXL3 checkpoint on `xtx-xtx` and `xt-xt`. Other shapes than `0.6`, so other sums: not the same bits. |
-| `FREETOKEN_ATTN_RANK` | unset (each rank its share of the heads) | `1` (or `0`), with `FREETOKEN_TP_SPLIT` (qwen4_exp): that rank holds the attention whole, its weights, every head and the K/V; the other ranks build none of it and add zeros to the all-reduce of its output, so the collectives stay the same. Qwen3.8-Flash-Next has two K/V heads, one a rank: they cannot follow an uneven split, only move together. For an EXL3 checkpoint on two identical cards (`FREETOKEN_TP_SPLIT=0.6`), `1` takes the K/V off the rank whose expert slices bound the cache. Measured with EXL3 3.05 bpw at 262,144 tokens, each role on the XTX: rank 0 without the attention uses 12,684 MiB instead of 20,838 (K/V 0.20 GiB instead of 3.45: the index keys stay) and plans 14,837 expert slots instead of 11,336; rank 1 with it (K/V 6.70 GiB) plans 12,837: +13 % for a pair of XTX. Answers checked on the XTX + XT: 110k-token prompts, four requests at once and a conversation taken back from the RAM tier answer as without it; greedy answers differ at rounding level (3 of 6 short ones identical): not the same bits. Not for `xtx-xt`: with the XT as rank 1 the cache is bounded at 7,172 slots (decode 80-87 tok/s instead of 104-114), with the XT as rank 0 decode is 86-94 tok/s. Reported from two RX 7900 XTX: 10,404 expert slots instead of 9,190, but an 8.3k-token cold read 11 % slower and decode no faster (87-91 tok/s against a median of 93.8), and worse with `FREETOKEN_TP_SPLIT_DENSE=0.4` on top (8,675 slots): `FREETOKEN_TP_SPLIT_DENSE` alone is the better setting there on short requests; long contexts and several requests were not measured. |
+| `FREETOKEN_TP_SPLIT_DENSE` | unset (the shares of `FREETOKEN_TP_SPLIT`) | With `FREETOKEN_TP_SPLIT`, same syntax: shares of their own for the axes other than the routed experts (GatedDeltaNet heads, shared expert, and the LM head with `FREETOKEN_LMHEAD_SPLIT`). For an EXL3 checkpoint on two identical cards, whose experts split 3 + 2 blocks (`0.6`): `0.4` puts the larger part of the other axes on rank 1, whose VRAM the expert cache cannot use. Measured on the XTX + XT with EXL3 3.05 bpw (rank 0 on the XTX, as on a pair of XTX): rank 0 uses 819 MiB less VRAM and plans 11,965 expert slots instead of 11,336 (+5.5 %), 12,021 with `FREETOKEN_LMHEAD_SPLIT=1`; rank 1 uses 717 MiB more. On that unequal pair it gives the slower card more work and decode is ~6 % slower (110 -> 104 tok/s, four runs each): not for `xtx-xt`. Reported from two RX 7900 XTX (the case it is for), without `FREETOKEN_GDN_SNAP_HOST`: 10,332 expert slots instead of 9,190 and decode +7 % (median of 7 runs each, 93.8 -> 100.0 tok/s), the cold read unchanged; with the whole profile 11,106 slots and 101.7 tok/s (median of 7); `serve.sh` sets it with the `0.6` it adds for an EXL3 checkpoint on `xtx-xtx` and `xt-xt`. Other shapes than `0.6`, so other sums: not the same bits. |
+| `FREETOKEN_ATTN_RANK` | unset (each rank its share of the heads) | `1` (or `0`), with `FREETOKEN_TP_SPLIT` (qwen4_exp): that rank holds the attention whole, its weights, every head and the K/V; the other ranks build none of it and add zeros to the all-reduce of its output, so the collectives stay the same. Qwen3.8-Flash-Next has two K/V heads, one a rank: they cannot follow an uneven split, only move together. For an EXL3 checkpoint on two identical cards (`FREETOKEN_TP_SPLIT=0.6`), `1` takes the K/V off the rank whose expert slices bound the cache. Measured with EXL3 3.05 bpw at 262,144 tokens, each role on the XTX: rank 0 without the attention uses 12,684 MiB instead of 20,838 (K/V 0.20 GiB instead of 3.45: the index keys stay) and plans 14,837 expert slots instead of 11,336; rank 1 with it (K/V 6.70 GiB) plans 12,837: +13 % for a pair of XTX. Answers checked on the XTX + XT: 110k-token prompts, four requests at once and a conversation taken back from the RAM tier answer as without it; greedy answers differ at rounding level (3 of 6 short ones identical): not the same bits. Not for `xtx-xt`: with the XT as rank 1 the cache is bounded at 7,172 slots (decode 80-87 tok/s instead of 104-114), with the XT as rank 0 decode is 86-94 tok/s. Reported from two RX 7900 XTX: 10,404 expert slots instead of 9,190, but an 8.3k-token cold read 11 % slower and decode no faster (87-91 tok/s against a median of 93.8), and worse with `FREETOKEN_TP_SPLIT_DENSE=0.4` on top (8,675 slots): with `FREETOKEN_TP_SPLIT_DENSE=0.7` instead, which brings the two ranks' plans closer (11,833 slots against 11,106 for `FREETOKEN_TP_SPLIT_DENSE=0.4` alone), decode 78-83 tok/s against 101.7 and the cold read 2.96-3.01 s against 2.57-2.67. `FREETOKEN_TP_SPLIT_DENSE=0.4` alone is the better setting there on short requests; long contexts and several requests were not measured. |
 | `FREETOKEN_LMHEAD_SPLIT` | `0`; `1` in `xtx-xt`, `xtx-xt-1m`, `xtx-xt-4x262k` | With `FREETOKEN_TP_SPLIT` (qwen4_exp), the LM head's vocabulary rows follow the ranks' shares instead of an even split: 136,576 / 111,744 at `0.55`. The head is bandwidth-bound (its even halves took 366 µs a pass on the XTX and 440 on the XT), and a decode step runs it ~3 times with the MTP head (up to 4). Each logit is one rank's dot product with the same K tiles: bit-exact with the int8 head (`FREETOKEN_INT8_DENSE`, the profiles; `tests/layers/test_lm_head_split.py`), not checked with a bf16 head (`F.linear` may pick other kernels for other heights). With `FREETOKEN_SPARSE_LOGITS` on `xtx-xt-4x262k` (EXL3 3.05 bpw): greedy decode +0.5 %, T 0.6 +0.3 %. |
 | `FREETOKEN_TP_ALLOW_IMBALANCE` | unset | `1`: accept ranks whose free memory differs by more than 2 GiB (upstream refuses them) and plan every pool on the smallest one. Needed for unequal cards; below a 2 GiB difference it changes nothing. |
 | `FREETOKEN_HOST_ALLREDUCE` | unset | `1` (two ranks, ROCm): small all-reduces through one shared host-memory region and a one-block kernel instead of RCCL's proxy path. 6 µs instead of ~12 µs per decode all-reduce, **+2.5-4.8 % decode, bit-exact** (fp32 accumulation, rounded to bf16 like RCCL). |
@@ -787,7 +788,8 @@ disagreements over ~8k sampled tokens in `check` mode). It is on the torch.distr
 | `FREETOKEN_INT8_DENSE` | unset | `1`: every dense (non-expert) linear layer in int8, weights only, one scale per output channel and rank; routers and the vision tower stay bf16. Converted at load. **+28 % decode**, frees ~2.4 GiB per card for the expert cache. Lossy, not bit-exact; no measurable loss on the scored benchmark, *agent-validated*. |
 | `FREETOKEN_INT8_DENSE_SKIP` | empty | Comma-separated module names to keep in bf16. |
 | `FREETOKEN_INT8_PREFILL_DEQUANT` | `triton` | With `FREETOKEN_INT8_DENSE=1`, a prefill dequantizes each int8 weight for its GEMM in one Triton pass (int8 times the row's fp32 scale, rounded once to bf16) instead of `torch.mul`'s mixed-dtype kernel: the same arithmetic, **bit-exact** (`tests/kernels/test_int8_dequant.py`). The dequant 2-8x faster on the 7900 XT (GDN in_proj 456 -> 58 us); agent turns 0.7-1.6 % shorter on `xtx-xt-4x262k`. `torch`: `torch.mul`. |
-| `FREETOKEN_INT8_COMPACT` | `1` | Compact the device allocator after the conversion; without it the freed VRAM stays fragmented and is lost to the expert cache. Every tensor is then read back against its host copy (under a second a rank). If one differs (reported on two RX 7900 XTX, where most did after every compaction), the differing ones are copied again and all must then read back right twice, a second apart; the load stops if they never do. `0`: no compaction, a smaller expert cache. |
+| `FREETOKEN_INT8_COMPACT` | `1` | Compact the device allocator after the conversion; without it the freed VRAM stays fragmented and is lost to the expert cache. Every tensor is then read back against its host copy (under a second a rank). If one differs (reported on two RX 7900 XTX, where most did after every compaction), the differing ones are copied again, all must then read back right twice, a second apart (the load stops if they never do), and the releases of VRAM that follow wait (`FREETOKEN_VRAM_RELEASE_SETTLE`). `0`: no compaction, a smaller expert cache. |
+| `FREETOKEN_VRAM_RELEASE_SETTLE` | unset | Seconds the engine waits after it gave cached VRAM back to the driver (the compaction above, the pools' re-allocations, before the graphs' capture and the memory plan), before that memory is allocated again. Unset: no wait, until the read-back after the compaction finds a difference in this process, then 1 s after each release. Reported from two RX 7900 XTX on a 7.2 kernel: copies into VRAM allocated right after a release were lost for most tensors, at every start; a wait of 0.5 s after the release, or between the allocation and the copies, left none (14 starts of 14). On such a machine `0.5` avoids the lost copies, hence the warning, from the first release on. `0`: never wait. Not needed on the reference machine (no difference at any start). |
 | `FREETOKEN_EMBED_HOST` | `1` on ROCm, `0` elsewhere | The input embedding, when it is not tied to the LM head (Qwen3.8-Flash-Next's is not), stays in pinned, device-mapped host memory instead of VRAM: the same lookup kernel reads the same rows across PCIe, a 5 KiB row per token. Its VRAM (606 MiB a rank at TP=2, 1.18 GiB on one card) goes to the expert cache: on `xtx-xt-4x262k` (a 3 x 262k pool) 8,768 -> 9,255 slots with NVFP4 and 11,554 -> 12,095 with EXL3 3.05 bpw, on `xtx` 4,783 -> 5,459 (EXL3); decode 1-6 % faster, agent turns ~3 % shorter, cold reads unchanged. The same bits (`tests/layers/test_embed_host.py`). The server locks 1.2 GiB more RAM (the table). `0`: the table in VRAM. |
 | `FREETOKEN_INT8_ROWS_MAX` | `8` | Decode batches up to this many rows (concurrent requests) use the row-looped GEMVs (the int8 one and the bf16 Triton one), each row bit-identical to a batch of one; bigger batches dequantize the int8 weight per call (bf16 layers use `F.linear`). |
 | `FREETOKEN_INT8_ROW_GROUPS` | `1` | With several rows (a speculative verify step, or requests decoding together), the int8 GEMVs whose input is longer than one tile (hyper-connection down projections, shared expert gate/up, index projection, LM head) read each weight tile once for up to 4 rows instead of once per row; same arithmetic per row, bit-exact. At 4 rows on the XT: HC down 17.7 -> 12.1 µs, LM head 704 -> 499 µs. `0`: each program runs the rows one after the other, reloading the tile for each. |
@@ -4994,7 +4996,45 @@ the order of its own snapshots is whatever the heap makes of a tie.)
   rest streamed from RAM by the copy engine. Streaming them all (the gather off above 4,096 tokens): a 255k-token read
   64.6 s against 63.7. The gather stays.
 
-## 52. Still open
+## 52. A report from two RX 7900 XTX: copies lost after a release of VRAM, EXL3 on identical cards (2026-11-13 to 15)
+
+The first report on the untested `xtx-xtx` profile (EXL3 3.05 bpw, kernel 7.2.11, both cards on Gen4 x8 links, an
+integrated GPU beside them) came with a crash: a rank died on a division by zero in the PLE row store at the first
+decode step.
+
+- **What was lost.** The n-gram hash constants read zeros or other values after the int8 compaction
+  (`FREETOKEN_INT8_COMPACT`), which moves the model's tensors to RAM, releases their VRAM and allocates it again. They
+  were only the first thing that could crash: read back against their host copies, 730 to 1,013 of a rank's 1,232
+  tensors differed after every compaction there, a second copy into the same tensors held, two read-backs in a row
+  could differ and values right just after the copies were wrong seconds later. Not reproduced on the XTX + XT
+  (kernel 7.0, no P2P link between the cards in the KFD topology, where that machine lists two): 1,232 of 1,232 at
+  every start. That kernel has `drm/amdkfd: Clear VRAM on allocation` too, so that change alone is not it.
+- **A wait is enough.** On that machine 0.5 s between the release and the next allocations, or between the
+  allocations and the copies, left no tensor wrong (14 starts of 14; 3 of 3 without a wait had 971-1,013 wrong a
+  rank). Allocating everything before copying, without a wait, changed nothing. So something still runs on VRAM that
+  was just released, for well under half a second; what, in the kernel or the runtime, is not known.
+- **What the engine does.** The compaction reads every tensor back, copies the differing ones again and asks for two
+  clean read-backs a second apart; the hash constants are checked before the row store is built; and once a process
+  has seen a difference it waits a second after each later release of cached VRAM
+  (`FREETOKEN_VRAM_RELEASE_SETTLE` sets that wait from the start).
+- **EXL3 on two identical cards.** The experts' intermediate is five 128-wide blocks: 3 + 2 on two ranks, never 2.5,
+  so `serve.sh` gives such a profile `FREETOKEN_TP_SPLIT=0.6`. The expert cache is then planned on rank 0 and rank 1
+  keeps VRAM the cache cannot use. `FREETOKEN_TP_SPLIT_DENSE=0.4` (the GatedDeltaNet heads and the shared expert the
+  other way round) was kept: on the two XTX 10,332 expert slots instead of 9,190 and decode 93.8 -> 100.0 tok/s
+  (medians of 7 runs), 11,106 slots and 101.7 tok/s with the whole profile. On the XTX + XT it gives the smaller card
+  the work: +5.5 % slots, decode ~6 % slower.
+- **Tried, not kept as a default: the attention on one rank** (`FREETOKEN_ATTN_RANK`). The model has two K/V heads,
+  one a rank, so the attention cannot follow an uneven split, only move whole. It frees 8 GiB on the other rank
+  (20,838 -> 12,684 MiB on the XTX, 14,837 expert slots planned instead of 11,336) and answers as before on 110k-token
+  prompts, four requests at once and conversations taken back from the RAM tier. On the two XTX it gave the slots
+  (10,404, and 11,833 with `FREETOKEN_TP_SPLIT_DENSE=0.7`) but an 8.3k-token cold read 11-15 % slower and decode
+  78-91 tok/s against 94-102: one rank then computes all the attention. Long contexts and several requests were not
+  measured there.
+- **Also from that report**: the automatic GPU choice took the integrated GPU as rank 0 (it reports 62 GiB, a share
+  of the RAM); it now keeps the cards of the architecture of the one with the most compute units. And a command
+  copied from an older `--dry-run` lacked `FREETOKEN_GDN_SNAP_HOST=1`: 9,190 slots instead of 11,106.
+
+## 53. Still open
 
 - In NVFP4 the model needs ~63 GiB of RAM for its experts alone (the engine keeps every expert in RAM). The EXL3 3.05
   bpw checkpoint needs 42.6 GiB and serves under a 56 GiB container limit with `serve.sh --low-ram` (section 50), but
@@ -5407,12 +5447,17 @@ is left out (a note says so). Force a choice with `--gpus 1,0` (rank 0 first).
 ## `tensors differ from their host copy after the compaction` or `the PLE n-gram hash constants are not the checkpoint's`
 
 With `FREETOKEN_INT8_DENSE=1` the load moves the model's tensors to RAM and back to pack the VRAM, then reads every
-one back. A warning means some came back different and were copied again, then read back right twice a second apart; the
-error means they never did, or
-that the n-gram hash constants (the smallest tensors of the model) are not a checkpoint's any more: the server stops
-instead of dividing by zero in the hash or reading wrong table rows. The warning was reported at every start on two RX 7900 XTX (kernel 7.2), with a server that then answers
-right; it does not happen on the reference machine (XTX + XT, kernel 7.0). To avoid the round trip, add
-`FREETOKEN_INT8_COMPACT=0` to the profile file (a smaller expert cache); report the machine: kernel version, cards, the lines above from the log.
+one back. A warning means some came back different: they were copied again, then all read back right twice a second
+apart, and from then on the engine waits a second each time it has given VRAM back to the driver before using that
+memory again. The server then serves normally. The error means the tensors never read back right, or that the n-gram
+hash constants (the smallest tensors of the model) are not a checkpoint's any more: the server stops instead of
+dividing by zero in the hash or reading wrong table rows.
+
+The warning was reported at every start on two RX 7900 XTX with a 7.2 kernel; it does not happen on the reference
+machine (XTX + XT, kernel 7.0). There, copies into VRAM allocated right after a release are lost for a fraction of a
+second: `FREETOKEN_VRAM_RELEASE_SETTLE=0.5` in the profile file makes every release wait half a second and the warning
+goes away. `FREETOKEN_INT8_COMPACT=0` skips the round trip altogether (a smaller expert cache). If you see the
+warning, report the machine: kernel version, cards, the lines from the log.
 
 ## Out of memory at start-up or on long prompts
 
@@ -5646,6 +5691,7 @@ docker run --rm --device=/dev/kfd --device=/dev/dri --security-opt seccomp=uncon
 | `host_allreduce_check.py` (2 GPUs: `HIP_VISIBLE_DEVICES=0,1`) | the host-memory all-reduce against RCCL |
 | `dma_allreduce_check.py` (2 GPUs: `HIP_VISIBLE_DEVICES=0,1`) | the copy-engine all-reduce of large messages against RCCL (bits, two in flight, timings, beside GEMMs) |
 | `host_kv_check.py` | the RAM-tier copies (device -> RAM -> device) are exact |
+| `vram_release_check.py` | copies into VRAM allocated right after a release hold (one GPU, torch only: fill, release, allocate again, copy, read back twice); `--wait 0.5` waits after the release. Passes on the XTX and the XT; for a machine that shows the compaction's `tensors differ from their host copy` warning ([troubleshooting.md](troubleshooting.md)) |
 | `qsa_kv_int8_check.py` | the int8 attention KV (off, not recommended) against bf16 and an fp32 reference |
 | `run_sampling_tests.sh <module>` + `sampling_test.py` | sampling kernels in four modes, each killed after 90 s (hang detector). Runs on the host and starts its own containers (image: `FREETOKEN_IMAGE`, default `freetoken-rdna3:latest`) |
 | `shape_check.py` (CPU) | the loader's per-rank tensors match the buffers the model declares, per TP rank; `--vision` includes the vision tower; needs the checkpoint mounted at `/models/m` (`-v <model dir>:/models/m:ro`) |
@@ -6305,6 +6351,20 @@ Line counts here are on top of the lines listed in the sections above.
 | `python/freetoken/kvcache/hybrid_radix_cache.py` | 33/1 | `FREETOKEN_GDN_EVICT_CHEAP_TOKENS` (2048; 0 = upstream's order): `evict_mamba` gives up first, oldest first, the snapshots whose loss costs a returning request fewer tokens than that to read again (`_snapshot_costs`: the tokens since the snapshot above on the path), then the others least recently used first |
 | `tests/scheduler/test_gdn_snap_host.py`, `tests/kvcache/test_host_kv_tier.py`, `tests/kvcache/radix/model.py`, `tests/kvcache/radix/test_hybrid_radix.py` | 248/0, 49/9, 14/1, 21/0 | the donation, restore, eviction, admission and rebuild paths with host slots (CPU: plain tensors) and on a GPU what a prefill's writes and the two copies leave in mapped memory; the RAM tier's lifecycle with the real pool in that mode; a conversation that waits keeps its snapshot while another takes turns (and loses it in upstream's order); the reference model's eviction check follows the rule |
 | `rdna3/profiles/xtx-xt.env`, `xtx-xt-4x262k.env`, `xtx-xt-1m.env`, `xt-xt.env`, `xtx-xtx.env`, `xtx.env`, `xt.env`, `gre.env`, `rdna3/serve.sh`, `tests/rdna3/test_serve_sh.py` | 1/0, 14/9, 1/0, 1/0, 1/0, 1/0, 1/0, 1/0, 19/10, 5/3 | the setting in the profiles; `serve.sh` counts its 2.2 GiB (0.8 on one card) of RAM (`--check`, the warning at start) and `--low-ram` drops it |
+
+## Tensors read back after the int8 compaction, a wait after a release of VRAM, EXL3 on two identical cards
+
+Line counts here are on top of the lines listed in the sections above.
+
+| File | Lines | Change |
+|---|---:|---|
+| `python/freetoken/layers/quantization/int8_weight_only.py`, `models/qwen4_exp/ple.py`, `models/qwen4_exp/model.py` | 49/5, 17/0, 2/0 | after the compaction every device tensor is read back against its host copy (`_verify_copies`: copied again, then two clean read-backs a second apart, or the load stops); the PLE n-gram hash constants are checked before the row store is built (`check_hash_constants`) |
+| `python/freetoken/utils/torch_utils.py`, `utils/__init__.py`, `engine/engine.py`, `engine/graph.py`, `kvcache/mha_pool.py`, `kvcache/linear_state_pool.py`, `layers/embedding.py`, `moe/offload_cache.py` | 37/0, 3/1, 2/2, 2/2, 2/2, 2/1, 2/2, 2/2 | `release_cached_vram` in place of `torch.cuda.empty_cache()`: it waits `FREETOKEN_VRAM_RELEASE_SETTLE` seconds when VRAM went back to the driver (unset: a second, once the read-back has seen a difference in this process) |
+| `python/freetoken/distributed/split.py`, `models/qwen4_exp/moe.py`, `models/qwen4_exp/weight.py` | 63/11, 3/3, 14/5 | `FREETOKEN_TP_SPLIT_DENSE`: shares of their own for the GatedDeltaNet heads, the shared expert and the LM head (`tp_shares(dense=True)`, `shared_intermediate_partition`); `FREETOKEN_ATTN_RANK`: `attn_owner`, `attn_local_heads`, the loader gives the attention's tensors whole to the owner and none to the other ranks |
+| `python/freetoken/models/qwen4_exp/attention.py`, `layers/linear.py`, `kvcache/base.py`, `kvcache/mha_pool.py`, `kvcache/qsa_pool.py` | 18/5, 3/1, 13/2, 3/1, 3/4 | under `FREETOKEN_ATTN_RANK` the owner builds the attention with every head (`LinearOProj(local_input_size=...)`), the other ranks add zeros to the all-reduce of its output; the K/V pools and their cost count the rank's own heads |
+| `rdna3/serve.sh`, `rdna3/profiles/xtx-xtx.env`, `xt-xt.env` | 20/2, 2/1, 2/0 | the automatic GPU choice keeps the cards of the architecture of the one with the most compute units (`pick_gpus`); an EXL3 checkpoint on an even-split profile gets `FREETOKEN_TP_SPLIT=0.6` and `FREETOKEN_TP_SPLIT_DENSE=0.4` |
+| `rdna3/tests/vram_release_check.py` | new | GPU check, torch only: fill a card, release, allocate again, copy from RAM, read back twice |
+| `tests/layers/test_int8_weight_only.py`, `tests/utils/test_vram_release.py`, `tests/models/qwen4_exp/test_ple.py`, `tests/models/qwen4_exp/test_tp_uneven.py`, `tests/rdna3/test_serve_sh.py` | 37/0, new, 23/0, 51/0, 32/4 | the read-back (a copy made again, one that never holds, a late write), the settle time, damaged hash constants, the dense shares and the attention on one rank, an integrated GPU and EXL3 on an even-split profile on the fake machine |
 
 ## Tooling and documentation
 

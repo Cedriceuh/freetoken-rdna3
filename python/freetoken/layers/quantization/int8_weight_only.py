@@ -29,7 +29,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from freetoken.utils import init_logger
+from freetoken.utils import init_logger, note_vram_release_race, release_cached_vram
 
 logger = init_logger(__name__)
 
@@ -133,7 +133,7 @@ def convert_model(root: Any) -> tuple[int, int]:
     before = torch.cuda.mem_get_info()[0] if torch.cuda.is_available() else 0
     walk(root, "")
     if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+        release_cached_vram()
         logger.info_rank0(f"INT8 weight-only: device free memory {before / 2**30:.2f} -> "
                           f"{torch.cuda.mem_get_info()[0] / 2**30:.2f} GiB")
     kinds = sorted({".".join(p.split(".")[-2:]) for p in names})
@@ -175,7 +175,7 @@ def compact_device_tensors(root: Any) -> None:
         host[k] = host_by_id[id(v)] if v.is_cuda else v
     del state
     root.load_state_dict(dict(host))
-    torch.cuda.empty_cache()
+    release_cached_vram()
     dev_by_id: dict[int, torch.Tensor] = {}
     order = sorted(host, key=lambda k: -(host[k].numel() * host[k].element_size()))
     placed = {}
@@ -185,7 +185,7 @@ def compact_device_tensors(root: Any) -> None:
             dev_by_id[id(v)] = v.to(device)
         placed[k] = dev_by_id[id(v)] if k in device_keys else v
     root.load_state_dict(dict(placed))  # load_state_dict empties the dict it is given
-    torch.cuda.empty_cache()
+    release_cached_vram()
     _verify_copies(placed, host, device_keys)
     logger.info_rank0(f"INT8 weight-only: compacted {len(device_keys)} device tensors, free memory "
                       f"{before / 2**30:.2f} -> {torch.cuda.mem_get_info()[0] / 2**30:.2f} GiB")
@@ -209,6 +209,10 @@ def _verify_copies(placed: dict[str, torch.Tensor], host: dict[str, torch.Tensor
     bad = differing()
     if not bad:
         return
+    # writes into VRAM allocated right after a release do not hold on this machine: every later release waits
+    note_vram_release_race()
+    logger.warning("INT8 weight-only: this machine loses writes into VRAM re-allocated right after a release; every "
+                   "later release of cached VRAM waits before the memory is used again (FREETOKEN_VRAM_RELEASE_SETTLE)")
     clean = 0
     for _ in range(rounds):
         if bad:

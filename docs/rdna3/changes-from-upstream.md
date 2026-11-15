@@ -472,6 +472,20 @@ Line counts here are on top of the lines listed in the sections above.
 | `tests/scheduler/test_gdn_snap_host.py`, `tests/kvcache/test_host_kv_tier.py`, `tests/kvcache/radix/model.py`, `tests/kvcache/radix/test_hybrid_radix.py` | 248/0, 49/9, 14/1, 21/0 | the donation, restore, eviction, admission and rebuild paths with host slots (CPU: plain tensors) and on a GPU what a prefill's writes and the two copies leave in mapped memory; the RAM tier's lifecycle with the real pool in that mode; a conversation that waits keeps its snapshot while another takes turns (and loses it in upstream's order); the reference model's eviction check follows the rule |
 | `rdna3/profiles/xtx-xt.env`, `xtx-xt-4x262k.env`, `xtx-xt-1m.env`, `xt-xt.env`, `xtx-xtx.env`, `xtx.env`, `xt.env`, `gre.env`, `rdna3/serve.sh`, `tests/rdna3/test_serve_sh.py` | 1/0, 14/9, 1/0, 1/0, 1/0, 1/0, 1/0, 1/0, 19/10, 5/3 | the setting in the profiles; `serve.sh` counts its 2.2 GiB (0.8 on one card) of RAM (`--check`, the warning at start) and `--low-ram` drops it |
 
+## Tensors read back after the int8 compaction, a wait after a release of VRAM, EXL3 on two identical cards
+
+Line counts here are on top of the lines listed in the sections above.
+
+| File | Lines | Change |
+|---|---:|---|
+| `python/freetoken/layers/quantization/int8_weight_only.py`, `models/qwen4_exp/ple.py`, `models/qwen4_exp/model.py` | 49/5, 17/0, 2/0 | after the compaction every device tensor is read back against its host copy (`_verify_copies`: copied again, then two clean read-backs a second apart, or the load stops); the PLE n-gram hash constants are checked before the row store is built (`check_hash_constants`) |
+| `python/freetoken/utils/torch_utils.py`, `utils/__init__.py`, `engine/engine.py`, `engine/graph.py`, `kvcache/mha_pool.py`, `kvcache/linear_state_pool.py`, `layers/embedding.py`, `moe/offload_cache.py` | 37/0, 3/1, 2/2, 2/2, 2/2, 2/1, 2/2, 2/2 | `release_cached_vram` in place of `torch.cuda.empty_cache()`: it waits `FREETOKEN_VRAM_RELEASE_SETTLE` seconds when VRAM went back to the driver (unset: a second, once the read-back has seen a difference in this process) |
+| `python/freetoken/distributed/split.py`, `models/qwen4_exp/moe.py`, `models/qwen4_exp/weight.py` | 63/11, 3/3, 14/5 | `FREETOKEN_TP_SPLIT_DENSE`: shares of their own for the GatedDeltaNet heads, the shared expert and the LM head (`tp_shares(dense=True)`, `shared_intermediate_partition`); `FREETOKEN_ATTN_RANK`: `attn_owner`, `attn_local_heads`, the loader gives the attention's tensors whole to the owner and none to the other ranks |
+| `python/freetoken/models/qwen4_exp/attention.py`, `layers/linear.py`, `kvcache/base.py`, `kvcache/mha_pool.py`, `kvcache/qsa_pool.py` | 18/5, 3/1, 13/2, 3/1, 3/4 | under `FREETOKEN_ATTN_RANK` the owner builds the attention with every head (`LinearOProj(local_input_size=...)`), the other ranks add zeros to the all-reduce of its output; the K/V pools and their cost count the rank's own heads |
+| `rdna3/serve.sh`, `rdna3/profiles/xtx-xtx.env`, `xt-xt.env` | 20/2, 2/1, 2/0 | the automatic GPU choice keeps the cards of the architecture of the one with the most compute units (`pick_gpus`); an EXL3 checkpoint on an even-split profile gets `FREETOKEN_TP_SPLIT=0.6` and `FREETOKEN_TP_SPLIT_DENSE=0.4` |
+| `rdna3/tests/vram_release_check.py` | new | GPU check, torch only: fill a card, release, allocate again, copy from RAM, read back twice |
+| `tests/layers/test_int8_weight_only.py`, `tests/utils/test_vram_release.py`, `tests/models/qwen4_exp/test_ple.py`, `tests/models/qwen4_exp/test_tp_uneven.py`, `tests/rdna3/test_serve_sh.py` | 37/0, new, 23/0, 51/0, 32/4 | the read-back (a copy made again, one that never holds, a late write), the settle time, damaged hash constants, the dense shares and the attention on one rank, an integrated GPU and EXL3 on an even-split profile on the fake machine |
+
 ## Tooling and documentation
 
 | File | Change |

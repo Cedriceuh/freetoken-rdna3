@@ -3158,7 +3158,45 @@ the order of its own snapshots is whatever the heap makes of a tie.)
   rest streamed from RAM by the copy engine. Streaming them all (the gather off above 4,096 tokens): a 255k-token read
   64.6 s against 63.7. The gather stays.
 
-## 52. Still open
+## 52. A report from two RX 7900 XTX: copies lost after a release of VRAM, EXL3 on identical cards (2026-11-13 to 15)
+
+The first report on the untested `xtx-xtx` profile (EXL3 3.05 bpw, kernel 7.2.11, both cards on Gen4 x8 links, an
+integrated GPU beside them) came with a crash: a rank died on a division by zero in the PLE row store at the first
+decode step.
+
+- **What was lost.** The n-gram hash constants read zeros or other values after the int8 compaction
+  (`FREETOKEN_INT8_COMPACT`), which moves the model's tensors to RAM, releases their VRAM and allocates it again. They
+  were only the first thing that could crash: read back against their host copies, 730 to 1,013 of a rank's 1,232
+  tensors differed after every compaction there, a second copy into the same tensors held, two read-backs in a row
+  could differ and values right just after the copies were wrong seconds later. Not reproduced on the XTX + XT
+  (kernel 7.0, no P2P link between the cards in the KFD topology, where that machine lists two): 1,232 of 1,232 at
+  every start. That kernel has `drm/amdkfd: Clear VRAM on allocation` too, so that change alone is not it.
+- **A wait is enough.** On that machine 0.5 s between the release and the next allocations, or between the
+  allocations and the copies, left no tensor wrong (14 starts of 14; 3 of 3 without a wait had 971-1,013 wrong a
+  rank). Allocating everything before copying, without a wait, changed nothing. So something still runs on VRAM that
+  was just released, for well under half a second; what, in the kernel or the runtime, is not known.
+- **What the engine does.** The compaction reads every tensor back, copies the differing ones again and asks for two
+  clean read-backs a second apart; the hash constants are checked before the row store is built; and once a process
+  has seen a difference it waits a second after each later release of cached VRAM
+  (`FREETOKEN_VRAM_RELEASE_SETTLE` sets that wait from the start).
+- **EXL3 on two identical cards.** The experts' intermediate is five 128-wide blocks: 3 + 2 on two ranks, never 2.5,
+  so `serve.sh` gives such a profile `FREETOKEN_TP_SPLIT=0.6`. The expert cache is then planned on rank 0 and rank 1
+  keeps VRAM the cache cannot use. `FREETOKEN_TP_SPLIT_DENSE=0.4` (the GatedDeltaNet heads and the shared expert the
+  other way round) was kept: on the two XTX 10,332 expert slots instead of 9,190 and decode 93.8 -> 100.0 tok/s
+  (medians of 7 runs), 11,106 slots and 101.7 tok/s with the whole profile. On the XTX + XT it gives the smaller card
+  the work: +5.5 % slots, decode ~6 % slower.
+- **Tried, not kept as a default: the attention on one rank** (`FREETOKEN_ATTN_RANK`). The model has two K/V heads,
+  one a rank, so the attention cannot follow an uneven split, only move whole. It frees 8 GiB on the other rank
+  (20,838 -> 12,684 MiB on the XTX, 14,837 expert slots planned instead of 11,336) and answers as before on 110k-token
+  prompts, four requests at once and conversations taken back from the RAM tier. On the two XTX it gave the slots
+  (10,404, and 11,833 with `FREETOKEN_TP_SPLIT_DENSE=0.7`) but an 8.3k-token cold read 11-15 % slower and decode
+  78-91 tok/s against 94-102: one rank then computes all the attention. Long contexts and several requests were not
+  measured there.
+- **Also from that report**: the automatic GPU choice took the integrated GPU as rank 0 (it reports 62 GiB, a share
+  of the RAM); it now keeps the cards of the architecture of the one with the most compute units. And a command
+  copied from an older `--dry-run` lacked `FREETOKEN_GDN_SNAP_HOST=1`: 9,190 slots instead of 11,106.
+
+## 53. Still open
 
 - In NVFP4 the model needs ~63 GiB of RAM for its experts alone (the engine keeps every expert in RAM). The EXL3 3.05
   bpw checkpoint needs 42.6 GiB and serves under a 56 GiB container limit with `serve.sh --low-ram` (section 50), but

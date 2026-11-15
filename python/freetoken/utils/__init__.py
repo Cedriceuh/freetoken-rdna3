@@ -27,7 +27,7 @@ from .mp import (
     ZmqSubQueue,
 )
 from .registry import Registry
-from .torch_utils import nvtx_annotate, torch_dtype
+from .torch_utils import note_vram_release_race, nvtx_annotate, release_cached_vram, torch_dtype
 
 __all__ = [
     "cached_load_hf_config",
@@ -53,7 +53,9 @@ __all__ = [
     "UNSET",
     "Unset",
     "torch_dtype",
+    "note_vram_release_race",
     "nvtx_annotate",
+    "release_cached_vram",
     "Registry",
     "ZmqPushQueue",
     "ZmqPullQueue",

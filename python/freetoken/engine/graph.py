@@ -11,7 +11,7 @@ import torch
 from freetoken.core import Batch, Req, get_global_ctx
 from freetoken.distributed import get_tp_info
 from freetoken.spec_decode import SHALLOW_M, SPEC_BS_DEEP, SPEC_BS_MAX, SPEC_M, SPEC_MS, rows_of
-from freetoken.utils import init_logger, mem_GB
+from freetoken.utils import init_logger, mem_GB, release_cached_vram
 from freetoken.utils.progress import emit_progress
 from tqdm import tqdm
 
@@ -260,7 +260,7 @@ class GraphRunner:
         self.attn_backend.init_capture_graph(max_seq_len=max_seq_len, bs_list=self.graph_bs_list, rows_per_req=self.rows_per_req)
 
         torch.cuda.synchronize(self.device)
-        torch.cuda.empty_cache()
+        release_cached_vram()
         torch.cuda.reset_peak_memory_stats(self.device)
 
         logger.info_rank0(f"Start capturing CUDA graphs with sizes: {self.graph_bs_list}")
