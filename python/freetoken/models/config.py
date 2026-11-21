@@ -130,6 +130,9 @@ class KVCacheGroupSpec:
     # Attention-type taxonomy value for this group; drives the backend capability
     # matrix and (with the pool factory) selects the KV pool family.
     attn_type: AttnType = AttnType.FULL
+    # (layer, source) pairs: layers of this group that read the source's slab and own none.
+    # They are not in ``layer_ids``, so neither the pool nor the cost model gives them a slab.
+    shared_layers: Tuple[Tuple[int, int], ...] = ()
 
     @property
     def num_layers(self) -> int:
@@ -269,9 +272,7 @@ class SlotVerify(Protocol):
 class SlotStateSpec:
     """One extra per-request tensor riding the LinearStatePool slots.
 
-    Allocated as ``[max(1, len(layer_ids)), num_slots, *shape]`` and advanced, snapshot,
-    COW'd and rebuilt with the GDN state; the owner reads it back through
-    ``pool.slot_state(name, layer_id)``. ``shape`` is per slot and TP-replicated.
+    Allocated as ``[max(1, len(layer_ids)), num_slots, *shape]``; ``copy_from``, ``reset`` and ``rebuild`` cover it with the GDN state. The owner advances it in the forward and writes its own prefill track snapshot into ``fla_metadata.track_dst``, after the chunk's rows; it reads the state back through ``pool.slot_state(name, layer_id)``. ``shape`` is per slot and TP-replicated.
     """
 
     name: str
@@ -279,7 +280,7 @@ class SlotStateSpec:
     layer_ids: Tuple[int, ...] = ()
     dtype: Any | None = None  # a torch dtype; None -> the pool's compute dtype
     fill_value: float = 0.0
-    # None: speculative decoding cannot serve a model carrying this state
+    # None on a model's own state: speculative decoding cannot serve the model; a proposer's state may leave it None and keep itself right in post_verify
     verify: type[SlotVerify] | None = None
 
 
@@ -381,9 +382,14 @@ class ModelConfig:
     # n-gram embedding geometry and the QSA indexer scoring geometry the model module
     # needs. Opaque to model-agnostic engine code; None for every other model.
     qwen4_args: Any | None = None
+    # Gemma-4 E2B / E4B payload (Gemma4EArgs): per-layer input embeddings and KV-shared
+    # layers. Opaque to model-agnostic engine code; None for every other model.
+    gemma4_e_args: Any | None = None
     # Generic execution-path capability flags (set by a model's parse_config) so the engine and
     # factories stay model-agnostic instead of branching on dsv4_args:
     single_stream_only: bool = False  # model runs one sequence at a time -> force bs=1
+    # (layer, source) pairs: the layer attends over the KV the source layer stored and stores none
+    kv_shared_layers: Tuple[Tuple[int, int], ...] = ()
     # Extra per-request tensors riding the LinearStatePool slots (see SlotStateSpec);
     # () for models without any. Requires a linear-attention group to ride on.
     slot_states: Tuple[SlotStateSpec, ...] = ()
@@ -500,13 +506,21 @@ class ModelConfig:
                 ),
             )
 
+        sources = dict(self.kv_shared_layers)
+
+        def split(group) -> dict:
+            return dict(
+                layer_ids=tuple(i for i in group.layer_ids if i not in sources),
+                shared_layers=tuple((i, sources[i]) for i in group.layer_ids if i in sources),
+            )
+
         specs: list[KVCacheGroupSpec] = []
         for group in self.attention_groups:
             if isinstance(group, FullAttentionGroupConfig):
                 specs.append(
                     KVCacheGroupSpec(
                         name=group.name,
-                        layer_ids=group.layer_ids,
+                        **split(group),
                         num_kv_heads=group.num_kv_heads,
                         head_dim=group.head_dim,
                         sliding_window=None,
@@ -521,7 +535,7 @@ class ModelConfig:
                 specs.append(
                     KVCacheGroupSpec(
                         name=group.name,
-                        layer_ids=group.layer_ids,
+                        **split(group),
                         num_kv_heads=group.num_kv_heads,
                         head_dim=group.head_dim,
                         sliding_window=group.sliding_window,

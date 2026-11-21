@@ -10,6 +10,7 @@ if TYPE_CHECKING:
     from freetoken.core import Batch, Req
     from freetoken.engine.sample import BatchSamplingArgs
     from freetoken.models.blocks import FeatureSink
+    from freetoken.models.config import SlotStateSpec
 
 SPEC_RUNNER = "freetoken.spec.runner:SpecRunner"
 
@@ -30,7 +31,16 @@ class SpecRuntime(Protocol):
     def adjust_config(cls, config, override) -> None: ...
 
     @classmethod
+    def prepare_target(cls, config, model) -> None: ...
+
+    @classmethod
     def budget(cls, config) -> tuple[int, int]: ...
+
+    @classmethod
+    def slot_states(cls, config) -> tuple[SlotStateSpec, ...]: ...
+
+    @classmethod
+    def target_may_be_windowed(cls, config) -> bool: ...
 
     def attach(self, engine) -> None: ...
 

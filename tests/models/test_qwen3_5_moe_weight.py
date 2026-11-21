@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import struct
+from collections.abc import Sequence
 from types import SimpleNamespace
 
 import pytest
@@ -22,6 +23,7 @@ from freetoken.models.qwen3_5_moe.config import parse_config
 from freetoken.models.qwen3_5_moe.weight import iter_expert_pieces, iter_weights, nvfp4_expert_spec
 from freetoken.models.register import checkpoint_quant_config, get_model_spec
 from freetoken.third_party import gguf as gguf_lib
+from freetoken.third_party.gguf import quants
 from freetoken.utils import cached_load_hf_config
 
 H, V = 128, 256  # hidden_size (every block-fp8 projection needs in/out multiples of 128), vocab
@@ -210,6 +212,14 @@ MODELOPT_MIXED = {
 MODELOPT_MIXED_A16 = {**MODELOPT_MIXED, "quantized_layers": {
     **MODELOPT_MIXED["quantized_layers"], **{f"{LM}.layers.{l}.mlp.experts": {"quant_algo": "W4A16_NVFP4", "group_size": 16} for l in (0, 1)}}}
 MODELOPT_MIXED_NOINPUT = {**MODELOPT_MIXED, "with_input_scale": False}
+# apodex/Apodex-1.1-mini-NVFP4: per-tensor FP8 attention / GDN / shared expert, NVFP4 experts, bf16 lm_head; the config says modelopt_mixed
+MODELOPT_TENSOR_FP8_MOE = {
+    "quant_method": "modelopt_mixed", "quant_algo": "MIXED_PRECISION", "ignore": ["mtp*"],
+    "quantized_layers": {
+        **{m: {"quant_algo": "FP8"} for m in GDN_QKVZ_OUT + ATTN + SHARED},
+        **{f"{LM}.layers.{l}.mlp.experts": {"quant_algo": "NVFP4", "group_size": 16} for l in (0, 1)},
+    },
+}
 # sakamakismile/Qwen3.6-27B-NVFP4: every Linear of the dense model, GDN in_proj included
 CT_NVFP4_DENSE = _ct({"group_0": {**NVFP4_GROUP, "targets": ["Linear"]}}, ["lm_head"], "nvfp4-pack-quantized")
 # RedHatAI/Qwen3.6-35B-A3B-NVFP4: every Linear but the GDN, the routers and lm_head
@@ -258,6 +268,10 @@ def _layout(name: str) -> tuple[bool, dict | None, dict[str, torch.Tensor]]:
         for key in [k for k in raw if k.endswith(".input_scale") and stripped(k)]:
             del raw[key]
         return moe, {"modelopt_mixed_a16": MODELOPT_MIXED_A16, "modelopt_mixed_noinput": MODELOPT_MIXED_NOINPUT}.get(name, MODELOPT_MIXED), raw
+    if name == "modelopt_tensor_fp8_moe":
+        _quantize(raw, GDN_QKVZ_OUT + ATTN + SHARED, _fp8_tensor)
+        _experts(raw, lambda w: _nvfp4(w, ct=False))
+        return moe, MODELOPT_TENSOR_FP8_MOE, raw
     if name == "ct_nvfp4_dense":
         _quantize(raw, GDN_QKVZ_OUT + GDN_BA + ATTN + DENSE_MLP, lambda w: _nvfp4(w, ct=True))
         return moe, CT_NVFP4_DENSE, raw
@@ -286,7 +300,7 @@ def _layout(name: str) -> tuple[bool, dict | None, dict[str, torch.Tensor]]:
     raise KeyError(name)
 
 
-LAYOUTS = ["bf16", "fp8_block", "modelopt_mixed", "modelopt_mixed_a16", "modelopt_mixed_noinput", "ct_nvfp4_dense", "ct_nvfp4_moe", "ct_mixed_fast", "ct_tensor_fp8_moe", "ct_block_moe", "ct_block_experts"]
+LAYOUTS = ["bf16", "fp8_block", "modelopt_mixed", "modelopt_mixed_a16", "modelopt_mixed_noinput", "modelopt_tensor_fp8_moe", "ct_nvfp4_dense", "ct_nvfp4_moe", "ct_mixed_fast", "ct_tensor_fp8_moe", "ct_block_moe", "ct_block_experts"]
 
 
 def _config_json(moe: bool, quantization_config) -> dict:
@@ -672,7 +686,8 @@ def test_mtp_head_fills_the_draft_and_its_experts(checkpoint):
 # --------------------------------------------------------------------------- the trunk's nextn block (GGUF)
 
 
-F32, BF16, Q8_0 = 0, 30, int(gguf_lib.GGMLQuantizationType.Q8_0)
+F32, BF16, Q4_0, Q8_0 = 0, 30, int(gguf_lib.GGMLQuantizationType.Q4_0), int(gguf_lib.GGMLQuantizationType.Q8_0)
+KV_U32, KV_F32, KV_BOOL, KV_STRING, KV_ARRAY = 4, 6, 7, 8, 9  # gguf metadata value types
 
 
 def _gguf_bytes(tensor: torch.Tensor, ggml_type: int) -> bytes:
@@ -680,20 +695,41 @@ def _gguf_bytes(tensor: torch.Tensor, ggml_type: int) -> bytes:
         return tensor.float().numpy().tobytes()
     if ggml_type == BF16:
         return tensor.to(torch.bfloat16).view(torch.uint16).numpy().tobytes()
-    raise KeyError(ggml_type)
+    # the packed types quantize from the float32 rows in torch order (the row's last dim is the block dim)
+    return quants.quantize(tensor.float().numpy(), gguf_lib.GGMLQuantizationType(ggml_type)).tobytes()
 
 
-def _write_gguf(path, arch: str, kv: dict[str, object], tensors: dict[str, tuple[int, tuple[int, ...], bytes]]) -> None:
-    """A minimal GGUF: header, the given KVs (u32 / string) and tensors; the reader needs no more."""
+def _kv_field(value: object) -> tuple[int, bytes]:
+    if isinstance(value, str):
+        return KV_STRING, struct.pack("<Q", len(value)) + value.encode()
+    if isinstance(value, float):
+        return KV_F32, struct.pack("<f", value)
+    if isinstance(value, bool):
+        return KV_BOOL, bytes([int(value)])
+    if isinstance(value, (list, tuple)):
+        if value and isinstance(value[0], str):
+            # the tokenizer tables
+            return KV_ARRAY, struct.pack("<IQ", KV_STRING, len(value)) + b"".join(
+                struct.pack("<Q", len(v)) + v.encode() for v in value)
+        if value and isinstance(value[0], bool):
+            # a bool array: dflash's sliding_window_pattern
+            return KV_ARRAY, struct.pack("<IQ", KV_BOOL, len(value)) + bytes(int(v) for v in value)
+        # an array of u32: dflash's target_layers and per-layer head_count_kv
+        return KV_ARRAY, struct.pack("<IQ", KV_U32, len(value)) + b"".join(struct.pack("<I", int(v)) for v in value)
+    return KV_U32, struct.pack("<I", int(value))
+
+
+def _write_gguf(path, arch: str, kv: dict[str, int | float | bool | str | Sequence[int] | Sequence[str]], tensors: dict[str, tuple[int, tuple[int, ...], bytes]]) -> None:
+    """A minimal GGUF: header, the given KVs (u32 / f32 / bool / string / arrays) and tensors; the reader needs no more."""
     out = bytearray(b"GGUF" + struct.pack("<IQQ", 3, len(tensors), len(kv) + 1))
 
     def field(name: str, vtype: int, payload: bytes) -> None:
         key = name.encode()
         out.extend(struct.pack("<Q", len(key)) + key + struct.pack("<I", vtype) + payload)
 
-    field("general.architecture", 8, struct.pack("<Q", len(arch)) + arch.encode())
+    field("general.architecture", KV_STRING, struct.pack("<Q", len(arch)) + arch.encode())
     for name, value in kv.items():
-        field(f"{arch}.{name}", 4, struct.pack("<I", int(value)))
+        field(name if name.startswith("tokenizer.") else f"{arch}.{name}", *_kv_field(value))
 
     data = bytearray()
     infos = []

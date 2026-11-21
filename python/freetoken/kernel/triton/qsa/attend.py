@@ -12,6 +12,8 @@ import torch
 import triton
 import triton.language as tl
 
+from freetoken.kvcache.format import NONE, KVFormat
+
 # FREETOKEN_QSA_MIN_WARPS (default 4 on ROCm, 0 = the profile's own): the prefill profile's 2 warps hold the
 # [BLOCK_M, HEAD_DIM] accumulator and the K / V tiles in ~2.2 KB of scratch per lane on RDNA3 (head_dim 256); at 4
 # warps none spills: the same bits (each lane's sums keep their order), the kernel ~40 % faster at 1k-16k rows, and no
@@ -479,6 +481,7 @@ def qsa_sparse_paged_attention(
     block_table: torch.Tensor,
     token_to_req: torch.Tensor,
     out: torch.Tensor | None = None,
+    kv_format: KVFormat = NONE,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
     decode: bool = False,
@@ -502,6 +505,9 @@ def qsa_sparse_paged_attention(
     ``dcache``: the layer's decode K/V cache (:class:`DecodeCache`): this call's selected rows are put there first
     (:func:`dc_fill`), then read there instead of across PCIe."""
 
+    if kv_format.quantized:
+        # upstream's --kv-cache-dtype rows; this kernel reads compute-dtype K/V or FREETOKEN_QSA_KV_INT8's
+        raise NotImplementedError(f"QSA sparse attention does not read {kv_format.name} K/V on this fork")
     if q.ndim != 3 or k_cache.ndim != 4 or v_cache.shape != k_cache.shape:
         raise ValueError("QSA sparse attention received invalid Q/K/V shapes")
     if logical_indices.ndim != 2 or logical_indices.shape[0] != q.shape[0]:

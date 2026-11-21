@@ -7,13 +7,15 @@ from typing import TYPE_CHECKING, Any, List, Mapping
 
 import torch
 from freetoken.distributed import DistributedInfo
-from freetoken.layers.quantization import set_quant_config
+from freetoken.kvcache.format import KVFormat, resolve_kv_format
+from freetoken.layers.quantization import online_kinds, set_quant_config
 from freetoken.mm.config import ENCODER_SECTIONS, MultimodalConfig
 from freetoken.models.register import EncoderSpec, ModelSpec, _load_attr, checkpoint_quant_config, get_model_spec
 from freetoken.utils import cached_load_hf_config, init_logger
 
 if TYPE_CHECKING:
     from freetoken.models import ModelConfig
+    from freetoken.models.config import SlotStateSpec
 
 logger = init_logger(__name__)
 
@@ -27,6 +29,8 @@ class EngineConfig:
     hf_overrides: Mapping[str, Any] = field(default_factory=dict)
     max_running_req: int = 4
     attention_backend: str = "auto"
+    # --kv-cache-dtype: "auto" stores K and V in the compute dtype
+    kv_cache_dtype: str = "auto"
     moe_strategy: str = "auto"
     # old name of moe_strategy; __post_init__ folds it in
     moe_backend: str | None = field(default=None, repr=False)
@@ -36,6 +40,10 @@ class EngineConfig:
     ple_backend: str = "disk"
     # --embed-weights: "gpu" (default) keeps the input embedding tables in VRAM; "host" keeps the untied ones in pinned host RAM, read zero-copy by the lookup.
     embed_weights: str = "gpu"
+    # --online-quant: a QuantKind the layers this checkpoint stores bf16 are converted to at load (df11)
+    online_quant: str | None = None
+    # --online-quant-modules: checkpoint module names / globs that limit --online-quant to those modules
+    online_quant_modules: tuple[str, ...] = ()
     # DeepSeek-V4.1 Decoder SWA Bounded Replay: "bounded" (default) runs the decoder layers on each
     # prompt's last window; "exact" runs them on every token.
     swa_decoder_replay: str = "bounded"
@@ -109,6 +117,9 @@ class EngineConfig:
     speculative_algorithm: str | None = None
     speculative_num_steps: int = 0
     speculative_draft_model_path: str | None = None
+    speculative_token_map: str | None = None
+    # the proposer's states on the target's linear-state slots, resolved by _adjust_config
+    spec_slot_states: tuple[SlotStateSpec, ...] = ()
     max_seq_len_override: int | None = None
     num_page_override: int | None = None  # if not None, will override the number of pages
     # KV capacity in tokens; resolved into num_page_override by _adjust_config once page_size
@@ -116,6 +127,10 @@ class EngineConfig:
     num_token_override: int | None = None
     # Runtime knobs of the multimodal path; the architecture side (vision_config, mrope) lives in ModelConfig.
     mm: MultimodalConfig = field(default_factory=MultimodalConfig)
+
+    @property
+    def kv_format(self) -> KVFormat:
+        return resolve_kv_format(self.kv_cache_dtype)
 
     def __post_init__(self):
         if not (self.moe_locked_fetch == -1 or 0.0 <= self.moe_locked_fetch <= 1.0):
@@ -125,6 +140,12 @@ class EngineConfig:
             raise ValueError(f"moe_locked_fetch {self.moe_locked_fetch} rounds to 0 in Q16; pass 0 to keep locked layers CPU-only")
         if self.moe_locked_max_fetch < 1:
             raise ValueError(f"moe_locked_max_fetch must be at least 1, got {self.moe_locked_max_fetch}")
+        if self.online_quant_modules and not self.online_quant:
+            raise ValueError("--online-quant-modules names the modules --online-quant converts; pass --online-quant too")
+        if self.online_quant is not None and self.online_quant not in (known := sorted(str(k) for k in online_kinds())):
+            raise ValueError(f"online_quant {self.online_quant!r} has no online method; known: {known}")
+        if isinstance(self.online_quant_modules, str):
+            raise TypeError("online_quant_modules takes a tuple of module names or globs, not a string")
         if self.moe_backend is None:
             return
         if self.moe_strategy != "auto":
@@ -144,12 +165,17 @@ class EngineConfig:
     @cached_property
     def active_encoders(self) -> tuple[EncoderSpec, ...]:
         """The encoder towers this process builds: the family registers them, the checkpoint config carries their section, --mm-disable did not name them."""
-        return tuple(
-            e
-            for e in self.model_spec.encoders
-            if getattr(self.hf_config, e.config_key, None) is not None
-            and e.kind not in self.mm.disabled_encoders
-        )
+        active = []
+        for e in self.model_spec.encoders:
+            section = getattr(self.hf_config, e.config_key, None)
+            if section is None or e.kind in self.mm.disabled_encoders:
+                continue
+            reason = e.unserved(section) if e.unserved is not None else None
+            if reason is not None:
+                logger.warning(f"{e.kind} input is not served on this checkpoint: {reason}")
+                continue
+            active.append(e)
+        return tuple(active)
 
     @cached_property
     def served_modalities(self) -> frozenset[str]:
@@ -165,7 +191,9 @@ class EngineConfig:
             if key not in built and getattr(hf_config, key, None) is not None:
                 setattr(hf_config, key, None)
         spec = self.model_spec
-        quant = checkpoint_quant_config(self.model_path, hf_config, spec)
+        quant = checkpoint_quant_config(
+            self.model_path, hf_config, spec, online=self.online_quant, online_modules=self.online_quant_modules
+        )
         set_quant_config(quant)
         model_config = _load_attr(spec.module, spec.parse_config)(hf_config)
         return replace(model_config, quant=quant)
@@ -184,6 +212,11 @@ class EngineConfig:
     def decode_rows_per_req(self) -> int:
         """Query rows each running request takes per decode step; every per-request decode allowance derives from it."""
         return self.speculative_num_steps + 1 if self.speculative_algorithm is not None else 1
+
+    @property
+    def slot_states(self) -> tuple[SlotStateSpec, ...]:
+        """Every per-request state the linear-state pool holds: the model's own, then the proposer's."""
+        return self.model_config.slot_states + self.spec_slot_states
 
     @property
     def distributed_addr(self) -> str:

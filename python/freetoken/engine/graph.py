@@ -34,11 +34,11 @@ class GraphCaptureBuffer:
     fla_cu_seqlens: dict
 
     @classmethod
-    def init(cls, bs: int, device: torch.device, mrope: bool = False, row_counts: tuple[int, ...] = (1,)) -> GraphCaptureBuffer:
+    def init(cls, bs: int, device: torch.device, dummy_loc: int, mrope: bool = False, row_counts: tuple[int, ...] = (1,)) -> GraphCaptureBuffer:
         rows = bs * max(row_counts)  # token rows: up to max(row_counts) per request
         return GraphCaptureBuffer(
             input_ids=torch.zeros(rows, dtype=torch.int32, device=device),
-            out_loc=torch.zeros(rows, dtype=torch.int32, device=device),
+            out_loc=torch.full((rows,), dummy_loc, dtype=torch.int32, device=device),
             positions=torch.zeros(rows, dtype=torch.int32, device=device),
             # flat: each row count views it as a contiguous [3, rows] (the rope kernels' layout), so no attention layer
             # copies a strided [3, rows] slice of a [3, max_rows] buffer
@@ -267,7 +267,9 @@ class GraphRunner:
         free_memory = get_free_memory(self.device)
         logger.info_rank0(f"Free GPU memory before capturing CUDA graphs: {mem_GB(free_memory)}")
 
-        self.buffer = GraphCaptureBuffer.init(self.max_graph_bs, self.device, mrope=self.mrope, row_counts=self.row_counts)
+        # capture runs the forward eagerly and stores K/V, so aim it at the dummy page as replay does for padded rows; slot 0 is a real page
+        dummy_loc = int(get_global_ctx().page_table[self.dummy_req.table_idx, 0])
+        self.buffer = GraphCaptureBuffer.init(self.max_graph_bs, self.device, dummy_loc, mrope=self.mrope, row_counts=self.row_counts)
         self._reset_moe_offload_cache()
 
         # spec_decode: one graph per (batch size, rows per request); the capture batch carries m rows per request.

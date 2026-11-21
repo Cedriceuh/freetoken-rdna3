@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, List
 import torch
 import torch.nn.functional as F
 from freetoken.layers import BaseOP, LinearReplicated, OPList
+from freetoken.layers.quantization import without_online
 from freetoken.utils import init_logger
 
 from freetoken.models.weight_stream import BlockWeightStreamer
@@ -209,6 +210,8 @@ class Qwen3VLVisionModel(BaseOP):
     """
 
     def __init__(self, vc: VisionConfig, *, quant_config: QuantConfig | None = None, prefix: str = "visual"):
+        # the blocks stream to the GPU in one shared layout, which entropy-sized online buffers break
+        quant_config = without_online(quant_config)
         self.patch_embed = VisionConv3dPatchEmbed(vc)
         self.pos_embed = _EmbeddingParams(vc.num_position_embeddings, vc.hidden_size)
         self.blocks = OPList(

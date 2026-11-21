@@ -202,9 +202,11 @@ class Qwen4ExpModel(BaseOP):
             meta = build_ple_metadata(batch, self._ple[0].args, input_ids.device)
             for ple in self._ple:  # gather the pinned-host PLE rows while the early layers run
                 ple.start_prefetch(batch, meta)
+        features = getattr(batch, "features", None)
+        wanted = features.wanted_layers if features is not None else ()
         layers = self.layers.op_list
         carry = []
-        if _FUSED_HC_NORM and hidden.is_cuda:
+        if _FUSED_HC_NORM and hidden.is_cuda and not wanted:
             for i, layer in enumerate(layers):
                 if i + 1 == len(layers):
                     nxt = self.hyper_connection_mixer
@@ -212,8 +214,11 @@ class Qwen4ExpModel(BaseOP):
                     nxt = layers[i + 1].attn_hyper_connection if layers[i + 1].ple is None else None
                 hidden = layer.forward_hc_fused(hidden, batch, carry, nxt)
         else:
-            for layer in layers:
+            # a draft that reads layer outputs (upstream's DFlash) gets them from the plain per-layer forward
+            for i, layer in enumerate(layers):
                 hidden = layer.forward(hidden, batch)
+                if i in wanted:
+                    features.layer_output(i, hidden, num_streams=self.hc_count)
         if meta is not None and meta.is_verify:
             # the commit rolls the context by the accepted rows only
             get_global_ctx().linear_state_pool.verify_handler(PLE_NGRAM_STATE).stash(meta)
@@ -223,7 +228,7 @@ class Qwen4ExpModel(BaseOP):
             commit_ngram_context(meta, getattr(batch, "fla_metadata", None))
         if MTP_ENABLED:
             self._keep_streams(hidden, batch)
-        if (features := getattr(batch, "features", None)) is not None:
+        if features is not None:
             # a draft reads the residual streams before the final mix
             features.final_hidden(hidden)
         if carry:

@@ -60,8 +60,8 @@ class FeatureSink(Protocol):
         """Every row's final hidden state, once per forward: the LM head's input, or what the model hands over itself before the head."""
         ...
 
-    def layer_output(self, layer_id: int, x: torch.Tensor, num_streams: int = 1) -> None:
-        """A layer's output rows; called only for layers in ``wanted_layers``."""
+    def layer_output(self, layer_id: int, x: torch.Tensor, residual: torch.Tensor | None = None, num_streams: int = 1) -> None:
+        """A layer's output rows, ``x + residual`` (``x`` alone when ``residual`` is None), ``[T, num_streams*H]`` stream-major; called only for layers in ``wanted_layers``. The sum is left to the sink, so it adds only the rows it keeps. The forward may overwrite ``x`` and ``residual`` afterwards, so copy what is kept."""
         ...
 
 
@@ -76,10 +76,18 @@ def embed_input_ids(embed_tokens, input_ids: torch.Tensor, batch: Batch) -> torc
 
 
 class GatedMLP(BaseOP):
-    def __init__(self, config: ModelConfig, *, quant_config: QuantConfig | None = None, prefix: str = ""):
+    def __init__(
+        self,
+        config: ModelConfig,
+        *,
+        intermediate_size: int | None = None,
+        quant_config: QuantConfig | None = None,
+        prefix: str = "",
+    ):
+        intermediate_size = intermediate_size or config.intermediate_size
         self.gate_up_proj = LinearColParallelMerged(
             config.hidden_size,
-            [config.intermediate_size, config.intermediate_size],
+            [intermediate_size, intermediate_size],
             has_bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
@@ -91,7 +99,7 @@ class GatedMLP(BaseOP):
             raise ValueError(f"Unsupported activation function: {config.hidden_act}")
         self.act_fn = act_fn
         self.down_proj = LinearRowParallel(
-            config.intermediate_size,
+            intermediate_size,
             config.hidden_size,
             has_bias=False,
             quant_config=quant_config,

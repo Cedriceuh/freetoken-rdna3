@@ -7,6 +7,8 @@ from typing import ClassVar, NamedTuple
 import torch
 from freetoken.utils import init_logger, mem_GB
 
+from .format import NONE, KVFormat
+
 logger = init_logger(__name__)
 
 
@@ -27,8 +29,8 @@ def _local_kv_heads(spec, config) -> int:
     return spec.num_kv_heads if config.tp_info.rank == owner else 0
 
 
-def spec_kv_bytes_per_token(spec, config) -> int:
-    """One paged-KV group's bytes per token: (1|2 slabs) x head_dim x local kv heads x dtype
+def spec_kv_bytes_per_token(spec, config, fmt: KVFormat = NONE) -> int:
+    """One paged-KV group's bytes per token: (1|2 slabs) x row bytes of ``fmt`` x local kv heads
     x layers, plus the bf16 DSA index-key slab when the spec carries indexer dims. Pure
     per-spec arithmetic -- pool families compose it over THEIR OWN groups; no family
     branching here. (2 bytes/elem == the torch.bfloat16 dsa_pool.DSAKVCache._alloc
@@ -38,9 +40,8 @@ def spec_kv_bytes_per_token(spec, config) -> int:
     ring and scratch rows are fixed-size and priced in QSAKVCache.kv_cost instead."""
     per_token = (
         (1 if spec.mla else 2)  # MLA latent groups store one slab (V aliases K)
-        * spec.head_dim
+        * fmt.row_bytes(spec.head_dim, config.dtype, segments=2 if spec.mla else 1)
         * _local_kv_heads(spec, config)
-        * config.dtype.itemsize
         * spec.num_layers
     )
     return per_token + spec.index_head_dim * spec.num_index_layers * 2 // spec.index_ratio
@@ -63,6 +64,9 @@ class BaseKVCachePool(ABC):
     # Pools whose buffers are bound into per-forward model scratch (DSV4's tiers) need the
     # model re-bound after a rebuild; the engine asks before it resizes.
     needs_rebind_on_rebuild: ClassVar[bool] = False
+    # KV formats this pool family can store
+    kv_formats: ClassVar[frozenset[str]] = frozenset({NONE.name})
+    kv_format: KVFormat = NONE
 
     @classmethod
     def window_spec(cls, config) -> WindowPoolSpec | None:
@@ -173,6 +177,12 @@ class BaseKVCachePool(ABC):
 
     @abstractmethod
     def v_cache(self, index: int) -> torch.Tensor: ...
+
+    def k_scale(self, index: int) -> torch.Tensor | None:
+        return None
+
+    def v_scale(self, index: int) -> torch.Tensor | None:
+        return None
 
     @abstractmethod
     def store_kv(

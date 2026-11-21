@@ -13,7 +13,7 @@ JIT, which needs nvcc):
 
 - store: ``element_size = num_kv_heads * head_dim * 2`` (bf16 KV row), one per
   paged-KV attention group (kvcache/mha_pool.py, kvcache/hybrid_swa_pool.py).
-  DSV4 writes its MLA latent via torch scatter and contributes nothing.
+  DSV4 writes its KV pools as packed byte rows via the dsv4 pack kernel and contributes nothing.
 - index: ``element_size = hidden_size * 2`` (bf16 embedding row) paired with
   the runtime ``num_splits_for`` rule (layers/embedding.py -> kernel/index.py).
   DSV4 (plain nn.Embedding) and GGUF embeddings (ggml get_rows) bypass it.
@@ -332,17 +332,19 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         # llama.cpp deepseek4 GGUF (unsloth 0731 GGUF; text only)
         arch_aliases=("DeepseekV4GGUFForCausalLM",),
         hidden_size=4096,
-        kv_groups=(),  # MLA latent pool writes via torch scatter, not store_cache
+        kv_groups=(),  # packed byte rows written by the dsv4 pack kernel, not store_cache
         top_k=6,
         moe_intermediate_size=2048,
         expert_formats=("ds_fp4",),
         embed_indexing=False,  # plain nn.Embedding
     ),
     AotModel(
-        # DSV41 pools are packed byte rows written by the dsv41 pack kernel, not store_cache;
+        # DSV41 pools are packed byte rows written by the dsv4 pack kernel, not store_cache;
         # the routed experts share DSV4's ds_fp4 bank layout (hidden 5120, intermediate 2304).
         name="deepseek-ai/DeepSeek-V4.1-Flash",
         architecture="DeepseekV41ForCausalLM",
+        # llama.cpp deepseek41 GGUF (unsloth 1017 GGUF; text only)
+        arch_aliases=("DeepseekV41GGUFForCausalLM",),
         hidden_size=5120,
         kv_groups=(),
         top_k=6,
@@ -389,6 +391,14 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         kv_groups=((2, 128),),  # sliding and full (NoPE) layers share the same geometry
         aliases=("RedHatAI/Muse-Glimmer-30B-NVFP4",),
         arch_aliases=("MuseGlimmerGGUFForCausalLM",),
+    ),
+    AotModel(
+        name="ricursiveAI/Ripple-65B-Preview",
+        architecture="RicursiveForCausalLM",
+        hidden_size=5120,
+        kv_groups=((8, 128),),  # sliding and full (NoPE) layers share the same geometry
+        aliases=("ricursiveAI/Ripple-65B-Preview-NVFP4",),
+        arch_aliases=("RicursiveGGUFForCausalLM",),
     ),
     AotModel(
         name="meta-llama/Llama-3.1-8B-Instruct",

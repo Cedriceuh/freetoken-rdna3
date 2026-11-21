@@ -19,8 +19,9 @@ from freetoken.distributed import destroy_distributed, enable_pynccl_distributed
 from freetoken.distributed.split import tp_shares
 from freetoken.gpu_select import gpu_identity
 from freetoken.checkpoint.ftw import ftw_tensor_names, is_ftw_checkpoint
-from freetoken.layers import OffloadMoELayer, VocabParallelEmbedding, iter_moe_layers, iter_ops, set_rope_device
+from freetoken.layers import OffloadMoELayer, ParallelLMHead, VocabParallelEmbedding, iter_moe_layers, iter_ops, set_rope_device
 from freetoken.layers.quantization import LayerKind, QuantBackend, QuantKind, finalize_quant, set_quant_backend
+from freetoken.layers.quantization.names import name_set
 from freetoken.moe.offload_cache import iter_offload_moe_layers
 from freetoken.mm.config import ENCODER_SECTIONS
 from freetoken.models.config import VISION_KEY_PREFIXES
@@ -39,6 +40,7 @@ from .graph import GraphRunner, _determine_cuda_graph_bs, get_free_memory
 from .sample import BatchSamplingArgs, Sampler
 from .spec_protocol import SpecRuntime
 from freetoken.kvcache import create_kv_pool, resolve_pool_class
+from freetoken.kvcache.format import FP8_DS_MLA, NONE, NVFP4_DS_MLA, KVFormat
 from freetoken.kvcache.base import CacheRebuildRejected
 from freetoken.kvcache.cache_status import _supports_swa_ratio
 from freetoken.kvcache.linear_state_pool import (
@@ -200,9 +202,9 @@ def _required_attn_types(model_config) -> frozenset[AttnType]:
     return types or frozenset({AttnType.FULL})
 
 
-def _backend_parts_serve(name: str, required: frozenset[AttnType]) -> bool:
+def _backend_parts_serve(name: str, required: frozenset[AttnType], kv_format: KVFormat = NONE) -> bool:
     return all(
-        required <= attention_backend_info(part).supported_types
+        required <= attention_backend_info(part).supported_types and kv_format.name in attention_backend_info(part).kv_formats
         for part in name.split(",")
     )
 
@@ -220,7 +222,7 @@ def _backend_requirements_met(name: str) -> bool:
     return True
 
 
-def _resolve_auto_attention_backend(required: frozenset[AttnType]) -> str:
+def _resolve_auto_attention_backend(required: frozenset[AttnType], kv_format: KVFormat = NONE) -> str:
     """First candidate (in per-type priority order) whose arch condition holds,
     whose packages are installed, and whose every comma part serves ALL required
     types. Reproduces the historical hardware tree for FULL-only models:
@@ -248,14 +250,14 @@ def _resolve_auto_attention_backend(required: frozenset[AttnType]) -> str:
     for name, arch_ok in candidates:
         if not arch_ok:
             continue
-        if not _backend_parts_serve(name, required):
+        if not _backend_parts_serve(name, required, kv_format):
             continue
         if not _backend_requirements_met(name):
             continue
         return name
     raise RuntimeError(
         "No attention backend can serve attention types "
-        f"{sorted(t.value for t in required)} on this machine."
+        f"{sorted(t.value for t in required)} with KV format {kv_format.name} on this machine."
     )
 
 
@@ -272,8 +274,16 @@ def _adjust_spec_config(config, override, windowed_kv: bool) -> None:
         # spec_decode.py's MTP decoding (FREETOKEN_SPEC_VERIFY_M, FREETOKEN_MTP: the rdna3 profiles) runs its own verify
         # rows and rollback on the same per-request states
         raise ValueError(f"--speculative-algorithm and FREETOKEN_SPEC_VERIFY_M={SPEC_M} are exclusive: unset one of them")
-    _spec_runner().adjust_config(config, override)
-    if windowed_kv:
+    runner = _spec_runner()
+    runner.adjust_config(config, override)
+    override("spec_slot_states", runner.slot_states(config))
+    if config.spec_slot_states:
+        from freetoken.kvcache.linear_state_pool import GDN_SNAP_HOST_ENV, gdn_snap_host_enabled
+
+        if gdn_snap_host_enabled():
+            # a proposer copies its states' track snapshots by slot id, on the device tensors
+            raise ValueError(f"--speculative-algorithm {config.speculative_algorithm} keeps per-request states: unset {GDN_SNAP_HOST_ENV}")
+    if windowed_kv and not runner.target_may_be_windowed(config):
         raise ValueError(
             "speculative decoding does not support targets with sliding-window or DSV4 window-tier KV yet: "
             "their window frees would release slots a verify step still reads"
@@ -292,6 +302,19 @@ def _adjust_spec_config(config, override, windowed_kv: bool) -> None:
             f"speculative decoding needs a decode attention backend that captures multi-row graphs "
             f"(fa, triton or fi), got {config.attention_backend!r}"
         )
+
+
+def _validate_kv_format(config, model_config) -> None:
+    kv_format = getattr(config, "kv_format", NONE)
+    if not kv_format.quantized:
+        return
+    pool_cls = resolve_pool_class(model_config)
+    if kv_format.name not in pool_cls.kv_formats:
+        raise ValueError(f"--kv-cache-dtype {kv_format.name}: {pool_cls.__name__} only stores {sorted(pool_cls.kv_formats)}")
+    if config.dtype != torch.bfloat16:
+        raise ValueError(f"--kv-cache-dtype {kv_format.name} needs --dtype bfloat16, got {config.dtype}")
+    if config.tp_info.size != 1:
+        raise ValueError(f"--kv-cache-dtype {kv_format.name} does not support tensor parallelism yet")
 
 
 def _validate_attention_backend_choice(config, override, required: frozenset[AttnType]) -> None:
@@ -327,6 +350,12 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
                 f"{getattr(model_config, 'model_type', 'model')} uses {missing_names} "
                 f"attention, which backend {part!r} does not support; valid backends: "
                 f"{', '.join(valid)} (or auto), got {config.attention_backend!r}."
+            )
+        kv_format = getattr(config, "kv_format", NONE)
+        if kv_format.name not in info.kv_formats:
+            raise ValueError(
+                f"--kv-cache-dtype {kv_format.name}: backend {part!r} cannot read that format, "
+                f"got {config.attention_backend!r}."
             )
         if AttnType.SWA in required and not info.consumes_attn_spec:
             # SWA models drive window/sinks/sm_scale through the per-call AttentionSpec;
@@ -397,19 +426,46 @@ def _host_embedding_keys(model, config: EngineConfig) -> frozenset[str]:
     """State-dict keys of the tables --embed-weights host keeps in pinned host RAM."""
     if config.embed_weights != "host":
         return frozenset()
-    if config.model_config.tie_word_embeddings:
+    # a tied LM head reads its whole table every step, so that table stays on the GPU
+    tied = {id(op.tied_embedding) for op in iter_ops(model) if isinstance(op, ParallelLMHead) and op.tied_embedding is not None}
+    tables = {
+        id(op.weight) for op in iter_ops(model) if type(op) is VocabParallelEmbedding and id(op) not in tied and not op.quant_method.online
+    }
+    keys = frozenset(key for key, t in model.state_dict().items() if id(t) in tables)
+    if not keys and tied:
         raise ValueError(
             "--embed-weights host: this model's embedding table is tied to its LM head, which reads the whole table "
             "every step; serve it with --embed-weights gpu"
         )
-    tables = {id(op.weight) for op in iter_ops(model) if type(op) is VocabParallelEmbedding}
-    keys = frozenset(key for key, t in model.state_dict().items() if id(t) in tables)
     if not keys:
         raise ValueError(
-            f"--embed-weights host: {type(model).__name__} has no plain embedding table to move (a DF11 table stays "
-            "on the GPU); serve it with --embed-weights gpu"
+            f"--embed-weights host: {type(model).__name__} has no plain embedding table to move (an --online-quant "
+            "table stays on the GPU); serve it with --embed-weights gpu"
         )
     return keys
+
+
+def _online_quant_keys(model, config: EngineConfig) -> frozenset[str]:
+    """State-dict keys of the bf16 weights an online quant method converts in finalize; they load to host RAM so the GPU holds one of them at a time."""
+    if not config.online_quant:
+        return frozenset()
+    to_checkpoint = config.model_config.quant.name_map.to_checkpoint
+    ops = [op for op in iter_ops(model) if getattr(op, "quant_method", None) is not None and op.quant_method.online]
+    names = [name for op in ops for name in to_checkpoint(op.prefix)]
+    missed = [p for p in config.online_quant_modules if not any(map(name_set((p,)), names))]
+    if missed:
+        example = to_checkpoint(next(op.prefix for op in iter_ops(model) if getattr(op, "prefix", "")))[0]
+        raise ValueError(
+            f"--online-quant-modules: no layer --online-quant {config.online_quant} converts matches {', '.join(missed)}; "
+            f"give the checkpoint's module names, e.g. {example!r}"
+        )
+    if not ops:
+        raise ValueError(
+            f"--online-quant {config.online_quant}: {config.model_path} has no layer it converts; the checkpoint quantizes "
+            "its Linear layers and tables, or they must stay as stored"
+        )
+    weights = {id(op.weight) for op in ops}
+    return frozenset(key for key, t in model.state_dict().items() if id(t) in weights)
 
 
 def _pinned_copy(key: str, t: torch.Tensor) -> torch.Tensor:
@@ -431,6 +487,7 @@ def _make_dummy_weight_state_dict(
     *,
     device: torch.device,
     host_keys: frozenset[str] = frozenset(),
+    staged_keys: frozenset[str] = frozenset(),
 ) -> Dict[str, torch.Tensor]:
     state_dict: Dict[str, torch.Tensor] = {}
     fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
@@ -455,6 +512,8 @@ def _make_dummy_weight_state_dict(
             state_dict[key] = torch.zeros(param.shape, dtype=param.dtype, device=device)
         if key in host_keys:
             state_dict[key] = _pinned_copy(key, state_dict[key])
+        elif key in staged_keys:
+            state_dict[key] = state_dict[key].cpu()
     return state_dict
 
 
@@ -489,6 +548,7 @@ def _materialize_loaded_weight_state_dict(
     *,
     device: torch.device,
     host_keys: frozenset[str] = frozenset(),
+    staged_keys: frozenset[str] = frozenset(),
 ) -> Dict[str, torch.Tensor]:
     state_dict: Dict[str, torch.Tensor] = {}
     for key, weight in weights:
@@ -500,6 +560,8 @@ def _materialize_loaded_weight_state_dict(
             state_dict[key] = weight.to(device=device)
         elif key in host_keys:
             state_dict[key] = _pinned_copy(key, weight.to(dtype=expected.dtype))
+        elif key in staged_keys:
+            state_dict[key] = weight.to(device="cpu", dtype=expected.dtype)
         else:
             state_dict[key] = weight.to(device=device, dtype=expected.dtype)
     return state_dict
@@ -618,7 +680,10 @@ class Engine:
         # Host-side auxiliary stores (--embed-weights host tables, qwen4_exp's pinned PLE table): after the weights so a
         # load failure is not masked, before the MoE offload cache so the bank residency
         # planning sees the pin quota the table already spent.
-        host_embeds = [op for op in iter_ops(self.model) if type(op) is VocabParallelEmbedding and not op.weight.is_cuda]
+        host_embeds = [
+            op for op in iter_ops(self.model)
+            if type(op) is VocabParallelEmbedding and not op.quant_method.online and not op.weight.is_cuda
+        ]
         self._host_tables_bytes = sum(op.weight.nbytes for op in host_embeds)
         if host_embeds:
             logger.info_rank0(f"Embedding tables in pinned host RAM (--embed-weights host): {mem_GB(self._host_tables_bytes)}")
@@ -679,7 +744,7 @@ class Engine:
                 dtype=self.dtype,
                 device=self.device,
                 tp_size=config.tp_info.size,
-                slot_states=config.model_config.slot_states,
+                slot_states=config.slot_states,
                 snap_slots=_linear_pool_snap_slots(config),
             )
             if self.linear_state_pool.host_snapshots:
@@ -817,8 +882,13 @@ class Engine:
         if resident and not config.use_dummy_weight and is_ftw_checkpoint(config.model_path) and not ftw_tensor_names(config.model_path, "experts_bank"):
             raise ValueError(f"{config.model_path} keeps its routed experts as dense weights (an older `ft checkpoint --moe-backend fused`); reconvert it with `ft checkpoint`")
         host_keys = _host_embedding_keys(self.model, config)
+        staged_keys = _online_quant_keys(self.model, config)
+        if config.online_quant:
+            logger.info_rank0(f"--online-quant {config.online_quant}: converting {len(staged_keys)} weights at load")
         with _weight_load_context():
-            self.model.load_state_dict(self._load_weight_state_dict(config, host_keys))
+            self.model.load_state_dict(self._load_weight_state_dict(config, host_keys, staged_keys))
+        if config.speculative_algorithm is not None:
+            _spec_runner().prepare_target(config, self.model)
         finalize_quant(self.model)
         if resident:
             self._load_resident_experts(config, resident)
@@ -844,14 +914,16 @@ class Engine:
             self._draft_head = build_draft_head(self.model.lm_head, download_hf_weight(config.model_path),
                                                 self.tp_cpu_group)
 
-    def _load_weight_state_dict(self, config: EngineConfig, host_keys: frozenset[str]) -> Dict[str, torch.Tensor]:
+    def _load_weight_state_dict(
+        self, config: EngineConfig, host_keys: frozenset[str], staged_keys: frozenset[str]
+    ) -> Dict[str, torch.Tensor]:
         model_state = self.model.state_dict()
         # a TP rank other than 0 may build no tower (it never encodes: _encode_item)
         vision = bool(config.active_encoders) and (
             config.tp_info.rank == 0 or any(k.startswith(VISION_KEY_PREFIXES) for k in model_state)
         )
         if config.use_dummy_weight:
-            return _make_dummy_weight_state_dict(model_state, device=self.device, host_keys=host_keys)
+            return _make_dummy_weight_state_dict(model_state, device=self.device, host_keys=host_keys, staged_keys=staged_keys)
         # _materialize casts each loaded tensor to its model-param dtype (model_state), so
         # models declaring per-tensor dtypes (e.g. DSV4's mixed fp8/fp32/bf16) are preserved;
         # MoE models exclude routed experts (they load as expert banks, not dense weights).
@@ -865,6 +937,7 @@ class Engine:
             ),
             device=self.device,
             host_keys=host_keys,
+            staged_keys=staged_keys,
         )
 
     def _load_resident_experts(self, config: EngineConfig, layers) -> None:
@@ -2312,6 +2385,8 @@ def _adjust_dsv41_config(config: EngineConfig, override) -> None:
     args.max_seq_len = config.max_seq_len
     args.max_batch_size = config.max_running_req + 1  # +1 dummy
     args.swa_decoder_replay = config.swa_decoder_replay
+    if getattr(config, "kv_cache_dtype", "auto") == "auto":
+        override("kv_cache_dtype", NVFP4_DS_MLA.name)
     P = args.window_size
     override("page_size", P)
     logger.info_rank0(
@@ -2341,6 +2416,10 @@ def _adjust_dsv4_config(config: EngineConfig, override) -> None:
     the DSV4 decode batch size.
     """
     model_config = config.model_config
+    if (dtype := getattr(config, "dtype", None)) is not None and dtype != torch.bfloat16:
+        raise ValueError(f"DeepSeek-V4 runs in bfloat16 only, got --dtype {dtype}")
+    if getattr(config, "kv_cache_dtype", "auto") == "auto":
+        override("kv_cache_dtype", FP8_DS_MLA.name)
     model_config.dsv4_args.max_seq_len = config.max_seq_len
     model_config.dsv4_args.max_batch_size = config.max_running_req + 1  # +1 dummy
     # config.swa_full_tokens_ratio is the DSV4 window/full ratio directly (default sizing);
@@ -2767,10 +2846,11 @@ def _adjust_config(config: EngineConfig):
     if _dtype == torch.float16 and getattr(getattr(model_config, "quant", None), "weight_scales", False):
         # GGUF NVFP4 results are stored in the activation dtype before weight_scale_2 (~1e-4) multiplies them, which overflows fp16.
         raise ValueError("--dtype float16 with NVFP4 GGUF weight scales is unsupported (the unscaled results overflow float16); use bfloat16.")
+    _validate_kv_format(config, model_config)
     if config.attention_backend == "auto":
         override(
             "attention_backend",
-            _resolve_auto_attention_backend(required_attn_types),
+            _resolve_auto_attention_backend(required_attn_types, getattr(config, "kv_format", NONE)),
         )
         logger.info_rank0(f"Auto-selected attention backend: {config.attention_backend}")
     _validate_attention_backend_choice(config, override, required_attn_types)

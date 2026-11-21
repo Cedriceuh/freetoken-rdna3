@@ -33,10 +33,11 @@ from __future__ import annotations
 
 import math
 import os
-from typing import Sequence
+from typing import ClassVar, Sequence
 
 import torch
 
+from .format import NONE, KVFormat
 from .mha_pool import MHAKVCache
 
 # The index tiers are always 2-byte (compute dtype); spec_kv_bytes_per_token budgets the same.
@@ -78,6 +79,8 @@ class QSAKVCache(MHAKVCache):
 
     # host KV tier: K/V (+ int8 scales), the compressed index rows and the mrope positions, all copied per page
     host_tier_supported = True
+    # upstream's --kv-cache-dtype rows are not read by this fork's QSA kernels (host K/V, decode cache, fused stores)
+    kv_formats: ClassVar[frozenset[str]] = frozenset({NONE.name})
 
     @classmethod
     def ring_capacity_for(cls, index_ratio: int, num_speculative_tokens: int = 0) -> int:
@@ -100,6 +103,7 @@ class QSAKVCache(MHAKVCache):
         ring_capacity: int | None = None,
         layer_ids: Sequence[int] | None = None,
         mrope: bool = False,
+        kv_format: KVFormat = NONE,
     ) -> None:
         if index_ratio < 1 or page_size % index_ratio != 0:
             # slot // index_ratio only names one group when a group never straddles a page.
@@ -140,6 +144,7 @@ class QSAKVCache(MHAKVCache):
             dtype=torch.int8 if self._kv_int8 else dtype,
             device=device,
             layer_ids=layer_ids,
+            kv_format=kv_format,
         )
         self._alloc_kv_scales()
         self._zero_kv_slabs()
@@ -287,6 +292,7 @@ class QSAKVCache(MHAKVCache):
             self._kv_buffer = None
             self._k_buffer = None
             self._v_buffer = None
+            self._scale_buffer = None
             raise
 
     @classmethod
@@ -302,7 +308,7 @@ class QSAKVCache(MHAKVCache):
         for spec in config.model_config.kv_cache_group_specs():
             if spec.is_swa:
                 continue
-            per_token += spec_kv_bytes_per_token(spec, config)
+            per_token += spec_kv_bytes_per_token(spec, config, getattr(config, "kv_format", NONE))
             if spec.attn_type is AttnType.QSA and kv_host_enabled():
                 # the K/V slab is host memory: only the index tiers count against the VRAM budget
                 heads = _local_kv_heads(spec, config)

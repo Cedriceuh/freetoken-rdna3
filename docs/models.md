@@ -16,11 +16,12 @@ for them; other checkpoints of the same architectures work too.
 | Qwen3-MoE | [Qwen/Qwen3-30B-A3B](https://huggingface.co/Qwen/Qwen3-30B-A3B) |
 | Qwen3-VL | [Qwen/Qwen3-VL-8B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct), [Qwen/Qwen3-VL-30B-A3B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-30B-A3B-Instruct) |
 | gpt-oss | [openai/gpt-oss-120b](https://huggingface.co/openai/gpt-oss-120b), [openai/gpt-oss-20b](https://huggingface.co/openai/gpt-oss-20b) |
-| Gemma-4 | [google/gemma-4-26B-A4B-it](https://huggingface.co/google/gemma-4-26B-A4B-it), [nvidia/Gemma-4-26B-A4B-NVFP4](https://huggingface.co/nvidia/Gemma-4-26B-A4B-NVFP4), [google/gemma-4-12B-it](https://huggingface.co/google/gemma-4-12B-it), [nvidia/Gemma-4-31B-IT-NVFP4](https://huggingface.co/nvidia/Gemma-4-31B-IT-NVFP4) .. |
+| Gemma-4 | [google/gemma-4-E2B-it](https://huggingface.co/google/gemma-4-E2B-it), [google/gemma-4-E4B-it](https://huggingface.co/google/gemma-4-E4B-it), [google/gemma-4-26B-A4B-it](https://huggingface.co/google/gemma-4-26B-A4B-it), [nvidia/Gemma-4-26B-A4B-NVFP4](https://huggingface.co/nvidia/Gemma-4-26B-A4B-NVFP4), [google/gemma-4-12B-it](https://huggingface.co/google/gemma-4-12B-it), [nvidia/Gemma-4-31B-IT-NVFP4](https://huggingface.co/nvidia/Gemma-4-31B-IT-NVFP4) .. |
 | MiniMax-M2.5 | [nvidia/MiniMax-M2.5-NVFP4](https://huggingface.co/nvidia/MiniMax-M2.5-NVFP4) |
 | MiniMax-M3 | [nvidia/MiniMax-M3-NVFP4](https://huggingface.co/nvidia/MiniMax-M3-NVFP4) |
 | Muse-Glimmer | [meta-models/Muse-Glimmer-30B](https://huggingface.co/meta-models/Muse-Glimmer-30B), [RedHatAI/Muse-Glimmer-30B-NVFP4](https://huggingface.co/RedHatAI/Muse-Glimmer-30B-NVFP4) |
 | Flint | [FutureMLS-Lab/flint-nvfp4-coldgptq](https://huggingface.co/FutureMLS-Lab/flint-nvfp4-coldgptq), [RecursiveSI/flint-nvfp4-gguf](https://huggingface.co/RecursiveSI/flint-nvfp4-gguf) |
+| Ripple-65B Preview | [ricursiveAI/Ripple-65B-Preview](https://huggingface.co/ricursiveAI/Ripple-65B-Preview), [ricursiveAI/Ripple-65B-Preview-NVFP4](https://huggingface.co/ricursiveAI/Ripple-65B-Preview-NVFP4), [AtomicChat/Ripple-65B-Preview-GGUF](https://huggingface.co/AtomicChat/Ripple-65B-Preview-GGUF) |
 
 ### GGUF
 
@@ -35,7 +36,7 @@ These llama.cpp architectures (`general.architecture`) are served:
 | `qwen3vlmoe`, `qwen3vl` | Qwen3-VL |
 | `qwen2` | Qwen2, Qwen2.5 |
 | `llama` | Llama, Mistral |
-| `gemma4` | Gemma-4, except E2B / E4B |
+| `gemma4` | Gemma-4 |
 | `glm4moe` | GLM-4.5, GLM-4.6, GLM-4.7 |
 | `glm5-next` | GLM-5.3-Flash |
 | `deepseek4` | DeepSeek-V4 Flash and Pro |
@@ -43,6 +44,7 @@ These llama.cpp architectures (`general.architecture`) are served:
 | `muse-glimmer` | Muse-Glimmer |
 | `gpt-oss` | gpt-oss |
 | `flint` | Flint |
+| `ricursive` | Ripple-65B Preview |
 
 ### Image input
 
@@ -137,6 +139,10 @@ unset on PCIe GPUs: wider grids add no bandwidth there.
   see [ftw-hotfix.md](ftw-hotfix.md) for the affected checkpoints and the repair tool.
 - Muse-Glimmer keeps the attention gate as its own linear next to `qkv_proj`; an FTW converted
   when the gate was fused into `qkvg_proj` no longer loads, reconvert it with `ft checkpoint`.
+- GLM-4.7 (`nvidia/GLM-4.7-NVFP4`) serves its attention and input embedding in bf16, as the checkpoint stores
+  them. `--online-quant df11` compresses them losslessly at load, about 8 GiB less VRAM, at the cost of decoding
+  them on every step; builds before the flag always did this. An FTW of GLM-4.7 converted by such a build stores
+  those weights as DF11 and no longer loads; reconvert it with `ft checkpoint`.
 - NVFP4 global scales are kept in fp32. An NVFP4 FTW that stores them as fp16 (converted by an
   older build) is refused at load; reconvert it with `ft checkpoint`.
 - Qwen3.5 / Qwen3.6 / Qwen3.8-27B load their zero-centred norm weights as stored and add the 1 in
@@ -151,6 +157,15 @@ unset on PCIe GPUs: wider grids add no bandwidth there.
   `deepseek4v` mmproj; the text-only 0731 release has no image token and refuses the
   mmproj. ggml-org's Vision-Exp text GGUF ships a chat template that renders no image
   placeholder; serve unsloth's release for image requests.
+- A DeepSeek-V4.1 GGUF (llama.cpp's `deepseek41` layout, such as
+  [unsloth/DeepSeek-V4.1-Flash-1017-GGUF](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF))
+  serves text; its `deepseek41v` mmproj and DSpark draft are not read. The Engram tables
+  stream from the file's `per_layer_token_embd` tensor, so keep that file on a fast NVMe.
+  A build that ships the tables as a separate shard needs it linked next to the others under
+  its shard name, as llama.cpp does. A file converted for an earlier llama.cpp branch has
+  no `ple.layers` key and is refused, and so are unsloth's UD-Q3_K_XL, UD-Q4_K_XL and UD-Q8_K_XL,
+  whose MXFP8 tables only unsloth's llama.cpp PR reads. `ft checkpoint` does not convert these
+  GGUFs: serve the `.gguf`.
 - DeepSeek-V4.1-Flash serves text and images from the HF checkpoint as shipped (fp8 block-32
   dense weights, fp4 experts on the offload cache, 890 B/token global KV in packed
   fp4/fp8 pools). Its two 98 GiB Engram tables stream from the checkpoint shards on
@@ -182,3 +197,4 @@ unset on PCIe GPUs: wider grids add no bandwidth there.
   "reasoning_effort": 37}`, and the checkpoint's encoder validates it. Runtime window-cache
   controls use 128-token pages.
 - Qwen3.8-Flash-Next keeps a 47.7 GiB PLE n-gram table pinned in host RAM.
+- Gemma-4 serves MTP speculative decoding from an assistant sidecar: unsloth's GGUF repos ship `mtp-*.gguf` files for it; upstream's `google/gemma-4-*-it-assistant` HF release must first go through llama.cpp's `convert_hf_to_gguf.py`, then pass the resulting GGUF with `--spec-draft-model`, see [CLI reference](cli.md#speculative-decoding).

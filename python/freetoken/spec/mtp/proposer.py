@@ -4,20 +4,26 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, List, Protocol
 
+import numpy as np
 import torch
 
 from freetoken.core import Batch, get_global_ctx
 from freetoken.engine.sample import make_device_tensor
+from freetoken.kvcache.format import NONE
 from freetoken.models.blocks import embed_input_ids
-from freetoken.spec.proposer import DraftContext, Proposer
+from freetoken.spec.proposer import DraftContext, Proposer, SpecProposal, check_draft_path
 from freetoken.spec.mtp.relay import HiddenRelay
+from freetoken.utils import init_logger
 
 if TYPE_CHECKING:
     from freetoken.core import Req
     from freetoken.layers.embedding import VocabParallelEmbedding
     from freetoken.models.config import ModelConfig
+
+logger = init_logger(__name__)
 
 
 class MTPDraft(Protocol):
@@ -86,7 +92,7 @@ class _PrefillSink:
     def final_hidden(self, x: torch.Tensor) -> None:
         self.hidden = x
 
-    def layer_output(self, layer_id: int, x: torch.Tensor, num_streams: int = 1) -> None:
+    def layer_output(self, layer_id: int, x: torch.Tensor, residual: torch.Tensor | None = None, num_streams: int = 1) -> None:
         pass
 
 
@@ -101,19 +107,28 @@ class _VerifySink:
     def final_hidden(self, x: torch.Tensor) -> None:
         self.buffer[: x.shape[0]].copy_(x)
 
-    def layer_output(self, layer_id: int, x: torch.Tensor, num_streams: int = 1) -> None:
+    def layer_output(self, layer_id: int, x: torch.Tensor, residual: torch.Tensor | None = None, num_streams: int = 1) -> None:
         pass
 
 
+def read_token_map(path: str, vocab_size: int) -> torch.Tensor:
+    """The token ids in a ``--speculative-token-map`` file."""
+    raw = Path(path).read_bytes()
+    ids = torch.from_numpy(np.frombuffer(raw, dtype="<i4", count=len(raw) // 4).astype(np.int64))
+    if len(raw) % 4 or ids.numel() == 0 or ids.min() < 0 or ids.max() >= vocab_size or ids.unique().numel() != ids.numel():
+        raise ValueError(f"--speculative-token-map {path} must hold distinct little-endian int32 token ids below {vocab_size}")
+    return ids
+
+
 class MTPProposer(Proposer):
-    default_k = 3
-    max_k = 8
     radix_lookahead = True
 
     @classmethod
-    def adjust_config(cls, config, override) -> None:
-        import os
+    def num_steps(cls, config) -> tuple[int, int]:
+        return 3, 8
 
+    @classmethod
+    def adjust_config(cls, config, override) -> None:
         from freetoken.checkpoint.ftw import is_ftw_checkpoint
 
         super().adjust_config(config, override)
@@ -124,14 +139,26 @@ class MTPProposer(Proposer):
             raise ValueError("MTP reads its draft from the checkpoint, so it cannot run with --dummy-weight")
         path = config.speculative_draft_model_path or config.model_path
         # checked here because a draft that cannot load otherwise fails only after the whole target has loaded
-        # a HF repo id is "name" or "org/name"; anything else names a local path
-        local = os.path.isabs(path) or path.startswith(".") or path.count("/") > 1 or path.endswith(".gguf")
-        if config.speculative_draft_model_path and local and not os.path.exists(path):
-            raise ValueError(f"--speculative-draft-model-path {path} does not exist")
+        if config.speculative_draft_model_path:
+            check_draft_path(path)
         # FTW keeps only what the target's iter_weights yields, which drops mtp.*
         if is_ftw_checkpoint(path):
             raise ValueError("MTP cannot load its draft from an FTW checkpoint yet")
         cls._draft_class(config).check_source(path, config.model_path)
+        if config.speculative_token_map:
+            if config.model_config.tie_word_embeddings:
+                raise ValueError("--speculative-token-map needs an LM head with its own weights, but this one is tied to the embedding")
+            read_token_map(config.speculative_token_map, config.model_config.vocab_size)
+
+    @classmethod
+    def prepare_target(cls, config, model) -> None:
+        if not config.speculative_token_map:
+            return
+        head = model.lm_head
+        head.keep_rows(read_token_map(config.speculative_token_map, head.num_embeddings), config.model_config.quant)
+        kept, ids = head.kept_rows
+        mib = sum(t.nbytes for t in kept.state_dict().values()) / 2**20
+        logger.info_rank0(f"--speculative-token-map: the draft head keeps {ids.numel()} of {head.num_embeddings} rows ({mib:.0f} MiB)")
 
     @classmethod
     def _draft_class(cls, config) -> type[MTPDraft]:
@@ -149,7 +176,8 @@ class MTPProposer(Proposer):
         # relay hidden and carry, and the verify hiddens
         fixed = rows * (config.speculative_num_steps + 3) * relay_bytes
         groups = draft_cls.draft_config(with_resident_moe(config.model_config)).kv_cache_group_specs()
-        return fixed, sum(spec_kv_bytes_per_token(group, config) for group in groups)
+        fmt = getattr(config, "kv_format", NONE)
+        return fixed, sum(spec_kv_bytes_per_token(group, config, fmt) for group in groups)
 
     def __init__(self, config, target_model) -> None:
         super().__init__(config, target_model)
@@ -164,7 +192,8 @@ class MTPProposer(Proposer):
         target_moe = {id(m) for m in iter_moe_layers(target_model)}
         if any(isinstance(m, OffloadMoELayer) or id(m) in target_moe for m in iter_moe_layers(self.draft)):
             raise RuntimeError(f"{draft_cls.__name__} must build its own MoE layers, resident on the GPU")
-        self.lm_head = target_model.lm_head
+        # hot_ids[i] is the target's token id of the draft head's row i
+        self.lm_head, self.hot_ids = target_model.lm_head.kept_rows or (target_model.lm_head, None)
         self.mrope = config.model_config.model_is_mrope
         self._prefill_state: dict[int, tuple[int, int]] = {}  # table row -> (uid, first position not drafted yet)
         self._prefill_sink: _PrefillSink | None = None
@@ -185,6 +214,7 @@ class MTPProposer(Proposer):
             self.kv = create_kvcache_pool(
                 model_config=cfg, num_pages=ctx.num_pages + 1, page_size=self.config.page_size, dtype=self.dtype,
                 device=ctx.device, num_req_slots=rows, num_speculative_tokens=self.k,
+                kv_format=getattr(self.config, "kv_format", NONE),
             )
         width = self.draft.relay_width(self.config.model_config)
         self.relay = HiddenRelay(rows, width, self.dtype, ctx.device)
@@ -247,7 +277,8 @@ class MTPProposer(Proposer):
             return self.draft.forward_hidden(embeds, prev_hidden)
 
     def _draft_token(self, hidden: torch.Tensor) -> torch.Tensor:
-        return self.lm_head.logits(self.draft.head_input(hidden)).argmax(dim=-1)
+        token = self.lm_head.logits(self.draft.head_input(hidden)).argmax(dim=-1)
+        return token if self.hot_ids is None else self.hot_ids[token]
 
     def _view(self, req, cached_len: int, device_len: int) -> _DraftReq:
         return _DraftReq(cached_len, device_len, req.table_idx, getattr(req, "mrope_delta", 0), getattr(req, "mrope_positions_full", None))
@@ -282,10 +313,10 @@ class MTPProposer(Proposer):
         if self.k > 1 and ChainGraphs.supports(self.chain_backend):
             self.chain_graphs = ChainGraphs(self, bs_list, self.extend_graphs.graph_pool)
 
-    def propose(self, reqs: List[Req], rows: torch.Tensor) -> torch.Tensor:
+    def propose(self, reqs: List[Req], rows: torch.Tensor, pending: torch.Tensor) -> SpecProposal:
         cs = [r.cached_len for r in reqs]
         if self.chain_graphs is not None and (drafts := self.chain_graphs.replay(reqs, cs)) is not None:
-            return drafts
+            return SpecProposal(drafts)
         token = self.relay.d1[rows]
         hidden = self.relay.hidden[rows]
         drafts = [token]
@@ -296,7 +327,7 @@ class MTPProposer(Proposer):
             hidden = self._forward(batch, self.chain_backend, self.draft.embed_tokens.forward(token), hidden)
             token = self._draft_token(hidden)
             drafts.append(token)
-        return torch.stack(drafts, dim=1)
+        return SpecProposal(torch.stack(drafts, dim=1))
 
     def feature_sink(self, batch: Batch) -> _PrefillSink | _VerifySink:
         if batch.phase == "verify":

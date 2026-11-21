@@ -45,6 +45,7 @@ class FLAMetadata:
     # GDN op (see GatedDeltaNet._write_track_snapshot). Built by the scheduler in P2;
     # left None by build_fla_metadata so the existing path is unchanged.
     track_dst: torch.Tensor | None = None        # [nt] int64 dst pool slot per tracked req
+    track_src: torch.Tensor | None = None        # [nt] int64 live slot of each tracked req, for states copied whole at the boundary
     track_h_row: torch.Tensor | None = None      # [nt] int64 row into h (boh_i + aligned//CHUNK)
     track_conv_src: torch.Tensor | None = None   # [nt, kernel-1] int64 conv-input token positions
     track_boundary_row: torch.Tensor | None = None  # [nt] int64 forward-local row of the track boundary; states with their own left context (qwen4_exp PLE) derive their windows from it
@@ -116,7 +117,8 @@ def _build_track_metadata(reqs, cu_host, device, pin, km1: int, track_base: int 
     prefill forward, snapshot its GDN state at the deepest mid-chunk boundary into its current
     ping-pong slot. Returns the ``FLAMetadata`` track kwargs, all None when no request
     tracks (non-hybrid, or all extends < CHUNK+1)."""
-    empty = dict(track_dst=None, track_h_row=None, track_conv_src=None, track_boundary_row=None, track_seq_chunk=None)
+    empty = dict(track_dst=None, track_src=None, track_h_row=None, track_conv_src=None, track_boundary_row=None,
+                 track_seq_chunk=None)
     if not any(r.mamba_ping_pong is not None for r in reqs):
         return empty
     from freetoken.kernel.fla.chunk import CHUNK_SIZE
@@ -127,7 +129,7 @@ def _build_track_metadata(reqs, cu_host, device, pin, km1: int, track_base: int 
         "would reach before this forward's first token"
     )
     boh = prepare_chunk_offsets(cu_host, CHUNK_SIZE).tolist()
-    dst, h_row, conv_src, boundary_rows, seq_chunk = [], [], [], [], []
+    dst, src, h_row, conv_src, boundary_rows, seq_chunk = [], [], [], [], [], []
     for i, r in enumerate(reqs):
         if r.mamba_ping_pong is None:
             continue
@@ -140,6 +142,7 @@ def _build_track_metadata(reqs, cu_host, device, pin, km1: int, track_base: int 
         boundary = r.cached_len + c * CHUNK_SIZE
         # rows of the pool's track tensors (LinearStatePool.track_*): the slot id itself unless they are host slots
         dst.append(r.mamba_ping_pong[r.mamba_next_track_idx] - track_base)
+        src.append(gdn_slot(r))
         h_row.append(boh[i] + c)
         seq_chunk.append((i, c))
         conv_src.append([off + c * CHUNK_SIZE - km1 + j for j in range(km1)])
@@ -151,6 +154,7 @@ def _build_track_metadata(reqs, cu_host, device, pin, km1: int, track_base: int 
     to = lambda xs, **kw: torch.tensor(xs, **pin, **kw).to(device, non_blocking=True)
     return dict(
         track_dst=to(dst, dtype=torch.int64),
+        track_src=to(src, dtype=torch.int64),
         track_h_row=to(h_row, dtype=torch.int64),
         track_conv_src=to(conv_src, dtype=torch.int64),
         track_boundary_row=to(boundary_rows, dtype=torch.int64),
