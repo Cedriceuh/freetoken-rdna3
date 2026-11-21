@@ -329,9 +329,10 @@ def make_host_kv_pool(kv_pool, linear_state_pool, page_size: int, device: torch.
         logger.warning(f"FREETOKEN_HOST_KV=1 ignored: needs a GDN state pool and a KV pool that declares "
                        f"host_tier_supported (got {type(kv_pool).__name__})")
         return None
-    if kv_pool.kv_format.quantized:
+    kv_format = getattr(kv_pool, "kv_format", None)
+    if kv_format is not None and kv_format.quantized:
         # --kv-cache-dtype rows carry scale tensors the tier does not copy
-        logger.warning(f"FREETOKEN_HOST_KV=1 ignored: the host tier does not copy {kv_pool.kv_format.name} K/V scales")
+        logger.warning(f"FREETOKEN_HOST_KV=1 ignored: the host tier does not copy {kv_format.name} K/V scales")
         return None
     if getattr(kv_pool, "kv_on_host", False):
         # FREETOKEN_QSA_KV_HOST: the pool is host memory already; a second copy of its pages would only pin more RAM

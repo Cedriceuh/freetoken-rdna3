@@ -578,7 +578,7 @@ def qsa_sparse_paged_attention(
     if torch.version.hip is not None:
         _props = torch.cuda.get_device_properties(q.device)
         _lds_budget = getattr(_props, "shared_memory_per_block", 64 * 1024) or 64 * 1024
-        _kv_bytes = k_cache.element_size()
+        _kv_bytes = q.element_size()
         while block_n > 16 and 2 * block_n * q.shape[2] * _kv_bytes + 2048 > _lds_budget:
             block_n //= 2
 

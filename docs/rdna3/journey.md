@@ -3196,7 +3196,35 @@ decode step.
   of the RAM); it now keeps the cards of the architecture of the one with the most compute units. And a command
   copied from an older `--dry-run` lacked `FREETOKEN_GDN_SNAP_HOST=1`: 9,190 slots instead of 11,106.
 
-## 53. Still open
+## 53. Upstream up to c84946b (2026-11-21)
+
+27 commits merged, the authors' kept; 15 files conflicted. What upstream brought: quantized K/V rows
+(`--kv-cache-dtype fp8_per_token_head` / `int8_per_token_head`, `27740fe`, one GPU), DFlash 2 drafts (`08cee44`,
+`1ba3e71`), `--online-quant df11` (`56e7f3a`), `--speculative-token-map`, Gemma-4 E2B / E4B and its assistant draft,
+DeepSeek-V4.1 GGUFs, a ripple-65b preview, timings on every streamed chunk, the `developer` role rendered as `system`,
+graph captures writing their K/V to the dummy page (`340db81`), and the CPU expert executor's work split by expert
+(`5209c8c`, `c84946b`).
+
+- **The CPU executor's grouping is upstream's now.** Upstream groups a step's routes by expert as this tree's
+  `FREETOKEN_CPU_MOE_GROUP` did, for every format and in the second pass too; this tree's grouping is gone and the
+  variable turns upstream's off. The EXL3 format, which runs its tasks whole, keeps its own groups.
+- **Quantized K/V rows: every pool but QSA's.** The QSA kernels of this tree (K/V in host RAM, the decode K/V cache,
+  the stores fused into the q/k launch) read compute-dtype K/V; rather than a second path nobody measured, the QSA
+  pool, backend and attend kernel refuse `--kv-cache-dtype` at start. This tree's own int8 K/V
+  (`FREETOKEN_QSA_KV_INT8`) lost points on the agentic benchmark, so nothing asks for it today.
+- **Found by the test suite:** the RAM tier's new guard read `kv_format` on pools that have none (56 tests). **Found
+  by a second read of the merge:** the int8 dense method lacked upstream's `online` flag (no path reads it there
+  today), the `--kv-cache-dtype` help still named `qsa_sparse`.
+- **Checked** (`xtx-xt-4x262k` as the launcher starts it, the image of the merge against the one before, kernel cache
+  filled): NVFP4 12 of 12 greedy answers identical, 149.4 tok/s against 148.0; a 255,420-token read at
+  4085 tok/s against 4182 (one pass each), the answer after it at 128.8 against 128.5, the next turn the same text.
+  EXL3 3.05 bpw: 12 of 12 identical, 161.9 against 161.3; the read at 3648 against 3647, the answer at 134.7 against
+  134.5, the next turn the same text. `--hybrid` on `xtx` (NVFP4): 72.2 and 71.6 tok/s against 71.4; its answers
+  differ from run to run on one image as much as between the two (6 of 12 identical either way). No GPU fault or error
+  in the nine servers. The CPU suite passes (the GPU tests skip).
+- Not tried on RDNA3: `--speculative-algorithm dflash`, `--online-quant`, the quantized K/V rows on the other pools.
+
+## 54. Still open
 
 - In NVFP4 the model needs ~63 GiB of RAM for its experts alone (the engine keeps every expert in RAM). The EXL3 3.05
   bpw checkpoint needs 42.6 GiB and serves under a 56 GiB container limit with `serve.sh --low-ram` (section 50), but

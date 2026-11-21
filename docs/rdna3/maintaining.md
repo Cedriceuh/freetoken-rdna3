@@ -4,12 +4,12 @@ How this repository relates to upstream FreeToken and how to keep it current. Fo
 
 ## What this tree is
 
-Upstream [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken) at `e5856ac` ("fix(utils): read stop ids
-from config.json without generation_config.json (#874)"), plus the changes listed file by file in
+Upstream [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken) at `c84946b` ("perf(cpu-moe): split the
+cpu executor's work by expert when tokens share one (#916)"), plus the changes listed file by file in
 [changes-from-upstream.md](changes-from-upstream.md). The history is upstream's own up to `0d652e7`, then this
 project's commits on top (the first one holds everything up to 0.1.0), a merge of upstream up to `ee9789f`, five
 upstream commits cherry-picked (`74a3877`, `9c635a1`, `7d6490c`, `9b68e00`, `b6193e8`, authors kept), a merge of the
-rest up to `9b68e00`, merges up to `cc56b6b`, `ba31db2` and `e5856ac`. Once
+rest up to `9b68e00`, merges up to `cc56b6b`, `ba31db2`, `e5856ac` and `c84946b`. Once
 the `upstream` remote is set up (below), `git diff $(git merge-base HEAD upstream/main)` shows every change against the
 upstream version this tree is based on.
 
@@ -18,7 +18,7 @@ upstream version this tree is based on.
 | Piece | Origin | Leaves the stack when |
 |---|---|---|
 | RCCL for tensor-parallel execution | upstream PR #135 (zihaomu) | #135 merges |
-| LDS clamp of the QSA attend kernel for RDNA's 64 KiB | community ROCm port (lukascechovic), upstream issue #349 | upstream's clamp (`7d6490c`, #587) sizes the tiles with the K/V cache's itemsize, this one with q's (the same tile unless K/V is 1 byte): kept ahead of it until they agree |
+| LDS clamp of the QSA attend kernel for RDNA's 64 KiB (a fixed 60 KiB budget) | community ROCm port (lukascechovic), upstream issue #349 | beside upstream's clamp (`7d6490c`, #587), which since `27740fe` sizes the tiles with q's itemsize as this one does and reads the device's limit: the same tiles at head_dim 256; can go once checked on both cards |
 | TP>1 relay handshake before the first request | community ROCm port (lukascechovic), upstream issue #364 | upstream fixes #364 |
 | GDN boundary carried across the prefill chunk seam | community ROCm port (lukascechovic) | upstream carries it |
 | qwen4_exp tensor parallelism | rewritten from the community port's | upstream supports qwen4_exp at TP>1 |
@@ -80,6 +80,19 @@ drain sends a verify step's kept tokens in one message (upstream's `_commit_toke
 upstream's `rollback_tail` lowers this tree's `alloc_len` so the pages it returns are allocated again. On ROCm the CPU
 MoE executor keeps its copies around the doorbell and the hybrid layer's in-kernel flags, where upstream now enables its
 kernel IO (`9cacd08`).
+
+At the merge of `c84946b`: upstream sizes the QSA attend tiles for RDNA's 64 KiB with q's itemsize (`27740fe`), as this
+tree's clamp does. Upstream's CPU expert executor gives work items only to the routes the
+CPU computes (`5209c8c`) and groups a step's routes by expert (`c84946b`): this tree's own grouping is gone,
+`FREETOKEN_CPU_MOE_GROUP=0` now turns upstream's off, and the EXL3 format keeps its groups (it runs its tasks whole).
+Upstream added quantized K/V rows (`--kv-cache-dtype fp8_per_token_head` / `int8_per_token_head`, `27740fe`, one GPU):
+every pool takes them as upstream's does except the QSA pool (Qwen3.8-Flash-Next), which refuses them here - its
+kernels (K/V in host RAM, the decode K/V cache, the stores fused into the q/k launch) read compute-dtype rows, and
+this tree's own int8 K/V (`FREETOKEN_QSA_KV_INT8`) lost points on the agentic benchmark. Graph captures write their
+K/V to the dummy page (`340db81`). Upstream's DFlash 2 drafts (`08cee44`, `1ba3e71`) keep per-request states a
+proposer copies by slot id, so `--speculative-algorithm` with such states refuses `FREETOKEN_GDN_SNAP_HOST`, and a
+draft that reads layer outputs gets them from the plain per-layer forward instead of the fused hyper-connection loop;
+`--speculative-algorithm` stays exclusive with this tree's MTP decoding, untested on RDNA3.
 
 ## Keeping current
 

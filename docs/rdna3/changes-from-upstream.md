@@ -2,9 +2,9 @@
 
 This repository is a modified version of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken) (Apache
 License 2.0), taken at `0d652e7` and merged with upstream up to `ee9789f`, then up to `9b68e00` (five of its commits
-cherry-picked first, then the rest merged), then up to `cc56b6b`, then up to `ba31db2`, then up to `e5856ac`. Every
+cherry-picked first, then the rest merged), then up to `cc56b6b`, then up to `ba31db2`, then up to `e5856ac`, then up to `c84946b`. Every
 file changed or added relative to upstream is listed here with the reason. Line counts are `added/removed`, against the
-upstream commit a section or row names, `0d652e7` otherwise; `git diff e5856ac` gives the current ones. Files the merge made
+upstream commit a section or row names, `0d652e7` otherwise; `git diff c84946b` gives the current ones. Files the merge made
 identical to upstream again are gone from the tables ([maintaining.md](maintaining.md#the-stack-on-top-of-upstream-oldest-first)).
 Who wrote what: [credits.md](credits.md).
 
@@ -434,6 +434,21 @@ GPU); this tree's MTP decoding stays the profiles' and the two are exclusive.
 | `tests/kvcache/test_qsa_pool.py`, `tests/layers/test_lm_head_dump.py` | 15/1, new | the ring sized for both methods' rows; a decode step's LM head logits local under `FREETOKEN_SPARSE_LOGITS` (fails on the unresolved merge) |
 | `tests/models/qwen4_exp/test_tp_shard.py`, `test_tp_uneven.py`, `tests/scheduler/test_gdn_boundary_carry.py` | new | on upstream's signatures (`_linear_local_dims`' k heads, `_build_track_metadata`'s conv width, the engine's draft budget) |
 | `Dockerfile.rdna3` | (this repository's) | the content check reads the GatedDeltaNet op at its new path |
+
+## On upstream up to `c84946b`
+
+Line counts here are each file's whole difference from `c84946b` (the sections above included). Upstream added quantized
+K/V rows (`--kv-cache-dtype`, `27740fe`), DFlash 2 drafts (`08cee44`, `1ba3e71`), `--online-quant` (`56e7f3a`) and its
+own grouping of the CPU expert executor's routes by expert (`5209c8c`, `c84946b`).
+
+| File | Lines | Change |
+|---|---:|---|
+| `python/freetoken/kernel/csrc/cpu_moe/cpu_moe_ext.cpp`, `format.h` | 110/7, 19/0 | on upstream's work items for the routes the CPU computes and its grouping by expert, which replaces this tree's: `FREETOKEN_CPU_MOE_GROUP=0` turns upstream's off; a format that runs its tasks whole (EXL3) still gets its own groups and every row's input prepared; the in-kernel flags and `FREETOKEN_CPU_MOE_ROUTE_STATS` as before |
+| `python/freetoken/kvcache/mha_pool.py`, `kvcache/base.py`, `kvcache/__init__.py`, `kvcache/host_kv_pool.py` | 16/10, 13/2, 11/2, 349/0 | upstream's `_alloc` (quantized rows and their scales) allocates compute-dtype K/V through this tree's `_new_kv_buffer` (host-mapped for QSA) and frees through `release_cached_vram`; the per-token cost takes upstream's format and this tree's local heads; the RAM tier refuses a pool of quantized rows (it does not copy their scales) |
+| `python/freetoken/kvcache/qsa_pool.py`, `kernel/triton/qsa/attend.py`, `attention/qsa_sparse.py`, `attention/__init__.py`, `server/args.py` | 188/5, 369/92, 177/57, 1/1, 18/3 | the QSA pool, backend and attend kernel refuse `--kv-cache-dtype` rows: this tree's kernels (K/V in host RAM, the decode K/V cache, the stores fused into the q/k launch) read compute-dtype K/V, or `FREETOKEN_QSA_KV_INT8`'s; upstream's second LDS clamp sized with q's itemsize, as upstream's now is |
+| `python/freetoken/engine/engine.py`, `engine/graph.py`, `attention/linear.py` | 782/22, 141/41, 26/10 | `--speculative-algorithm` with a proposer's per-request states refuses `FREETOKEN_GDN_SNAP_HOST` (the proposer copies their track snapshots by slot id on the device tensors); upstream's capture on the dummy page in this tree's capture buffer; the track metadata carries upstream's live slots beside this tree's track rows |
+| `python/freetoken/models/qwen4_exp/model.py`, `layers/embedding.py`, `layers/quantization/int8_weight_only.py` | 136/10, 127/8, 238/0 | a draft that reads layer outputs (DFlash) gets them from the plain per-layer loop, the fused hyper-connection loop otherwise; upstream's kept-rows head beside the local decode logits; the int8 method carries upstream's `online` flag |
+| `tests/models/qwen4_exp/test_qsa_kernels.py`, `tests/kvcache/test_kv_cache_rebuild.py` | 38/6, 5/1 | upstream's quantized-K/V tests skip on QSA; a test that the QSA attend kernel and pool refuse those rows |
 
 ## The states a verify step keeps for its rollback in one flat buffer, a sampled step's token sync without RCCL (bit-exact)
 

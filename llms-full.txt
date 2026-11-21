@@ -840,7 +840,7 @@ disagreements over ~8k sampled tokens in `check` mode). It is on the torch.distr
 | `FREETOKEN_HYBRID_MIN_REQS` | `1` | With `--moe-strategy hybrid`: decode steps of fewer requests fetch every miss (the offload path). CUDA graphs are captured per batch size, so each size takes one path. `rdna3/serve.sh --hybrid` does not set it. |
 | `FREETOKEN_HYBRID_FLAG_IN_KERNEL` | `1` | With `--moe-strategy hybrid`: one kernel writes the CPU's inputs into its pinned IO rows and rings the coordinator, another waits for the CPU's partial and adds it back, over two pinned flag words (`0`: upstream's copies around the doorbell's stream memops, ~3.2 us a node). Bit-identical. With the other hybrid kernels, one request on NVFP4 `xtx-xt` 74.3 -> 78.3 tok/s, measured with an earlier handshake that these replaced, not again since ([cpu-experts.md](cpu-experts.md)). Replaces `FREETOKEN_HYBRID_SPLIT_KERNEL`. |
 | `FREETOKEN_CPU_MOE_KERNEL_IO_ROCM` | `0` | CPU expert executor on ROCm: `1` tries upstream's kernel IO there too (a publish kernel copies the inputs and rings the doorbell, a combine kernel adds the result back), kept only when its start-up probe matches a CPU reference; `0` keeps the copies around the doorbell with upstream's event before it. Upstream's CPU MoE tests pass both ways on the 7900 XTX; not measured in serving. |
-| `FREETOKEN_CPU_MOE_GROUP` | `1` | CPU expert executor, NVFP4 / bf16: one task per (expert, row block) for the routes of rows that share an expert, so its rows are read from RAM once (`0`: one task per route). Bit-identical. |
+| `FREETOKEN_CPU_MOE_GROUP` | `1` | CPU expert executor, every format but EXL3 (which decodes a shared expert once by itself): upstream's grouping, one task per (expert, row block) for the routes of rows that share an expert, so its rows are read from RAM once, and several rows per task in the second pass (`0`: one task per route and per row). Bit-identical. |
 | `FREETOKEN_CPU_MOE_ROUTE_STATS` | unset | Measurement: every `n` CPU expert tasks, print how many of the CPU's routes repeat an expert of another row of the same step (8-13 % in the `--hybrid` runs). |
 | `FREETOKEN_HYBRID_SKIP_CPU_ROUTES` | `1` | With `--moe-strategy hybrid`, NVFP4 and EXL3: the GPU decode kernels write zeros for the routes the CPU computes (slot -1) instead of computing them on slot 0 at weight 0. Bit-identical; +1-3 % decode ([cpu-experts.md](cpu-experts.md)). |
 | `FREETOKEN_CPU_MOE_CORES_BY_SLICE` | `0` | `1`: under tensor parallelism each rank's CPU expert pool takes a share of the cores proportional to its expert slice (an uneven `FREETOKEN_TP_SPLIT`) instead of half. Measured without gain. |
@@ -5034,7 +5034,35 @@ decode step.
   of the RAM); it now keeps the cards of the architecture of the one with the most compute units. And a command
   copied from an older `--dry-run` lacked `FREETOKEN_GDN_SNAP_HOST=1`: 9,190 slots instead of 11,106.
 
-## 53. Still open
+## 53. Upstream up to c84946b (2026-11-21)
+
+27 commits merged, the authors' kept; 15 files conflicted. What upstream brought: quantized K/V rows
+(`--kv-cache-dtype fp8_per_token_head` / `int8_per_token_head`, `27740fe`, one GPU), DFlash 2 drafts (`08cee44`,
+`1ba3e71`), `--online-quant df11` (`56e7f3a`), `--speculative-token-map`, Gemma-4 E2B / E4B and its assistant draft,
+DeepSeek-V4.1 GGUFs, a ripple-65b preview, timings on every streamed chunk, the `developer` role rendered as `system`,
+graph captures writing their K/V to the dummy page (`340db81`), and the CPU expert executor's work split by expert
+(`5209c8c`, `c84946b`).
+
+- **The CPU executor's grouping is upstream's now.** Upstream groups a step's routes by expert as this tree's
+  `FREETOKEN_CPU_MOE_GROUP` did, for every format and in the second pass too; this tree's grouping is gone and the
+  variable turns upstream's off. The EXL3 format, which runs its tasks whole, keeps its own groups.
+- **Quantized K/V rows: every pool but QSA's.** The QSA kernels of this tree (K/V in host RAM, the decode K/V cache,
+  the stores fused into the q/k launch) read compute-dtype K/V; rather than a second path nobody measured, the QSA
+  pool, backend and attend kernel refuse `--kv-cache-dtype` at start. This tree's own int8 K/V
+  (`FREETOKEN_QSA_KV_INT8`) lost points on the agentic benchmark, so nothing asks for it today.
+- **Found by the test suite:** the RAM tier's new guard read `kv_format` on pools that have none (56 tests). **Found
+  by a second read of the merge:** the int8 dense method lacked upstream's `online` flag (no path reads it there
+  today), the `--kv-cache-dtype` help still named `qsa_sparse`.
+- **Checked** (`xtx-xt-4x262k` as the launcher starts it, the image of the merge against the one before, kernel cache
+  filled): NVFP4 12 of 12 greedy answers identical, 149.4 tok/s against 148.0; a 255,420-token read at
+  4085 tok/s against 4182 (one pass each), the answer after it at 128.8 against 128.5, the next turn the same text.
+  EXL3 3.05 bpw: 12 of 12 identical, 161.9 against 161.3; the read at 3648 against 3647, the answer at 134.7 against
+  134.5, the next turn the same text. `--hybrid` on `xtx` (NVFP4): 72.2 and 71.6 tok/s against 71.4; its answers
+  differ from run to run on one image as much as between the two (6 of 12 identical either way). No GPU fault or error
+  in the nine servers. The CPU suite passes (the GPU tests skip).
+- Not tried on RDNA3: `--speculative-algorithm dflash`, `--online-quant`, the quantized K/V rows on the other pools.
+
+## 54. Still open
 
 - In NVFP4 the model needs ~63 GiB of RAM for its experts alone (the engine keeps every expert in RAM). The EXL3 3.05
   bpw checkpoint needs 42.6 GiB and serves under a 56 GiB container limit with `serve.sh --low-ram` (section 50), but
@@ -5747,12 +5775,12 @@ How this repository relates to upstream FreeToken and how to keep it current. Fo
 
 ## What this tree is
 
-Upstream [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken) at `e5856ac` ("fix(utils): read stop ids
-from config.json without generation_config.json (#874)"), plus the changes listed file by file in
+Upstream [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken) at `c84946b` ("perf(cpu-moe): split the
+cpu executor's work by expert when tokens share one (#916)"), plus the changes listed file by file in
 [changes-from-upstream.md](changes-from-upstream.md). The history is upstream's own up to `0d652e7`, then this
 project's commits on top (the first one holds everything up to 0.1.0), a merge of upstream up to `ee9789f`, five
 upstream commits cherry-picked (`74a3877`, `9c635a1`, `7d6490c`, `9b68e00`, `b6193e8`, authors kept), a merge of the
-rest up to `9b68e00`, merges up to `cc56b6b`, `ba31db2` and `e5856ac`. Once
+rest up to `9b68e00`, merges up to `cc56b6b`, `ba31db2`, `e5856ac` and `c84946b`. Once
 the `upstream` remote is set up (below), `git diff $(git merge-base HEAD upstream/main)` shows every change against the
 upstream version this tree is based on.
 
@@ -5761,7 +5789,7 @@ upstream version this tree is based on.
 | Piece | Origin | Leaves the stack when |
 |---|---|---|
 | RCCL for tensor-parallel execution | upstream PR #135 (zihaomu) | #135 merges |
-| LDS clamp of the QSA attend kernel for RDNA's 64 KiB | community ROCm port (lukascechovic), upstream issue #349 | upstream's clamp (`7d6490c`, #587) sizes the tiles with the K/V cache's itemsize, this one with q's (the same tile unless K/V is 1 byte): kept ahead of it until they agree |
+| LDS clamp of the QSA attend kernel for RDNA's 64 KiB (a fixed 60 KiB budget) | community ROCm port (lukascechovic), upstream issue #349 | beside upstream's clamp (`7d6490c`, #587), which since `27740fe` sizes the tiles with q's itemsize as this one does and reads the device's limit: the same tiles at head_dim 256; can go once checked on both cards |
 | TP>1 relay handshake before the first request | community ROCm port (lukascechovic), upstream issue #364 | upstream fixes #364 |
 | GDN boundary carried across the prefill chunk seam | community ROCm port (lukascechovic) | upstream carries it |
 | qwen4_exp tensor parallelism | rewritten from the community port's | upstream supports qwen4_exp at TP>1 |
@@ -5824,6 +5852,19 @@ upstream's `rollback_tail` lowers this tree's `alloc_len` so the pages it return
 MoE executor keeps its copies around the doorbell and the hybrid layer's in-kernel flags, where upstream now enables its
 kernel IO (`9cacd08`).
 
+At the merge of `c84946b`: upstream sizes the QSA attend tiles for RDNA's 64 KiB with q's itemsize (`27740fe`), as this
+tree's clamp does. Upstream's CPU expert executor gives work items only to the routes the
+CPU computes (`5209c8c`) and groups a step's routes by expert (`c84946b`): this tree's own grouping is gone,
+`FREETOKEN_CPU_MOE_GROUP=0` now turns upstream's off, and the EXL3 format keeps its groups (it runs its tasks whole).
+Upstream added quantized K/V rows (`--kv-cache-dtype fp8_per_token_head` / `int8_per_token_head`, `27740fe`, one GPU):
+every pool takes them as upstream's does except the QSA pool (Qwen3.8-Flash-Next), which refuses them here - its
+kernels (K/V in host RAM, the decode K/V cache, the stores fused into the q/k launch) read compute-dtype rows, and
+this tree's own int8 K/V (`FREETOKEN_QSA_KV_INT8`) lost points on the agentic benchmark. Graph captures write their
+K/V to the dummy page (`340db81`). Upstream's DFlash 2 drafts (`08cee44`, `1ba3e71`) keep per-request states a
+proposer copies by slot id, so `--speculative-algorithm` with such states refuses `FREETOKEN_GDN_SNAP_HOST`, and a
+draft that reads layer outputs gets them from the plain per-layer forward instead of the fused hyper-connection loop;
+`--speculative-algorithm` stays exclusive with this tree's MTP decoding, untested on RDNA3.
+
 ## Keeping current
 
 ```bash
@@ -5882,9 +5923,9 @@ Infinity Cache and promises gains that serving does not see.
 
 This repository is a modified version of [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken) (Apache
 License 2.0), taken at `0d652e7` and merged with upstream up to `ee9789f`, then up to `9b68e00` (five of its commits
-cherry-picked first, then the rest merged), then up to `cc56b6b`, then up to `ba31db2`, then up to `e5856ac`. Every
+cherry-picked first, then the rest merged), then up to `cc56b6b`, then up to `ba31db2`, then up to `e5856ac`, then up to `c84946b`. Every
 file changed or added relative to upstream is listed here with the reason. Line counts are `added/removed`, against the
-upstream commit a section or row names, `0d652e7` otherwise; `git diff e5856ac` gives the current ones. Files the merge made
+upstream commit a section or row names, `0d652e7` otherwise; `git diff c84946b` gives the current ones. Files the merge made
 identical to upstream again are gone from the tables ([maintaining.md](maintaining.md#the-stack-on-top-of-upstream-oldest-first)).
 Who wrote what: [credits.md](credits.md).
 
@@ -6315,6 +6356,21 @@ GPU); this tree's MTP decoding stays the profiles' and the two are exclusive.
 | `tests/models/qwen4_exp/test_tp_shard.py`, `test_tp_uneven.py`, `tests/scheduler/test_gdn_boundary_carry.py` | new | on upstream's signatures (`_linear_local_dims`' k heads, `_build_track_metadata`'s conv width, the engine's draft budget) |
 | `Dockerfile.rdna3` | (this repository's) | the content check reads the GatedDeltaNet op at its new path |
 
+## On upstream up to `c84946b`
+
+Line counts here are each file's whole difference from `c84946b` (the sections above included). Upstream added quantized
+K/V rows (`--kv-cache-dtype`, `27740fe`), DFlash 2 drafts (`08cee44`, `1ba3e71`), `--online-quant` (`56e7f3a`) and its
+own grouping of the CPU expert executor's routes by expert (`5209c8c`, `c84946b`).
+
+| File | Lines | Change |
+|---|---:|---|
+| `python/freetoken/kernel/csrc/cpu_moe/cpu_moe_ext.cpp`, `format.h` | 110/7, 19/0 | on upstream's work items for the routes the CPU computes and its grouping by expert, which replaces this tree's: `FREETOKEN_CPU_MOE_GROUP=0` turns upstream's off; a format that runs its tasks whole (EXL3) still gets its own groups and every row's input prepared; the in-kernel flags and `FREETOKEN_CPU_MOE_ROUTE_STATS` as before |
+| `python/freetoken/kvcache/mha_pool.py`, `kvcache/base.py`, `kvcache/__init__.py`, `kvcache/host_kv_pool.py` | 16/10, 13/2, 11/2, 349/0 | upstream's `_alloc` (quantized rows and their scales) allocates compute-dtype K/V through this tree's `_new_kv_buffer` (host-mapped for QSA) and frees through `release_cached_vram`; the per-token cost takes upstream's format and this tree's local heads; the RAM tier refuses a pool of quantized rows (it does not copy their scales) |
+| `python/freetoken/kvcache/qsa_pool.py`, `kernel/triton/qsa/attend.py`, `attention/qsa_sparse.py`, `attention/__init__.py`, `server/args.py` | 188/5, 369/92, 177/57, 1/1, 18/3 | the QSA pool, backend and attend kernel refuse `--kv-cache-dtype` rows: this tree's kernels (K/V in host RAM, the decode K/V cache, the stores fused into the q/k launch) read compute-dtype K/V, or `FREETOKEN_QSA_KV_INT8`'s; upstream's second LDS clamp sized with q's itemsize, as upstream's now is |
+| `python/freetoken/engine/engine.py`, `engine/graph.py`, `attention/linear.py` | 782/22, 141/41, 26/10 | `--speculative-algorithm` with a proposer's per-request states refuses `FREETOKEN_GDN_SNAP_HOST` (the proposer copies their track snapshots by slot id on the device tensors); upstream's capture on the dummy page in this tree's capture buffer; the track metadata carries upstream's live slots beside this tree's track rows |
+| `python/freetoken/models/qwen4_exp/model.py`, `layers/embedding.py`, `layers/quantization/int8_weight_only.py` | 136/10, 127/8, 238/0 | a draft that reads layer outputs (DFlash) gets them from the plain per-layer loop, the fused hyper-connection loop otherwise; upstream's kept-rows head beside the local decode logits; the int8 method carries upstream's `online` flag |
+| `tests/models/qwen4_exp/test_qsa_kernels.py`, `tests/kvcache/test_kv_cache_rebuild.py` | 38/6, 5/1 | upstream's quantized-K/V tests skip on QSA; a test that the QSA attend kernel and pool refuse those rows |
+
 ## The states a verify step keeps for its rollback in one flat buffer, a sampled step's token sync without RCCL (bit-exact)
 
 Line counts here are on top of the lines listed in the sections above.
@@ -6689,8 +6745,8 @@ How the fractions were chosen (decode tok/s; measured on older builds than the f
 - **Rows routed to the same expert.** Computed one (row, expert) route at a time, an expert two rows of a step use
   (MTP verify rows, several requests) is read from RAM, or for EXL3 decoded, once per row: 8-13 % of the CPU's routes
   in these runs (`FREETOKEN_CPU_MOE_ROUTE_STATS=n` prints the share). NVFP4: one task per (expert, row block) runs its
-  routes back to back, the second from the core's cache (`FREETOKEN_CPU_MOE_GROUP`); EXL3: each tile row is decoded
-  once for all of them. Both bit-identical to one route at a time.
+  routes back to back, the second from the core's cache (upstream's executor groups them itself; `FREETOKEN_CPU_MOE_GROUP=0`
+  turns it off); EXL3: each tile row is decoded once for all of them. Both bit-identical to one route at a time.
 - **EXL3 experts** have no CPU path upstream. The executor reads the EXL3 banks in place (mul1 codebook, 2-4 bits):
   rotate in (`H(x * suh)`), the gate|up products, silu and the rotation into down's domain, the down products, the
   rotation out and the routed sum, AVX2 + F16C. The trellis states are decoded 8 at a time from one 64-bit window, the

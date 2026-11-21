@@ -138,6 +138,13 @@ What each change measured, and how it was found: [docs/rdna3/journey.md](docs/rd
   before (one request, greedy and T 0.6, both checkpoints; a 255k-token read and the turn after it) and the same speeds;
   a verify step's kept tokens now stream in one piece, and the decode log line shows the drafts' acceptance
   (`accept len`).
+- Upstream FreeToken merged up to `c84946b`, the authors' commits kept: among others quantized K/V rows
+  (`--kv-cache-dtype`, one GPU; refused for Qwen3.8-Flash-Next here, whose kernels keep compute-dtype K/V), DFlash 2
+  drafts (`--speculative-algorithm dflash`, untested on RDNA3), `--online-quant df11`, Gemma-4 E2B / E4B, DeepSeek-V4.1
+  GGUFs, timings on every streamed chunk, the `developer` role rendered as `system`. The CPU expert executor groups a
+  step's routes by expert itself (`FREETOKEN_CPU_MOE_GROUP=0` turns that off). On `xtx-xt-4x262k` the same greedy
+  answers as before with both checkpoints (twelve short ones, a 255k-token read and the turn after it) at the same
+  speeds; `--hybrid` on `xtx` at the same speed.
 - Opt-in, not bit-exact: `FREETOKEN_INT8_TP_TILES`. Measured and left off: `FREETOKEN_MOE_COPY_OVERLAP` (33 % slower).
 
 ### Fixed

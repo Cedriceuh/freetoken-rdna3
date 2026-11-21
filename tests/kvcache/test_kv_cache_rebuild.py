@@ -176,7 +176,11 @@ def _factory_specs():
     }
 
 
-@pytest.mark.parametrize("family", ["mha", "bsa", "qsa", "mla", "dsa", "kpool", "swa"])
+@pytest.mark.parametrize("family", [
+    "mha", "bsa",
+    pytest.param("qsa", marks=pytest.mark.skip(reason="this fork's QSA pool stores compute-dtype K/V only")),
+    "mla", "dsa", "kpool", "swa",
+])
 def test_pool_factory_forwards_the_kv_format(family: str):
     from freetoken.kvcache import create_kvcache_pool
     from freetoken.kvcache.format import FP8_PER_TOKEN_HEAD

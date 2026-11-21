@@ -105,6 +105,8 @@ class QSAKVCache(MHAKVCache):
         mrope: bool = False,
         kv_format: KVFormat = NONE,
     ) -> None:
+        if kv_format.name not in self.kv_formats:
+            raise ValueError(f"--kv-cache-dtype {kv_format.name}: QSAKVCache only stores {sorted(self.kv_formats)}")
         if index_ratio < 1 or page_size % index_ratio != 0:
             # slot // index_ratio only names one group when a group never straddles a page.
             raise ValueError(

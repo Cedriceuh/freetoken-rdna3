@@ -522,6 +522,7 @@ def test_capture_graph_provisions_the_block_topk_scratch():
 
 
 @requires_cuda
+@pytest.mark.skip(reason="this fork's QSA kernels read compute-dtype K/V only (--kv-cache-dtype is refused on QSA)")
 @pytest.mark.parametrize("fmt_name", ["fp8_per_token_head", "int8_per_token_head"])
 def test_sparse_attention_reads_quantized_kv(fmt_name: str):
     from freetoken.kernel.triton.kv_rows import store_kv_rows
@@ -571,3 +572,16 @@ def test_sparse_attention_reads_quantized_kv(fmt_name: str):
             logits = (q[row, head].float() @ keys.T) * dim**-0.5
             expected[row, head] = logits.softmax(-1) @ v_ref[live, head // group]
     torch.testing.assert_close(out.float(), expected, atol=2e-2 * expected.abs().max().item(), rtol=2e-2)
+
+
+def test_sparse_attention_refuses_quantized_kv():
+    from freetoken.kernel.triton.qsa import qsa_sparse_paged_attention
+    from freetoken.kvcache.format import KV_FORMATS
+    from freetoken.kvcache.qsa_pool import QSAKVCache
+
+    assert QSAKVCache.kv_formats == frozenset({"none"})
+    q = torch.zeros(1, 2, 16, dtype=torch.bfloat16)
+    kv = torch.zeros(1, PAGE_SIZE, 2, 16, dtype=torch.uint8)
+    with pytest.raises(NotImplementedError, match="fp8_per_token_head"):
+        qsa_sparse_paged_attention(q, kv, kv, torch.zeros(1, 4, dtype=torch.int32), torch.zeros(1, 1, dtype=torch.int32),
+                                   torch.zeros(1, dtype=torch.int32), kv_format=KV_FORMATS["fp8_per_token_head"])

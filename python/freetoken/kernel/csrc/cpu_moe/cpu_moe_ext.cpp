@@ -100,7 +100,6 @@ struct CpuMoeExecutor {
   const bool apply_on_input;
   MoeParams params;  // the formats keep a reference; declared before fmts
   std::vector<std::unique_ptr<MoeFormat>> fmts;
-  std::vector<std::string> fmt_names;  // [fmts], as cpu_executor.py named them
   std::vector<int> layer_fmt;  // [num_layers], index into fmts
   int n_iblk = 0, n_hblk = 0;  // kRowBlock blocks per intermediate row and per output row
 
@@ -201,10 +200,8 @@ struct CpuMoeExecutor {
         num_threads(num_threads_ > 0 ? num_threads_ : 1),
         core_ids(std::move(core_ids_)) {
     if (params.top_k > kMaxTopK) throw std::invalid_argument("CPU MoE supports top_k <= " + std::to_string(kMaxTopK));
-    for (auto& [name, banks, options] : formats) {
+    for (auto& [name, banks, options] : formats)
       fmts.push_back(make_format(name, params, FormatArgs{name, std::move(banks), std::move(options)}));
-      fmt_names.push_back(name);
-    }
     if (static_cast<int>(layer_formats.size()) != num_layers)
       throw std::invalid_argument("CPU MoE needs the format of every layer");
     for (const int f : layer_formats)

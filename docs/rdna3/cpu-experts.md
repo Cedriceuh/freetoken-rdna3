@@ -144,8 +144,8 @@ How the fractions were chosen (decode tok/s; measured on older builds than the f
 - **Rows routed to the same expert.** Computed one (row, expert) route at a time, an expert two rows of a step use
   (MTP verify rows, several requests) is read from RAM, or for EXL3 decoded, once per row: 8-13 % of the CPU's routes
   in these runs (`FREETOKEN_CPU_MOE_ROUTE_STATS=n` prints the share). NVFP4: one task per (expert, row block) runs its
-  routes back to back, the second from the core's cache (`FREETOKEN_CPU_MOE_GROUP`); EXL3: each tile row is decoded
-  once for all of them. Both bit-identical to one route at a time.
+  routes back to back, the second from the core's cache (upstream's executor groups them itself; `FREETOKEN_CPU_MOE_GROUP=0`
+  turns it off); EXL3: each tile row is decoded once for all of them. Both bit-identical to one route at a time.
 - **EXL3 experts** have no CPU path upstream. The executor reads the EXL3 banks in place (mul1 codebook, 2-4 bits):
   rotate in (`H(x * suh)`), the gate|up products, silu and the rotation into down's domain, the down products, the
   rotation out and the routed sum, AVX2 + F16C. The trellis states are decoded 8 at a time from one 64-bit window, the

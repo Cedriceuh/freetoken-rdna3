@@ -51,6 +51,8 @@ def _skip_list() -> tuple[str, ...]:
 class Int8WeightOnlyLinearMethod:
     """Replaces an unquantized linear's method after conversion (duck-typed like LinearMethod.apply/finalize)."""
 
+    online = False  # QuantMethod's flag, which the engine reads on every op's method
+
     def apply(self, layer: Any, x: torch.Tensor) -> torch.Tensor:
         if layer.bias is None and x.is_cuda and x.dim() == 2 and x.dtype is torch.bfloat16 and x.stride(-1) == 1:
             from freetoken.kernel.triton.int8_gemv import ROWS_MAX, gemv_int8
